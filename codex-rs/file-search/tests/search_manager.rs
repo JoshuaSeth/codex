@@ -188,3 +188,58 @@ fn search_manager_walk_includes_directories() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn search_manager_walk_follows_symlinked_directories() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root_dir = temp_dir.path().join("root");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    let target_dir = temp_dir.path().join("target");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::write(target_dir.join("gamma.rs"), "fn main() {}").unwrap();
+
+    std::os::unix::fs::symlink(&target_dir, root_dir.join("link")).unwrap();
+
+    let notify_flag = Arc::new(AtomicUsize::new(0));
+    let notify_counter = Arc::clone(&notify_flag);
+    let notify = Arc::new(move || {
+        notify_counter.fetch_add(1, Ordering::Relaxed);
+    });
+
+    let limit = NonZeroUsize::new(10).unwrap();
+    let threads = NonZeroUsize::new(1).unwrap();
+
+    let mut manager =
+        SearchManager::new("gamma", limit, &root_dir, Vec::new(), threads, true, notify).unwrap();
+
+    let start = std::time::Instant::now();
+    let mut found = false;
+
+    loop {
+        let status = manager.tick(Duration::from_millis(20));
+        let _ = notify_flag.swap(0, Ordering::AcqRel);
+        let results = manager.current_results();
+        if results.matches.iter().any(|m| m.path == "link/gamma.rs") {
+            found = true;
+            break;
+        }
+        if !status.running && start.elapsed() > Duration::from_secs(1) {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            break;
+        }
+    }
+
+    assert!(
+        found,
+        "expected walker to find symlinked file; matches: {:?}",
+        manager
+            .current_results()
+            .matches
+            .iter()
+            .map(|m| m.path.clone())
+            .collect::<Vec<_>>()
+    );
+}

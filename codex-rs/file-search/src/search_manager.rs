@@ -194,6 +194,7 @@ fn spawn_walker(
             walk_builder
                 .threads(threads)
                 .hidden(false)
+                .follow_links(true)
                 .require_git(false);
 
             if let Some(override_matcher) = override_matcher {
