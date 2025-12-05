@@ -1,12 +1,14 @@
 #![cfg(not(target_os = "windows"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::config::CustomToolConfig;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
@@ -88,6 +90,100 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
     let expected = format!("unsupported custom tool call: {tool_name}");
     assert_eq!(output, expected);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_defined_custom_tool_runs_command() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    builder = builder.with_config(|config| {
+        let script_path = config.cwd.join("custom_echo.py");
+        fs::write(
+            &script_path,
+            r#"
+import json
+import os
+
+payload = json.loads(os.environ.get("CODEX_TOOL_ARGS_JSON", "{}"))
+prefix = os.environ.get("CUSTOM_TOOL_PREFIX", "")
+print(prefix + payload.get("text", ""))
+"#,
+        )
+        .expect("write helper script");
+
+        let mut env = HashMap::new();
+        env.insert("CUSTOM_TOOL_PREFIX".to_string(), "custom: ".to_string());
+
+        config.custom_tools.insert(
+            "custom.echo".to_string(),
+            CustomToolConfig {
+                name: "custom.echo".to_string(),
+                command: vec![
+                    "python3".to_string(),
+                    script_path.to_string_lossy().into_owned(),
+                ],
+                description: Some("Echo text".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                }),
+                cwd: None,
+                env,
+                timeout_ms: Some(2_000),
+                with_escalated_permissions: None,
+                parallel: false,
+            },
+        );
+    });
+    let test = builder.build(&server).await?;
+
+    let call_id = "custom-echo";
+    let args = json!({ "text": "config-powered" });
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "custom.echo", &serde_json::to_string(&args)?),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn_with_policies(
+        "invoke custom echo",
+        AskForApproval::Never,
+        SandboxPolicy::DangerFullAccess,
+    )
+    .await?;
+
+    let (content, _success) = mock
+        .single_request()
+        .function_call_output_content_and_success(call_id)
+        .expect("tool output present");
+    let content = content.expect("string output");
+    let payload: Value = serde_json::from_str(&content)?;
+    let stdout = payload["output"].as_str().unwrap_or_default();
+    assert!(
+        stdout.contains("config-powered"),
+        "stdout missing text: {stdout}"
+    );
+    assert!(
+        stdout.contains("custom: "),
+        "stdout missing prefix: {stdout}"
+    );
     Ok(())
 }
 

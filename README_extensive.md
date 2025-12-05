@@ -94,8 +94,17 @@ This document grows over multiple **iterations**. Each pass adds more depth, con
 ## Iteration 5 – Packaging & Config Isolation
 
 ### 5.1 Shipping a Local `codex-dev`
-- The workspace already exposes the CLI binary, so a single command builds a standalone tool without touching the packaged install: `cargo install --path codex-rs/cli --root ~/.local && mv ~/.local/bin/codex ~/.local/bin/codex-dev`. Cargo reads the root workspace manifest plus the CLI crate, so the resulting binary matches what `cargo run --bin codex` provides. codex-rs/Cargo.toml:1-80codex-rs/cli/Cargo.toml:1-60
-- Keep both binaries on your `$PATH` by aliasing `codex-dev` or wrapping it in a script that injects config overrides (see §5.2). Rebuilding after local edits is just rerunning the same `cargo install` pipeline; Cargo overwrites the previous binary before you rename it again.
+- Treat `codex` as the official distribution and `codex-dev` as “whatever binary was produced from the working tree.” Keeping them separate avoids collisions with the npm/brew releases while letting you dogfood experimental patches.
+- Build/rebuild with:
+  ```bash
+  cd codex/codex-rs
+  cargo build -p codex-cli --release             # or omit --release for faster debug builds
+  ln -sf $(pwd)/target/release/codex ~/.local/bin/codex-dev
+  codex-dev --version
+  ```
+  Running the `cargo build` step after *every* Rust edit is the only way to ensure `codex-dev` picks up your latest code. Release builds mimic the shipped binary; debug builds are faster to iterate on but slower at runtime.
+- Both CLIs read from `~/.codex` by default. Keep their state isolated by running `codex-dev --config-home ~/.codex-dev` (or by pointing `CODEX_CONFIG_FILE` at a dev-only TOML). This also makes it easy to test new knobs like `[custom_tools]` without polluting your primary install. codex-rs/common/src/config_override.rs:17-120
+- If you prefer a one-liner installer, `cargo install --locked --path codex-rs/cli --bin codex --root ~/.local` followed by `mv ~/.local/bin/codex ~/.local/bin/codex-dev` reproduces the same layout as above. Re-run the `cargo install` command whenever you need to refresh the binary.
 
 ### 5.2 CLI-Level Config Overrides
 - Every entry point now accepts `--config-home DIR` (override `$CODEX_HOME`) and `--config-file FILE` (load an arbitrary TOML). These flags live on `CliConfigOverrides`, propagate via `prepend_from`, and therefore affect the interactive CLI, `codex exec`, the MCP/app servers, etc. codex-rs/common/src/config_override.rs:17-165codex-rs/cli/src/main.rs:431-690codex-rs/exec/src/main.rs:17-45codex-rs/tui/src/main.rs:9-34
@@ -113,5 +122,21 @@ This document grows over multiple **iterations**. Each pass adds more depth, con
   uvicorn session_viewer.app:app --reload --port 8001
   ```
   Open `http://localhost:8001`, paste a conversation UUID (or pick from the recent list), and the visualizer loads from your local session logs.
+
+### 5.4 Config-defined CLI Tools
+- You can now declare first-class tools directly inside `config.toml` under `[custom_tools.<name>]`. Each entry mirrors an OpenAI function tool: provide an argv array, optional JSON Schema, description, env vars, and timeout/escalation knobs. During startup `Config::load_with_cli_overrides` resolves the table into `CustomToolConfig` structs, and `ToolsConfig::new` emits `ToolSpec::Function` definitions plus a dedicated handler that shells out via the same sandbox used by the builtin shell tool. codex-rs/core/src/config/mod.rs:580-720codex-rs/core/src/tools/spec.rs:33-230codex-rs/core/src/tools/handlers/custom.rs:1-96
+- Minimal example (drop this into `~/.codex/config.toml` or a dev override file) demonstrating the bundled `tools/custom_tools/echo_tool.py` helper:
+  ```toml
+  [custom_tools.echo_demo]
+  command = ["python3", "/path/to/codex/tools/custom_tools/echo_tool.py"]
+  description = "Echoes text using CODEX_TOOL_ARGS_JSON"
+  # Optional JSON schema; omit to accept an empty object.
+  parameters = { type = "object", properties = { text = { type = "string" } }, required = ["text"] }
+  timeout_ms = 4000
+  [custom_tools.echo_demo.env]
+  CUSTOM_TOOL_PREFIX = "dev-build: "
+  ```
+  At runtime Codex injects three env vars—`CODEX_TOOL_ARGS_JSON`, `CODEX_TOOL_NAME`, and `CODEX_TOOL_CALL_ID`—before running the command under the session sandbox/approval policy. The script can log/emit anything; Codex captures stdout/stderr, renders it in rollouts, and surfaces the JSON-formatted result back to the model as a normal function call output.
+- Validation: we added an integration test (`config_defined_custom_tool_runs_command`) that wires a custom Python helper, lets the mock model request `custom.echo`, and asserts the tool output contains both the agent-provided text and the config-specified prefix. Running `cargo test -p codex-core config_defined_custom_tool_runs_command` exercises the entire pipeline (config parsing, tool registry, sandbox exec, telemetry, and SSE plumbing) without needing a live OpenAI connection.
 
 *Last updated: \`README_extensive.md\` created as part of the deep-study task; extend it in further iterations as the system evolves.*

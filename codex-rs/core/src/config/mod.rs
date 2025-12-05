@@ -1,4 +1,5 @@
 use crate::auth::AuthCredentialsStoreMode;
+use crate::config::types::CustomToolToml;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
@@ -44,6 +45,8 @@ use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dirs::home_dir;
 use dunce::canonicalize;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use serde_json::json;
 use similar::DiffableStr;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -365,6 +368,22 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config::types::OtelConfig,
+
+    /// User-defined custom CLI tools.
+    pub custom_tools: BTreeMap<String, CustomToolConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomToolConfig {
+    pub name: String,
+    pub command: Vec<String>,
+    pub description: Option<String>,
+    pub parameters: JsonValue,
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub with_escalated_permissions: Option<bool>,
+    pub parallel: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -740,6 +759,10 @@ pub struct ConfigToml {
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// User-defined CLI tools implemented via local commands.
+    #[serde(default)]
+    pub custom_tools: HashMap<String, CustomToolToml>,
 
     /// Preferred backend for storing MCP OAuth credentials.
     /// keyring: Use an OS-specific keyring service.
@@ -1318,6 +1341,7 @@ impl Config {
             .unwrap_or_else(default_review_model);
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
+        let custom_tools = build_custom_tools(cfg.custom_tools.clone())?;
 
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
@@ -1456,6 +1480,7 @@ impl Config {
                     trace_exporter,
                 }
             },
+            custom_tools,
         };
         Ok(config)
     }
@@ -1552,7 +1577,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
 
 /// Returns the config.toml path, honoring the `CODEX_CONFIG_FILE` override
 /// when present.
-pub fn config_file_path(codex_home: &Path) -> PathBuf {
+pub fn config_file_path(codex_home: impl AsRef<Path>) -> PathBuf {
     if let Some(path) = CONFIG_FILE_OVERRIDE.get() {
         return path.clone();
     }
@@ -1562,8 +1587,51 @@ pub fn config_file_path(codex_home: &Path) -> PathBuf {
     {
         PathBuf::from(val)
     } else {
-        codex_home.join(CONFIG_TOML_FILE)
+        codex_home.as_ref().join(CONFIG_TOML_FILE)
     }
+}
+
+fn build_custom_tools(
+    entries: HashMap<String, CustomToolToml>,
+) -> std::io::Result<BTreeMap<String, CustomToolConfig>> {
+    let mut tools = BTreeMap::new();
+    for (name, entry) in entries {
+        if entry.command.is_empty() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("custom tool {name} must provide a non-empty command"),
+            ));
+        }
+
+        let description = entry
+            .description
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| entry.command.first().map(|cmd| format!("Run {cmd}")));
+
+        let parameters = entry.parameters.unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        });
+
+        tools.insert(
+            name.clone(),
+            CustomToolConfig {
+                name,
+                command: entry.command,
+                description,
+                parameters,
+                cwd: entry.cwd,
+                env: entry.env.unwrap_or_default(),
+                timeout_ms: entry.timeout_ms,
+                with_escalated_permissions: entry.with_escalated_permissions,
+                parallel: entry.parallel.unwrap_or(false),
+            },
+        );
+    }
+    Ok(tools)
 }
 
 /// Override the codex home directory for the running process. The first
@@ -3218,6 +3286,7 @@ model_verbosity = "high"
                 mcp_servers: HashMap::new(),
                 mcp_oauth_credentials_store_mode: Default::default(),
                 model_providers: fixture.model_provider_map.clone(),
+                custom_tools: BTreeMap::new(),
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
@@ -3303,6 +3372,7 @@ model_verbosity = "high"
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
+            custom_tools: BTreeMap::new(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
@@ -3403,6 +3473,7 @@ model_verbosity = "high"
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
+            custom_tools: BTreeMap::new(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
@@ -3489,6 +3560,7 @@ model_verbosity = "high"
             mcp_servers: HashMap::new(),
             mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
+            custom_tools: BTreeMap::new(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,

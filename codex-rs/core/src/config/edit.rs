@@ -711,7 +711,7 @@ mod tests {
         )
         .expect("persist");
 
-        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(&codex_home)).expect("read config");
         let expected = r#"model = "gpt-5.1-codex"
 model_reasoning_effort = "high"
 "#;
@@ -761,7 +761,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         )
         .expect("persist");
 
-        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(&codex_home)).expect("read config");
         let value: TomlValue = toml::from_str(&raw).expect("parse config");
 
         // Ensure sandbox_mode is preserved under profiles.fast and model updated.

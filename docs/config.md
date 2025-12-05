@@ -7,6 +7,7 @@ Codex configuration gives you fine-grained control over the model, execution env
 - [Feature flags](#feature-flags)
 - [Model selection](#model-selection)
 - [Execution environment](#execution-environment)
+- [Custom CLI tools](#custom-cli-tools)
 - [MCP integration](#mcp-integration)
 - [Observability and telemetry](#observability-and-telemetry)
 - [Profiles and overrides](#profiles-and-overrides)
@@ -434,6 +435,38 @@ set = { PATH = "/usr/bin", MY_FLAG = "1" }
 ```
 
 Currently, `CODEX_SANDBOX_NETWORK_DISABLED=1` is also added to the environment, assuming network is disabled. This is not configurable.
+
+## Custom CLI tools
+
+Codex can expose bespoke tools without writing an MCP server by defining `[custom_tools.<name>]` entries in `config.toml`. Each entry is converted into an OpenAI function tool at startup and is executed via the same sandbox/approval machinery as the builtin shell tool.
+
+```toml
+[custom_tools.echo_demo]
+command = ["python3", "/path/to/codex/tools/custom_tools/echo_tool.py"]
+description = "Echo text via CODEX_TOOL_ARGS_JSON"
+parameters = { type = "object", properties = { text = { type = "string" } }, required = ["text"] }
+timeout_ms = 4000
+[custom_tools.echo_demo.env]
+CUSTOM_TOOL_PREFIX = "dev-build: "
+```
+
+**Fields**
+
+- `command` *(required)* – argv array executed directly (no shell interpolation). The command inherits the turn’s sandbox policy, approval requirements, and `shell_environment_policy`.
+- `description`, `parameters` *(optional)* – surface metadata to the model. `parameters` must be a JSON Schema object; omit it to accept an empty object.
+- `cwd` *(optional)* – relative path inside the workspace; omit to run in the turn cwd.
+- `env` *(table)* – extra environment variables merged into the process environment.
+- `timeout_ms`, `with_escalated_permissions`, `parallel` – mirror the knobs used by builtin tools.
+
+At runtime Codex injects three additional environment variables so scripts can inspect the call context without parsing arguments:
+
+| Env var | Meaning |
+| ------- | ------- |
+| `CODEX_TOOL_ARGS_JSON` | Canonical JSON string containing the tool arguments. |
+| `CODEX_TOOL_NAME` | The fully-qualified tool name (table key). |
+| `CODEX_TOOL_CALL_ID` | The unique call identifier for the turn. |
+
+Tool stdout/stderr are captured and fed back to the model as the function output (Codex uses the structured exec output format, so both streams plus metadata are available in rollouts). See `tools/custom_tools/echo_tool.py` for a ready-made helper that prints the incoming text along with a timestamp.
 
 ## MCP integration
 
@@ -1023,6 +1056,7 @@ Valid values:
 | `model_context_window`                           | number                                                            | Context window tokens.                                                                                                          |
 | `tool_output_token_limit`                        | number                                                            | Token budget for stored function/tool outputs in history (default: 2,560 tokens).                                               |
 | `tool_hook_command`                              | array<string>                                                     | Command invoked before/after each tool call; receives a JSON payload over stdin.                                                |
+| `custom_tools.<name>`                            | table                                                             | Define config-based CLI tools (`command`, `parameters`, `env`, `timeout_ms`, etc.). See [Custom CLI tools](#custom-cli-tools).   |
 | `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                                    |
 | `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                              |
 | `sandbox_workspace_write.writable_roots`         | array<string>                                                     | Extra writable roots in workspace‑write.                                                                                        |

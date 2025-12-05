@@ -201,7 +201,7 @@ impl ToolHandler for ShellCommandHandler {
 }
 
 impl ShellHandler {
-    async fn run_exec_like(
+    pub(crate) async fn run_exec_like(
         tool_name: &str,
         exec_params: ExecParams,
         session: Arc<crate::codex::Session>,

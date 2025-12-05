@@ -1,5 +1,6 @@
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
+use crate::config::CustomToolConfig;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::models_manager::model_family::ModelFamily;
@@ -15,6 +16,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use tracing::error;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
@@ -23,11 +25,26 @@ pub(crate) struct ToolsConfig {
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub custom_tools: Vec<ConfigCustomTool>,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) model_family: &'a ModelFamily,
     pub(crate) features: &'a Features,
+    pub(crate) custom_tools: &'a BTreeMap<String, CustomToolConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigCustomTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: JsonSchema,
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub with_escalated_permissions: Option<bool>,
+    pub parallel: bool,
 }
 
 impl ToolsConfig {
@@ -35,6 +52,7 @@ impl ToolsConfig {
         let ToolsConfigParams {
             model_family,
             features,
+            custom_tools,
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_web_search_request = features.enabled(Feature::WebSearchRequest);
@@ -71,6 +89,7 @@ impl ToolsConfig {
             web_search_request: include_web_search_request,
             include_view_image_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
+            custom_tools: build_custom_tool_specs(custom_tools),
         }
     }
 }
@@ -975,12 +994,44 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
+fn build_custom_tool_specs(entries: &BTreeMap<String, CustomToolConfig>) -> Vec<ConfigCustomTool> {
+    let mut specs = Vec::new();
+    for tool in entries.values() {
+        let mut schema_value = tool.parameters.clone();
+        sanitize_json_schema(&mut schema_value);
+        match serde_json::from_value::<JsonSchema>(schema_value) {
+            Ok(parameters) => {
+                let description = tool
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Run {}", tool.command[0]));
+                specs.push(ConfigCustomTool {
+                    name: tool.name.clone(),
+                    description,
+                    parameters,
+                    command: tool.command.clone(),
+                    cwd: tool.cwd.clone(),
+                    env: tool.env.clone(),
+                    timeout_ms: tool.timeout_ms,
+                    with_escalated_permissions: tool.with_escalated_permissions,
+                    parallel: tool.parallel,
+                });
+            }
+            Err(err) => {
+                error!(tool = tool.name, ?err, "failed to parse custom tool schema");
+            }
+        }
+    }
+    specs
+}
+
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
+    use crate::tools::handlers::CustomToolHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
@@ -1102,6 +1153,20 @@ pub(crate) fn build_specs(
         builder.register_handler("view_image", view_image_handler);
     }
 
+    if !config.custom_tools.is_empty() {
+        let handler = Arc::new(CustomToolHandler::new(config.custom_tools.clone()));
+        for tool in &config.custom_tools {
+            let spec = ToolSpec::Function(ResponsesApiTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                strict: false,
+                parameters: tool.parameters.clone(),
+            });
+            builder.push_spec_with_parallel_support(spec, tool.parallel);
+            builder.register_handler(tool.name.clone(), handler.clone());
+        }
+    }
+
     if let Some(mcp_tools) = mcp_tools {
         let mut entries: Vec<(String, mcp_types::Tool)> = mcp_tools.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1125,10 +1190,12 @@ pub(crate) fn build_specs(
 #[cfg(test)]
 mod tests {
     use crate::client_common::tools::FreeformTool;
+    use crate::config::CustomToolConfig;
     use crate::config::test_config;
     use crate::models_manager::manager::ModelsManager;
     use crate::tools::registry::ConfiguredToolSpec;
     use mcp_types::ToolInputSchema;
+    use once_cell::sync::Lazy;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -1139,6 +1206,22 @@ mod tests {
             ToolSpec::LocalShell {} => "local_shell",
             ToolSpec::WebSearch {} => "web_search",
             ToolSpec::Freeform(FreeformTool { name, .. }) => name,
+        }
+    }
+
+    fn empty_custom_tools() -> &'static BTreeMap<String, CustomToolConfig> {
+        static EMPTY: Lazy<BTreeMap<String, CustomToolConfig>> = Lazy::new(BTreeMap::new);
+        &EMPTY
+    }
+
+    fn tools_config_params<'a>(
+        model_family: &'a ModelFamily,
+        features: &'a Features,
+    ) -> ToolsConfigParams<'a> {
+        ToolsConfigParams {
+            model_family,
+            features,
+            custom_tools: empty_custom_tools(),
         }
     }
 
@@ -1227,10 +1310,7 @@ mod tests {
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
         features.enable(Feature::ViewImageTool);
-        let config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(&config, None).build();
 
         // Build actual map name -> spec
@@ -1283,10 +1363,7 @@ mod tests {
     fn assert_model_tools(model_slug: &str, features: &Features, expected_tools: &[&str]) {
         let config = test_config();
         let model_family = ModelsManager::construct_model_family_offline(model_slug, &config);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, features));
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
         assert_eq!(&tool_names, &expected_tools,);
@@ -1479,10 +1556,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.enable(Feature::WebSearchRequest);
         features.enable(Feature::UnifiedExec);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
 
         // Only check the shell variant and a couple of core tools.
@@ -1501,10 +1575,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.disable(Feature::ViewImageTool);
         features.enable(Feature::UnifiedExec);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(&tools_config, None).build();
 
         assert!(!find_tool(&tools, "exec_command").supports_parallel_tool_calls);
@@ -1521,10 +1592,7 @@ mod tests {
             ModelsManager::construct_model_family_offline("test-gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.disable(Feature::ViewImageTool);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(&tools_config, None).build();
 
         assert!(
@@ -1552,10 +1620,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(
             &tools_config,
             Some(HashMap::from([(
@@ -1646,10 +1711,7 @@ mod tests {
         let model_family = ModelsManager::construct_model_family_offline("o3", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
 
         // Intentionally construct a map with keys that would sort alphabetically.
         let tools_map: HashMap<String, mcp_types::Tool> = HashMap::from([
@@ -1723,10 +1785,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
 
         let (tools, _) = build_specs(
             &tools_config,
@@ -1780,10 +1839,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
 
         let (tools, _) = build_specs(
             &tools_config,
@@ -1834,10 +1890,7 @@ mod tests {
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
         features.enable(Feature::ApplyPatchFreeform);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
 
         let (tools, _) = build_specs(
             &tools_config,
@@ -1890,10 +1943,7 @@ mod tests {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
 
         let (tools, _) = build_specs(
             &tools_config,
@@ -2002,10 +2052,7 @@ Examples of valid command strings:
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::WebSearchRequest);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            features: &features,
-        });
+        let tools_config = ToolsConfig::new(&tools_config_params(&model_family, &features));
         let (tools, _) = build_specs(
             &tools_config,
             Some(HashMap::from([(

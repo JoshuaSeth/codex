@@ -14,8 +14,28 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as SerdeError;
+use serde_json::Value as JsonValue;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct CustomToolToml {
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<JsonValue>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub with_escalated_permissions: Option<bool>,
+    #[serde(default)]
+    pub parallel: Option<bool>,
+}
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {

@@ -517,6 +517,7 @@ impl Session {
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
             features: &per_turn_config.features,
+            custom_tools: &per_turn_config.custom_tools,
         });
 
         TurnContext {
@@ -540,7 +541,10 @@ impl Session {
                 per_turn_config.as_ref(),
                 model_family.truncation_policy,
             ),
-            tool_hook: config.tool_hook_command.clone().and_then(ToolHook::new),
+            tool_hook: per_turn_config
+                .tool_hook_command
+                .clone()
+                .and_then(ToolHook::new),
         }
     }
 
@@ -1657,13 +1661,8 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::compact(&sess, id.clone()).await;
             }
             Op::RunUserShellCommand { command } => {
-                handlers::run_user_shell_command(
-                    &sess,
-                    id.clone(),
-                    command,
-                    &mut previous_context,
-                )
-                .await;
+                handlers::run_user_shell_command(&sess, id.clone(), command, &mut previous_context)
+                    .await;
             }
             Op::ResolveElicitation {
                 server_name,
@@ -2147,6 +2146,7 @@ async fn spawn_review_thread(
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_family: &review_model_family,
         features: &review_features,
+        custom_tools: &config.custom_tools,
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();

@@ -33,6 +33,17 @@ Then simply run `codex` to get started:
 codex
 ```
 
+### Developing locally with `codex-dev`
+
+The published `codex` binary always targets the latest official release. When you are editing this repository you should build a **separate** binary named `codex-dev` so that you can iterate without touching the official install. A quick workflow:
+
+1. `cd codex/codex-rs`
+2. Build the CLI with your current changes (`cargo build -p codex-cli --release` for a release build, or omit `--release` for faster debug builds).
+3. Copy or symlink the produced binary to somewhere on your `$PATH`, e.g. `cp target/release/codex ~/.local/bin/codex-dev` or `ln -sf $(pwd)/target/debug/codex ~/.local/bin/codex-dev`.
+4. Run `codex-dev --version` to make sure the binary came from your workspace.
+
+Any time you change Rust code you must re-run step 2 so the `codex-dev` binary picks up the latest build artifacts. Because both binaries read from `~/.codex` by default, prefer running `codex-dev --config-home ~/.codex-dev` (or set `CODEX_CONFIG_FILE=/path/to/dev-config.toml`) so experiments never trample the settings from your official installation.
+
 If you're running into upgrade issues with Homebrew, see the [FAQ entry on brew upgrade codex](./docs/faq.md#brew-upgrade-codex-isnt-upgrading-me).
 
 <details>
