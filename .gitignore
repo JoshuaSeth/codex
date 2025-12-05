@@ -47,9 +47,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# env
-.env*
+# env / virtual envs
+.env
+.env.*
 !.env.example
+.venv/
+**/.venv/
+tools/session_viewer/.env
 
 # package
 *.tgz
