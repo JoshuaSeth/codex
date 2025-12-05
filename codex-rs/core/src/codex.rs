@@ -137,6 +137,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::hooks::ToolHook;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::tools::spec::ToolsConfig;
@@ -373,6 +374,7 @@ pub(crate) struct TurnContext {
     pub(crate) tool_call_gate: Arc<ReadinessFlag>,
     pub(crate) exec_policy: Arc<RwLock<ExecPolicy>>,
     pub(crate) truncation_policy: TruncationPolicy,
+    pub(crate) tool_hook: Option<ToolHook>,
 }
 
 impl TurnContext {
@@ -538,6 +540,7 @@ impl Session {
                 per_turn_config.as_ref(),
                 model_family.truncation_policy,
             ),
+            tool_hook: config.tool_hook_command.clone().and_then(ToolHook::new),
         }
     }
 
@@ -2156,6 +2159,7 @@ async fn spawn_review_thread(
         tool_call_gate: Arc::new(ReadinessFlag::new()),
         exec_policy: parent_turn_context.exec_policy.clone(),
         truncation_policy: TruncationPolicy::new(&per_turn_config, model_family.truncation_policy),
+        tool_hook: parent_turn_context.tool_hook.clone(),
     };
 
     // Seed the child task with the review prompt as the initial user message.

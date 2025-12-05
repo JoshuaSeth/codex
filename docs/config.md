@@ -362,6 +362,16 @@ view_image = false  # disable image uploads (they're enabled by default)
 
 The `view_image` toggle is useful when you want to include screenshots or diagrams from your repo without pasting them manually. Codex still respects sandboxing: it can only attach files inside the workspace roots you allow.
 
+### tool_hook_command
+
+Run an external command before and after each model-initiated tool call. Codex writes a JSON payload to the hook's `stdin` describing the phase (`"before_execution"` or `"after_execution"`), the tool name, call id, captured arguments, and—after execution—the final `ResponseInputItem` or error message. This is ideal for piping events into a Python logger or appending to a JSONL audit file.
+
+```toml
+tool_hook_command = ["python3", "~/scripts/log_tool_calls.py"]
+```
+
+Hooks are best-effort. Failures are logged but never interrupt the turn.
+
 ### approval_presets
 
 Codex provides three main Approval Presets:
@@ -991,6 +1001,7 @@ Valid values:
 | `model_provider`                                 | string                                                            | Provider id from `model_providers` (default: `openai`).                                                                         |
 | `model_context_window`                           | number                                                            | Context window tokens.                                                                                                          |
 | `tool_output_token_limit`                        | number                                                            | Token budget for stored function/tool outputs in history (default: 2,560 tokens).                                               |
+| `tool_hook_command`                              | array<string>                                                     | Command invoked before/after each tool call; receives a JSON payload over stdin.                                                |
 | `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                                    |
 | `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                              |
 | `sandbox_workspace_write.writable_roots`         | array<string>                                                     | Extra writable roots in workspace‑write.                                                                                        |

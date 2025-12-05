@@ -6,6 +6,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::hooks::{ToolCallSnapshot, ToolHookEvent};
 use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
@@ -134,6 +135,12 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
     ) -> Result<ResponseInputItem, FunctionCallError> {
+        let hook = turn.tool_hook.clone();
+        let hook_snapshot = hook.as_ref().map(|_| ToolCallSnapshot::from_call(&call));
+        if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
+            hook.emit(ToolHookEvent::before(snapshot.clone())).await;
+        }
+
         let ToolCall {
             tool_name,
             call_id,
@@ -152,13 +159,40 @@ impl ToolRouter {
         };
 
         match self.registry.dispatch(invocation).await {
-            Ok(response) => Ok(response),
-            Err(FunctionCallError::Fatal(message)) => Err(FunctionCallError::Fatal(message)),
-            Err(err) => Ok(Self::failure_response(
-                failure_call_id,
-                payload_outputs_custom,
-                err,
-            )),
+            Ok(response) => {
+                if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
+                    hook.emit(ToolHookEvent::after_success(
+                        snapshot.clone(),
+                        response.clone(),
+                    ))
+                    .await;
+                }
+                Ok(response)
+            }
+            Err(FunctionCallError::Fatal(message)) => {
+                if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
+                    hook.emit(ToolHookEvent::after_error(
+                        snapshot.clone(),
+                        message.clone(),
+                    ))
+                    .await;
+                }
+                Err(FunctionCallError::Fatal(message))
+            }
+            Err(err) => {
+                if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
+                    hook.emit(ToolHookEvent::after_error(
+                        snapshot.clone(),
+                        err.to_string(),
+                    ))
+                    .await;
+                }
+                Ok(Self::failure_response(
+                    failure_call_id,
+                    payload_outputs_custom,
+                    err,
+                ))
+            }
         }
     }
 

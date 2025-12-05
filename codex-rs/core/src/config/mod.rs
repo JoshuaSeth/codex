@@ -267,6 +267,11 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// When set, Codex will invoke this command before and after every tool call with a JSON payload describing the event.
+    /// Example `~/.codex/config.toml` entry:
+    /// `tool_hook_command = ["python3", "~/capture_tool_calls.py"]`
+    pub tool_hook_command: Option<Vec<String>>,
+
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: PathBuf,
@@ -745,6 +750,9 @@ pub struct ConfigToml {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Command to run before/after each tool call.
+    pub tool_hook_command: Option<Vec<String>>,
 
     /// Profile to use from the `profiles` map.
     pub profile: Option<String>,
@@ -1348,6 +1356,7 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            tool_hook_command: cfg.tool_hook_command.clone(),
             codex_home,
             history,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
@@ -3166,6 +3175,7 @@ model_verbosity = "high"
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
+                tool_hook_command: None,
                 codex_home: fixture.codex_home(),
                 history: History::default(),
                 file_opener: UriBasedFileOpener::VsCode,
@@ -3249,6 +3259,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
@@ -3347,6 +3358,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
@@ -3431,6 +3443,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
