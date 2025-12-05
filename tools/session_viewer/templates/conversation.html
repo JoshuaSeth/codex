@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Conversation {{ session.meta.conversation_id }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>Conversation {{ session.meta.conversation_id }}</h2>
+  <dl class="meta-grid">
+    <div><dt>Started</dt><dd>{{ session.meta.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</dd></div>
+    <div><dt>Originator</dt><dd>{{ session.meta.originator or 'n/a' }}</dd></div>
+    <div><dt>Provider</dt><dd>{{ session.meta.provider or 'n/a' }}</dd></div>
+    <div><dt>CLI version</dt><dd>{{ session.meta.cli_version or 'n/a' }}</dd></div>
+    <div><dt>Working dir</dt><dd>{{ session.meta.cwd or 'n/a' }}</dd></div>
+    <div><dt>File</dt><dd>{{ session.meta.file_path }}</dd></div>
+  </dl>
+  {% if session.meta.instructions %}
+  <details class="instructions" open>
+    <summary>Instructions</summary>
+    <pre>{{ session.meta.instructions }}</pre>
+  </details>
+  {% endif %}
+</section>
+<section class="timeline">
+  {% for card in session.cards %}
+  <article class="timeline-card level-{{ card.level }}">
+    <div class="timeline-icon">
+      {% if card.icon_class %}
+      <i class="{{ card.icon_class }}"></i>
+      {% else %}
+      {{ card.icon }}
+      {% endif %}
+    </div>
+    <div class="timeline-body">
+      <div class="timeline-header">
+        <h3>{{ card.title }}</h3>
+        <span class="timestamp">{{ card.timestamp.strftime('%H:%M:%S') }} · {{ card.delta_human }}</span>
+      </div>
+      {% if card.presentation == 'full' %}
+        {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
+        {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
+        {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
+        <details>
+          <summary>Raw event</summary>
+          <pre>{{ card.raw | tojson(indent=2) }}</pre>
+        </details>
+      {% elif card.presentation == 'hidden' %}
+        <details class="card-details hidden-details">
+          <summary>Hidden event – click to expand</summary>
+          {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
+          {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
+          {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
+          <pre>{{ card.raw | tojson(indent=2) }}</pre>
+        </details>
+      {% else %}
+        <details class="card-details" {% if card.presentation == 'summary-open' %}open{% endif %}>
+          <summary>Show details</summary>
+          {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
+          {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
+          {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
+          <pre>{{ card.raw | tojson(indent=2) }}</pre>
+        </details>
+      {% endif %}
+    </div>
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}

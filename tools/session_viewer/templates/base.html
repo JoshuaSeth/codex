@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Codex Session Viewer{% endblock %}</title>
+    <link rel="stylesheet" href="https://unpkg.com/lucide-static@0.468.0/font/lucide.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container">
+        <h1><a href="/">Codex Session Viewer</a></h1>
+        <p class="subtitle">Visualize conversation rollouts from {{ config.codex_home }}</p>
+      </div>
+    </header>
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer container">
+      <p>Data source: {{ config.sessions_dir }}</p>
+    </footer>
+  </body>
+</html>

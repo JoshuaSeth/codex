@@ -86,7 +86,7 @@ CHANGELOG.ignore.md
 .direnv
 .envrc
 
-# Python bytecode files
+# Python
 __pycache__/
 *.pyc
-
+*.egg-info/

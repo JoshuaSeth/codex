@@ -104,4 +104,14 @@ This document grows over multiple **iterations**. Each pass adds more depth, con
   1. `codex-dev --config-home ~/.codex-dev exec "status"` isolates auth, session logs, and hook output for the dev build.  
   2. `codex --config-file ./ci/replay.toml exec "run smoke tests"` pins CI runs to a checked-in config while still using the default home for auth/keyrings.
 
+### 5.3 Conversation Visualizer
+- Added `tools/session_viewer/`, a FastAPI micro-app that parses `$CODEX_HOME/sessions/**/rollout-*.jsonl` and renders them as a clickable timeline with icons, deltas, and raw payloads. tools/session_viewer/session_viewer/app.py:1-90tools/session_viewer/session_viewer/parser.py:1-67tools/session_viewer/session_viewer/templates/conversation.html:1-39
+- Install and run:
+  ```bash
+  cd tools/session_viewer
+  pip install -e .
+  uvicorn session_viewer.app:app --reload --port 8001
+  ```
+  Open `http://localhost:8001`, paste a conversation UUID (or pick from the recent list), and the visualizer loads from your local session logs.
+
 *Last updated: \`README_extensive.md\` created as part of the deep-study task; extend it in further iterations as the system evolves.*

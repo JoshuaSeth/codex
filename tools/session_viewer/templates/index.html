@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Session Viewer{% endblock %}
+{% block content %}
+<section class="card">
+  <form method="get" action="/">
+    <label for="conversation_id">Conversation ID</label>
+    <div class="search-row">
+      <input id="conversation_id" name="conversation_id" placeholder="019a..." />
+      <button type="submit">Open</button>
+    </div>
+    <p class="hint">Paste a full conversation UUID or prefix. We'll search {{ config.sessions_dir }}.</p>
+    {% if message %}<p class="message error">{{ message }}</p>{% endif %}
+  </form>
+</section>
+<section class="card">
+  <h2>Recent sessions</h2>
+  {% if recent %}
+  <table class="recent-table">
+    <thead>
+      <tr><th>Conversation ID</th><th>File</th><th>Modified</th><th>Open</th></tr>
+    </thead>
+    <tbody>
+    {% for row in recent %}
+      <tr>
+        <td>{{ row.conversation_id or 'unknown' }}</td>
+        <td>{{ row.relative_dir }}/{{ row.filename }}</td>
+        <td>{{ row.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td><a href="/conversations/{{ row.conversation_id or row.filename }}">View</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No sessions found under {{ config.sessions_dir }}.</p>
+  {% endif %}
+</section>
+{% endblock %}
