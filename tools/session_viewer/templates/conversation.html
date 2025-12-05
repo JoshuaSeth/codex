@@ -12,14 +12,15 @@
     <div><dt>File</dt><dd>{{ session.meta.file_path }}</dd></div>
   </dl>
   {% if session.meta.instructions %}
-  <details class="instructions" open>
+  <details class="instructions">
     <summary>Instructions</summary>
     <pre>{{ session.meta.instructions }}</pre>
   </details>
   {% endif %}
 </section>
 <section class="timeline">
-  {% for card in session.cards %}
+{% for card in session.cards %}
+  {% if card.presentation != 'hidden' %}
   <article class="timeline-card level-{{ card.level }}">
     <div class="timeline-icon">
       {% if card.icon_class %}
@@ -35,31 +36,32 @@
       </div>
       {% if card.presentation == 'full' %}
         {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
-        {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
+        {% if card.body_html %}
+          <div class="body markdown">{{ card.body_html | safe }}</div>
+        {% elif card.body %}
+          <p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>
+        {% endif %}
         {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
         <details>
           <summary>Raw event</summary>
-          <pre>{{ card.raw | tojson(indent=2) }}</pre>
-        </details>
-      {% elif card.presentation == 'hidden' %}
-        <details class="card-details hidden-details">
-          <summary>Hidden event – click to expand</summary>
-          {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
-          {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
-          {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
           <pre>{{ card.raw | tojson(indent=2) }}</pre>
         </details>
       {% else %}
         <details class="card-details" {% if card.presentation == 'summary-open' %}open{% endif %}>
           <summary>Show details</summary>
           {% if card.subtitle %}<p class="subtitle">{{ card.subtitle }}</p>{% endif %}
-          {% if card.body %}<p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>{% endif %}
+          {% if card.body_html %}
+            <div class="body markdown">{{ card.body_html | safe }}</div>
+          {% elif card.body %}
+            <p class="body">{{ card.body | replace('\n', '<br/>') | safe }}</p>
+          {% endif %}
           {% if card.code %}<pre class="code-block">{{ card.code }}</pre>{% endif %}
           <pre>{{ card.raw | tojson(indent=2) }}</pre>
         </details>
       {% endif %}
     </div>
   </article>
-  {% endfor %}
+  {% endif %}
+{% endfor %}
 </section>
 {% endblock %}

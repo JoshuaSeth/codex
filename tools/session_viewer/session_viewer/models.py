@@ -26,10 +26,11 @@ class TimelineCard(BaseModel):
     title: str
     subtitle: Optional[str] = None
     body: Optional[str] = None
+    body_html: Optional[str] = None
     code: Optional[str] = None
     level: str = "info"
     icon: str = "📝"
-    icon_class: str = "lucide-file-text"
+    icon_class: str = "icon icon-file-text"
     presentation: str = "summary-collapsed"  # full, summary-collapsed, summary-open, hidden
     raw: Dict[str, Any]
 

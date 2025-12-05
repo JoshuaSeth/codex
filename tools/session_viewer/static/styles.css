@@ -163,9 +163,13 @@ button:hover {
   z-index: 1;
 }
 
-.timeline-icon i {
+.timeline-icon i,
+.timeline-icon i::before {
   font-size: 28px;
-  color: #38bdf8;
+  color: #ff0000;
+  line-height: 1;
+  font-family: "lucide", "Lucide", sans-serif;
+  font-style: normal;
 }
 
 .timeline-header {
@@ -187,6 +191,22 @@ button:hover {
 .body {
   margin: 0.5rem 0 0;
   line-height: 1.4;
+}
+
+.body.markdown :is(p, ul, ol, pre, code) {
+  margin-top: 0.5rem;
+}
+
+.body.markdown ul,
+.body.markdown ol {
+  padding-left: 1.5rem;
+}
+
+.body.markdown pre {
+  background: #020617;
+  border-radius: 12px;
+  padding: 0.75rem;
+  overflow-x: auto;
 }
 
 .code-block {
