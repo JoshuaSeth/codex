@@ -447,27 +447,18 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
 
     match subcommand {
         None => {
-            prepend_config_flags(
-                &mut interactive.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
             handle_app_exit(exit_info)?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
-            prepend_config_flags(
-                &mut exec_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut exec_cli.config_overrides, &root_config_overrides);
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
-            prepend_config_flags(
-                &mut exec_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut exec_cli.config_overrides, &root_config_overrides);
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::McpServer) => {
@@ -475,7 +466,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             // Propagate any root-level config overrides (e.g. `-c key=value`).
-            prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
+            prepend_config_flags(&mut mcp_cli.config_overrides, &root_config_overrides);
             mcp_cli.run().await?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
@@ -510,10 +501,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             handle_app_exit(exit_info)?;
         }
         Some(Subcommand::Login(mut login_cli)) => {
-            prepend_config_flags(
-                &mut login_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut login_cli.config_overrides, &root_config_overrides);
             match login_cli.action {
                 Some(LoginSubcommand::Status) => {
                     run_login_status(login_cli.config_overrides).await;
@@ -541,28 +529,19 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Some(Subcommand::Logout(mut logout_cli)) => {
-            prepend_config_flags(
-                &mut logout_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut logout_cli.config_overrides, &root_config_overrides);
             run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
         }
         Some(Subcommand::Cloud(mut cloud_cli)) => {
-            prepend_config_flags(
-                &mut cloud_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut cloud_cli.config_overrides, &root_config_overrides);
             codex_cloud_tasks::run_main(cloud_cli, codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::Sandbox(sandbox_args)) => match sandbox_args.cmd {
             SandboxCommand::Macos(mut seatbelt_cli) => {
-                prepend_config_flags(
-                    &mut seatbelt_cli.config_overrides,
-                    root_config_overrides.clone(),
-                );
+                prepend_config_flags(&mut seatbelt_cli.config_overrides, &root_config_overrides);
                 codex_cli::debug_sandbox::run_command_under_seatbelt(
                     seatbelt_cli,
                     codex_linux_sandbox_exe,
@@ -570,10 +549,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 .await?;
             }
             SandboxCommand::Linux(mut landlock_cli) => {
-                prepend_config_flags(
-                    &mut landlock_cli.config_overrides,
-                    root_config_overrides.clone(),
-                );
+                prepend_config_flags(&mut landlock_cli.config_overrides, &root_config_overrides);
                 codex_cli::debug_sandbox::run_command_under_landlock(
                     landlock_cli,
                     codex_linux_sandbox_exe,
@@ -581,10 +557,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 .await?;
             }
             SandboxCommand::Windows(mut windows_cli) => {
-                prepend_config_flags(
-                    &mut windows_cli.config_overrides,
-                    root_config_overrides.clone(),
-                );
+                prepend_config_flags(&mut windows_cli.config_overrides, &root_config_overrides);
                 codex_cli::debug_sandbox::run_command_under_windows(
                     windows_cli,
                     codex_linux_sandbox_exe,
@@ -596,10 +569,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             ExecpolicySubcommand::Check(cmd) => run_execpolicycheck(cmd)?,
         },
         Some(Subcommand::Apply(mut apply_cli)) => {
-            prepend_config_flags(
-                &mut apply_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
+            prepend_config_flags(&mut apply_cli.config_overrides, &root_config_overrides);
             run_apply_command(apply_cli, None).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
@@ -654,11 +624,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
 /// CLI-specific ones specified after the subcommand (if any).
 fn prepend_config_flags(
     subcommand_config_overrides: &mut CliConfigOverrides,
-    cli_config_overrides: CliConfigOverrides,
+    cli_config_overrides: &CliConfigOverrides,
 ) {
-    subcommand_config_overrides
-        .raw_overrides
-        .splice(0..0, cli_config_overrides.raw_overrides);
+    subcommand_config_overrides.prepend_from(cli_config_overrides);
 }
 
 /// Run the interactive Codex TUI, dispatching to either the legacy implementation or the
@@ -722,7 +690,7 @@ fn finalize_resume_interactive(
     merge_resume_cli_flags(&mut interactive, resume_cli);
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
-    prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
+    prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
 
     interactive
 }

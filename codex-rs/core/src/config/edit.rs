@@ -1,4 +1,4 @@
-use crate::config::CONFIG_TOML_FILE;
+use crate::config::config_file_path;
 use crate::config::types::McpServerConfig;
 use crate::config::types::Notice;
 use anyhow::Context;
@@ -504,7 +504,7 @@ pub fn apply_blocking(
         return Ok(());
     }
 
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let config_path = config_file_path(codex_home);
     let serialized = match std::fs::read_to_string(&config_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -711,8 +711,7 @@ mod tests {
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"model = "gpt-5.1-codex"
 model_reasoning_effort = "high"
 "#;
@@ -744,7 +743,7 @@ model_reasoning_effort = "high"
 
         // Seed with inline tables for profiles to simulate common user config.
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"profile = "fast"
 
 profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
@@ -762,7 +761,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         )
         .expect("persist");
 
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let value: TomlValue = toml::from_str(&raw).expect("parse config");
 
         // Ensure sandbox_mode is preserved under profiles.fast and model updated.
@@ -852,7 +851,7 @@ network_access = true
         let codex_home = tmp.path();
 
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"profile = "fast"
 
 profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
@@ -870,8 +869,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"profile = "fast"
 
 [profiles.fast]
@@ -886,7 +884,7 @@ model_reasoning_effort = "high"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"profile = "team"
 
 [profiles.team]
@@ -905,8 +903,7 @@ model_reasoning_effort = "low"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"profile = "team"
 
 [profiles.team]
@@ -921,7 +918,7 @@ model = "o5-preview"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[profiles."team a"]
 model = "gpt-5.1-codex"
 "#,
@@ -938,8 +935,7 @@ model = "gpt-5.1-codex"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[profiles."team a"]
 model = "o4-mini"
 "#;
@@ -951,7 +947,7 @@ model = "o4-mini"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"# Global comment
 
 [notice]
@@ -968,8 +964,7 @@ existing = "value"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"# Global comment
 
 [notice]
@@ -985,7 +980,7 @@ hide_full_access_warning = true
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[notice]
 existing = "value"
 "#,
@@ -999,8 +994,7 @@ existing = "value"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[notice]
 existing = "value"
 hide_rate_limit_model_nudge = true
@@ -1012,7 +1006,7 @@ hide_rate_limit_model_nudge = true
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[notice]
 existing = "value"
 "#,
@@ -1028,8 +1022,7 @@ existing = "value"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[notice]
 existing = "value"
 hide_gpt5_1_migration_prompt = true
@@ -1042,7 +1035,7 @@ hide_gpt5_1_migration_prompt = true
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[notice]
 existing = "value"
 "#,
@@ -1058,8 +1051,7 @@ existing = "value"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[notice]
 existing = "value"
 "hide_gpt-5.1-codex-max_migration_prompt" = true
@@ -1158,7 +1150,7 @@ gpt-5 = "gpt-5.1"
         )
         .expect("persist");
 
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = "\
 [mcp_servers.http]
 url = \"https://example.com\"
@@ -1370,7 +1362,7 @@ foo = { command = "cmd" , enabled = false }
         .expect("apply");
 
         assert!(
-            !codex_home.join(CONFIG_TOML_FILE).exists(),
+            !config_file_path(codex_home).exists(),
             "config.toml should not be created on noop"
         );
     }
@@ -1391,7 +1383,7 @@ foo = { command = "cmd" , enabled = false }
         )
         .expect("apply");
 
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let config: TomlValue = toml::from_str(&raw).expect("parse config");
         let notifications = config
             .get("tui")
@@ -1412,8 +1404,7 @@ foo = { command = "cmd" , enabled = false }
             .await
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"model = "gpt-5.1-codex"
 model_reasoning_effort = "high"
 "#;
@@ -1433,7 +1424,7 @@ model_reasoning_effort = "low"
             .apply_blocking()
             .expect("persist initial");
         let mut contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+            std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         assert_eq!(contents, initial_expected);
 
         let updated_expected = r#"model = "gpt-5.1-codex"
@@ -1443,14 +1434,14 @@ model_reasoning_effort = "high"
             .set_model(Some("gpt-5.1-codex"), Some(ReasoningEffort::High))
             .apply_blocking()
             .expect("persist update");
-        contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         assert_eq!(contents, updated_expected);
 
         ConfigEditsBuilder::new(codex_home)
             .set_model(Some("o4-mini"), Some(ReasoningEffort::Low))
             .apply_blocking()
             .expect("persist revert");
-        contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         assert_eq!(contents, initial_expected);
     }
 
@@ -1465,7 +1456,7 @@ model_reasoning_effort = "high"
             .await
             .expect("persist");
 
-        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let notice = toml::from_str::<TomlValue>(&raw)
             .expect("parse config")
             .get("notice")
@@ -1480,7 +1471,7 @@ model_reasoning_effort = "high"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             "[mcp_servers]\nfoo = { command = \"cmd\" }\n",
         )
         .expect("seed");
@@ -1492,8 +1483,7 @@ model_reasoning_effort = "high"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         assert!(!contents.contains("mcp_servers"));
     }
 }

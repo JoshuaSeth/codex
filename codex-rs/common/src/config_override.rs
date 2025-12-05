@@ -9,7 +9,10 @@
 
 use clap::ArgAction;
 use clap::Parser;
+use codex_core::config::set_codex_home_override;
+use codex_core::config::set_config_file_override;
 use serde::de::Error as SerdeError;
+use std::path::{Path, PathBuf};
 use toml::Value;
 
 /// CLI option that captures arbitrary configuration overrides specified as
@@ -34,12 +37,31 @@ pub struct CliConfigOverrides {
         global = true,
     )]
     pub raw_overrides: Vec<String>,
+
+    /// Override the Codex config directory (`CODEX_HOME`) for this invocation.
+    #[arg(
+        long = "config-home",
+        value_name = "DIR",
+        global = true,
+        help = "Load config/auth/logs from DIR instead of $CODEX_HOME (~/.codex by default)"
+    )]
+    pub config_home: Option<PathBuf>,
+
+    /// Load configuration from an explicit TOML file regardless of codex home.
+    #[arg(
+        long = "config-file",
+        value_name = "FILE",
+        global = true,
+        help = "Use FILE instead of config.toml (can be outside of $CODEX_HOME)"
+    )]
+    pub config_file: Option<PathBuf>,
 }
 
 impl CliConfigOverrides {
     /// Parse the raw strings captured from the CLI into a list of `(path,
     /// value)` tuples where `value` is a `serde_json::Value`.
     pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
+        self.apply_config_location_overrides()?;
         self.raw_overrides
             .iter()
             .map(|s| {
@@ -85,6 +107,60 @@ impl CliConfigOverrides {
             apply_single_override(target, &path, value);
         }
         Ok(())
+    }
+
+    /// Merge root-level overrides (e.g., parsed before a subcommand) into this
+    /// struct so that downstream parsing sees a single view of the overrides.
+    /// Values already set on `self` take precedence.
+    pub fn prepend_from(&mut self, other: &CliConfigOverrides) {
+        self.raw_overrides.splice(0..0, other.raw_overrides.clone());
+
+        inherit_if_absent(&mut self.config_home, other.config_home.clone());
+        inherit_if_absent(&mut self.config_file, other.config_file.clone());
+    }
+
+    fn apply_config_location_overrides(&self) -> Result<(), String> {
+        if let Some(path) = &self.config_home {
+            let normalized = canonicalize_or_absolute(path).map_err(|err| {
+                format!(
+                    "Failed to resolve --config-home path `{}`: {err}",
+                    path.display()
+                )
+            })?;
+            set_codex_home_override(normalized);
+        }
+
+        if let Some(path) = &self.config_file {
+            let normalized = canonicalize_or_absolute(path).map_err(|err| {
+                format!(
+                    "Failed to resolve --config-file path `{}`: {err}",
+                    path.display()
+                )
+            })?;
+            set_config_file_override(normalized);
+        }
+
+        Ok(())
+    }
+}
+
+fn canonicalize_or_absolute(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if path.is_absolute() {
+                Ok(path.to_path_buf())
+            } else {
+                Ok(std::env::current_dir()?.join(path))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn inherit_if_absent<T: Clone>(target: &mut Option<T>, candidate: Option<T>) {
+    if target.is_none() {
+        *target = candidate;
     }
 }
 

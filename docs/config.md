@@ -25,6 +25,15 @@ Codex supports several mechanisms for setting config values:
     - Because quotes are interpreted by one's shell, `-c key="true"` will be correctly interpreted in TOML as `key = true` (a boolean) and not `key = "true"` (a string). If for some reason you needed the string `"true"`, you would need to use `-c key='"true"'` (note the two sets of quotes).
 - The `$CODEX_HOME/config.toml` configuration file where the `CODEX_HOME` environment value defaults to `~/.codex`. (Note `CODEX_HOME` will also be where logs and other Codex-related information are stored.)
 
+You no longer have to set environment variables to isolate dev/test runs: pass `--config-home ~/.codex-dev` to load configuration, auth, logs, and sessions from that folder, or `--config-file /path/to/custom-config.toml` to point the CLI at a single TOML file while keeping the rest of `$CODEX_HOME` unchanged. Both flags are available on *every* command (interactive CLI, `codex exec`, `codex mcp`, etc.) because they live on the root `CliConfigOverrides`.
+
+| Flag | What it overrides | Example |
+| ---- | ----------------- | ------- |
+| `--config-home DIR` | Entire Codex home (auth.json, sessions, hooks, `config.toml`, logs). Mirrors `$CODEX_HOME`. | `codex-dev --config-home ~/.codex-dev exec "status"` |
+| `--config-file FILE` | Only the TOML config. Useful when you want a checked-in config but still use the default Codex home for credentials. | `codex exec --config-file ./ci/replay.toml -- sandbox ls` |
+
+Both options accept relative or absolute paths; Codex canonicalizes them before any file access so downstream helpers (e.g., `codex config edit`, session logging) automatically pick up the same location.
+
 Both the `--config` flag and the `config.toml` file support the following options:
 
 ## Feature flags

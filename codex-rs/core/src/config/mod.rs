@@ -42,6 +42,7 @@ use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dirs::home_dir;
+use dunce::canonicalize;
 use serde::Deserialize;
 use similar::DiffableStr;
 use std::collections::BTreeMap;
@@ -49,6 +50,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 #[cfg(test)]
 use tempfile::tempdir;
 
@@ -68,6 +70,8 @@ pub use constraint::ConstraintResult;
 pub use service::ConfigService;
 pub use service::ConfigServiceError;
 
+static CODEX_HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+static CONFIG_FILE_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 const OPENAI_DEFAULT_REVIEW_MODEL: &str = "gpt-5.1-codex-max";
 
 pub use codex_git::GhostSnapshotConfig;
@@ -642,7 +646,7 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
             ));
         }
     }
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let config_path = config_file_path(codex_home);
 
     // Read existing config or create empty string if file doesn't exist
     let content = match std::fs::read_to_string(&config_path) {
@@ -1509,12 +1513,16 @@ fn default_review_model() -> String {
 /// - If `CODEX_HOME` is not set, this function does not verify that the
 ///   directory exists.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
+    if let Some(path) = CODEX_HOME_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
+
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     if let Ok(val) = std::env::var("CODEX_HOME")
         && !val.is_empty()
     {
-        return PathBuf::from(val).canonicalize();
+        return canonicalize(PathBuf::from(val));
     }
 
     let mut p = home_dir().ok_or_else(|| {
@@ -1525,6 +1533,34 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
     })?;
     p.push(".codex");
     Ok(p)
+}
+
+/// Returns the config.toml path, honoring the `CODEX_CONFIG_FILE` override
+/// when present.
+pub fn config_file_path(codex_home: &Path) -> PathBuf {
+    if let Some(path) = CONFIG_FILE_OVERRIDE.get() {
+        return path.clone();
+    }
+
+    if let Ok(val) = std::env::var("CODEX_CONFIG_FILE")
+        && !val.is_empty()
+    {
+        PathBuf::from(val)
+    } else {
+        codex_home.join(CONFIG_TOML_FILE)
+    }
+}
+
+/// Override the codex home directory for the running process. The first
+/// invocation wins; subsequent calls are ignored.
+pub fn set_codex_home_override(path: PathBuf) {
+    let _ = CODEX_HOME_OVERRIDE.set(path);
+}
+
+/// Override the config.toml file path for the running process. The first
+/// invocation wins; subsequent calls are ignored.
+pub fn set_config_file_override(path: PathBuf) {
+    let _ = CONFIG_FILE_OVERRIDE.set(path);
 }
 
 /// Returns the path to the folder where Codex logs are stored. Does not verify
@@ -2045,7 +2081,7 @@ trust_level = "trusted"
     async fn managed_config_overrides_oauth_store_mode() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
         let managed_path = codex_home.path().join("managed_config.toml");
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         std::fs::write(&config_path, "mcp_oauth_credentials_store = \"file\"\n")?;
         std::fs::write(&managed_path, "mcp_oauth_credentials_store = \"keyring\"\n")?;
@@ -2164,10 +2200,7 @@ trust_level = "trusted"
         let codex_home = TempDir::new()?;
         let managed_path = codex_home.path().join("managed_config.toml");
 
-        std::fs::write(
-            codex_home.path().join(CONFIG_TOML_FILE),
-            "model = \"base\"\n",
-        )?;
+        std::fs::write(config_file_path(codex_home.path()), "model = \"base\"\n")?;
         std::fs::write(&managed_path, "model = \"managed_config\"\n")?;
 
         let overrides = LoaderOverrides {
@@ -2201,7 +2234,7 @@ trust_level = "trusted"
     #[tokio::test]
     async fn load_global_mcp_servers_accepts_legacy_ms_field() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         std::fs::write(
             &config_path,
@@ -2223,7 +2256,7 @@ startup_timeout_ms = 2500
     #[tokio::test]
     async fn load_global_mcp_servers_rejects_inline_bearer_token() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         std::fs::write(
             &config_path,
@@ -2276,7 +2309,7 @@ bearer_token = "secret"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert_eq!(
             serialized,
@@ -2344,7 +2377,7 @@ ZIG_VAR = "3"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert!(
             serialized.contains(r#"env_vars = ["ALPHA", "BETA"]"#),
@@ -2392,7 +2425,7 @@ ZIG_VAR = "3"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert!(
             serialized.contains(r#"cwd = "/tmp/codex-mcp""#),
@@ -2438,7 +2471,7 @@ ZIG_VAR = "3"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert_eq!(
             serialized,
@@ -2499,7 +2532,7 @@ startup_timeout_sec = 2.0
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert_eq!(
             serialized,
@@ -2546,7 +2579,7 @@ X-Auth = "DOCS_AUTH"
     async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         let mut servers = BTreeMap::from([(
             "docs".to_string(),
@@ -2634,7 +2667,7 @@ url = "https://example.com/mcp"
     async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers()
     -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         let servers = BTreeMap::from([
             (
@@ -2763,7 +2796,7 @@ url = "https://example.com/mcp"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert!(
             serialized.contains("enabled = false"),
@@ -2805,7 +2838,7 @@ url = "https://example.com/mcp"
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )?;
 
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
         let serialized = std::fs::read_to_string(&config_path)?;
         assert!(serialized.contains(r#"enabled_tools = ["allowed"]"#));
         assert!(serialized.contains(r#"disabled_tools = ["blocked"]"#));
@@ -2833,8 +2866,7 @@ url = "https://example.com/mcp"
             .apply()
             .await?;
 
-        let serialized =
-            tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
+        let serialized = tokio::fs::read_to_string(config_file_path(codex_home.path())).await?;
         let parsed: ConfigToml = toml::from_str(&serialized)?;
 
         assert_eq!(parsed.model.as_deref(), Some("gpt-5.1-codex"));
@@ -2846,7 +2878,7 @@ url = "https://example.com/mcp"
     #[tokio::test]
     async fn set_model_overwrites_existing_model() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         tokio::fs::write(
             &config_path,
@@ -2891,8 +2923,7 @@ model = "gpt-4.1"
             .apply()
             .await?;
 
-        let serialized =
-            tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
+        let serialized = tokio::fs::read_to_string(config_file_path(codex_home.path())).await?;
         let parsed: ConfigToml = toml::from_str(&serialized)?;
         let profile = parsed
             .profiles
@@ -2911,7 +2942,7 @@ model = "gpt-4.1"
     #[tokio::test]
     async fn set_model_updates_existing_profile() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
-        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home.path());
 
         tokio::fs::write(
             &config_path,
@@ -3610,7 +3641,7 @@ trust_level = "trusted"
     fn test_set_default_oss_provider() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let codex_home = temp_dir.path();
-        let config_path = codex_home.join(CONFIG_TOML_FILE);
+        let config_path = config_file_path(codex_home);
 
         // Test setting valid provider on empty config
         set_default_oss_provider(codex_home, OLLAMA_OSS_PROVIDER_ID)?;

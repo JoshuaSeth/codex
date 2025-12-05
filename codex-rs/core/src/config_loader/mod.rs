@@ -10,7 +10,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use crate::config::CONFIG_TOML_FILE;
+use crate::config::config_file_path;
 use crate::config_loader::config_requirements::ConfigRequirementsToml;
 use crate::config_loader::layer_io::LoadedConfigLayers;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -97,7 +97,7 @@ pub async fn load_config_layers_state(
     // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
     // exists, but is malformed, then this error should be propagated to the
     // user.
-    let user_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home)?;
+    let user_file = AbsolutePathBuf::from_absolute_path(config_file_path(codex_home))?;
     match tokio::fs::read_to_string(&user_file).await {
         Ok(contents) => {
             let user_config: TomlValue = toml::from_str(&contents).map_err(|e| {

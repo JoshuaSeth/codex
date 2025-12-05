@@ -31,8 +31,7 @@ fn main() -> anyhow::Result<()> {
         let mut inner = top_cli.inner;
         inner
             .config_overrides
-            .raw_overrides
-            .splice(0..0, top_cli.config_overrides.raw_overrides);
+            .prepend_from(&top_cli.config_overrides);
 
         run_main(inner, codex_linux_sandbox_exe).await?;
         Ok(())

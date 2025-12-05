@@ -19,8 +19,7 @@ fn main() -> anyhow::Result<()> {
         let mut inner = top_cli.inner;
         inner
             .config_overrides
-            .raw_overrides
-            .splice(0..0, top_cli.config_overrides.raw_overrides);
+            .prepend_from(&top_cli.config_overrides);
         let exit_info = run_main(inner, codex_linux_sandbox_exe).await?;
         let token_usage = exit_info.token_usage;
         if !token_usage.is_zero() {
