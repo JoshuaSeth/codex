@@ -282,6 +282,12 @@ pub struct Config {
     /// `tool_hook_command = ["python3", "~/capture_tool_calls.py"]`
     pub tool_hook_command: Option<Vec<String>>,
 
+    /// When set, Codex will invoke this command once per turn right after the final
+    /// assistant response is produced. The hook receives a JSON payload containing
+    /// the conversation/turn identifiers, final message text, response items, and
+    /// latest token usage snapshot.
+    pub stop_hook_command: Option<Vec<String>>,
+
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: PathBuf,
@@ -787,6 +793,9 @@ pub struct ConfigToml {
 
     /// Command to run before/after each tool call.
     pub tool_hook_command: Option<Vec<String>>,
+
+    /// Command to run once a turn completes (after the final assistant reply).
+    pub stop_hook_command: Option<Vec<String>>,
 
     /// Profile to use from the `profiles` map.
     pub profile: Option<String>,
@@ -1399,7 +1408,14 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
-            tool_hook_command: cfg.tool_hook_command.clone(),
+            tool_hook_command: config_profile
+                .tool_hook_command
+                .clone()
+                .or_else(|| cfg.tool_hook_command.clone()),
+            stop_hook_command: config_profile
+                .stop_hook_command
+                .clone()
+                .or_else(|| cfg.stop_hook_command.clone()),
             codex_home,
             history,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
@@ -3291,6 +3307,7 @@ model_verbosity = "high"
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
                 tool_hook_command: None,
+                stop_hook_command: None,
                 codex_home: fixture.codex_home(),
                 history: History::default(),
                 file_opener: UriBasedFileOpener::VsCode,
@@ -3377,6 +3394,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             tool_hook_command: None,
+            stop_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
@@ -3478,6 +3496,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             tool_hook_command: None,
+            stop_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
@@ -3565,6 +3584,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             tool_hook_command: None,
+            stop_hook_command: None,
             codex_home: fixture.codex_home(),
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,

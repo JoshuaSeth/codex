@@ -1,6 +1,8 @@
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
 use serde_json::Value;
 use std::process::Stdio;
@@ -181,4 +183,83 @@ enum ToolHookPhase {
 enum ToolHookOutcome {
     Success { response: ResponseInputItem },
     Error { message: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct StopHook {
+    command: Arc<Vec<String>>,
+}
+
+impl StopHook {
+    pub fn new(command: Vec<String>) -> Option<Self> {
+        if command.is_empty() {
+            return None;
+        }
+        Some(Self {
+            command: Arc::new(command),
+        })
+    }
+
+    pub async fn emit(&self, event: StopHookEvent) {
+        if let Err(err) = self.spawn_and_send(event).await {
+            warn!("stop_hook_error" = %err, "failed to run stop hook command");
+        }
+    }
+
+    async fn spawn_and_send(&self, event: StopHookEvent) -> std::io::Result<()> {
+        let mut cmd = Command::new(&self.command[0]);
+        if self.command.len() > 1 {
+            cmd.args(&self.command[1..]);
+        }
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+
+        let mut child = cmd.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = serde_json::to_vec(&event).map_err(|err| {
+                std::io::Error::other(format!("failed to serialize stop hook event: {err}"))
+            })?;
+            stdin.write_all(&payload).await?;
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "hook exited with status {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+pub struct StopHookEvent {
+    conversation_id: String,
+    turn_id: String,
+    cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_message: Option<String>,
+    response_items: Vec<ResponseItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_usage: Option<TokenUsage>,
+}
+
+impl StopHookEvent {
+    pub fn new(
+        conversation_id: String,
+        turn_id: String,
+        cwd: String,
+        final_message: Option<String>,
+        response_items: Vec<ResponseItem>,
+        token_usage: Option<TokenUsage>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            turn_id,
+            cwd,
+            final_message,
+            response_items,
+            token_usage,
+        }
+    }
 }

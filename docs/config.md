@@ -377,10 +377,30 @@ The `view_image` toggle is useful when you want to include screenshots or diagra
 Run an external command before and after each model-initiated tool call. Codex writes a JSON payload to the hook's `stdin` describing the phase (`"before_execution"` or `"after_execution"`), the tool name, call id, captured arguments, and—after execution—the final `ResponseInputItem` or error message. This is ideal for piping events into a Python logger or appending to a JSONL audit file.
 
 ```toml
-tool_hook_command = ["python3", "~/scripts/log_tool_calls.py"]
+tool_hook_command = ["python3", "./tool_hook_logger.py", "/tmp/web-agent-tool-calls.jsonl"]
 ```
 
 Hooks are best-effort. Failures are logged but never interrupt the turn.
+
+> Tip: the bundled `tool_hook_logger.py` accepts either a CLI argument (as above) or the `CODEX_TOOL_HOOK_LOG` env var to decide where the JSONL file lives. That lets you point multiple configs at different audit logs without editing the script.
+
+### stop_hook_command
+
+Fire a hook once per turn, immediately after the assistant produces its final
+response. The payload arrives on `stdin` as JSON with the conversation ID,
+turn ID, working directory, optional final message text, the full list of
+`response_items`, and the most recent `token_usage` snapshot. This is useful
+for emitting audit records only when a run completes.
+
+```toml
+stop_hook_command = ["python3", "./tool_hook_logger.py", "/tmp/web-agent-stop-calls.jsonl"]
+```
+
+Hooks are best-effort, and failures show up as warnings without interrupting
+the turn. You can point both `tool_hook_command` and `stop_hook_command` at the
+same helper script; the stop payload contains `conversation_id`, `turn_id`,
+`cwd`, `final_message`, `response_items`, and `token_usage`, so your logger can
+tag them however it likes.
 
 ### approval_presets
 
@@ -467,6 +487,30 @@ At runtime Codex injects three additional environment variables so scripts can i
 | `CODEX_TOOL_CALL_ID` | The unique call identifier for the turn. |
 
 Tool stdout/stderr are captured and fed back to the model as the function output (Codex uses the structured exec output format, so both streams plus metadata are available in rollouts). See `tools/custom_tools/echo_tool.py` for a ready-made helper that prints the incoming text along with a timestamp.
+
+### Bundled helper scripts
+
+The repo includes a few Python helpers so you can experiment without copying files around:
+
+| Script | Description | Sample config |
+| --- | --- | --- |
+| `tools/custom_tools/count_files.py` | Counts files under the repo (accepts optional `path`, `follow_symlinks`, `include_hidden`). | ```toml
+[custom_tools.count_files]
+command = ["python3", "./tools/custom_tools/count_files.py"]
+description = "Count files under the repository"
+``` |
+| `tools/custom_tools/send_email_stub.py` | Development-only “email” sender that appends entries to a JSONL log (path defaults to `~/.codex/dev_emails.jsonl`). | ```toml
+[custom_tools.notify_boss]
+command = ["python3", "./tools/custom_tools/send_email_stub.py"]
+description = "Log an email to the dev mailbox"
+parameters = { type = "object", required = ["subject", "body"], properties = { subject = { type = "string" }, body = { type = "string" } } }
+``` |
+| `tools/custom_tools/echo_tool.py` | Echoes tool arguments for quick smoke tests. | ```toml
+[custom_tools.echo]
+command = ["python3", "./tools/custom_tools/echo_tool.py"]
+``` |
+
+Each script reads arguments from `CODEX_TOOL_ARGS_JSON`, so make sure your config schema matches the keys you expect. Feel free to add more helpers to `tools/custom_tools/` as reusable patterns emerge.
 
 ## MCP integration
 
@@ -1056,6 +1100,7 @@ Valid values:
 | `model_context_window`                           | number                                                            | Context window tokens.                                                                                                          |
 | `tool_output_token_limit`                        | number                                                            | Token budget for stored function/tool outputs in history (default: 2,560 tokens).                                               |
 | `tool_hook_command`                              | array<string>                                                     | Command invoked before/after each tool call; receives a JSON payload over stdin.                                                |
+| `stop_hook_command`                              | array<string>                                                     | Command invoked once per turn after the final assistant reply; receives the final response items and token usage snapshot.      |
 | `custom_tools.<name>`                            | table                                                             | Define config-based CLI tools (`command`, `parameters`, `env`, `timeout_ms`, etc.). See [Custom CLI tools](#custom-cli-tools).   |
 | `approval_policy`                                | `untrusted` \| `on-failure` \| `on-request` \| `never`            | When to prompt for approval.                                                                                                    |
 | `sandbox_mode`                                   | `read-only` \| `workspace-write` \| `danger-full-access`          | OS sandbox policy.                                                                                                              |

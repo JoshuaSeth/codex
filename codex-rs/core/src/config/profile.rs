@@ -28,6 +28,8 @@ pub struct ConfigProfile {
     pub experimental_use_freeform_apply_patch: Option<bool>,
     pub tools_web_search: Option<bool>,
     pub tools_view_image: Option<bool>,
+    pub tool_hook_command: Option<Vec<String>>,
+    pub stop_hook_command: Option<Vec<String>>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
     pub features: Option<crate::features::FeaturesToml>,

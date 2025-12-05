@@ -137,7 +137,7 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::hooks::ToolHook;
+use crate::tools::hooks::{StopHook, StopHookEvent, ToolHook};
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::tools::spec::ToolsConfig;
@@ -375,6 +375,7 @@ pub(crate) struct TurnContext {
     pub(crate) exec_policy: Arc<RwLock<ExecPolicy>>,
     pub(crate) truncation_policy: TruncationPolicy,
     pub(crate) tool_hook: Option<ToolHook>,
+    pub(crate) stop_hook: Option<StopHook>,
 }
 
 impl TurnContext {
@@ -545,6 +546,10 @@ impl Session {
                 .tool_hook_command
                 .clone()
                 .and_then(ToolHook::new),
+            stop_hook: per_turn_config
+                .stop_hook_command
+                .clone()
+                .and_then(StopHook::new),
         }
     }
 
@@ -1374,6 +1379,11 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
+    pub(crate) async fn latest_token_usage(&self) -> Option<TokenUsage> {
+        let state = self.state.lock().await;
+        state.token_info().map(|info| info.last_token_usage)
+    }
+
     pub(crate) async fn update_rate_limits(
         &self,
         turn_context: &TurnContext,
@@ -2198,6 +2208,7 @@ async fn spawn_review_thread(
         exec_policy: parent_turn_context.exec_policy.clone(),
         truncation_policy: TruncationPolicy::new(&per_turn_config, model_family.truncation_policy),
         tool_hook: parent_turn_context.tool_hook.clone(),
+        stop_hook: parent_turn_context.stop_hook.clone(),
     };
 
     // Seed the child task with the review prompt as the initial user message.
@@ -2361,6 +2372,19 @@ pub(crate) async fn run_task(
 
                 if !needs_follow_up {
                     last_agent_message = turn_last_agent_message;
+                    if let Some(stop_hook) = turn_context.stop_hook.as_ref() {
+                        let response_items = sess.clone_history().await.get_history();
+                        let token_usage = sess.latest_token_usage().await;
+                        let event = StopHookEvent::new(
+                            sess.conversation_id.to_string(),
+                            turn_context.sub_id.clone(),
+                            turn_context.cwd.display().to_string(),
+                            last_agent_message.clone(),
+                            response_items,
+                            token_usage,
+                        );
+                        stop_hook.emit(event).await;
+                    }
                     sess.notifier()
                         .notify(&UserNotification::AgentTurnComplete {
                             thread_id: sess.conversation_id.to_string(),

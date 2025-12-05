@@ -6,8 +6,8 @@ profiles we maintain in this repository and how to run them with the CLI.
 
 ## How profile configs work
 
-- Every config lives as a standalone TOML (for example `docs/web-agent-config.md` has a
-  copy-paste block that you can save as `~/.codex/web-agent.toml`).
+- Every config lives as a standalone TOML (for example `docs/web-agent.toml` can be
+  copied straight to `~/.codex/web-agent.toml`).
 - Launch Codex with `--config-file /path/to/profile.toml` to use that file without
   touching `~/.codex/config.toml`.
 - Optional: add `--config-home DIR` if you want the profile to use a dedicated
@@ -22,7 +22,7 @@ profiles we maintain in this repository and how to run them with the CLI.
 
 ### Web Agent (Chrome DevTools MCP)
 
-- **Location:** see `docs/web-agent-config.md`.
+- **Location:** see `docs/web-agent.toml`.
 - **Purpose:** give Codex a browser-focused toolset (Chrome DevTools MCP + shell/read
   tools) for on-screen automation.
 - **Key settings:**
@@ -32,13 +32,29 @@ profiles we maintain in this repository and how to run them with the CLI.
   - Built-in tools limited to `shell`, `update_plan`, `view_image`, and `web_search`.
   - Notices to hide the max-model upgrade nudge.
 - **Usage:**
-  1. Copy the TOML snippet in `docs/web-agent-config.md` to `~/.codex/web-agent.toml`.
+  1. Copy `docs/web-agent.toml` to `~/.codex/web-agent.toml`.
   2. Launch Codex dev build:
      ```bash
      codex-dev --config-file ~/.codex/web-agent.toml
      ```
   3. Optional: add `--config-home ~/.codex-web` if you want separate auth/session logs
      for browser automation.
+
+### Web Agent AIPC
+
+- **Location:** see `docs/web-agent-aipc.toml`.
+- **Purpose:** same browsing-centric surface as the default Web Agent, but scoped to a
+  separate profile name (`web-agent-aipc`) so you can run two configurations side by
+-  side (for example, one tuned for an AIPC workspace).
+- **Key settings:** identical Chrome DevTools MCP command + tool restrictions, plus
+  an explicit base prompt extension that requires the agent to end every reply with
+  `<status>SUCCESS</status>` or `<status>FAILURE</status>`. The profile also
+  registers both `tool_hook_command` and `stop_hook_command` so that every tool call
+  and final turn summary is appended to `~/.codex/aipc_tool_calls.jsonl` and
+  `~/.codex/aipc_turns.jsonl` via the bundled `tool_hook_logger.py` helper.
+- **Usage:** copy the TOML to `~/.codex/web-agent-aipc.toml` and launch with
+  `codex-dev --config-file ~/.codex/web-agent-aipc.toml` (plus `--config-home` if you
+  want isolated auth/logs for the AIPC profile).
 
 ## Tips
 
