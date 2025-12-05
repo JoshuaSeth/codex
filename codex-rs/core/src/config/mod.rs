@@ -145,6 +145,9 @@ pub struct Config {
     /// Base instructions override.
     pub base_instructions: Option<String>,
 
+    /// Optional text appended to each user message before it is sent to the model.
+    pub base_prompt_extend: Option<String>,
+
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
 
@@ -707,6 +710,10 @@ pub struct ConfigToml {
 
     /// System instructions.
     pub instructions: Option<String>,
+
+    /// Optional text appended to every user request.
+    #[serde(default)]
+    pub base_prompt_extend: Option<String>,
 
     /// Developer instructions inserted as a `developer` role message.
     #[serde(default)]
@@ -1286,6 +1293,13 @@ impl Config {
             "experimental instructions file",
         )?;
         let base_instructions = base_instructions.or(file_base_instructions);
+        let base_prompt_extend = cfg.base_prompt_extend.clone().and_then(|value| {
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        });
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
 
         let experimental_compact_prompt_path = config_profile
@@ -1335,6 +1349,7 @@ impl Config {
             notify: cfg.notify,
             user_instructions,
             base_instructions,
+            base_prompt_extend,
             developer_instructions,
             compact_prompt,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
@@ -3220,6 +3235,7 @@ model_verbosity = "high"
                 model_verbosity: None,
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
+                base_prompt_extend: None,
                 developer_instructions: None,
                 compact_prompt: None,
                 forced_chatgpt_workspace_id: None,
@@ -3304,6 +3320,7 @@ model_verbosity = "high"
             model_verbosity: None,
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            base_prompt_extend: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -3403,6 +3420,7 @@ model_verbosity = "high"
             model_verbosity: None,
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            base_prompt_extend: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -3488,6 +3506,7 @@ model_verbosity = "high"
             model_verbosity: Some(Verbosity::High),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            base_prompt_extend: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,

@@ -1591,9 +1591,14 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     let mut previous_context: Option<Arc<TurnContext>> = Some(sess.new_default_turn().await);
 
     // To break out of this loop, send Op::Shutdown.
-    while let Ok(sub) = rx_sub.recv().await {
-        debug!(?sub, "Submission");
-        match sub.op.clone() {
+    while let Ok(mut sub) = rx_sub.recv().await {
+        if let Some(extension) = config.base_prompt_extend.as_deref() {
+            apply_base_prompt_extension(&mut sub.op, extension);
+        }
+
+        let Submission { id, op } = sub;
+        debug!(?id, ?op, "Submission");
+        match op {
             Op::Interrupt => {
                 handlers::interrupt(&sess).await;
             }
@@ -1620,9 +1625,8 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 )
                 .await;
             }
-            Op::UserInput { .. } | Op::UserTurn { .. } => {
-                handlers::user_input_or_turn(&sess, sub.id.clone(), sub.op, &mut previous_context)
-                    .await;
+            op @ Op::UserInput { .. } | op @ Op::UserTurn { .. } => {
+                handlers::user_input_or_turn(&sess, id.clone(), op, &mut previous_context).await;
             }
             Op::ExecApproval { id, decision } => {
                 handlers::exec_approval(&sess, id, decision).await;
@@ -1634,28 +1638,28 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::add_to_history(&sess, &config, text).await;
             }
             Op::GetHistoryEntryRequest { offset, log_id } => {
-                handlers::get_history_entry_request(&sess, &config, sub.id.clone(), offset, log_id)
+                handlers::get_history_entry_request(&sess, &config, id.clone(), offset, log_id)
                     .await;
             }
             Op::ListMcpTools => {
-                handlers::list_mcp_tools(&sess, &config, sub.id.clone()).await;
+                handlers::list_mcp_tools(&sess, &config, id.clone()).await;
             }
             Op::ListCustomPrompts => {
-                handlers::list_custom_prompts(&sess, sub.id.clone()).await;
+                handlers::list_custom_prompts(&sess, id.clone()).await;
             }
             Op::ListSkills { cwds, force_reload } => {
                 handlers::list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
             }
             Op::Undo => {
-                handlers::undo(&sess, sub.id.clone()).await;
+                handlers::undo(&sess, id.clone()).await;
             }
             Op::Compact => {
-                handlers::compact(&sess, sub.id.clone()).await;
+                handlers::compact(&sess, id.clone()).await;
             }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
-                    sub.id.clone(),
+                    id.clone(),
                     command,
                     &mut previous_context,
                 )
@@ -1669,17 +1673,51 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::resolve_elicitation(&sess, server_name, request_id, decision).await;
             }
             Op::Shutdown => {
-                if handlers::shutdown(&sess, sub.id.clone()).await {
+                if handlers::shutdown(&sess, id.clone()).await {
                     break;
                 }
             }
             Op::Review { review_request } => {
-                handlers::review(&sess, &config, sub.id.clone(), review_request).await;
+                handlers::review(&sess, &config, id.clone(), review_request).await;
             }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
     }
     debug!("Agent loop exited");
+}
+
+fn apply_base_prompt_extension(op: &mut Op, extension: &str) {
+    match op {
+        Op::UserInput { items } | Op::UserTurn { items, .. } => {
+            append_extension_to_user_inputs(items, extension);
+        }
+        _ => {}
+    }
+}
+
+fn append_extension_to_user_inputs(items: &mut Vec<UserInput>, extension: &str) {
+    if extension.is_empty() {
+        return;
+    }
+    if let Some(text) = items.iter_mut().find_map(|item| {
+        if let UserInput::Text { text } = item {
+            Some(text)
+        } else {
+            None
+        }
+    }) {
+        if !text.is_empty() {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push('\n');
+        }
+        text.push_str(extension);
+    } else {
+        items.push(UserInput::Text {
+            text: extension.to_string(),
+        });
+    }
 }
 
 /// Operation handlers
@@ -2786,6 +2824,36 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn append_extension_updates_first_text_item() {
+        let mut items = vec![UserInput::Text {
+            text: "Original request".to_string(),
+        }];
+
+        append_extension_to_user_inputs(&mut items, "Additional instructions");
+
+        match &items[0] {
+            UserInput::Text { text } => {
+                assert_eq!(text, "Original request\n\nAdditional instructions");
+            }
+            _ => panic!("expected text input"),
+        }
+    }
+
+    #[test]
+    fn append_extension_adds_text_when_missing() {
+        let mut items = vec![UserInput::Image {
+            image_url: "data:image/png;base64,abc".to_string(),
+        }];
+
+        append_extension_to_user_inputs(&mut items, "Extra context");
+
+        match items.last().expect("items not empty") {
+            UserInput::Text { text } => assert_eq!(text, "Extra context"),
+            _ => panic!("expected appended text item"),
+        }
+    }
 
     #[tokio::test]
     async fn reconstruct_history_matches_live_compactions() {

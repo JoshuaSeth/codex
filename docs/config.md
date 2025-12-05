@@ -863,6 +863,18 @@ Note this is **not** a general editor setting (like `$EDITOR`), as it only accep
 
 Currently, `"vscode"` is the default, though Codex does not verify VS Code is installed. As such, `file_opener` may default to `"none"` or something else in the future.
 
+### base_prompt_extend
+
+Append a short suffix to every request without editing your actual prompt. The text is added to each user message before Codex sends it to the model.
+
+```toml
+base_prompt_extend = """
+Respond with a JSON object containing `plan`, `actions`, and `risks`.
+"""
+```
+
+Leave the key unset (or blank) to disable the feature.
+
 ### project_doc_max_bytes
 
 Maximum number of bytes to read from an `AGENTS.md` file to include in the instructions sent with the first turn of a session. Defaults to 32 KiB.
@@ -1020,6 +1032,7 @@ Valid values:
 | `notify`                                         | array<string>                                                     | External program for notifications.                                                                                             |
 | `tui.animations`                                 | boolean                                                           | Enable terminal animations (welcome screen, shimmer, spinner). Defaults to true; set to `false` to disable visual motion.       |
 | `instructions`                                   | string                                                            | Currently ignored; use `experimental_instructions_file` or `AGENTS.md`.                                                         |
+| `base_prompt_extend`                             | string                                                            | Extra text appended to every user request before it is sent to the model.                                                       |
 | `features.<feature-flag>`                        | boolean                                                           | See [feature flags](#feature-flags) for details                                                                                 |
 | `ghost_snapshot.disable_warnings`                | boolean                                                           | Disable every warnings around ghost snapshot (large files, directory, ...)                                                      |
 | `ghost_snapshot.ignore_large_untracked_files`    | number                                                            | Exclude untracked files larger than this many bytes from ghost snapshots (default: 10 MiB). Set to `0` to disable.              |

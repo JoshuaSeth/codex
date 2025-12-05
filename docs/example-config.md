@@ -62,6 +62,11 @@ model_reasoning_summary_format = "none"
 # Optional legacy base instructions override (prefer AGENTS.md). Default: unset.
 # instructions = ""
 
+# Extra text appended to every user prompt before it is sent to the model.
+# base_prompt_extend = """
+# Always include a numbered plan before executing commands.
+# """
+
 # Inline override for the history compaction prompt. Default: unset.
 # compact_prompt = ""
 
