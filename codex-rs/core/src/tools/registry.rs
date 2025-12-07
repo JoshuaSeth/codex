@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client_common::tools::ToolSpec;
+use crate::codex::shutdown_session;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -109,7 +110,11 @@ impl ToolRegistry {
                     let handler = handler.clone();
                     let output_cell = &output_cell;
                     let invocation = invocation;
+                    let tool_label = tool_name.clone();
+                    let call_id_for_note = call_id_owned.clone();
                     async move {
+                        let session = Arc::clone(&invocation.session);
+                        let turn = Arc::clone(&invocation.turn);
                         if handler.is_mutating(&invocation).await {
                             tracing::trace!("waiting for tool gate");
                             invocation.turn.tool_call_gate.wait_ready().await;
@@ -119,8 +124,34 @@ impl ToolRegistry {
                             Ok(output) => {
                                 let preview = output.log_preview();
                                 let success = output.success_for_logging();
-                                let mut guard = output_cell.lock().await;
-                                *guard = Some(output);
+                                let pending_note = output.pending_message().map(|msg| msg.to_string());
+                                let should_shutdown = output.requests_shutdown();
+                                {
+                                    let mut guard = output_cell.lock().await;
+                                    *guard = Some(output);
+                                }
+                                if should_shutdown {
+                                    let session = Arc::clone(&session);
+                                    let turn = Arc::clone(&turn);
+                                    let tool = tool_label.clone();
+                                    let call_id = call_id_for_note.clone();
+                                    let note = pending_note.map_or_else(
+                                        || {
+                                            format!(
+                                                "Tool `{tool}` ({call_id}) is waiting on external completion. Codex will exit; resume this conversation once results are ready."
+                                            )
+                                        },
+                                        |msg| {
+                                            format!(
+                                                "Tool `{tool}` ({call_id}) returned a pending payload: {msg}\nCodex will exit; resume this conversation once results are ready."
+                                            )
+                                        },
+                                    );
+                                    tokio::spawn(async move {
+                                        session.notify_background_event(&turn, note).await;
+                                        shutdown_session(&session, turn.sub_id.clone()).await;
+                                    });
+                                }
                                 Ok((preview, success))
                             }
                             Err(err) => Err(err),

@@ -64,6 +64,12 @@ pub enum ToolOutput {
         content_items: Option<Vec<FunctionCallOutputContentItem>>,
         success: Option<bool>,
     },
+    Pending {
+        content: String,
+        content_items: Option<Vec<FunctionCallOutputContentItem>>,
+        success: Option<bool>,
+        shutdown: bool,
+    },
     Mcp {
         result: Result<CallToolResult, String>,
     },
@@ -73,6 +79,7 @@ impl ToolOutput {
     pub fn log_preview(&self) -> String {
         match self {
             ToolOutput::Function { content, .. } => telemetry_preview(content),
+            ToolOutput::Pending { content, .. } => telemetry_preview(content),
             ToolOutput::Mcp { result } => format!("{result:?}"),
         }
     }
@@ -80,6 +87,7 @@ impl ToolOutput {
     pub fn success_for_logging(&self) -> bool {
         match self {
             ToolOutput::Function { success, .. } => success.unwrap_or(true),
+            ToolOutput::Pending { success, .. } => success.unwrap_or(true),
             ToolOutput::Mcp { result } => result.is_ok(),
         }
     }
@@ -107,10 +115,43 @@ impl ToolOutput {
                     }
                 }
             }
+            ToolOutput::Pending {
+                content,
+                content_items,
+                success,
+                ..
+            } => {
+                if matches!(payload, ToolPayload::Custom { .. }) {
+                    ResponseInputItem::CustomToolCallOutput {
+                        call_id: call_id.to_string(),
+                        output: content,
+                    }
+                } else {
+                    ResponseInputItem::FunctionCallOutput {
+                        call_id: call_id.to_string(),
+                        output: FunctionCallOutputPayload {
+                            content,
+                            content_items,
+                            success,
+                        },
+                    }
+                }
+            }
             ToolOutput::Mcp { result } => ResponseInputItem::McpToolCallOutput {
                 call_id: call_id.to_string(),
                 result,
             },
+        }
+    }
+
+    pub fn requests_shutdown(&self) -> bool {
+        matches!(self, ToolOutput::Pending { shutdown, .. } if *shutdown)
+    }
+
+    pub fn pending_message(&self) -> Option<&str> {
+        match self {
+            ToolOutput::Pending { content, .. } => Some(content.as_str()),
+            _ => None,
         }
     }
 }

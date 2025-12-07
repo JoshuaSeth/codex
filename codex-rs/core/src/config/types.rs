@@ -35,6 +35,8 @@ pub struct CustomToolToml {
     pub with_escalated_permissions: Option<bool>,
     #[serde(default)]
     pub parallel: Option<bool>,
+    #[serde(default)]
+    pub shutdown_after_call: Option<bool>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]

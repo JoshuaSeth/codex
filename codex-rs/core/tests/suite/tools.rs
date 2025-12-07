@@ -11,8 +11,12 @@ use anyhow::Result;
 use codex_core::config::CustomToolConfig;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -25,6 +29,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
@@ -136,6 +141,7 @@ print(prefix + payload.get("text", ""))
                 timeout_ms: Some(2_000),
                 with_escalated_permissions: None,
                 parallel: false,
+                shutdown_after_call: false,
             },
         );
     });
@@ -184,6 +190,105 @@ print(prefix + payload.get("text", ""))
         stdout.contains("custom: "),
         "stdout missing prefix: {stdout}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_tool_shutdown_after_call_triggers_pending_flow() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    builder = builder.with_config(|config| {
+        let script_path = config.cwd.join("custom_pending.py");
+        fs::write(
+            &script_path,
+            r#"
+import json
+import os
+
+payload = json.loads(os.environ.get("CODEX_TOOL_ARGS_JSON", "{}"))
+ticket = payload.get("ticket", "none")
+print(json.dumps({"status": "pending", "ticket": ticket}))
+"#,
+        )
+        .expect("write pending helper script");
+
+        config.custom_tools.insert(
+            "custom.pending".to_string(),
+            CustomToolConfig {
+                name: "custom.pending".to_string(),
+                command: vec![
+                    "python3".to_string(),
+                    script_path.to_string_lossy().into_owned(),
+                ],
+                description: Some("Queue async job".to_string()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "ticket": { "type": "string" } },
+                    "required": ["ticket"],
+                }),
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(2_000),
+                with_escalated_permissions: None,
+                parallel: false,
+                shutdown_after_call: true,
+            },
+        );
+    });
+    let test = builder.build(&server).await?;
+
+    let call_id = "custom-pending";
+    let args = json!({ "ticket": "sync-42" });
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(call_id, "custom.pending", &serde_json::to_string(&args)?),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "run the pending tool".to_string(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: test.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+        })
+        .await?;
+
+    let background = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::BackgroundEvent(_))
+    })
+    .await;
+    if let EventMsg::BackgroundEvent(evt) = background {
+        assert!(
+            evt.message.contains("custom.pending"),
+            "background note missing tool name: {}",
+            evt.message
+        );
+        assert!(
+            evt.message.contains("sync-42"),
+            "background note missing ticket: {}",
+            evt.message
+        );
+    }
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
     Ok(())
 }
 

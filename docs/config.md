@@ -477,6 +477,7 @@ CUSTOM_TOOL_PREFIX = "dev-build: "
 - `cwd` *(optional)* – relative path inside the workspace; omit to run in the turn cwd.
 - `env` *(table)* – extra environment variables merged into the process environment.
 - `timeout_ms`, `with_escalated_permissions`, `parallel` – mirror the knobs used by builtin tools.
+- `shutdown_after_call` *(bool)* – when `true`, Codex records the tool output, emits a background note (using the tool’s stdout/stderr as the note body), and shuts the session down immediately. Use this for fire-and-forget automations that will resume later with `codex resume` once the external system produces a result.
 
 At runtime Codex injects three additional environment variables so scripts can inspect the call context without parsing arguments:
 

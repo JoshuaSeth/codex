@@ -139,10 +139,32 @@ This document grows over multiple **iterations**. Each pass adds more depth, con
   ```
   At runtime Codex injects three env vars—`CODEX_TOOL_ARGS_JSON`, `CODEX_TOOL_NAME`, and `CODEX_TOOL_CALL_ID`—before running the command under the session sandbox/approval policy. The script can log/emit anything; Codex captures stdout/stderr, renders it in rollouts, and surfaces the JSON-formatted result back to the model as a normal function call output.
 - Validation: we added an integration test (`config_defined_custom_tool_runs_command`) that wires a custom Python helper, lets the mock model request `custom.echo`, and asserts the tool output contains both the agent-provided text and the config-specified prefix. Running `cargo test -p codex-core config_defined_custom_tool_runs_command` exercises the entire pipeline (config parsing, tool registry, sandbox exec, telemetry, and SSE plumbing) without needing a live OpenAI connection.
+- Long running automations can now mark a turn as “pending” by setting `shutdown_after_call = true` in their stanza. Codex still executes the command and records its stdout/stderr, but then emits a background note, writes the placeholder output to the rollout, and triggers `codex shutdown` so you can append the eventual result (via `codex resume`) once the external workflow finishes. This behavior is covered by `cargo test -p codex-core custom_tool_shutdown_after_call_triggers_pending_flow`.
 - For convenience the repo now ships a few ready-made helpers under `tools/custom_tools/`:
   - `count_files.py` – counts files beneath a directory, respecting optional `path`, `follow_symlinks`, and `include_hidden` args.
   - `send_email_stub.py` – appends email payloads to a JSONL log (dev-only “send email” stand-in).
   - `echo_tool.py` – previously documented quick echo.
   Wire them up in config with relative paths, e.g. `command = ["python3", "./tools/custom_tools/count_files.py"]` while running from the repo root. See `tools/custom_tools/README.md` for usage notes.
+
+### 5.5 Running a forked Chrome DevTools MCP
+- To iterate on the Chrome DevTools MCP locally, build the fork (this repo keeps it in `~/PitchAI Code/chrome-devtools-mcp`):
+  ```bash
+  cd ~/PitchAI\ Code/chrome-devtools-mcp
+  npm install         # first run only
+  npm run build       # transpiles to build/src/index.js
+  ```
+- Register the freshly built server with the CLI via the MCP helper:
+  ```bash
+  cd codex
+  codex mcp remove chrome-devtools   # safe even if it wasn't registered
+  codex mcp add chrome-devtools node \
+    "/Users/sethvanderbijl/PitchAI Code/chrome-devtools-mcp/build/src/index.js"
+  ```
+  This updates `~/.codex/config.toml` with an entry under `[mcp_servers.chrome-devtools]` pointing to the forked binary.
+- Smoke test with the standard CLI (or `cargo run --bin codex`) using a prompt that forces DevTools usage. Example session:
+  ```bash
+  CODEX_STOP_HOOK_LOG=/tmp/devtools_mcp.log codex-dev exec "Open google.com"
+  ```
+  You should see `mcp: chrome-devtools ready` plus telemetry from the stop hook; the browser page navigates via your fork, proving the MCP wiring works end to end.
 
 *Last updated: \`README_extensive.md\` created as part of the deep-study task; extend it in further iterations as the system evolves.*

@@ -1765,7 +1765,6 @@ mod handlers {
     use mcp_types::RequestId;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tracing::info;
     use tracing::warn;
 
     pub async fn interrupt(sess: &Arc<Session>) {
@@ -2067,39 +2066,7 @@ mod handlers {
     }
 
     pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-        sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-        sess.services
-            .unified_exec_manager
-            .terminate_all_sessions()
-            .await;
-        info!("Shutting down Codex instance");
-
-        // Gracefully flush and shutdown rollout recorder on session end so tests
-        // that inspect the rollout file do not race with the background writer.
-        let recorder_opt = {
-            let mut guard = sess.services.rollout.lock().await;
-            guard.take()
-        };
-        if let Some(rec) = recorder_opt
-            && let Err(e) = rec.shutdown().await
-        {
-            warn!("failed to shutdown rollout recorder: {e}");
-            let event = Event {
-                id: sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    message: "Failed to shutdown rollout recorder".to_string(),
-                    codex_error_info: Some(CodexErrorInfo::Other),
-                }),
-            };
-            sess.send_event_raw(event).await;
-        }
-
-        let event = Event {
-            id: sub_id,
-            msg: EventMsg::ShutdownComplete,
-        };
-        sess.send_event_raw(event).await;
-        true
+        crate::codex::shutdown_session(sess, sub_id).await
     }
 
     pub async fn review(
@@ -2132,6 +2099,42 @@ mod handlers {
             }
         }
     }
+}
+
+pub(crate) async fn shutdown_session(sess: &Arc<Session>, sub_id: String) -> bool {
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.services
+        .unified_exec_manager
+        .terminate_all_sessions()
+        .await;
+    info!("Shutting down Codex instance");
+
+    // Gracefully flush and shutdown rollout recorder on session end so tests
+    // that inspect the rollout file do not race with the background writer.
+    let recorder_opt = {
+        let mut guard = sess.services.rollout.lock().await;
+        guard.take()
+    };
+    if let Some(rec) = recorder_opt
+        && let Err(e) = rec.shutdown().await
+    {
+        warn!("failed to shutdown rollout recorder: {e}");
+        let event = Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: "Failed to shutdown rollout recorder".to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
+    let event = Event {
+        id: sub_id,
+        msg: EventMsg::ShutdownComplete,
+    };
+    sess.send_event_raw(event).await;
+    true
 }
 
 /// Spawn a review thread using the given prompt.
