@@ -107,6 +107,10 @@ pub struct ResumeArgs {
     #[arg(long = "last", default_value_t = false)]
     pub last: bool,
 
+    /// Replace the last tool call output before resuming (useful after pending flows).
+    #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
+    pub replace_last_tool_result: Option<String>,
+
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,

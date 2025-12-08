@@ -85,6 +85,10 @@ pub struct Cli {
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 
+    /// Replace the last tool call output in the rollout before resuming a session.
+    #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
+    pub replace_last_tool_result: Option<String>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

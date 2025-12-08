@@ -10,6 +10,7 @@ mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
 
+use anyhow::Context;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
@@ -56,6 +57,7 @@ use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_id_str;
+use codex_core::replace_last_tool_result as patch_last_tool_result;
 
 enum InitialOperation {
     UserTurn {
@@ -298,9 +300,22 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-        let resume_path = resolve_resume_path(&config, args).await?;
+        let mut resume_path = resolve_resume_path(&config, args).await?;
 
-        if let Some(path) = resume_path {
+        if let Some(replacement) = args.replace_last_tool_result.as_deref() {
+            let path = resume_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--replace-last-toolresult requires specifying a session id or --last"
+                )
+            })?;
+            patch_last_tool_result(path, replacement)
+                .await
+                .with_context(|| {
+                    format!("failed to replace last tool result in {}", path.display())
+                })?;
+        }
+
+        if let Some(path) = resume_path.take() {
             conversation_manager
                 .resume_conversation_from_rollout(config.clone(), path, auth_manager.clone())
                 .await?

@@ -22,8 +22,10 @@ use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
+use codex_core::replace_last_tool_result as patch_last_tool_result;
 use codex_protocol::config_types::SandboxMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use color_eyre::eyre::eyre;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::error;
@@ -428,6 +430,8 @@ async fn run_ratatui_app(
     };
 
     // Determine resume behavior: explicit id, then resume last, then picker.
+    let replace_last_tool_result_text = cli.replace_last_tool_result.clone();
+
     let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
         match find_conversation_path_by_id_str(&config.codex_home, id_str).await? {
             Some(path) => resume_picker::ResumeSelection::Resume(path),
@@ -491,6 +495,28 @@ async fn run_ratatui_app(
     } else {
         resume_picker::ResumeSelection::StartFresh
     };
+
+    if let Some(replacement) = replace_last_tool_result_text {
+        match &resume_selection {
+            resume_picker::ResumeSelection::Resume(path) => {
+                if let Err(err) = patch_last_tool_result(path, &replacement).await {
+                    restore();
+                    session_log::log_session_end();
+                    return Err(eyre!(
+                        "Failed to replace last tool result in {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            _ => {
+                restore();
+                session_log::log_session_end();
+                return Err(eyre!(
+                    "--replace-last-toolresult requires resuming a saved session (provide an id or --last)"
+                ));
+            }
+        }
+    }
 
     let Cli { prompt, images, .. } = cli;
 
