@@ -30,6 +30,8 @@ pub struct ConfigProfile {
     pub tools_view_image: Option<bool>,
     pub tool_hook_command: Option<Vec<String>>,
     pub stop_hook_command: Option<Vec<String>>,
+    /// Optional default cwd used when this profile is active.
+    pub default_cwd: Option<PathBuf>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
     pub features: Option<crate::features::FeaturesToml>,

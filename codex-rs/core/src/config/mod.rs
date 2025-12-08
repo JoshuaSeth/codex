@@ -792,6 +792,13 @@ pub struct ConfigToml {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// When set, Codex treats this directory as the default working directory
+    /// whenever the CLI is started without an explicit `--cd/-C` flag. Paths can
+    /// be absolute or relative to the process cwd. This is useful when a
+    /// profile/config file should always operate from a specific repository.
+    #[serde(default)]
+    pub default_cwd: Option<PathBuf>,
+
     /// Command to run before/after each tool call.
     pub tool_hook_command: Option<Vec<String>>,
 
@@ -1181,6 +1188,10 @@ impl Config {
 
         let resolved_cwd = {
             use std::env;
+
+            let cwd = cwd
+                .or_else(|| config_profile.default_cwd.clone())
+                .or_else(|| cfg.default_cwd.clone());
 
             match cwd {
                 None => {
@@ -1890,6 +1901,88 @@ trust_level = "trusted"
                 }
             );
         }
+    }
+
+    #[test]
+    fn default_cwd_applies_without_overrides() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let default_dir = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.default_cwd = Some(default_dir.path().to_path_buf());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.cwd, default_dir.path());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_default_cwd_overrides_root_value() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let root_dir = TempDir::new()?;
+        let profile_dir = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.default_cwd = Some(root_dir.path().to_path_buf());
+        cfg.profile = Some("elise".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "elise".to_string(),
+            ConfigProfile {
+                default_cwd: Some(profile_dir.path().to_path_buf()),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.cwd, profile_dir.path());
+        Ok(())
+    }
+
+    #[test]
+    fn cli_cwd_override_wins_over_defaults() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let root_dir = TempDir::new()?;
+        let profile_dir = TempDir::new()?;
+        let cli_dir = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.default_cwd = Some(root_dir.path().to_path_buf());
+        cfg.profile = Some("ops".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "ops".to_string(),
+            ConfigProfile {
+                default_cwd: Some(profile_dir.path().to_path_buf()),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let overrides = ConfigOverrides {
+            cwd: Some(cli_dir.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.cwd, cli_dir.path());
+        Ok(())
     }
 
     #[test]

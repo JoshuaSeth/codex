@@ -456,6 +456,24 @@ set = { PATH = "/usr/bin", MY_FLAG = "1" }
 
 Currently, `CODEX_SANDBOX_NETWORK_DISABLED=1` is also added to the environment, assuming network is disabled. This is not configurable.
 
+## default_cwd
+
+Set `default_cwd` at the root of a config (or inside a profile) to force Codex
+to operate from a specific repository whenever the CLI starts **without** an
+explicit `--cd/-C` override. Absolute paths are recommended, but relative values
+are resolved against the shell’s current directory.
+
+```toml
+default_cwd = "/Users/sethvanderbijl/PitchAI Code/mail_mcp"
+
+[profiles.elise]
+default_cwd = "/Users/sethvanderbijl/PitchAI Code/mail_mcp"
+```
+
+When present, `default_cwd` takes precedence over the shell’s cwd but is still
+overridden by the CLI (`codex --cd …`) or by `ConfigOverrides.cwd` inside the
+API/app-server layers.
+
 ## Custom CLI tools
 
 Codex can expose bespoke tools without writing an MCP server by defining `[custom_tools.<name>]` entries in `config.toml`. Each entry is converted into an OpenAI function tool at startup and is executed via the same sandbox/approval machinery as the builtin shell tool.
@@ -477,7 +495,7 @@ CUSTOM_TOOL_PREFIX = "dev-build: "
 - `cwd` *(optional)* – relative path inside the workspace; omit to run in the turn cwd.
 - `env` *(table)* – extra environment variables merged into the process environment.
 - `timeout_ms`, `with_escalated_permissions`, `parallel` – mirror the knobs used by builtin tools.
-- `shutdown_after_call` *(bool)* – when `true`, Codex records the tool output, emits a background note (using the tool’s stdout/stderr as the note body), and shuts the session down immediately. Use this for fire-and-forget automations that will resume later with `codex resume` once the external system produces a result.
+- `shutdown_after_call` *(bool)* – when `true`, Codex records the tool output, emits a background note (using the tool’s stdout/stderr as the note body), and shuts the session down immediately. Use this for fire-and-forget automations that will resume later with `codex resume` once the external system produces a result. When the result arrives, run `codex-dev --replace-last-toolresult "…" resume <session-id>` (or the `codex exec resume` equivalent) to inject the final payload into the JSONL before continuing.
 
 At runtime Codex injects three additional environment variables so scripts can inspect the call context without parsing arguments:
 
@@ -512,6 +530,15 @@ command = ["python3", "./tools/custom_tools/echo_tool.py"]
 ``` |
 
 Each script reads arguments from `CODEX_TOOL_ARGS_JSON`, so make sure your config schema matches the keys you expect. Feel free to add more helpers to `tools/custom_tools/` as reusable patterns emerge.
+
+Runtime environment variables:
+
+- `CODEX_TOOL_ARGS_JSON`, `CODEX_TOOL_NAME`, `CODEX_TOOL_CALL_ID` – existing payload metadata.
+- `CODEX_CONVERSATION_ID` – the active conversation UUID so tools can tag artifacts.
+- `CODEX_TURN_ID` – the current turn/submission identifier.
+- `CODEX_TURN_CWD` – absolute working directory resolved for this turn (mirrors the CLI `-C` flag/trusted project root).
+
+These make it easy to log results that need to be stitched back into rollouts (for example, persisting a Graph message id alongside the Codex session id).
 
 ## MCP integration
 
