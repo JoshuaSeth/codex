@@ -1,0 +1,50 @@
+# Web-Agent profile for Chrome DevTools MCP
+profile = "web-agent"
+sandbox_mode = "danger-full-access"
+
+[features]
+view_image_tool = true
+web_search_request = true
+apply_patch_freeform = false
+unified_exec = false
+
+[mcp_servers.chrome_devtools]
+command = "npx"
+args = [
+  "-y",
+  "chrome-devtools-mcp@latest",
+  "--isolated",
+  "--logFile", "/tmp/chrome-devtools-mcp.log",
+  "--chrome-arg=--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.90 Safari/537.36",
+]
+enabled = true
+startup_timeout_sec = 20
+tool_timeout_sec = 30
+
+[profiles.web-agent]
+model = "gpt-5.1-codex"
+model_provider = "openai"
+approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "high"
+developer_instructions = """
+You are operating as the Codex Web Agent. The Chrome DevTools MCP is your
+primary actuator: prefer it for every browsing/navigation action. You may use
+shell commands solely for lightweight read-only inspection (`cat`, `rg`, etc.).
+Do not run build systems, package managers, or mutating commands. Never call
+apply_patch or other write tools—they are intentionally disabled.
+"""
+
+[profiles.web-agent.features]
+view_image_tool = true
+web_search_request = true
+apply_patch_freeform = false
+unified_exec = false
+
+[profiles.web-agent.tools]
+view_image = true
+web_search = true
+
+[notice]
+hide_rate_limit_model_nudge = true
+hide_gpt-5.1-codex-max_migration_prompt = true
