@@ -45,6 +45,8 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::PendingToolStateEvent;
+use codex_core::protocol::PendingToolStatus;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
@@ -1058,6 +1060,25 @@ impl ChatWidget {
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(message);
+    }
+
+    fn on_pending_tool_state(&mut self, event: PendingToolStateEvent) {
+        let status_text = match event.status {
+            PendingToolStatus::Waiting => "waiting on external completion",
+            PendingToolStatus::Resolved => "resumed",
+            PendingToolStatus::Cancelled => "cancelled",
+        };
+        let mut message = format!(
+            "Pending tool {} ({}) {status_text}.",
+            event.tool_name, event.call_id
+        );
+        if let Some(note) = event.note.as_ref() {
+            if !note.trim().is_empty() {
+                message.push(' ');
+                message.push_str(note.trim());
+            }
+        }
+        self.on_background_event(message);
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -2075,6 +2096,7 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::PendingToolState(event) => self.on_pending_tool_state(event),
             EventMsg::RawResponseItem(_)
             | EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)

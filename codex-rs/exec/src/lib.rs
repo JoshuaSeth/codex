@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
+mod pending_tool_ipc;
 
 use anyhow::Context;
 pub use cli::Cli;
@@ -37,6 +38,7 @@ use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SessionSource;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
@@ -46,15 +48,22 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
 use supports_color::Stream;
+use tokio::fs;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::cli::Command as ExecCommand;
+use crate::cli::DeliverPendingArgs;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
+use crate::pending_tool_ipc::PendingToolServer;
+use crate::pending_tool_ipc::addr_from_metadata;
+use crate::pending_tool_ipc::load_metadata;
+use crate::pending_tool_ipc::send_pending_result;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::replace_last_tool_result as patch_last_tool_result;
@@ -94,6 +103,14 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         output_schema: output_schema_path,
         config_overrides,
     } = cli;
+
+    let command = match command {
+        Some(Command::DeliverPending(args)) => {
+            run_deliver_pending(args).await?;
+            return Ok(());
+        }
+        other => other,
+    };
 
     let (stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -296,7 +313,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewConversation {
-        conversation_id: _,
+        conversation_id,
         conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
@@ -329,6 +346,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             .new_conversation(config.clone())
             .await?
     };
+    let _pending_tool_server =
+        match PendingToolServer::start(&config.codex_home, &conversation_id, conversation.clone())
+            .await
+        {
+            Ok(server) => Some(server),
+            Err(err) => {
+                warn!(?err, "failed to start pending tool IPC server");
+                None
+            }
+        };
+
     let (initial_operation, prompt_summary) = match (command, prompt, images) {
         (Some(ExecCommand::Review(review_cli)), _, _) => {
             let review_request = build_review_request(review_cli)?;
@@ -336,33 +364,55 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             (InitialOperation::Review { review_request }, summary)
         }
         (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-            let prompt_arg = args
-                .prompt
-                .clone()
-                .or_else(|| {
-                    if args.last {
-                        args.session_id.clone()
-                    } else {
-                        None
-                    }
-                })
-                .or(root_prompt);
-            let prompt_text = resolve_prompt(prompt_arg);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .map(|path| UserInput::LocalImage { path })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-            });
-            let output_schema = load_output_schema(output_schema_path.clone());
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
+            if args.no_prompt && root_prompt.is_some() {
+                eprintln!(
+                    "--no-prompt cannot be combined with a PROMPT argument or piped stdin input."
+                );
+                std::process::exit(1);
+            }
+
+            if args.no_prompt {
+                let items: Vec<UserInput> = imgs
+                    .into_iter()
+                    .map(|path| UserInput::LocalImage { path })
+                    .collect();
+                let output_schema = load_output_schema(output_schema_path.clone());
+                (
+                    InitialOperation::UserTurn {
+                        items,
+                        output_schema,
+                    },
+                    "(resume without prompt)".to_string(),
+                )
+            } else {
+                let prompt_arg = args
+                    .prompt
+                    .clone()
+                    .or_else(|| {
+                        if args.last {
+                            args.session_id.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .or(root_prompt);
+                let prompt_text = resolve_prompt(prompt_arg);
+                let mut items: Vec<UserInput> = imgs
+                    .into_iter()
+                    .map(|path| UserInput::LocalImage { path })
+                    .collect();
+                items.push(UserInput::Text {
+                    text: prompt_text.clone(),
+                });
+                let output_schema = load_output_schema(output_schema_path.clone());
+                (
+                    InitialOperation::UserTurn {
+                        items,
+                        output_schema,
+                    },
+                    prompt_text,
+                )
+            }
         }
         (None, root_prompt, imgs) => {
             let prompt_text = resolve_prompt(root_prompt);
@@ -381,6 +431,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 },
                 prompt_text,
             )
+        }
+        (Some(ExecCommand::DeliverPending(_)), _, _) => {
+            unreachable!("deliver command handled earlier")
         }
     };
 
@@ -490,6 +543,30 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
+    let codex_home = find_codex_home().context("failed to locate codex home")?;
+    let metadata_path = codex_home
+        .join("live")
+        .join(format!("{}.json", args.session_id));
+    let bytes = fs::read(&metadata_path)
+        .await
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let meta = load_metadata(value)?;
+    let addr = addr_from_metadata(meta)?;
+    let payload = FunctionCallOutputPayload {
+        content: args.output,
+        success: Some(args.success),
+        ..Default::default()
+    };
+    send_pending_result(addr, args.call_id, payload).await?;
+    eprintln!(
+        "Delivered pending tool result for session {}.",
+        args.session_id
+    );
     Ok(())
 }
 

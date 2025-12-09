@@ -13,6 +13,7 @@ use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
+use codex_core::protocol::PendingToolStatus;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::config_types::ReasoningSummary;
@@ -141,7 +142,7 @@ print(prefix + payload.get("text", ""))
                 timeout_ms: Some(2_000),
                 with_escalated_permissions: None,
                 parallel: false,
-                shutdown_after_call: false,
+                hibernate_after_call: false,
             },
         );
     });
@@ -194,7 +195,7 @@ print(prefix + payload.get("text", ""))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn custom_tool_shutdown_after_call_triggers_pending_flow() -> Result<()> {
+async fn custom_tool_hibernate_after_call_triggers_pending_flow() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -233,7 +234,7 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
                 timeout_ms: Some(2_000),
                 with_escalated_permissions: None,
                 parallel: false,
-                shutdown_after_call: true,
+                hibernate_after_call: true,
             },
         );
     });
@@ -284,10 +285,15 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
         );
     }
 
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ShutdownComplete)
+    let pending = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::PendingToolState(_))
     })
     .await;
+    if let EventMsg::PendingToolState(evt) = pending {
+        assert_eq!(PendingToolStatus::Waiting, evt.status);
+        assert_eq!("custom.pending", evt.tool_name);
+        assert!(evt.note.unwrap_or_default().contains("sync-42"));
+    }
 
     Ok(())
 }

@@ -91,6 +91,9 @@ use crate::exec_policy::ExecPolicyUpdateError;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_provider_info::CHAT_WIRE_API_DEPRECATION_SUMMARY;
+use crate::openai_model_info::get_model_info;
+use crate::pending_tools::PendingToolManager;
+use crate::pending_tools::PendingToolMetadata;
 use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageContentDeltaEvent;
 use crate::protocol::AgentReasoningSectionBreakEvent;
@@ -103,6 +106,8 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::Op;
+use crate::protocol::PendingToolStateEvent;
+use crate::protocol::PendingToolStatus;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
 use crate::protocol::ReasoningRawContentDeltaEvent;
@@ -137,7 +142,9 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::hooks::{StopHook, StopHookEvent, ToolHook};
+use crate::tools::hooks::StopHook;
+use crate::tools::hooks::StopHookEvent;
+use crate::tools::hooks::ToolHook;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::tools::spec::ToolsConfig;
@@ -349,6 +356,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+    pending_tools: PendingToolManager,
 }
 
 /// The context needed for a single turn of the conversation.
@@ -488,6 +496,60 @@ impl Session {
 
     pub(crate) fn conversation_id(&self) -> ConversationId {
         self.conversation_id
+    }
+
+    pub(crate) async fn mark_tool_pending(
+        &self,
+        turn: &Arc<TurnContext>,
+        call_id: String,
+        tool_name: String,
+        note: Option<String>,
+    ) {
+        let metadata = self
+            .pending_tools
+            .register(call_id, tool_name, turn.sub_id.clone(), note)
+            .await;
+        let event = EventMsg::PendingToolState(PendingToolStateEvent {
+            call_id: metadata.call_id,
+            tool_name: metadata.tool_name,
+            turn_id: metadata.turn_id,
+            status: PendingToolStatus::Waiting,
+            note: metadata.note,
+        });
+        self.send_event(turn, event).await;
+    }
+
+    pub(crate) async fn take_pending_tool_receiver(
+        &self,
+        call_id: &str,
+    ) -> Option<(
+        PendingToolMetadata,
+        oneshot::Receiver<FunctionCallOutputPayload>,
+    )> {
+        self.pending_tools.take_receiver(call_id).await
+    }
+
+    pub(crate) async fn complete_pending_tool(
+        &self,
+        call_id: &str,
+        payload: FunctionCallOutputPayload,
+    ) -> Option<PendingToolMetadata> {
+        let metadata = self.pending_tools.resolve(call_id, payload).await;
+        if let Some(meta) = &metadata {
+            let event = EventMsg::PendingToolState(PendingToolStateEvent {
+                call_id: meta.call_id.clone(),
+                tool_name: meta.tool_name.clone(),
+                turn_id: meta.turn_id.clone(),
+                status: PendingToolStatus::Resolved,
+                note: None,
+            });
+            self.send_event_raw(Event {
+                id: meta.turn_id.clone(),
+                msg: event,
+            })
+            .await;
+        }
+        metadata
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -697,6 +759,7 @@ impl Session {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            pending_tools: PendingToolManager::new(),
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -1693,6 +1756,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Review { review_request } => {
                 handlers::review(&sess, &config, id.clone(), review_request).await;
             }
+            Op::DeliverPendingToolResult { call_id, output } => {
+                handlers::deliver_pending_tool_result(&sess, call_id, output).await;
+            }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
     }
@@ -1750,6 +1816,7 @@ mod handlers {
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandTask;
     use codex_protocol::custom_prompts::CustomPrompt;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
@@ -2067,6 +2134,16 @@ mod handlers {
             CompactTask,
         )
         .await;
+    }
+
+    pub async fn deliver_pending_tool_result(
+        sess: &Arc<Session>,
+        call_id: String,
+        output: FunctionCallOutputPayload,
+    ) {
+        if sess.complete_pending_tool(&call_id, output).await.is_none() {
+            warn!("pending tool result received for unknown call_id {call_id}");
+        }
     }
 
     pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
@@ -3271,6 +3348,7 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            pending_tools: PendingToolManager::new(),
         };
 
         (session, turn_context)
@@ -3357,6 +3435,7 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            pending_tools: PendingToolManager::new(),
         });
 
         (session, turn_context, rx_event)

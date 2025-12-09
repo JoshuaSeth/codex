@@ -94,3 +94,7 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 *.egg-info/
+
+# Local Codex homes (generated during tests/dev)
+.codex_home/
+codex-rs/.codex_home/

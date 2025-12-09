@@ -16,6 +16,7 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
+use codex_core::protocol::PendingToolStatus;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
@@ -221,6 +222,23 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 ts_msg!(self, "{}", message.style(self.dimmed));
+            }
+            EventMsg::PendingToolState(event) => {
+                let status_text = match event.status {
+                    PendingToolStatus::Waiting => "waiting",
+                    PendingToolStatus::Resolved => "resumed",
+                    PendingToolStatus::Cancelled => "cancelled",
+                };
+                ts_msg!(
+                    self,
+                    "{} {} {}",
+                    "pending:".style(self.cyan),
+                    event.tool_name,
+                    status_text
+                );
+                if let Some(note) = event.note.as_deref() {
+                    ts_msg!(self, "  {}", note.style(self.dimmed));
+                }
             }
             EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
                 ts_msg!(self, "{}", message.style(self.dimmed));

@@ -94,6 +94,9 @@ pub enum Command {
 
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+
+    /// Deliver the final output for a pending tool call to a running session.
+    DeliverPending(DeliverPendingArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -114,6 +117,10 @@ pub struct ResumeArgs {
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+
+    /// Resume the session without sending any new user prompt.
+    #[arg(long = "no-prompt", default_value_t = false, conflicts_with = "prompt")]
+    pub no_prompt: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -149,6 +156,25 @@ pub struct ReviewArgs {
     /// Custom review instructions. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct DeliverPendingArgs {
+    /// Conversation/session id whose pending tool should be fulfilled.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// Call id that was marked as pending.
+    #[arg(long = "call-id", value_name = "CALL_ID")]
+    pub call_id: String,
+
+    /// Plaintext output to deliver to the agent.
+    #[arg(long = "output", value_name = "TEXT")]
+    pub output: String,
+
+    /// Whether the tool succeeded (sets the `success` flag in the payload).
+    #[arg(long = "success", default_value_t = true)]
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]

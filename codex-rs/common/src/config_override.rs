@@ -12,7 +12,8 @@ use clap::Parser;
 use codex_core::config::set_codex_home_override;
 use codex_core::config::set_config_file_override;
 use serde::de::Error as SerdeError;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use toml::Value;
 
 /// CLI option that captures arbitrary configuration overrides specified as

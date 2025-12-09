@@ -10,6 +10,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use async_channel::Sender;
+use futures::future;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
@@ -67,13 +68,16 @@ pub enum ExecExpiration {
     Timeout(Duration),
     DefaultTimeout,
     Cancellation(CancellationToken),
+    Never,
 }
 
 impl From<Option<u64>> for ExecExpiration {
     fn from(timeout_ms: Option<u64>) -> Self {
-        timeout_ms.map_or(ExecExpiration::DefaultTimeout, |timeout_ms| {
-            ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
-        })
+        match timeout_ms {
+            Some(0) => ExecExpiration::Never,
+            Some(timeout_ms) => ExecExpiration::Timeout(Duration::from_millis(timeout_ms)),
+            None => ExecExpiration::DefaultTimeout,
+        }
     }
 }
 
@@ -93,6 +97,7 @@ impl ExecExpiration {
             ExecExpiration::Cancellation(cancel) => {
                 cancel.cancelled().await;
             }
+            ExecExpiration::Never => future::pending::<()>().await,
         }
     }
 
@@ -102,6 +107,7 @@ impl ExecExpiration {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
             ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
             ExecExpiration::Cancellation(_) => None,
+            ExecExpiration::Never => Some(0),
         }
     }
 }
@@ -946,6 +952,13 @@ mod tests {
         assert!(output.timed_out);
         assert_eq!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
         Ok(())
+    }
+
+    #[test]
+    fn zero_timeout_disables_expiration() {
+        let expiration: ExecExpiration = Some(0).into();
+        assert!(matches!(expiration, ExecExpiration::Never));
+        assert_eq!(expiration.timeout_ms(), None);
     }
 
     #[cfg(unix)]

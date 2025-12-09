@@ -45,7 +45,7 @@ pub(crate) struct ConfigCustomTool {
     pub timeout_ms: Option<u64>,
     pub with_escalated_permissions: Option<bool>,
     pub parallel: bool,
-    pub shutdown_after_call: bool,
+    pub hibernate_after_call: bool,
 }
 
 impl ToolsConfig {
@@ -1016,7 +1016,7 @@ fn build_custom_tool_specs(entries: &BTreeMap<String, CustomToolConfig>) -> Vec<
                     timeout_ms: tool.timeout_ms,
                     with_escalated_permissions: tool.with_escalated_permissions,
                     parallel: tool.parallel,
-                    shutdown_after_call: tool.shutdown_after_call,
+                    hibernate_after_call: tool.hibernate_after_call,
                 });
             }
             Err(err) => {

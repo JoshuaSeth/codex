@@ -211,6 +211,9 @@ async fn run_codex_tool_session_inner(
                         // TODO: forward elicitation requests to the client?
                         continue;
                     }
+                    EventMsg::PendingToolState(_) => {
+                        continue;
+                    }
                     EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
                         call_id,
                         turn_id: _,

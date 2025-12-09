@@ -495,7 +495,7 @@ CUSTOM_TOOL_PREFIX = "dev-build: "
 - `cwd` *(optional)* – relative path inside the workspace; omit to run in the turn cwd.
 - `env` *(table)* – extra environment variables merged into the process environment.
 - `timeout_ms`, `with_escalated_permissions`, `parallel` – mirror the knobs used by builtin tools.
-- `shutdown_after_call` *(bool)* – when `true`, Codex records the tool output, emits a background note (using the tool’s stdout/stderr as the note body), and shuts the session down immediately. Use this for fire-and-forget automations that will resume later with `codex resume` once the external system produces a result. When the result arrives, run `codex-dev --replace-last-toolresult "…" resume <session-id>` (or the `codex exec resume` equivalent) to inject the final payload into the JSONL before continuing.
+- `hibernate_after_call` *(bool)* – when `true`, Codex executes the helper as usual but then marks the tool call as *pending*: the CLI keeps running, prints a spinner/notice (“pending: <tool> waiting”), and publishes a metadata file at `~/.codex/live/<conversation_id>.json` containing the local IPC endpoint. Your webhook (or human) can then call `codex-dev exec deliver-pending <conversation-id> --call-id <tool_call_id> --output "final text"` to push the real payload straight into the paused turn. This flag is perfect for small “wait_*” helpers (for example, `wait_for_email_response`) that simply record work to monitor. If the CLI is no longer running, fall back to `codex-dev exec resume <session-id> --replace-last-toolresult "…" --no-prompt` to splice the result into the rollout before restarting.
 
 At runtime Codex injects three additional environment variables so scripts can inspect the call context without parsing arguments:
 

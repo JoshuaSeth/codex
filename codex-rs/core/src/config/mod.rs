@@ -390,7 +390,7 @@ pub struct CustomToolConfig {
     pub timeout_ms: Option<u64>,
     pub with_escalated_permissions: Option<bool>,
     pub parallel: bool,
-    pub shutdown_after_call: bool,
+    pub hibernate_after_call: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1656,7 +1656,7 @@ fn build_custom_tools(
                 timeout_ms: entry.timeout_ms,
                 with_escalated_permissions: entry.with_escalated_permissions,
                 parallel: entry.parallel.unwrap_or(false),
-                shutdown_after_call: entry.shutdown_after_call.unwrap_or(false),
+                hibernate_after_call: entry.hibernate_after_call.unwrap_or(false),
             },
         );
     }

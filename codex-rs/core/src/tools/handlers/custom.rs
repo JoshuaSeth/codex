@@ -106,7 +106,7 @@ impl ToolHandler for CustomToolHandler {
         )
         .await?;
 
-        if tool.shutdown_after_call {
+        if tool.hibernate_after_call {
             if let ToolOutput::Function {
                 content,
                 content_items,

@@ -17,6 +17,7 @@ use crate::custom_prompts::CustomPrompt;
 use crate::items::TurnItem;
 use crate::message_history::HistoryEntry;
 use crate::models::ContentItem;
+use crate::models::FunctionCallOutputPayload;
 use crate::models::ResponseItem;
 use crate::num_format::format_with_separators;
 use crate::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -104,6 +105,14 @@ pub enum Op {
         summary: ReasoningSummaryConfig,
         // The JSON schema to use for the final assistant message
         final_output_json_schema: Option<Value>,
+    },
+
+    /// Deliver the final output for a pending tool call so the session can resume.
+    DeliverPendingToolResult {
+        /// Identifier of the pending tool call.
+        call_id: String,
+        /// Structured payload to send back to the model.
+        output: FunctionCallOutputPayload,
     },
 
     /// Override parts of the persistent turn context for subsequent turns.
@@ -613,6 +622,7 @@ pub enum EventMsg {
     DeprecationNotice(DeprecationNoticeEvent),
 
     BackgroundEvent(BackgroundEventEvent),
+    PendingToolState(PendingToolStateEvent),
 
     UndoStarted(UndoStartedEvent),
 
@@ -744,6 +754,24 @@ pub struct AgentMessageContentDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PendingToolStatus {
+    Waiting,
+    Resolved,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
+pub struct PendingToolStateEvent {
+    pub call_id: String,
+    pub tool_name: String,
+    pub turn_id: String,
+    pub status: PendingToolStatus,
+    pub note: Option<String>,
 }
 
 impl HasLegacyEvent for AgentMessageContentDeltaEvent {

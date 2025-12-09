@@ -14,7 +14,9 @@ pub(crate) mod policy;
 pub mod recorder;
 
 pub use codex_protocol::protocol::SessionMeta;
-pub use edit::{PatchedToolCall, ToolResultKind, replace_last_tool_result};
+pub use edit::PatchedToolCall;
+pub use edit::ToolResultKind;
+pub use edit::replace_last_tool_result;
 pub(crate) use error::map_session_init_error;
 pub use list::find_conversation_path_by_id_str;
 pub use recorder::RolloutRecorder;

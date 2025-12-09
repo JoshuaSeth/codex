@@ -22,8 +22,8 @@ pub struct PatchedToolCall {
 
 /// Replace the payload of the most recent tool call output within the rollout at `path`.
 ///
-/// This is primarily used to swap in the real result for sessions that shut down immediately
-/// after a `shutdown_after_call` tool execution.
+/// This is primarily used to swap in the real result for sessions that hibernated immediately
+/// after a `hibernate_after_call` tool execution.
 pub async fn replace_last_tool_result(
     path: &Path,
     new_output: &str,

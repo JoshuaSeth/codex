@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client_common::tools::ToolSpec;
-use crate::codex::shutdown_session;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -131,26 +130,30 @@ impl ToolRegistry {
                                     *guard = Some(output);
                                 }
                                 if should_shutdown {
-                                    let session = Arc::clone(&session);
-                                    let turn = Arc::clone(&turn);
                                     let tool = tool_label.clone();
                                     let call_id = call_id_for_note.clone();
-                                    let note = pending_note.map_or_else(
+                                    let note_for_event = pending_note.clone();
+                                    let note = note_for_event.clone().map_or_else(
                                         || {
                                             format!(
-                                                "Tool `{tool}` ({call_id}) is waiting on external completion. Codex will exit; resume this conversation once results are ready."
+                                                "Tool `{tool}` ({call_id}) is waiting on external completion. Codex will resume automatically once results are ready."
                                             )
                                         },
                                         |msg| {
                                             format!(
-                                                "Tool `{tool}` ({call_id}) returned a pending payload: {msg}\nCodex will exit; resume this conversation once results are ready."
+                                                "Tool `{tool}` ({call_id}) returned a pending payload: {msg}\nCodex will resume automatically once results are ready."
                                             )
                                         },
                                     );
-                                    tokio::spawn(async move {
-                                        session.notify_background_event(&turn, note).await;
-                                        shutdown_session(&session, turn.sub_id.clone()).await;
-                                    });
+                                    session.notify_background_event(&turn, note).await;
+                                    session
+                                        .mark_tool_pending(
+                                            &turn,
+                                            call_id,
+                                            tool,
+                                            note_for_event,
+                                        )
+                                        .await;
                                 }
                                 Ok((preview, success))
                             }
