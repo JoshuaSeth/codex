@@ -138,6 +138,12 @@ impl CliConfigOverrides {
                     path.display()
                 )
             })?;
+            if !normalized.exists() {
+                return Err(format!(
+                    "Config file `{}` does not exist",
+                    normalized.display()
+                ));
+            }
             set_config_file_override(normalized);
         }
 
