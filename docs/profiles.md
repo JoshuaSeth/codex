@@ -56,6 +56,22 @@ profiles we maintain in this repository and how to run them with the CLI.
   `codex-dev --config-file ~/.codex/web-agent-aipc.toml` (plus `--config-home` if you
   want isolated auth/logs for the AIPC profile).
 
+### Orchestrator / ask_colleague
+
+- **Location:** see `docs/orchestrator-profile.toml`.
+- **Purpose:** adds both the `ask_colleague` helper (spawns `codex-dev` recursively) and
+  the `web_form_colleague` helper (dispatches the Chrome DevTools web agent Elise uses), so
+  you can coordinate multi-agent work or farm out browser automation without leaving the CLI.
+- **Key settings:** mirrors the default CLI config, keeps the sandbox at `workspace-write`, and
+  registers both helpers under `[custom_tools]` (`ask_colleague` for parallel Codex threads,
+  `web_form_colleague` for the DevTools workflow).
+- **Usage:** launch Codex with `codex-dev --config-file ~/.codex/orchestrator-profile.toml`
+  (plus `--config-home` if you want an isolated Codex home). Inside the session, call
+  `ask_colleague(prompt="Draft release notes")` to spin up a new colleague or
+  `ask_colleague(prompt="Please continue", id="gentle-otter")` to resume. When you need
+  hands-on UI work, call `web_form_colleague(instructions="Fill the onboarding form", context="..." )`
+  and wait for the hibernated turn to resume automatically once the DevTools agent reports back.
+
 ## Tips
 
 - Keep profile files under version control (for example in `~/.codex/profiles/`) so you

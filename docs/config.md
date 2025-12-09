@@ -464,10 +464,10 @@ explicit `--cd/-C` override. Absolute paths are recommended, but relative values
 are resolved against the shell’s current directory.
 
 ```toml
-default_cwd = "/Users/sethvanderbijl/PitchAI Code/mail_mcp"
+default_cwd = "/Users/sethvanderbijl/PitchAI Code/Elise/core"
 
 [profiles.elise]
-default_cwd = "/Users/sethvanderbijl/PitchAI Code/mail_mcp"
+default_cwd = "/Users/sethvanderbijl/PitchAI Code/Elise/core"
 ```
 
 When present, `default_cwd` takes precedence over the shell’s cwd but is still
@@ -523,6 +523,26 @@ description = "Count files under the repository"
 command = ["python3", "./tools/custom_tools/send_email_stub.py"]
 description = "Log an email to the dev mailbox"
 parameters = { type = "object", required = ["subject", "body"], properties = { subject = { type = "string" }, body = { type = "string" } } }
+``` |
+| `tools/custom_tools/wait_for_email_response.py` | Registers one or more Graph `internet_message_id` values and hibernates the turn until a reply arrives. Pair it with a normal send helper (for example, `send_graph_email.py`) that returns immediately. | ```toml
+[custom_tools.wait_for_email_response]
+command = ["python3", "./tools/custom_tools/wait_for_email_response.py"]
+description = "Pause until the listed email replies arrive"
+parameters = { type = "object", properties = { message_ids = { type = "array", items = { type = "string" }, minItems = 1 } }, required = ["message_ids"], additionalProperties = false }
+hibernate_after_call = true
+``` |
+| `tools/custom_tools/web_form_colleague.py` | Dispatches Elise’s Chrome DevTools automation helper; queues a job and hibernates until the runner posts the final summary. | ```toml
+[custom_tools.web_form_colleague]
+command = ["python3", "./tools/custom_tools/web_form_colleague.py"]
+description = "Delegate browser form work to the web-form colleague"
+parameters = { type = "object", properties = { instructions = { type = "string" }, context = { type = "string" } }, required = ["instructions"], additionalProperties = false }
+hibernate_after_call = true
+``` |
+| `tools/custom_tools/ask_colleague.py` | Recursively spawns `codex-dev` (in JSON mode) so the agent can ask a “colleague” for help or resume a previous colleague conversation by friendly id. | ```toml
+[custom_tools.ask_colleague]
+command = ["python3", "./tools/custom_tools/ask_colleague.py"]
+description = "Ask or resume a Codex colleague"
+parameters = { type = "object", properties = { prompt = { type = "string" }, id = { type = "string" } }, required = ["prompt"], additionalProperties = false }
 ``` |
 | `tools/custom_tools/echo_tool.py` | Echoes tool arguments for quick smoke tests. | ```toml
 [custom_tools.echo]
