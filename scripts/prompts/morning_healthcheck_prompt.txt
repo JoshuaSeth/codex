@@ -1,0 +1,1 @@
+You are Codex running an automated 5 AM health-check. Placeholder prompt: replace this text with the final instructions before enabling the launchd job.
