@@ -3,6 +3,7 @@ use crate::tools::router::ToolCall;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::process::Stdio;
@@ -26,19 +27,31 @@ impl ToolHook {
         })
     }
 
-    pub async fn emit(&self, event: ToolHookEvent) {
-        if let Err(err) = self.spawn_and_send(event).await {
-            warn!("tool_hook_error" = %err, "failed to run tool hook command");
+    pub async fn emit(&self, event: ToolHookEvent) -> Option<ToolHookDirective> {
+        match self.spawn_and_send(event).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("tool_hook_error" = %err, "failed to run tool hook command");
+                None
+            }
         }
     }
 
-    async fn spawn_and_send(&self, event: ToolHookEvent) -> std::io::Result<()> {
+    async fn spawn_and_send(
+        &self,
+        event: ToolHookEvent,
+    ) -> std::io::Result<Option<ToolHookDirective>> {
+        let capture_response = matches!(event.phase, ToolHookPhase::BeforeExecution);
         let mut cmd = Command::new(&self.command[0]);
         if self.command.len() > 1 {
             cmd.args(&self.command[1..]);
         }
         cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::inherit());
+        if capture_response {
+            cmd.stdout(Stdio::piped());
+        } else {
+            cmd.stdout(Stdio::inherit());
+        }
         cmd.stderr(Stdio::inherit());
 
         let mut child = cmd.spawn()?;
@@ -48,13 +61,38 @@ impl ToolHook {
             })?;
             stdin.write_all(&payload).await?;
         }
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "hook exited with status {status}"
-            )));
+        if capture_response {
+            let output = child.wait_with_output().await?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "hook exited with status {}",
+                    output.status
+                )));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.is_empty() {
+                return Ok(None);
+            }
+            match serde_json::from_str::<ToolHookDirective>(&stdout) {
+                Ok(directive) => Ok(Some(directive)),
+                Err(err) => {
+                    warn!(
+                        "tool_hook_parse_error" = %err,
+                        "stdout" = %stdout,
+                        "failed to parse tool hook output"
+                    );
+                    Ok(None)
+                }
+            }
+        } else {
+            let status = child.wait().await?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!(
+                    "hook exited with status {status}"
+                )));
+            }
+            Ok(None)
         }
-        Ok(())
     }
 }
 
@@ -185,6 +223,56 @@ enum ToolHookOutcome {
     Error { message: String },
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolHookDirective {
+    #[serde(default)]
+    pub local_shell: Option<HookLocalShellDirective>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookLocalShellDirective {
+    #[serde(default)]
+    timeout_ms: Option<ToolHookTimeoutOverride>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ToolHookTimeoutOverride {
+    Millis(u64),
+    Keyword(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutBehavior {
+    Millis(u64),
+    Infinite,
+}
+
+impl HookLocalShellDirective {
+    pub fn timeout_behavior(&self) -> Option<TimeoutBehavior> {
+        self.timeout_ms.as_ref().and_then(|value| value.behavior())
+    }
+}
+
+impl ToolHookTimeoutOverride {
+    fn behavior(&self) -> Option<TimeoutBehavior> {
+        match self {
+            Self::Millis(ms) => Some(TimeoutBehavior::Millis(*ms)),
+            Self::Keyword(keyword) => {
+                let normalized = keyword.trim().to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "infinite" | "no_timeout" | "none" | "unlimited"
+                ) {
+                    Some(TimeoutBehavior::Infinite)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StopHook {
     command: Arc<Vec<String>>,
@@ -229,6 +317,35 @@ impl StopHook {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_infinite_timeout_directive() {
+        let directive: ToolHookDirective =
+            serde_json::from_str(r#"{"local_shell":{"timeout_ms":"infinite"}}"#).unwrap();
+        let behavior = directive
+            .local_shell
+            .as_ref()
+            .and_then(HookLocalShellDirective::timeout_behavior)
+            .unwrap();
+        assert!(matches!(behavior, TimeoutBehavior::Infinite));
+    }
+
+    #[test]
+    fn parses_numeric_timeout_directive() {
+        let directive: ToolHookDirective =
+            serde_json::from_str(r#"{"local_shell":{"timeout_ms":60000}}"#).unwrap();
+        let behavior = directive
+            .local_shell
+            .as_ref()
+            .and_then(HookLocalShellDirective::timeout_behavior)
+            .unwrap();
+        assert_eq!(behavior, TimeoutBehavior::Millis(60_000));
     }
 }
 

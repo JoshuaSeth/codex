@@ -6,7 +6,10 @@ use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::hooks::{ToolCallSnapshot, ToolHookEvent};
+use crate::tools::hooks::TimeoutBehavior;
+use crate::tools::hooks::ToolCallSnapshot;
+use crate::tools::hooks::ToolHookDirective;
+use crate::tools::hooks::ToolHookEvent;
 use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
@@ -15,9 +18,10 @@ use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ShellToolCallParams;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{debug, instrument, warn};
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {
@@ -136,9 +140,16 @@ impl ToolRouter {
         call: ToolCall,
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let hook = turn.tool_hook.clone();
+        let mut call = call;
         let hook_snapshot = hook.as_ref().map(|_| ToolCallSnapshot::from_call(&call));
-        if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
-            hook.emit(ToolHookEvent::before(snapshot.clone())).await;
+        let directive =
+            if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
+                hook.emit(ToolHookEvent::before(snapshot.clone())).await
+            } else {
+                None
+            };
+        if let Some(directive) = directive {
+            Self::apply_tool_hook_directive(&mut call, directive);
         }
 
         let ToolCall {
@@ -161,31 +172,34 @@ impl ToolRouter {
         match self.registry.dispatch(invocation).await {
             Ok(response) => {
                 if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
-                    hook.emit(ToolHookEvent::after_success(
-                        snapshot.clone(),
-                        response.clone(),
-                    ))
-                    .await;
+                    let _ = hook
+                        .emit(ToolHookEvent::after_success(
+                            snapshot.clone(),
+                            response.clone(),
+                        ))
+                        .await;
                 }
                 Ok(response)
             }
             Err(FunctionCallError::Fatal(message)) => {
                 if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
-                    hook.emit(ToolHookEvent::after_error(
-                        snapshot.clone(),
-                        message.clone(),
-                    ))
-                    .await;
+                    let _ = hook
+                        .emit(ToolHookEvent::after_error(
+                            snapshot.clone(),
+                            message.clone(),
+                        ))
+                        .await;
                 }
                 Err(FunctionCallError::Fatal(message))
             }
             Err(err) => {
                 if let (Some(hook), Some(snapshot)) = (hook.as_ref(), hook_snapshot.as_ref()) {
-                    hook.emit(ToolHookEvent::after_error(
-                        snapshot.clone(),
-                        err.to_string(),
-                    ))
-                    .await;
+                    let _ = hook
+                        .emit(ToolHookEvent::after_error(
+                            snapshot.clone(),
+                            err.to_string(),
+                        ))
+                        .await;
                 }
                 Ok(Self::failure_response(
                     failure_call_id,
@@ -216,6 +230,62 @@ impl ToolRouter {
                     ..Default::default()
                 },
             }
+        }
+    }
+
+    fn apply_tool_hook_directive(call: &mut ToolCall, directive: ToolHookDirective) {
+        let Some(local_shell) = directive.local_shell else {
+            return;
+        };
+
+        let Some(behavior) = local_shell.timeout_behavior() else {
+            return;
+        };
+
+        match (&mut call.payload, call.tool_name.as_str()) {
+            (ToolPayload::LocalShell { params }, _) => {
+                Self::apply_timeout_behavior(&mut params.timeout_ms, behavior);
+                debug!("tool_hook_timeout_override" = "local_shell", command = ?params.command, timeout = ?params.timeout_ms);
+            }
+            (ToolPayload::Function { arguments }, "shell_command") => {
+                match serde_json::from_str::<Value>(arguments) {
+                    Ok(mut params) => {
+                        if let Some(obj) = params.as_object_mut() {
+                            let value = match behavior {
+                                TimeoutBehavior::Millis(ms) => Value::from(ms),
+                                TimeoutBehavior::Infinite => Value::from(0u64),
+                            };
+                            obj.insert("timeout_ms".to_string(), value);
+                            match serde_json::to_string(&params) {
+                                Ok(updated) => {
+                                    *arguments = updated;
+                                    debug!("tool_hook_timeout_override" = "shell_command", timeout_behavior = ?behavior);
+                                }
+                                Err(err) => {
+                                    warn!("shell_command_hook_serialize_error" = %err,
+                                        "failed to serialize shell_command arguments after applying timeout override");
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "shell_command_hook_parse_error: shell_command arguments were not an object"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!("shell_command_hook_parse_error" = %err,
+                            "failed to parse shell_command arguments for timeout override");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_timeout_behavior(target: &mut Option<u64>, behavior: TimeoutBehavior) {
+        match behavior {
+            TimeoutBehavior::Millis(ms) => *target = Some(ms),
+            TimeoutBehavior::Infinite => *target = Some(0),
         }
     }
 }
