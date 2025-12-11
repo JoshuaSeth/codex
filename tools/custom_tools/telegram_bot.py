@@ -363,13 +363,16 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
 
     status = _extract_status(final_message)
 
-    lines: list[str] = ["🤖 *Codex Run Complete*"]
-    lines.append(f"🧵 Conversation: `{conversation_id}`")
-    lines.append(f"🔁 Turns: `{turn_id}`")
-    lines.append("📂 *Working directory*:\n```\n" + cwd + "\n```")
+    project_name = cwd
+    try:
+        project_name = str(Path(cwd).resolve())
+    except Exception:  # noqa: BLE001
+        project_name = cwd
+
+    lines: list[str] = [f"*Project:* {project_name}"]
 
     if status:
-        lines.append(f"📌 Status: *{status}*")
+        lines.append(f"*Status:* {status}")
 
     # if total_tokens is not None:
     #     lines.append(
@@ -381,6 +384,8 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     #         )
     #     )
 
+    if lines:
+        lines.append("")
     lines.append(final_message)
     return "\n".join(lines)
 
