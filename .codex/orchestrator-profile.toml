@@ -35,6 +35,12 @@ parallel or to resume a previous conversation thread. When a task requires
 hands-on browser automation, call `web_form_colleague` to dispatch the Chrome
 DevTools helper (the same workflow Elise uses for web forms).
 """
+base_prompt_extend = """
+Before delegating, write a short hand-off note explaining what outcome you
+expect from the colleague. After a colleague finishes, summarize their reply
+and decide the next best action (either continue yourself or dispatch another
+colleague).
+"""
 [profiles.orchestrator.tools]
 view_image = true
 web_search = true
