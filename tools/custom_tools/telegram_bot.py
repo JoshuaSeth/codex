@@ -345,8 +345,6 @@ def _extract_last_assistant_message(response_items: list[dict[str, Any]] | None)
 
 
 def _format_stop_hook_message(payload: dict[str, Any]) -> str:
-    conversation_id = payload.get("conversation_id", "unknown")
-    turn_id = payload.get("turn_id", "unknown")
     cwd = payload.get("cwd", "(unknown cwd)")
     final_message = payload.get("final_message") or _extract_last_assistant_message(
         payload.get("response_items")
@@ -355,39 +353,13 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     final_message = final_message.strip()
     final_message = _truncate(final_message, 1500)
 
-    token_usage = payload.get("token_usage") or {}
-    total_tokens = token_usage.get("total_tokens")
-    input_tokens = token_usage.get("input_tokens")
-    output_tokens = token_usage.get("output_tokens")
-    reasoning_tokens = token_usage.get("reasoning_output_tokens")
-
-    status = _extract_status(final_message)
-
     project_name = cwd
     try:
         project_name = str(Path(cwd).resolve())
     except Exception:  # noqa: BLE001
         project_name = cwd
 
-    lines: list[str] = [f"*Project:* {project_name}"]
-
-    if status:
-        lines.append(f"*Status:* {status}")
-
-    # if total_tokens is not None:
-    #     lines.append(
-    #         "📊 Tokens — total {total} (in {inp}, out {out}, reasoning {reason})".format(
-    #             total=total_tokens,
-    #             inp=input_tokens if input_tokens is not None else "?",
-    #             out=output_tokens if output_tokens is not None else "?",
-    #             reason=reasoning_tokens if reasoning_tokens is not None else "?",
-    #         )
-    #     )
-
-    if lines:
-        lines.append("")
-    lines.append(final_message)
-    return "\n".join(lines)
+    return f"*WorkingDirectory:* {project_name}: {final_message}"
 
 
 def _append_debug_log(payload: dict[str, Any], message: str) -> None:
