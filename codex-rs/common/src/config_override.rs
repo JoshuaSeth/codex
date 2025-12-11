@@ -12,6 +12,7 @@ use clap::Parser;
 use codex_core::config::set_codex_home_override;
 use codex_core::config::set_config_file_override;
 use serde::de::Error as SerdeError;
+use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 use toml::Value;
@@ -132,19 +133,13 @@ impl CliConfigOverrides {
         }
 
         if let Some(path) = &self.config_file {
-            let normalized = canonicalize_or_absolute(path).map_err(|err| {
+            let resolved = resolve_config_file_override(path).map_err(|err| {
                 format!(
                     "Failed to resolve --config-file path `{}`: {err}",
                     path.display()
                 )
             })?;
-            if !normalized.exists() {
-                return Err(format!(
-                    "Config file `{}` does not exist",
-                    normalized.display()
-                ));
-            }
-            set_config_file_override(normalized);
+            set_config_file_override(resolved);
         }
 
         Ok(())
@@ -162,6 +157,77 @@ fn canonicalize_or_absolute(path: &Path) -> std::io::Result<PathBuf> {
             }
         }
         Err(err) => Err(err),
+    }
+}
+
+fn resolve_config_file_override(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        if path.exists() {
+            return std::fs::canonicalize(path);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Config file `{}` does not exist", path.display()),
+        ));
+    }
+
+    let cwd = env::current_dir()?;
+    let mut candidates = vec![cwd.join(path)];
+    candidates.push(cwd.join(".codex").join(path));
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".codex").join(path));
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return std::fs::canonicalize(candidate);
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("Config file `{}` was not found", path.display()),
+    ))
+}
+
+#[cfg(test)]
+mod config_file_resolution_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn with_cwd<F: FnOnce()>(dir: &Path, func: F) {
+        let original = env::current_dir().expect("current dir");
+        env::set_current_dir(dir).expect("set cwd");
+        func();
+        env::set_current_dir(original).expect("restore cwd");
+    }
+
+    #[test]
+    fn resolves_relative_config_in_current_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let cfg = tmp.path().join("local.toml");
+        fs::write(&cfg, "model = \"test\"").expect("write");
+
+        with_cwd(tmp.path(), || {
+            let resolved = resolve_config_file_override(Path::new("local.toml")).expect("resolved");
+            assert_eq!(resolved, fs::canonicalize(&cfg).unwrap());
+        });
+    }
+
+    #[test]
+    fn falls_back_to_dot_codex_folder() {
+        let tmp = tempdir().expect("tempdir");
+        let dot_codex = tmp.path().join(".codex");
+        fs::create_dir_all(&dot_codex).expect("mkdir");
+        let cfg = dot_codex.join("profile.toml");
+        fs::write(&cfg, "model = \"test\"").expect("write");
+
+        with_cwd(tmp.path(), || {
+            let resolved =
+                resolve_config_file_override(Path::new("profile.toml")).expect("resolved");
+            assert_eq!(resolved, fs::canonicalize(&cfg).unwrap());
+        });
     }
 }
 

@@ -1246,8 +1246,10 @@ dependencies = [
  "codex-ollama",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "dirs",
  "pretty_assertions",
  "serde",
+ "tempfile",
  "toml 0.9.5",
 ]
 
