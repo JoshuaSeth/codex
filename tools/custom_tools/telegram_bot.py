@@ -355,9 +355,9 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
 
     project_name = cwd
     try:
-        project_name = str(Path(cwd).resolve())
+        project_name = Path(cwd).resolve().name or str(Path(cwd).resolve())
     except Exception:  # noqa: BLE001
-        project_name = cwd
+        project_name = Path(cwd).name or cwd
 
     return f"*WorkingDirectory:* {project_name}: {final_message}"
 
