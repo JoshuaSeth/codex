@@ -58,6 +58,10 @@ pub struct Cli {
     #[arg(long = "skip-git-repo-check", default_value_t = false)]
     pub skip_git_repo_check: bool,
 
+    /// Path to a prompt-sequence TOML file describing multiple prompts to run sequentially.
+    #[arg(long = "prompt-sequence", value_name = "FILE")]
+    pub prompt_sequence: Option<PathBuf>,
+
     /// Additional directories that should be writable alongside the primary workspace.
     #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,

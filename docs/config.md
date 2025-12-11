@@ -35,6 +35,38 @@ You no longer have to set environment variables to isolate dev/test runs: pass `
 
 Both options accept relative or absolute paths; Codex canonicalizes them before any file access so downstream helpers (e.g., `codex config edit`, session logging) automatically pick up the same location.
 
+### Prompt sequences
+
+Sometimes you want Codex to run through a fixed series of prompts without babysitting the terminal. Supply `--prompt-sequence FILE` and Codex will:
+
+1. Load the `[[steps]]` table from the provided TOML file.
+2. Send the first step's `prompt` (plus any `attachments`) exactly as if you typed it.
+3. After each `TaskComplete` event, automatically submit the next step until the sequence finishes.
+
+Example sequence (`docs/prompt_sequences/two_step_demo.toml`):
+
+```toml
+[[steps]]
+name = "Greeting"
+prompt = "Respond with a concise hello and nothing else."
+
+[[steps]]
+name = "Status tag"
+prompt = "Acknowledge that the greeting was sent and output only: <status>SEQUENCE_COMPLETE</status>"
+```
+
+Launch it with:
+
+```bash
+codex-dev exec --config-file ~/.codex/default.toml --prompt-sequence docs/prompt_sequences/two_step_demo.toml --yolo
+```
+
+Notes:
+
+- `--prompt-sequence` cannot be combined with an explicit PROMPT argument, `--image`, or exec subcommands like `codex exec review`.
+- Attachments listed under `attachments = ["relative/path.png"]` are resolved relative to the sequence file on disk.
+- Codex writes normal tool/stop hooks between steps. The CLI stays open until the final step completes.
+
 Both the `--config` flag and the `config.toml` file support the following options:
 
 ## Feature flags

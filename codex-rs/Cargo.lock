@@ -1367,6 +1367,7 @@ dependencies = [
  "supports-color 3.0.2",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ts-rs",

@@ -10,6 +10,7 @@ mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
 mod pending_tool_ipc;
+mod prompt_sequence;
 
 use anyhow::Context;
 pub use cli::Cli;
@@ -64,6 +65,7 @@ use crate::pending_tool_ipc::PendingToolServer;
 use crate::pending_tool_ipc::addr_from_metadata;
 use crate::pending_tool_ipc::load_metadata;
 use crate::pending_tool_ipc::send_pending_result;
+use crate::prompt_sequence::PromptSequenceRunner;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::replace_last_tool_result as patch_last_tool_result;
@@ -94,6 +96,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         dangerously_bypass_approvals_and_sandbox,
         cwd,
         skip_git_repo_check,
+        prompt_sequence,
         add_dir,
         color,
         last_message_file,
@@ -111,6 +114,25 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
         other => other,
     };
+
+    if prompt_sequence.is_some() {
+        if command.is_some() {
+            eprintln!(
+                "--prompt-sequence cannot be combined with exec subcommands like review or resume."
+            );
+            std::process::exit(1);
+        }
+        if prompt.is_some() {
+            eprintln!("PROMPT arguments cannot be provided when using --prompt-sequence.");
+            std::process::exit(1);
+        }
+        if !images.is_empty() {
+            eprintln!(
+                "--image is not supported together with --prompt-sequence. Attachments should be listed in the sequence file."
+            );
+            std::process::exit(1);
+        }
+    }
 
     let (stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -357,46 +379,95 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             }
         };
 
-    let (initial_operation, prompt_summary) = match (command, prompt, images) {
-        (Some(ExecCommand::Review(review_cli)), _, _) => {
-            let review_request = build_review_request(review_cli)?;
-            let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
-            (InitialOperation::Review { review_request }, summary)
-        }
-        (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-            if args.no_prompt && root_prompt.is_some() {
-                eprintln!(
-                    "--no-prompt cannot be combined with a PROMPT argument or piped stdin input."
-                );
-                std::process::exit(1);
-            }
+    let mut prompt_sequence_runner = match prompt_sequence {
+        Some(path) => Some(PromptSequenceRunner::load(&path)?),
+        None => None,
+    };
 
-            if args.no_prompt {
-                let items: Vec<UserInput> = imgs
-                    .into_iter()
-                    .map(|path| UserInput::LocalImage { path })
-                    .collect();
-                let output_schema = load_output_schema(output_schema_path.clone());
-                (
-                    InitialOperation::UserTurn {
-                        items,
-                        output_schema,
-                    },
-                    "(resume without prompt)".to_string(),
-                )
-            } else {
-                let prompt_arg = args
-                    .prompt
-                    .clone()
-                    .or_else(|| {
-                        if args.last {
-                            args.session_id.clone()
-                        } else {
-                            None
-                        }
-                    })
-                    .or(root_prompt);
-                let prompt_text = resolve_prompt(prompt_arg);
+    let output_schema = load_output_schema(output_schema_path);
+
+    let mut initial_sequence_entry = None;
+    if let Some(runner) = prompt_sequence_runner.as_mut() {
+        initial_sequence_entry = Some(runner.next_entry().ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt-sequence {} did not contain any steps",
+                runner.source().display()
+            )
+        })?);
+    }
+
+    let (initial_operation, prompt_summary) = if let Some(entry) = initial_sequence_entry {
+        let description = format!(
+            "{} ({}/{})",
+            entry.description,
+            entry.index + 1,
+            entry.total
+        );
+        (
+            InitialOperation::UserTurn {
+                items: entry.items,
+                output_schema: output_schema.clone(),
+            },
+            description,
+        )
+    } else {
+        match (command, prompt, images) {
+            (Some(ExecCommand::Review(review_cli)), _, _) => {
+                let review_request = build_review_request(review_cli)?;
+                let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
+                (InitialOperation::Review { review_request }, summary)
+            }
+            (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
+                if args.no_prompt && root_prompt.is_some() {
+                    eprintln!(
+                        "--no-prompt cannot be combined with a PROMPT argument or piped stdin input."
+                    );
+                    std::process::exit(1);
+                }
+
+                if args.no_prompt {
+                    let items: Vec<UserInput> = imgs
+                        .into_iter()
+                        .map(|path| UserInput::LocalImage { path })
+                        .collect();
+                    (
+                        InitialOperation::UserTurn {
+                            items,
+                            output_schema: output_schema.clone(),
+                        },
+                        "(resume without prompt)".to_string(),
+                    )
+                } else {
+                    let prompt_arg = args
+                        .prompt
+                        .clone()
+                        .or_else(|| {
+                            if args.last {
+                                args.session_id.clone()
+                            } else {
+                                None
+                            }
+                        })
+                        .or(root_prompt);
+                    let prompt_text = resolve_prompt(prompt_arg);
+                    let mut items: Vec<UserInput> = imgs
+                        .into_iter()
+                        .map(|path| UserInput::LocalImage { path })
+                        .collect();
+                    items.push(UserInput::Text {
+                        text: prompt_text.clone(),
+                    });
+                    (
+                        InitialOperation::UserTurn {
+                            items,
+                            output_schema: output_schema.clone(),
+                        },
+                        prompt_text,
+                    )
+                }
+            }
+            (None, root_prompt, imgs) => {
+                let prompt_text = resolve_prompt(root_prompt);
                 let mut items: Vec<UserInput> = imgs
                     .into_iter()
                     .map(|path| UserInput::LocalImage { path })
@@ -404,36 +475,17 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 items.push(UserInput::Text {
                     text: prompt_text.clone(),
                 });
-                let output_schema = load_output_schema(output_schema_path.clone());
                 (
                     InitialOperation::UserTurn {
                         items,
-                        output_schema,
+                        output_schema: output_schema.clone(),
                     },
                     prompt_text,
                 )
             }
-        }
-        (None, root_prompt, imgs) => {
-            let prompt_text = resolve_prompt(root_prompt);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .map(|path| UserInput::LocalImage { path })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-            });
-            let output_schema = load_output_schema(output_schema_path);
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
-        }
-        (Some(ExecCommand::DeliverPending(_)), _, _) => {
-            unreachable!("deliver command handled earlier")
+            (Some(ExecCommand::DeliverPending(_)), _, _) => {
+                unreachable!("deliver command handled earlier")
+            }
         }
     };
 
@@ -490,10 +542,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             let task_id = conversation
                 .submit(Op::UserTurn {
                     items,
-                    cwd: default_cwd,
+                    cwd: default_cwd.clone(),
                     approval_policy: default_approval_policy,
                     sandbox_policy: default_sandbox_policy.clone(),
-                    model: default_model,
+                    model: default_model.clone(),
                     effort: default_effort,
                     summary: default_summary,
                     final_output_json_schema: output_schema,
@@ -514,6 +566,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
     while let Some(event) = rx.recv().await {
+        let mut queued_sequence_step = None;
+        if let Some(runner) = prompt_sequence_runner.as_mut() {
+            if matches!(&event.msg, EventMsg::TaskComplete(_)) && runner.has_remaining() {
+                queued_sequence_step = runner.next_entry();
+            }
+        }
+
         if let EventMsg::ElicitationRequest(ev) = &event.msg {
             // Automatically cancel elicitation requests in exec mode.
             conversation
@@ -524,10 +583,33 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 })
                 .await?;
         }
-        if matches!(event.msg, EventMsg::Error(_)) {
+        if matches!(&event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
-        let shutdown: CodexStatus = event_processor.process_event(event);
+        let mut shutdown: CodexStatus = event_processor.process_event(event);
+
+        if let Some(entry) = queued_sequence_step {
+            info!(
+                "Prompt sequence: launching step {}/{} ({})",
+                entry.index + 1,
+                entry.total,
+                entry.description
+            );
+            conversation
+                .submit(Op::UserTurn {
+                    items: entry.items,
+                    cwd: default_cwd.clone(),
+                    approval_policy: default_approval_policy,
+                    sandbox_policy: default_sandbox_policy.clone(),
+                    model: default_model.clone(),
+                    effort: default_effort,
+                    summary: default_summary,
+                    final_output_json_schema: output_schema.clone(),
+                })
+                .await?;
+            shutdown = CodexStatus::Running;
+        }
+
         match shutdown {
             CodexStatus::Running => continue,
             CodexStatus::InitiateShutdown => {

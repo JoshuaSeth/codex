@@ -1,0 +1,7 @@
+[[steps]]
+name = "Greeting"
+prompt = "Respond with a concise hello and nothing else."
+
+[[steps]]
+name = "Status tag"
+prompt = "Acknowledge that the greeting was sent and output only: <status>SEQUENCE_COMPLETE</status>"
