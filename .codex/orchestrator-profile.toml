@@ -1,0 +1,42 @@
+# Orchestrator profile (ask colleagues + web-form helper)
+profile = "orchestrator"
+sandbox_mode = "workspace-write"
+
+[custom_tools.ask_colleague]
+command = ["python3", "./tools/custom_tools/ask_colleague.py"]
+description = "Ask or resume a Codex colleague conversation."
+parameters = { type = "object", properties = { prompt = { type = "string", description = "Instructions to send to the colleague." }, id = { type = "string", description = "Optional friendly colleague id returned from a prior call." } }, required = ["prompt"], additionalProperties = false }
+timeout_ms = 600000
+with_escalated_permissions = true
+
+[custom_tools.web_form_colleague]
+command = ["python3", "./tools/custom_tools/web_form_colleague.py"]
+description = "Dispatch the Chrome DevTools web-form colleague to perform UI steps."
+parameters = { type = "object", properties = { instructions = { type = "string", description = "Primary request for the web agent." }, context = { type = "string", description = "Optional extra context or data." } }, required = ["instructions"], additionalProperties = false }
+hibernate_after_call = true
+
+[features]
+view_image_tool = true
+web_search_request = true
+apply_patch_freeform = true
+unified_exec = false
+
+[profiles.orchestrator]
+model = "gpt-5.1-codex"
+model_provider = "openai"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "high"
+developer_instructions = """
+You can delegate work to other Codex colleagues via the `ask_colleague` tool.
+Use it when you want another autonomous Codex instance to explore an idea in
+parallel or to resume a previous conversation thread. When a task requires
+hands-on browser automation, call `web_form_colleague` to dispatch the Chrome
+DevTools helper (the same workflow Elise uses for web forms).
+"""
+[profiles.orchestrator.tools]
+view_image = true
+web_search = true
+
+[notice]
+hide_rate_limit_model_nudge = true
