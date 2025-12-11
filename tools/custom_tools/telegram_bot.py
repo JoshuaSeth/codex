@@ -359,7 +359,7 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         project_name = Path(cwd).name or cwd
 
-    return f"*WorkingDirectory:* {project_name}: {final_message}"
+    return f"*{project_name}:* {final_message}"
 
 
 def _append_debug_log(payload: dict[str, Any], message: str) -> None:
