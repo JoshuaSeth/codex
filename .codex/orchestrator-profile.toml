@@ -6,7 +6,8 @@ sandbox_mode = "workspace-write"
 command = ["python3", "./tools/custom_tools/ask_colleague.py"]
 description = "Ask or resume a Codex colleague conversation."
 parameters = { type = "object", properties = { prompt = { type = "string", description = "Instructions to send to the colleague." }, id = { type = "string", description = "Optional friendly colleague id returned from a prior call." } }, required = ["prompt"], additionalProperties = false }
-timeout_ms = 600000
+# Disable timeout so colleague runs can finish regardless of duration
+timeout_ms = 0
 with_escalated_permissions = true
 
 [custom_tools.web_form_colleague]
