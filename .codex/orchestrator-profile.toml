@@ -1,14 +1,17 @@
 # Orchestrator profile (ask colleagues + web-form helper)
 profile = "orchestrator"
-sandbox_mode = "workspace-write"
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
 
 [custom_tools.ask_colleague]
-command = ["python3", "./tools/custom_tools/ask_colleague.py"]
+command = ["python3", "/Users/sethvanderbijl/codex/tools/custom_tools/ask_colleague.py"]
 description = "Ask or resume a Codex colleague conversation."
 parameters = { type = "object", properties = { prompt = { type = "string", description = "Instructions to send to the colleague." }, id = { type = "string", description = "Optional friendly colleague id returned from a prior call." } }, required = ["prompt"], additionalProperties = false }
 # Disable timeout so colleague runs can finish regardless of duration
 timeout_ms = 0
-with_escalated_permissions = true
+[custom_tools.ask_colleague.env]
+CODEX_COLLEAGUE_SKIP_GIT_CHECK = "1"
+CODEX_COLLEAGUE_HOME = "/Users/sethvanderbijl/.codex/colleagues_home"
 
 [custom_tools.web_form_colleague]
 command = ["python3", "./tools/custom_tools/web_form_colleague.py"]
@@ -26,7 +29,7 @@ unified_exec = false
 model = "gpt-5.1-codex"
 model_provider = "openai"
 approval_policy = "on-request"
-sandbox_mode = "workspace-write"
+sandbox_mode = "danger-full-access"
 model_reasoning_effort = "high"
 developer_instructions = """
 You can delegate work to other Codex colleagues via the `ask_colleague` tool.
@@ -47,3 +50,4 @@ web_search = true
 
 [notice]
 hide_rate_limit_model_nudge = true
+"hide_gpt-5.1-codex-max_migration_prompt" = true

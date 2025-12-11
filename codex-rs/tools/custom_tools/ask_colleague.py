@@ -98,6 +98,14 @@ def random_slug(existing: Dict[str, Any]) -> str:
 
 
 def resolve_codex_home() -> Path:
+    colleague_home = os.environ.get("CODEX_COLLEAGUE_HOME")
+    if colleague_home:
+        path = Path(colleague_home).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ["CODEX_HOME"] = str(path)
+        bootstrap_codex_home_if_needed(path)
+        return path
+
     env_home = os.environ.get("CODEX_HOME")
     if env_home:
         path = Path(env_home).expanduser()
@@ -182,7 +190,10 @@ def build_command(new_thread: bool, conversation_id: str | None, prompt: str) ->
     else:
         if not conversation_id:
             raise ValueError("conversation_id required for resume")
-        cmd.extend(["exec", "--json", "resume", conversation_id, prompt])
+        cmd.extend(["exec", "--json"])
+        if os.environ.get("CODEX_COLLEAGUE_SKIP_GIT_CHECK") == "1":
+            cmd.append("--skip-git-repo-check")
+        cmd.extend(["resume", conversation_id, prompt])
     return cmd
 
 

@@ -98,3 +98,4 @@ __pycache__/
 # Local Codex homes (generated during tests/dev)
 .codex_home/
 codex-rs/.codex_home/
+.codex_home/
