@@ -60,7 +60,8 @@ RUN mkdir -p /opt/pitchai \
 COPY scripts/pitchai_sharepoint_tool.py /opt/pitchai/sharepoint_tool.py
 COPY scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
 COPY scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
-RUN chmod 755 /opt/pitchai/sharepoint_tool.py
+COPY scripts/pitchai_run_sharepoint_inbox_job.sh /opt/pitchai/run_sharepoint_inbox_job.sh
+RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/run_sharepoint_inbox_job.sh
 USER node
 
 # Inside the container we consider the environment already sufficiently locked
