@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 

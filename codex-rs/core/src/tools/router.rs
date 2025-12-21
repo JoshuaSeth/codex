@@ -21,7 +21,9 @@ use codex_protocol::models::ShellToolCallParams;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, instrument, warn};
+use tracing::debug;
+use tracing::instrument;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {

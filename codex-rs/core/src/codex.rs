@@ -32,6 +32,7 @@ use async_channel::Sender;
 use codex_protocol::ConversationId;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
@@ -91,7 +92,6 @@ use crate::exec_policy::ExecPolicyUpdateError;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_provider_info::CHAT_WIRE_API_DEPRECATION_SUMMARY;
-use crate::openai_model_info::get_model_info;
 use crate::pending_tools::PendingToolManager;
 use crate::pending_tools::PendingToolMetadata;
 use crate::project_doc::get_user_instructions;
@@ -1693,7 +1693,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             } => {
                 handlers::override_turn_context(
                     &sess,
-                    sub.id.clone(),
+                    id.clone(),
                     SessionSettingsUpdate {
                         cwd,
                         approval_policy,
@@ -1729,7 +1729,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::list_custom_prompts(&sess, id.clone()).await;
             }
             Op::ListSkills { cwds, force_reload } => {
-                handlers::list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
+                handlers::list_skills(&sess, id.clone(), cwds, force_reload).await;
             }
             Op::Undo => {
                 handlers::undo(&sess, id.clone()).await;
@@ -1827,7 +1827,6 @@ mod handlers {
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
     use codex_protocol::protocol::SkillsListEntry;
-    use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::WarningEvent;
 
     use codex_protocol::user_input::UserInput;

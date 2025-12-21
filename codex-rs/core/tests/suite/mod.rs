@@ -30,6 +30,7 @@ mod exec;
 mod exec_policy;
 mod fork_conversation;
 mod grep_files;
+mod hooks;
 mod items;
 mod json_result;
 mod list_dir;

@@ -42,13 +42,13 @@ async fn replace_last_function_call_output() -> anyhow::Result<()> {
         }
     );
 
-    let rewritten = read_lines(&path).await;
+    let rewritten = read_lines(&path).await?;
     match &rewritten[1].item {
         RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { output, .. }) => {
             assert_eq!(output.content, "final output");
             assert_eq!(output.content_items, None);
         }
-        other => panic!("unexpected item: {other:?}"),
+        other => anyhow::bail!("unexpected item: {other:?}"),
     }
 
     Ok(())
@@ -80,12 +80,12 @@ async fn replace_last_custom_tool_output() -> anyhow::Result<()> {
         }
     );
 
-    let rewritten = read_lines(&path).await;
+    let rewritten = read_lines(&path).await?;
     match &rewritten[1].item {
         RolloutItem::ResponseItem(ResponseItem::CustomToolCallOutput { output, .. }) => {
             assert_eq!(output, "delivered");
         }
-        other => panic!("unexpected item: {other:?}"),
+        other => anyhow::bail!("unexpected item: {other:?}"),
     }
 
     Ok(())
@@ -124,10 +124,11 @@ async fn write_lines(path: &Path, lines: &[RolloutLine]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_lines(path: &Path) -> Vec<RolloutLine> {
-    let text = fs::read_to_string(path).await.expect("read rollout");
+async fn read_lines(path: &Path) -> anyhow::Result<Vec<RolloutLine>> {
+    let text = fs::read_to_string(path).await?;
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("parse line"))
-        .collect()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }

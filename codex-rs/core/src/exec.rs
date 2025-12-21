@@ -107,7 +107,7 @@ impl ExecExpiration {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
             ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
             ExecExpiration::Cancellation(_) => None,
-            ExecExpiration::Never => Some(0),
+            ExecExpiration::Never => None,
         }
     }
 }

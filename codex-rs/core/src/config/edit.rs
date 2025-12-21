@@ -711,7 +711,7 @@ mod tests {
         )
         .expect("persist");
 
-        let contents = std::fs::read_to_string(config_file_path(&codex_home)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"model = "gpt-5.1-codex"
 model_reasoning_effort = "high"
 "#;
@@ -731,8 +731,7 @@ model_reasoning_effort = "high"
             .apply_blocking()
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         assert_eq!(contents, "enabled = true\n");
     }
 
@@ -761,7 +760,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         )
         .expect("persist");
 
-        let raw = std::fs::read_to_string(config_file_path(&codex_home)).expect("read config");
+        let raw = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let value: TomlValue = toml::from_str(&raw).expect("parse config");
 
         // Ensure sandbox_mode is preserved under profiles.fast and model updated.
@@ -801,7 +800,7 @@ foo = "bar"
 # ok 3
 network_access = false
 "#;
-        std::fs::write(codex_home.join(CONFIG_TOML_FILE), original).expect("seed config");
+        std::fs::write(config_file_path(codex_home), original).expect("seed config");
 
         apply_blocking(
             codex_home,
@@ -826,8 +825,7 @@ network_access = false
         )
         .expect("apply");
 
-        let updated =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let updated = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"approval_policy = "never"
 
 [mcp_servers.linear]
@@ -1064,7 +1062,7 @@ existing = "value"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[notice]
 existing = "value"
 "#,
@@ -1080,8 +1078,7 @@ existing = "value"
         )
         .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[notice]
 existing = "value"
 
@@ -1180,7 +1177,7 @@ B = \"2\"
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[mcp_servers]
 # keep me
 foo = { command = "cmd" }
@@ -1210,8 +1207,7 @@ foo = { command = "cmd" }
         apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[mcp_servers]
 # keep me
 foo = { command = "cmd" }
@@ -1224,7 +1220,7 @@ foo = { command = "cmd" }
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[mcp_servers]
 foo = { command = "cmd" } # keep me
 "#,
@@ -1253,8 +1249,7 @@ foo = { command = "cmd" } # keep me
         apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[mcp_servers]
 foo = { command = "cmd" , enabled = false } # keep me
 "#;
@@ -1266,7 +1261,7 @@ foo = { command = "cmd" , enabled = false } # keep me
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[mcp_servers]
 foo = { command = "cmd", args = ["--flag"] } # keep me
 "#,
@@ -1295,8 +1290,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
         apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[mcp_servers]
 foo = { command = "cmd"} # keep me
 "#;
@@ -1308,7 +1302,7 @@ foo = { command = "cmd"} # keep me
         let tmp = tempdir().expect("tmpdir");
         let codex_home = tmp.path();
         std::fs::write(
-            codex_home.join(CONFIG_TOML_FILE),
+            config_file_path(codex_home),
             r#"[mcp_servers]
 # keep me
 foo = { command = "cmd" }
@@ -1338,8 +1332,7 @@ foo = { command = "cmd" }
         apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
             .expect("persist");
 
-        let contents =
-            std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+        let contents = std::fs::read_to_string(config_file_path(codex_home)).expect("read config");
         let expected = r#"[mcp_servers]
 # keep me
 foo = { command = "cmd" , enabled = false }

@@ -567,10 +567,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let mut error_seen = false;
     while let Some(event) = rx.recv().await {
         let mut queued_sequence_step = None;
-        if let Some(runner) = prompt_sequence_runner.as_mut() {
-            if matches!(&event.msg, EventMsg::TaskComplete(_)) && runner.has_remaining() {
-                queued_sequence_step = runner.next_entry();
-            }
+        if let Some(runner) = prompt_sequence_runner.as_mut()
+            && matches!(&event.msg, EventMsg::TaskComplete(_))
+            && runner.has_remaining()
+        {
+            queued_sequence_step = runner.next_entry();
         }
 
         if let EventMsg::ElicitationRequest(ev) = &event.msg {

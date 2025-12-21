@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::function_tool::FunctionCallError;
+use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -85,12 +86,17 @@ impl ToolHandler for CustomToolHandler {
             turn.cwd.to_string_lossy().into_owned(),
         );
 
+        let sandbox_permissions = match tool.with_escalated_permissions {
+            Some(true) => SandboxPermissions::RequireEscalated,
+            _ => SandboxPermissions::UseDefault,
+        };
+
         let exec_params = ExecParams {
             command: tool.command.clone(),
             cwd: turn.resolve_path(tool.cwd.clone()),
             expiration: tool.timeout_ms.into(),
             env,
-            with_escalated_permissions: tool.with_escalated_permissions,
+            sandbox_permissions,
             justification: None,
             arg0: None,
         };
@@ -106,20 +112,19 @@ impl ToolHandler for CustomToolHandler {
         )
         .await?;
 
-        if tool.hibernate_after_call {
-            if let ToolOutput::Function {
+        if tool.hibernate_after_call
+            && let ToolOutput::Function {
                 content,
                 content_items,
                 success,
             } = output
-            {
-                return Ok(ToolOutput::Pending {
-                    content,
-                    content_items,
-                    success,
-                    shutdown: true,
-                });
-            }
+        {
+            return Ok(ToolOutput::Pending {
+                content,
+                content_items,
+                success,
+                shutdown: true,
+            });
         }
 
         Ok(output)

@@ -131,9 +131,6 @@ pub enum ToolCallPayloadSnapshot {
         #[serde(skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
     },
-    UnifiedExec {
-        arguments: String,
-    },
     Mcp {
         server: String,
         tool: String,
@@ -158,9 +155,6 @@ impl ToolCallPayloadSnapshot {
                 command: params.command.clone(),
                 workdir: params.workdir.clone(),
                 timeout_ms: params.timeout_ms,
-            },
-            ToolPayload::UnifiedExec { arguments } => Self::UnifiedExec {
-                arguments: arguments.clone(),
             },
             ToolPayload::Mcp {
                 server,
@@ -250,7 +244,9 @@ pub enum TimeoutBehavior {
 
 impl HookLocalShellDirective {
     pub fn timeout_behavior(&self) -> Option<TimeoutBehavior> {
-        self.timeout_ms.as_ref().and_then(|value| value.behavior())
+        self.timeout_ms
+            .as_ref()
+            .and_then(ToolHookTimeoutOverride::behavior)
     }
 }
 

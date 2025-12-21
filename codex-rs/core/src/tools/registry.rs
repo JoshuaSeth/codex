@@ -123,7 +123,7 @@ impl ToolRegistry {
                             Ok(output) => {
                                 let preview = output.log_preview();
                                 let success = output.success_for_logging();
-                                let pending_note = output.pending_message().map(|msg| msg.to_string());
+                                let pending_note = output.pending_message().map(std::string::ToString::to_string);
                                 let should_shutdown = output.requests_shutdown();
                                 {
                                     let mut guard = output_cell.lock().await;

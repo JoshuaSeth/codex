@@ -1951,6 +1951,60 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn profile_tool_hook_command_overrides_root_value() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.tool_hook_command = Some(vec!["root".to_string()]);
+        cfg.profile = Some("hooks".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "hooks".to_string(),
+            ConfigProfile {
+                tool_hook_command: Some(vec!["profile".to_string()]),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.tool_hook_command, Some(vec!["profile".to_string()]));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_stop_hook_command_overrides_root_value() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.stop_hook_command = Some(vec!["root".to_string()]);
+        cfg.profile = Some("hooks".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "hooks".to_string(),
+            ConfigProfile {
+                stop_hook_command: Some(vec!["profile".to_string()]),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.stop_hook_command, Some(vec!["profile".to_string()]));
+        Ok(())
+    }
+
+    #[test]
     fn cli_cwd_override_wins_over_defaults() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let root_dir = TempDir::new()?;

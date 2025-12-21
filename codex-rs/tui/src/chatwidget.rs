@@ -1072,11 +1072,11 @@ impl ChatWidget {
             "Pending tool {} ({}) {status_text}.",
             event.tool_name, event.call_id
         );
-        if let Some(note) = event.note.as_ref() {
-            if !note.trim().is_empty() {
-                message.push(' ');
-                message.push_str(note.trim());
-            }
+        if let Some(note) = event.note.as_ref()
+            && !note.trim().is_empty()
+        {
+            message.push(' ');
+            message.push_str(note.trim());
         }
         self.on_background_event(message);
     }

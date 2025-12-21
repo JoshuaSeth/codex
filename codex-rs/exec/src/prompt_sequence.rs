@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use codex_protocol::user_input::UserInput;
@@ -35,7 +36,7 @@ impl PromptSequenceRunner {
 
         let base_dir = path
             .parent()
-            .map(|p| p.to_path_buf())
+            .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let steps = sequence
             .steps

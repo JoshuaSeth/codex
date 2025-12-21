@@ -649,8 +649,7 @@ async fn run_interactive_tui(
 /// bootstrap: `$CODEX_HOME`, config.toml, profile, and CLI `-c` overrides) solely to decide which
 /// TUI frontend to launch. The full configuration is still loaded later by the interactive TUI.
 async fn is_tui2_enabled(cli: &TuiCli) -> std::io::Result<bool> {
-    let raw_overrides = cli.config_overrides.raw_overrides.clone();
-    let overrides_cli = codex_common::CliConfigOverrides { raw_overrides };
+    let overrides_cli = cli.config_overrides.clone();
     let cli_kv_overrides = overrides_cli
         .parse_overrides()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
