@@ -1,0 +1,40 @@
+# PitchAI Codex runtime config (container).
+#
+# This file defines SharePoint tools only. The Codex agent is responsible for deciding
+# how to tag and where to move documents; these tools just execute SharePoint operations.
+
+# This job runs in an externally sandboxed container (Docker / Azure Container Apps Job),
+# so disable Codex sandbox + approvals to avoid Landlock/seccomp issues in some runtimes.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+hide_agent_reasoning = true
+
+[custom_tools.sp_list_inbox]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "list_inbox"]
+description = "List recent files in the SharePoint Documenten/INBOX folder."
+parameters = { type = "object", additionalProperties = false, properties = { library = { type = "string" }, limit = { type = "integer" }, orderby = { type = "string" } } }
+timeout_ms = 120000
+
+[custom_tools.sp_read_file]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "read_file"]
+description = "Download a SharePoint file, extract text, and write it to a local .txt file. Returns the local path (use read_file tool next)."
+parameters = { type = "object", additionalProperties = false, required = ["file_ref"], properties = { file_ref = { type = "string" }, max_chars = { type = "integer" } } }
+timeout_ms = 300000
+
+[custom_tools.sp_ensure_folder]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "ensure_folder"]
+description = "Ensure a SharePoint folder path exists (creates intermediate folders)."
+parameters = { type = "object", additionalProperties = false, required = ["folder_ref"], properties = { folder_ref = { type = "string" } } }
+timeout_ms = 180000
+
+[custom_tools.sp_move_file]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "move_file"]
+description = "Move a SharePoint file to a new ServerRelativeUrl."
+parameters = { type = "object", additionalProperties = false, required = ["src_ref", "dest_ref"], properties = { src_ref = { type = "string" }, dest_ref = { type = "string" }, keep_both = { type = "boolean" } } }
+timeout_ms = 300000
+
+[custom_tools.sp_update_fields]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "update_fields"]
+description = "Update SharePoint list item fields for a file (PitchAI* columns, etc.)."
+parameters = { type = "object", additionalProperties = false, required = ["file_ref", "fields"], properties = { library = { type = "string" }, file_ref = { type = "string" }, fields = { type = "object" } } }
+timeout_ms = 180000

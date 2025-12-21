@@ -19,9 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   jq \
   less \
   man-db \
+  python3 \
+  python3-pip \
+  python3-venv \
   procps \
   unzip \
   ripgrep \
+  tesseract-ocr \
   zsh \
   && rm -rf /var/lib/apt/lists/*
 
@@ -45,6 +49,19 @@ RUN npm install -g codex.tgz \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/node_modules/.cache \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/tests \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/docs
+
+# PitchAI SharePoint tooling dependencies + assets
+USER root
+COPY scripts/pitchai_sharepoint_requirements.txt /tmp/pitchai_sharepoint_requirements.txt
+RUN mkdir -p /opt/pitchai \
+  && python3 -m venv /opt/pitchai/venv \
+  && /opt/pitchai/venv/bin/pip install --no-cache-dir -r /tmp/pitchai_sharepoint_requirements.txt \
+  && rm -f /tmp/pitchai_sharepoint_requirements.txt
+COPY scripts/pitchai_sharepoint_tool.py /opt/pitchai/sharepoint_tool.py
+COPY scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
+COPY scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
+RUN chmod 755 /opt/pitchai/sharepoint_tool.py
+USER node
 
 # Inside the container we consider the environment already sufficiently locked
 # down, therefore instruct Codex CLI to allow running without sandboxing.
