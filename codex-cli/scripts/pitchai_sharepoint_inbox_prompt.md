@@ -8,12 +8,14 @@ Important rules:
 - Use the provided SharePoint tools (`sp_*`) for SharePoint operations. Do not write ad-hoc scripts.
 - You MAY use built-in Codex read-only tools (e.g. `read_file`) after `sp_read_file` has written extracted text to disk.
 - If you are uncertain where something belongs, move it to a safe fallback instead of guessing.
+- Your final message must be a concise summary only (no questions, no “tell me which one”, no follow-ups).
 
 ## How to work
 1) Call `sp_list_inbox` (limit 25) and get:
    - `library_root`
    - `inbox`
    - `files[]` (name, file_ref, modified_utc, size_bytes)
+   If `count` is 0, stop immediately and output: `INBOX is empty. Summary: processed 0, moved 0, failed 0.`
 2) For each file (process newest first):
    - Call `sp_read_file` with `max_chars=15000`.
    - Then call `read_file` on the returned `extracted_text_path` to read the extracted text.
