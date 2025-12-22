@@ -17,7 +17,7 @@ from email import policy
 from email.parser import BytesParser
 from html import unescape
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import msal
 import requests
@@ -304,6 +304,19 @@ class SharePointRestClient:
         if not src_name:
             raise ValueError("source file ref has no basename")
 
+        def to_server_relative(url_or_ref: str) -> str:
+            value = url_or_ref.strip()
+            if not value:
+                raise ValueError("empty url/ref")
+            if value.startswith(("https://", "http://")):
+                parsed = urlparse(value)
+                if not parsed.path:
+                    raise ValueError(f"invalid url/ref: {url_or_ref}")
+                return unquote(parsed.path)
+            if not value.startswith("/"):
+                raise ValueError(f"expected server-relative url starting with '/': {url_or_ref}")
+            return value
+
         # The SharePoint MoveFileByPath API expects a destination *file* URL. The agent often
         # produces a destination folder URL. If we detect a folder-like destination, append the
         # original filename.
@@ -317,31 +330,57 @@ class SharePointRestClient:
         if not src or not dst:
             raise ValueError("source/dest file ref is empty")
 
-        host = urlparse(self._site_url).netloc
-        src_abs = f"https://{host}{src}" if src.startswith("/") else src
-        dst_abs = f"https://{host}{dst}" if dst.startswith("/") else dst
+        src_sr = to_server_relative(src)
+        dst_sr = to_server_relative(dst)
 
         url = f"{self._site_url}/_api/SP.MoveCopyUtil.MoveFileByPath()"
-        body = {
-            "srcPath": {"DecodedUrl": src_abs},
-            "destPath": {"DecodedUrl": dst_abs},
-            "options": {
-                "KeepBoth": bool(keep_both),
-                "ShouldBypassSharedLocks": True,
-                "ResetAuthorAndCreatedOnCopy": False,
-                "RetainEditorAndModifiedOnMove": True,
-            },
-        }
-        self._request(
-            "POST",
-            url,
-            extra_headers={
-                "Content-Type": "application/json;odata=nometadata",
-                "X-RequestDigest": self._ensure_digest(),
-            },
-            json_body=body,
-            timeout_s=300,
-        )
+        dest_folder, dest_name = dst_sr.rsplit("/", 1)
+
+        def attempt(move_dest_name: str, *, keep_both_opt: bool) -> None:
+            dest_ref = f"{dest_folder}/{move_dest_name}"
+            body = {
+                "srcPath": {"DecodedUrl": src_sr},
+                "destPath": {"DecodedUrl": dest_ref},
+                "options": {
+                    "KeepBoth": bool(keep_both_opt),
+                    "ShouldBypassSharedLocks": True,
+                    "ResetAuthorAndCreatedOnCopy": False,
+                    "RetainEditorAndModifiedOnMove": True,
+                },
+            }
+            self._request(
+                "POST",
+                url,
+                extra_headers={
+                    "Content-Type": "application/json;odata=nometadata",
+                    "X-RequestDigest": self._ensure_digest(),
+                },
+                json_body=body,
+                timeout_s=300,
+            )
+
+        try:
+            attempt(dest_name, keep_both_opt=keep_both)
+            return
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            # Retry with a sanitized filename (common cause: spaces or unsupported characters).
+            safe_name = _safe_filename(dest_name)
+            if safe_name != dest_name:
+                try:
+                    attempt(safe_name, keep_both_opt=keep_both)
+                    return
+                except requests.HTTPError:
+                    pass
+
+            # If we collide with an existing file, retry with KeepBoth to let SharePoint rename.
+            if status in (400, 409) and not keep_both:
+                try:
+                    attempt(safe_name, keep_both_opt=True)
+                    return
+                except requests.HTTPError:
+                    pass
+            raise
 
     def delete_file(self, file_ref: str) -> None:
         ref = file_ref.rstrip("/")
