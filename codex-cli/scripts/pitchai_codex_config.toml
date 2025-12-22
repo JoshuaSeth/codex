@@ -8,6 +8,7 @@
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 hide_agent_reasoning = true
+experimental_supported_tools = ["read_file"]
 
 [custom_tools.sp_list_inbox]
 command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "list_inbox"]

@@ -662,7 +662,11 @@ def _new_sharepoint_client() -> SharePointRestClient:
 def _op_list_inbox() -> Dict[str, Any]:
     args = _load_tool_args()
     library = str(args.get("library") or _optional_env("PITCHAI_SP_LIBRARY") or "Documenten")
-    limit = int(args.get("limit") or 50)
+    override_limit = _optional_env("PITCHAI_MAX_FILES")
+    if override_limit and override_limit.isdigit() and int(override_limit) > 0:
+        limit = int(override_limit)
+    else:
+        limit = int(args.get("limit") or 50)
     orderby = str(args.get("orderby") or "TimeLastModified desc")
 
     sp = _new_sharepoint_client()
