@@ -34,6 +34,14 @@ case "${PITCHAI_CODEX_MODEL:-}" in
 esac
 
 PROMPT_PATH="/opt/pitchai/sharepoint_inbox_prompt.md"
+
+if [[ -n "${PITCHAI_PROMPT_OVERRIDE:-}" ]]; then
+  TMP_PROMPT="$(mktemp /tmp/pitchai_prompt_override.XXXXXX.md)"
+  printf "%s\n" "$PITCHAI_PROMPT_OVERRIDE" > "$TMP_PROMPT"
+  PROMPT_PATH="$TMP_PROMPT"
+elif [[ -n "${PITCHAI_PROMPT_PATH:-}" ]]; then
+  PROMPT_PATH="$PITCHAI_PROMPT_PATH"
+fi
 if [[ -n "${PITCHAI_MAX_FILES:-}" ]]; then
   if ! [[ "$PITCHAI_MAX_FILES" =~ ^[0-9]+$ ]] || [[ "$PITCHAI_MAX_FILES" -le 0 ]]; then
     echo "Invalid PITCHAI_MAX_FILES (expected positive integer): $PITCHAI_MAX_FILES" >&2
