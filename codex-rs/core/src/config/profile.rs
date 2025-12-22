@@ -32,6 +32,9 @@ pub struct ConfigProfile {
     pub tools_view_image: Option<bool>,
     pub tool_hook_command: Option<Vec<String>>,
     pub stop_hook_command: Option<Vec<String>>,
+    /// Additional experimental tools to expose to the model. These are merged with the
+    /// model-family defaults (if any).
+    pub experimental_supported_tools: Option<Vec<String>>,
     /// Optional default cwd used when this profile is active.
     pub default_cwd: Option<PathBuf>,
     /// Optional feature toggles scoped to this profile.

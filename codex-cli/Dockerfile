@@ -1,3 +1,21 @@
+FROM rust:1.90-slim-bookworm AS codex-builder
+
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  build-essential \
+  libssl-dev \
+  pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY codex-rs /src/codex-rs
+WORKDIR /src/codex-rs
+# Reduce peak memory usage during LTO-heavy builds in constrained Docker environments.
+ENV CARGO_BUILD_JOBS=1
+ENV CARGO_PROFILE_RELEASE_LTO=thin
+RUN cargo build -p codex-cli --release --locked
+
 FROM node:24-slim
 
 ARG TZ
@@ -43,24 +61,43 @@ ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
 
 # Install codex
-COPY dist/codex.tgz codex.tgz
+COPY codex-cli/dist/codex.tgz codex.tgz
 RUN npm install -g codex.tgz \
   && npm cache clean --force \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/node_modules/.cache \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/tests \
   && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/docs
 
+# Replace the bundled native Codex binary with the one built from this checkout.
+#
+# Note: the npm package is `@openai/codex`, and it selects the native binary by
+# target triple at runtime (e.g. `x86_64-unknown-linux-musl` or
+# `aarch64-unknown-linux-musl`). Populate the appropriate vendor folder for the
+# image architecture so `codex` works both locally (Apple Silicon) and in Azure.
+COPY --from=codex-builder --chown=node:node /src/codex-rs/target/release/codex /tmp/codex
+RUN set -eu; \
+  pkg="/usr/local/share/npm-global/lib/node_modules/@openai/codex"; \
+  arch="$(uname -m)"; \
+  case "$arch" in \
+    x86_64) triple="x86_64-unknown-linux-musl" ;; \
+    aarch64) triple="aarch64-unknown-linux-musl" ;; \
+    *) echo "Unsupported arch for native codex binary: $arch" >&2; exit 1 ;; \
+  esac; \
+  mkdir -p "$pkg/vendor/$triple/codex"; \
+  mv /tmp/codex "$pkg/vendor/$triple/codex/codex"; \
+  chmod 755 "$pkg/vendor/$triple/codex/codex"
+
 # PitchAI SharePoint tooling dependencies + assets
 USER root
-COPY scripts/pitchai_sharepoint_requirements.txt /tmp/pitchai_sharepoint_requirements.txt
+COPY codex-cli/scripts/pitchai_sharepoint_requirements.txt /tmp/pitchai_sharepoint_requirements.txt
 RUN mkdir -p /opt/pitchai \
   && python3 -m venv /opt/pitchai/venv \
   && /opt/pitchai/venv/bin/pip install --no-cache-dir -r /tmp/pitchai_sharepoint_requirements.txt \
   && rm -f /tmp/pitchai_sharepoint_requirements.txt
-COPY scripts/pitchai_sharepoint_tool.py /opt/pitchai/sharepoint_tool.py
-COPY scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
-COPY scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
-COPY scripts/pitchai_run_sharepoint_inbox_job.sh /opt/pitchai/run_sharepoint_inbox_job.sh
+COPY codex-cli/scripts/pitchai_sharepoint_tool.py /opt/pitchai/sharepoint_tool.py
+COPY codex-cli/scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
+COPY codex-cli/scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
+COPY codex-cli/scripts/pitchai_run_sharepoint_inbox_job.sh /opt/pitchai/run_sharepoint_inbox_job.sh
 RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/run_sharepoint_inbox_job.sh
 USER node
 
@@ -70,7 +107,7 @@ ENV CODEX_UNSAFE_ALLOW_NO_SANDBOX=1
 
 # Copy and set up firewall script as root.
 USER root
-COPY scripts/init_firewall.sh /usr/local/bin/
+COPY codex-cli/scripts/init_firewall.sh /usr/local/bin/
 RUN chmod 500 /usr/local/bin/init_firewall.sh
 
 # Drop back to non-root.

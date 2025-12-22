@@ -50,6 +50,7 @@ use serde_json::json;
 use similar::DiffableStr;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -339,6 +340,9 @@ pub struct Config {
     pub include_apply_patch_tool: bool,
 
     pub tools_web_search_request: bool,
+
+    /// Extra experimental tools to expose to the selected model.
+    pub experimental_supported_tools: Vec<String>,
 
     /// If set to `true`, used only the experimental unified exec tool.
     pub use_experimental_unified_exec_tool: bool,
@@ -849,6 +853,12 @@ pub struct ConfigToml {
 
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
+
+    /// Additional experimental tools to expose to the model (e.g. `["read_file"]`).
+    ///
+    /// This supplements any experimental tool list provided by the selected model family.
+    #[serde(default)]
+    pub experimental_supported_tools: Option<Vec<String>>,
 
     /// Centralized feature flags (new). Prefer this over individual toggles.
     #[serde(default)]
@@ -1363,6 +1373,25 @@ impl Config {
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let custom_tools = build_custom_tools(cfg.custom_tools.clone())?;
+        let experimental_supported_tools = {
+            let list = config_profile
+                .experimental_supported_tools
+                .clone()
+                .or_else(|| cfg.experimental_supported_tools.clone())
+                .unwrap_or_default();
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for tool in list {
+                let tool = tool.trim();
+                if tool.is_empty() {
+                    continue;
+                }
+                if seen.insert(tool.to_string()) {
+                    out.push(tool.to_string());
+                }
+            }
+            out
+        };
 
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
@@ -1456,6 +1485,7 @@ impl Config {
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
             tools_web_search_request,
+            experimental_supported_tools,
             use_experimental_unified_exec_tool,
             ghost_snapshot,
             features,
@@ -3477,6 +3507,7 @@ model_verbosity = "high"
                 forced_login_method: None,
                 include_apply_patch_tool: false,
                 tools_web_search_request: false,
+                experimental_supported_tools: Vec::new(),
                 use_experimental_unified_exec_tool: false,
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
@@ -3564,6 +3595,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             tools_web_search_request: false,
+            experimental_supported_tools: Vec::new(),
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3666,6 +3698,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             tools_web_search_request: false,
+            experimental_supported_tools: Vec::new(),
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
@@ -3754,6 +3787,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             tools_web_search_request: false,
+            experimental_supported_tools: Vec::new(),
             use_experimental_unified_exec_tool: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),

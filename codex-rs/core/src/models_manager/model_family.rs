@@ -97,6 +97,13 @@ impl ModelFamily {
         if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {
             self.auto_compact_token_limit = Some(auto_compact_token_limit);
         }
+        if !config.experimental_supported_tools.is_empty() {
+            for tool in &config.experimental_supported_tools {
+                if !self.experimental_supported_tools.contains(tool) {
+                    self.experimental_supported_tools.push(tool.clone());
+                }
+            }
+        }
         self
     }
     pub(super) fn with_remote_overrides(mut self, remote_models: Vec<ModelInfo>) -> Self {

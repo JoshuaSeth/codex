@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rand::Rng;
@@ -152,6 +153,10 @@ struct SessionEntry {
     call_id: String,
     process_id: String,
     command: Vec<String>,
+    cwd: PathBuf,
+    started_at: tokio::time::Instant,
+    transcript: Arc<Mutex<CommandTranscript>>,
+    end_event_emitted: Arc<AtomicBool>,
     last_used: tokio::time::Instant,
 }
 

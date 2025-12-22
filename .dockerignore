@@ -1,0 +1,23 @@
+# Keep Docker build contexts small when building from repo root (e.g. `-f codex-cli/Dockerfile .`).
+
+# Git metadata
+.git
+.git/**
+
+# Rust build outputs
+**/target
+**/target/**
+
+# Node dependencies
+**/node_modules
+**/node_modules/**
+
+# OS / editor files
+.DS_Store
+**/.DS_Store
+.vscode
+.vscode/**
+
+# Misc caches
+**/.cache
+**/.cache/**
