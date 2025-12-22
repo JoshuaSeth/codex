@@ -344,6 +344,18 @@ def _extract_last_assistant_message(response_items: list[dict[str, Any]] | None)
     return None
 
 
+def _escape_markdown(text: str) -> str:
+    # Telegram "Markdown" parse_mode is sensitive to unbalanced entities, so
+    # escape common special characters in arbitrary model output.
+    return (
+        text.replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
 def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     cwd = payload.get("cwd", "(unknown cwd)")
     final_message = payload.get("final_message") or _extract_last_assistant_message(
@@ -359,6 +371,8 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         project_name = Path(cwd).name or cwd
 
+    project_name = _escape_markdown(project_name)
+    final_message = _escape_markdown(final_message)
     return f"*{project_name}:* {final_message}"
 
 
