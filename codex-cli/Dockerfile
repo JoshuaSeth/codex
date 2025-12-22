@@ -95,10 +95,11 @@ RUN mkdir -p /opt/pitchai \
   && /opt/pitchai/venv/bin/pip install --no-cache-dir -r /tmp/pitchai_sharepoint_requirements.txt \
   && rm -f /tmp/pitchai_sharepoint_requirements.txt
 COPY codex-cli/scripts/pitchai_sharepoint_tool.py /opt/pitchai/sharepoint_tool.py
+COPY tools/custom_tools/telegram_bot.py /opt/pitchai/telegram_bot.py
 COPY codex-cli/scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
 COPY codex-cli/scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
 COPY codex-cli/scripts/pitchai_run_sharepoint_inbox_job.sh /opt/pitchai/run_sharepoint_inbox_job.sh
-RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/run_sharepoint_inbox_job.sh
+RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/telegram_bot.py /opt/pitchai/run_sharepoint_inbox_job.sh
 USER node
 
 # Inside the container we consider the environment already sufficiently locked
