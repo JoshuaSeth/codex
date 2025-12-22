@@ -5,8 +5,9 @@ Goal: clear the SharePoint `Documenten/INBOX` folder by reading each document’
 Important rules:
 - Do NOT ask for human input. Do the work end-to-end.
 - Do NOT print or reveal secrets (certs, keys, tokens, auth.json, env vars).
+- Do NOT print or quote document contents in your final answer. (Summaries + tags only.)
 - Use the provided SharePoint tools (`sp_*`) for SharePoint operations. Do not write ad-hoc scripts.
-- You MAY use built-in Codex read-only tools (e.g. `read_file`) after `sp_read_file` has written extracted text to disk.
+- You MUST NOT use shell/exec commands (e.g. `cat`, `sed`, `python`, etc.) to read extracted text files; use the `read_file` tool only.
 - If you are uncertain where something belongs, move it to a safe fallback instead of guessing.
 - Your final message must be a concise summary only (no questions, no “tell me which one”, no follow-ups).
 

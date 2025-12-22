@@ -771,8 +771,73 @@ def _op_update_fields() -> Dict[str, Any]:
 
     sp = _new_sharepoint_client()
     item_id = sp.get_file_list_item_id(file_ref)
-    sp.update_list_item_fields(library, item_id, fields)
-    return {"library": library, "file_ref": file_ref, "item_id": item_id, "updated_keys": sorted(fields.keys()), "ok": True, "ts": _now_utc_iso()}
+    remaining = dict(fields)
+    dropped: List[str] = []
+
+    def extract_error_message(resp: requests.Response) -> str:
+        try:
+            data = resp.json()
+        except Exception:
+            return (resp.text or "").strip()
+        if not isinstance(data, dict):
+            return (resp.text or "").strip()
+        error = data.get("error")
+        if isinstance(error, dict):
+            msg = error.get("message")
+            if isinstance(msg, dict):
+                value = msg.get("value")
+                if isinstance(value, str):
+                    return value.strip()
+            if isinstance(msg, str):
+                return msg.strip()
+        return (resp.text or "").strip()
+
+    def parse_unknown_field_name(message: str) -> Optional[str]:
+        patterns = [
+            r"The property '([^']+)' does not exist on type",
+            r"Property '([^']+)' does not exist on type",
+            r"Field or property '([^']+)' does not exist",
+            r"Cannot find field '([^']+)'",
+        ]
+        for pat in patterns:
+            m = re.search(pat, message)
+            if m:
+                return str(m.group(1))
+        return None
+
+    while remaining:
+        try:
+            sp.update_list_item_fields(library, item_id, remaining)
+            return {
+                "library": library,
+                "file_ref": file_ref,
+                "item_id": item_id,
+                "updated_keys": sorted(remaining.keys()),
+                "dropped_keys": sorted(set(dropped)),
+                "ok": True,
+                "ts": _now_utc_iso(),
+            }
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is None:
+                raise
+            message = extract_error_message(resp)
+            unknown = parse_unknown_field_name(message)
+            if unknown and unknown in remaining:
+                dropped.append(unknown)
+                remaining.pop(unknown, None)
+                continue
+            raise
+
+    return {
+        "library": library,
+        "file_ref": file_ref,
+        "item_id": item_id,
+        "updated_keys": [],
+        "dropped_keys": sorted(set(dropped)),
+        "ok": False,
+        "ts": _now_utc_iso(),
+    }
 
 
 def main() -> int:
