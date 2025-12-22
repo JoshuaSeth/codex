@@ -332,15 +332,18 @@ class SharePointRestClient:
 
         src_sr = to_server_relative(src)
         dst_sr = to_server_relative(dst)
+        host = urlparse(self._site_url).netloc
 
         url = f"{self._site_url}/_api/SP.MoveCopyUtil.MoveFileByPath()"
         dest_folder, dest_name = dst_sr.rsplit("/", 1)
 
         def attempt(move_dest_name: str, *, keep_both_opt: bool) -> None:
             dest_ref = f"{dest_folder}/{move_dest_name}"
+            src_abs = f"https://{host}{src_sr}"
+            dest_abs = f"https://{host}{dest_ref}"
             body = {
-                "srcPath": {"DecodedUrl": src_sr},
-                "destPath": {"DecodedUrl": dest_ref},
+                "srcPath": {"DecodedUrl": src_abs},
+                "destPath": {"DecodedUrl": dest_abs},
                 "options": {
                     "KeepBoth": bool(keep_both_opt),
                     "ShouldBypassSharedLocks": True,
