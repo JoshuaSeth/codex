@@ -296,7 +296,24 @@ class SharePointRestClient:
 
     def move_file(self, source_file_ref: str, dest_file_ref: str, *, keep_both: bool) -> None:
         src = source_file_ref.rstrip("/")
-        dst = dest_file_ref.rstrip("/")
+        dst_raw = dest_file_ref.strip()
+        if not dst_raw:
+            raise ValueError("dest file ref is empty")
+
+        src_name = src.rsplit("/", 1)[-1]
+        if not src_name:
+            raise ValueError("source file ref has no basename")
+
+        # The SharePoint MoveFileByPath API expects a destination *file* URL. The agent often
+        # produces a destination folder URL. If we detect a folder-like destination, append the
+        # original filename.
+        if dst_raw.endswith("/"):
+            dst = dst_raw.rstrip("/") + "/" + src_name
+        else:
+            dst = dst_raw.rstrip("/")
+            dst_name = dst.rsplit("/", 1)[-1]
+            if "." not in dst_name:
+                dst = dst + "/" + src_name
         if not src or not dst:
             raise ValueError("source/dest file ref is empty")
 
