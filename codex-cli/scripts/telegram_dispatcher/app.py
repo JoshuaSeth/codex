@@ -56,6 +56,12 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _now_utc_compact() -> str:
+    # Azure Files share names and paths must be compatible with SMB/Windows rules
+    # (e.g., ':' is not allowed). Use a compact ISO-like timestamp for filenames.
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def _sanitize_filename(value: str) -> str:
     value = value.strip()
     value = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
@@ -107,13 +113,14 @@ def _telegram_send_message(bot_token: str, chat_id: str, text: str) -> None:
 
 
 def _write_prompt_file(settings: Settings, *, update_id: int, chat_id: str, from_user_id: str, from_username: str, text: str) -> Path:
-    ts = _now_utc()
+    ts_utc = _now_utc()
+    ts_id = _now_utc_compact()
     settings.prompt_queue_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{ts}_{update_id}_{_sanitize_filename(from_username)}.md"
+    filename = f"{ts_id}_{update_id}_{_sanitize_filename(from_username)}.md"
     path = settings.prompt_queue_dir / filename
 
     payload = settings.prompt_wrapper_template.format(
-        ts_utc=ts,
+        ts_utc=ts_utc,
         update_id=update_id,
         chat_id=chat_id,
         from_user_id=from_user_id,
@@ -264,4 +271,3 @@ async def telegram_webhook(
         raise HTTPException(status_code=500, detail=f"failed to start job: {exc}") from exc
 
     return "ok"
-
