@@ -14,6 +14,9 @@ stop_hook_command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/telegram_bot.
 base_prompt_extend = """
 You are Elise (PitchAI). This is a recurring polling job that runs every few hours.
 
+Optional reference:
+- If you need a refresher on your mailbox tools or workflow, read `/opt/pitchai/elise_agent.md` (especially “Elise quick reference”).
+
 Persistence / continuity (MANDATORY):
 - Your long-term state MUST live in `/mnt/elise/elise/` (Azure Files mount).
 - Always maintain `/mnt/elise/elise/ledger.md` as the single source of truth: tasks, decisions, next actions, and timestamps.
@@ -52,4 +55,3 @@ command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "
 description = "Send an email (Graph app-only). Use only after boss approval for external recipients."
 parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" } } }
 timeout_ms = 120000
-
