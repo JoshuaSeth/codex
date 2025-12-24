@@ -197,7 +197,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(path)?.permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(path, perms)?;
+            if let Err(err) = fs::set_permissions(path, perms)
+                && err.kind() != std::io::ErrorKind::PermissionDenied {
+                    return Err(err.into());
+                }
             Ok(())
         }
 

@@ -12,11 +12,15 @@ Important rules:
 - Your final message must be a concise summary only (no questions, no “tell me which one”, no follow-ups).
 
 ## How to work
+0) Call `sp_route_eml_by_sender` (limit 50) once to auto-route `.eml` files by sender email/domain mapping.
+   - This may move some `.eml` files out of `Documenten/INBOX` before you start processing.
+   - Track `auto_routed_count` and the filenames you auto-routed for the final summary.
+
 1) Call `sp_list_inbox` (limit 25) and get:
    - `library_root`
    - `inbox`
    - `files[]` (name, file_ref, modified_utc, size_bytes)
-   If `count` is 0, stop immediately and output: `INBOX is empty. Summary: processed 0, moved 0, failed 0.`
+   If `count` is 0, stop immediately and output: `INBOX is empty. Summary: processed 0, moved 0, failed 0.` (and if any were auto-routed, append `Auto-routed: <N>.`)
 2) For each file (process newest first):
    - Call `sp_read_file` with `max_chars=15000`.
    - Then call `read_file` on the returned `extracted_text_path` to read the extracted text.
@@ -37,12 +41,15 @@ Important rules:
    - Call `sp_move_file` from `file_ref` to `dest_folder/filename` (keep_both=false).
    - Call `sp_update_fields` on the *destination* `file_ref` with the metadata fields above.
 
-3) Finish with a concise summary: how many processed, moved, failed; list failed filenames with reasons.
+3) Finish with a concise summary: how many processed, moved, failed, auto-routed; list failed filenames with reasons.
 
 ## Allowed values (use these)
 
 ### `PitchAIProject`
-`AFASASK`, `AIPRICE`, `AUTOPAR`, `BROECKX`, `DEPLANBOOK`, `DRIESTAR`, `GZB`, `HETCIS`, `HOW`, `LEZ`, `ORTHOCENTER`, `POTATAI`, `UIUX`, `UNASSIGNED`, `UNIMIX`, `ZLTO`
+`AFASASK`, `AIPRICE`, `AUTOPAR`, `BROECKX`, `DEPLANBOOK`, `DRIESTAR`, `GZB`, `HETCIS`, `HOW`, `LEZ`, `potAIto`, `UIUX`, `UNASSIGNED`, `UNIMIX`
+
+Note: Orthocenter is merged into `AUTOPAR`. Always use `AUTOPAR` (never `ORTHOCENTER`).
+Note: ZLTO is merged into `potAIto`. Always use `potAIto` (never `ZLTO`).
 
 ### `PitchAIRecordSeries` (choose the best match)
 `Ops.Email`, `Ops.Project`,

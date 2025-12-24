@@ -3,4 +3,4 @@ requests==2.32.3
 pypdf==5.1.0
 Pillow==11.0.0
 pytesseract==0.3.13
-
+PyYAML==6.0.2

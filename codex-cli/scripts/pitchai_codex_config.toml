@@ -17,6 +17,12 @@ description = "List recent files in the SharePoint Documenten/INBOX folder."
 parameters = { type = "object", additionalProperties = false, properties = { library = { type = "string" }, limit = { type = "integer" }, orderby = { type = "string" } } }
 timeout_ms = 120000
 
+[custom_tools.sp_route_eml_by_sender]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "route_eml_by_sender"]
+description = "Auto-move .eml files from SharePoint Documenten/INBOX into a project comms_inbox folder based on sender email/domain/name mapping (YAML)."
+parameters = { type = "object", additionalProperties = false, properties = { library = { type = "string" }, limit = { type = "integer" }, orderby = { type = "string" }, mapping_file_ref = { type = "string" }, date_utc = { type = "string" } } }
+timeout_ms = 300000
+
 [custom_tools.sp_read_file]
 command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/sharepoint_tool.py", "read_file"]
 description = "Download a SharePoint file, extract text, and write it to a local .txt file. Returns the local path (use read_file tool next)."

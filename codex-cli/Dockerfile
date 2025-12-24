@@ -99,7 +99,11 @@ COPY tools/custom_tools/telegram_bot.py /opt/pitchai/telegram_bot.py
 COPY codex-cli/scripts/pitchai_codex_config.toml /opt/pitchai/config.toml
 COPY codex-cli/scripts/pitchai_sharepoint_inbox_prompt.md /opt/pitchai/sharepoint_inbox_prompt.md
 COPY codex-cli/scripts/pitchai_run_sharepoint_inbox_job.sh /opt/pitchai/run_sharepoint_inbox_job.sh
-RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/telegram_bot.py /opt/pitchai/run_sharepoint_inbox_job.sh
+COPY codex-cli/scripts/pitchai_elise_config.toml /opt/pitchai/elise_config.toml
+COPY codex-cli/scripts/pitchai_elise_prompt.md /opt/pitchai/elise_prompt.md
+COPY codex-cli/scripts/pitchai_elise_graph_tool.py /opt/pitchai/elise_graph_tool.py
+COPY codex-cli/scripts/pitchai_run_elise_job.py /opt/pitchai/run_elise_job.py
+RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/elise_graph_tool.py /opt/pitchai/run_sharepoint_inbox_job.sh /opt/pitchai/run_elise_job.py /opt/pitchai/telegram_bot.py
 USER node
 
 # Inside the container we consider the environment already sufficiently locked

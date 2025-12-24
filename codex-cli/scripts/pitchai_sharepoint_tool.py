@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
+from email.utils import getaddresses
 from html import unescape
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import unquote, urlparse
@@ -32,6 +33,11 @@ try:
     import pytesseract  # type: ignore
 except Exception:  # pragma: no cover
     pytesseract = None
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 def _now_utc_iso() -> str:
@@ -718,6 +724,394 @@ def _new_sharepoint_client() -> SharePointRestClient:
     return SharePointRestClient(site_url, token, token_provider=lambda: _acquire_token(app, scope))
 
 
+def _normalize_project_code(value: str) -> Optional[str]:
+    project = value.strip()
+    if not project:
+        return None
+    project = project.upper()
+    if project.startswith("PRJ-"):
+        project = project[4:]
+    project = project.strip()
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]{0,31}", project):
+        return None
+    if project == "ORTHOCENTER":
+        return "AUTOPAR"
+    if project in ("POTAITO", "POTATAI"):
+        return "potAIto"
+    if project == "ZLTO":
+        return "potAIto"
+    return project
+
+
+def _normalize_domain(value: str) -> str:
+    domain = value.strip().lower()
+    if domain.startswith("@"):
+        domain = domain[1:]
+    if domain.startswith("."):
+        domain = domain[1:]
+    return domain.strip(".")
+
+
+def _is_valid_domain_label(label: str) -> bool:
+    # Be forgiving: allow single-label keys like "zlto" that match a domain label.
+    return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label))
+
+
+def _normalize_name(value: str) -> str:
+    text = value.strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_routing_mapping(config: Any) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], List[str]]:
+    emails: Dict[str, str] = {}
+    domains: Dict[str, str] = {}
+    names: Dict[str, str] = {}
+    errors: List[str] = []
+
+    if config is None:
+        return emails, domains, names, errors
+    if not isinstance(config, dict):
+        errors.append("routing YAML must be a mapping/object at the top level")
+        return emails, domains, names, errors
+
+    raw_emails = config.get("emails") or {}
+    raw_domains = config.get("domains") or {}
+    raw_names = config.get("names") or {}
+
+    def add_email(email_raw: Any, project_raw: Any) -> None:
+        email = str(email_raw).strip().lower()
+        project = _normalize_project_code(str(project_raw))
+        if not email or "@" not in email:
+            errors.append(f"invalid email key: {email_raw!r}")
+            return
+        if not project:
+            errors.append(f"invalid project code for email {email}: {project_raw!r}")
+            return
+        emails[email] = project
+
+    def add_domain(domain_raw: Any, project_raw: Any) -> None:
+        domain = _normalize_domain(str(domain_raw))
+        project = _normalize_project_code(str(project_raw))
+        labels = [p for p in domain.split(".") if p]
+        if not labels or not all(_is_valid_domain_label(p) for p in labels):
+            errors.append(f"invalid domain key: {domain_raw!r}")
+            return
+        if not project:
+            errors.append(f"invalid project code for domain {domain}: {project_raw!r}")
+            return
+        domains[domain] = project
+
+    def add_name(name_raw: Any, project_raw: Any) -> None:
+        name = _normalize_name(str(name_raw))
+        project = _normalize_project_code(str(project_raw))
+        if not name:
+            errors.append(f"invalid name key: {name_raw!r}")
+            return
+        if not project:
+            errors.append(f"invalid project code for name '{name}': {project_raw!r}")
+            return
+        names[name] = project
+
+    if isinstance(raw_emails, dict):
+        for k, v in raw_emails.items():
+            add_email(k, v)
+    elif isinstance(raw_emails, list):
+        for entry in raw_emails:
+            if not isinstance(entry, dict):
+                continue
+            if "email" in entry and "project" in entry:
+                add_email(entry.get("email"), entry.get("project"))
+    else:
+        errors.append("emails must be a mapping or list")
+
+    if isinstance(raw_domains, dict):
+        for k, v in raw_domains.items():
+            add_domain(k, v)
+    elif isinstance(raw_domains, list):
+        for entry in raw_domains:
+            if not isinstance(entry, dict):
+                continue
+            if "domain" in entry and "project" in entry:
+                add_domain(entry.get("domain"), entry.get("project"))
+    else:
+        errors.append("domains must be a mapping or list")
+
+    if isinstance(raw_names, dict):
+        for k, v in raw_names.items():
+            add_name(k, v)
+    elif isinstance(raw_names, list):
+        for entry in raw_names:
+            if not isinstance(entry, dict):
+                continue
+            if "name" in entry and "project" in entry:
+                add_name(entry.get("name"), entry.get("project"))
+    else:
+        errors.append("names must be a mapping or list")
+
+    return emails, domains, names, errors
+
+
+def _match_sender_to_project(
+    sender_addresses: List[tuple[str, str]],
+    emails: Dict[str, str],
+    names: Dict[str, str],
+    domains: Dict[str, str],
+) -> Optional[Dict[str, str]]:
+    # Match precedence: exact email > sender name > sender domain.
+    cleaned: List[Dict[str, str]] = []
+    for raw_name, raw_email in sender_addresses:
+        name = str(raw_name or "").strip()
+        email_addr = str(raw_email or "").strip().lower()
+        if not name and not email_addr:
+            continue
+        cleaned.append({"name": name, "name_norm": _normalize_name(name), "email": email_addr})
+
+    for sender in cleaned:
+        email_addr = sender.get("email") or ""
+        if email_addr and "@" in email_addr:
+            project = emails.get(email_addr)
+            if project:
+                return {
+                    "project": project,
+                    "match_type": "email",
+                    "match_key": email_addr,
+                    "sender_email": email_addr,
+                    "sender_name": sender.get("name") or "",
+                }
+
+    best_name_key: Optional[str] = None
+    best_name_project: Optional[str] = None
+    best_sender_name: Optional[str] = None
+    for sender in cleaned:
+        name_norm = sender.get("name_norm") or ""
+        if not name_norm:
+            continue
+        name_words = set(name_norm.split())
+        for key, project in names.items():
+            key_words = key.split()
+            if not key_words:
+                continue
+            if key in name_norm or all(word in name_words for word in key_words):
+                if best_name_key is None or (len(key_words), len(key)) > (len(best_name_key.split()), len(best_name_key)):
+                    best_name_key = key
+                    best_name_project = project
+                    best_sender_name = sender.get("name") or ""
+    if best_name_project and best_name_key:
+        return {
+            "project": best_name_project,
+            "match_type": "name",
+            "match_key": best_name_key,
+            "sender_name": best_sender_name or "",
+        }
+
+    best_domain_key: Optional[str] = None
+    best_domain_project: Optional[str] = None
+    best_sender_email: Optional[str] = None
+    for sender in cleaned:
+        email_addr = sender.get("email") or ""
+        if not email_addr or "@" not in email_addr:
+            continue
+        sender_domain = _normalize_domain(email_addr.split("@", 1)[1])
+        if not sender_domain:
+            continue
+        sender_labels = sender_domain.split(".")
+        for key, project in domains.items():
+            if "." in key:
+                matched = sender_domain == key or sender_domain.endswith("." + key)
+            else:
+                matched = key in sender_labels
+            if not matched:
+                continue
+            if best_domain_key is None or (key.count("."), len(key)) > (best_domain_key.count("."), len(best_domain_key)):
+                best_domain_key = key
+                best_domain_project = project
+                best_sender_email = email_addr
+
+    if best_domain_project and best_domain_key:
+        return {
+            "project": best_domain_project,
+            "match_type": "domain",
+            "match_key": best_domain_key,
+            "sender_email": best_sender_email or "",
+        }
+    return None
+
+
+def _op_route_eml_by_sender() -> Dict[str, Any]:
+    args = _load_tool_args()
+    library = str(args.get("library") or _optional_env("PITCHAI_SP_LIBRARY") or "Documenten")
+    override_limit = _optional_env("PITCHAI_MAX_FILES")
+    if override_limit and override_limit.isdigit() and int(override_limit) > 0:
+        limit = int(override_limit)
+    else:
+        limit = int(args.get("limit") or 50)
+    orderby = str(args.get("orderby") or "TimeLastModified desc")
+
+    sp = _new_sharepoint_client()
+    root = sp.get_library_root_folder(library)
+    inbox = f"{root}/INBOX".rstrip("/")
+
+    mapping_file_ref = args.get("mapping_file_ref") or _optional_env("PITCHAI_MAIL_ROUTING_FILE_REF")
+    if isinstance(mapping_file_ref, str) and mapping_file_ref.strip():
+        mapping_ref = mapping_file_ref.strip()
+    else:
+        mapping_ref = f"{root}/_CONFIG/mail_routing.yaml"
+
+    out: Dict[str, Any] = {
+        "library": library,
+        "library_root": root,
+        "inbox": inbox,
+        "mapping_file_ref": mapping_ref,
+        "moved": [],
+        "skipped": [],
+        "errors": [],
+        "ts": _now_utc_iso(),
+    }
+
+    if yaml is None:
+        out["ok"] = False
+        out["skipped_reason"] = "PyYAML not installed in this runtime"
+        return out
+
+    try:
+        exists = sp.file_exists(mapping_ref)
+    except Exception as exc:
+        out["ok"] = False
+        out["skipped_reason"] = f"failed to check mapping file existence: {exc}"
+        return out
+    if not exists:
+        out["ok"] = True
+        out["skipped_reason"] = "mapping file not found"
+        return out
+
+    try:
+        mapping_bytes = sp.download_file_bytes(mapping_ref)
+    except Exception as exc:
+        out["ok"] = False
+        out["skipped_reason"] = f"failed to download mapping file: {exc}"
+        return out
+
+    try:
+        config = yaml.safe_load(mapping_bytes.decode("utf-8", errors="replace"))
+    except Exception as exc:
+        out["ok"] = False
+        out["skipped_reason"] = f"invalid YAML: {exc}"
+        return out
+
+    emails, domains, names, mapping_errors = _parse_routing_mapping(config)
+    out["mapping_errors"] = mapping_errors
+    out["mapping_email_count"] = len(emails)
+    out["mapping_domain_count"] = len(domains)
+    out["mapping_name_count"] = len(names)
+    if not emails and not domains and not names:
+        out["ok"] = True
+        out["skipped_reason"] = "mapping empty"
+        return out
+
+    date_folder = str(args.get("date_utc") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+    try:
+        files = sp.list_files_in_folder(inbox, top=limit, orderby=orderby)
+    except Exception as exc:
+        out["ok"] = False
+        out["errors"].append({"error": f"failed to list inbox: {exc}"})
+        return out
+
+    for f in files:
+        name = str(f.get("Name") or "")
+        ref = str(f.get("ServerRelativeUrl") or "")
+        if not name or not ref:
+            continue
+        if not name.lower().endswith(".eml"):
+            continue
+
+        try:
+            raw = sp.download_file_bytes(ref)
+        except Exception as exc:
+            out["errors"].append({"file_ref": ref, "name": name, "error": f"download failed: {exc}"})
+            continue
+
+        try:
+            msg = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
+        except Exception as exc:
+            out["errors"].append({"file_ref": ref, "name": name, "error": f"parse_eml_failed: {exc}"})
+            continue
+
+        from_header = msg.get("from")
+        if not isinstance(from_header, str) or not from_header.strip():
+            out["skipped"].append({"file_ref": ref, "name": name, "reason": "missing_from_header"})
+            continue
+        try:
+            sender_addresses = getaddresses([from_header])
+        except Exception as exc:
+            out["errors"].append({"file_ref": ref, "name": name, "error": f"parse_from_header_failed: {exc}"})
+            continue
+
+        match = _match_sender_to_project(sender_addresses, emails, names, domains)
+        if not match:
+            out["skipped"].append(
+                {
+                    "file_ref": ref,
+                    "name": name,
+                    "sender_from": from_header.strip(),
+                    "reason": "no_match",
+                }
+            )
+            continue
+
+        project = match["project"]
+        dest_folder = f"{root}/05_OPERATIONS_PROJECTS/Projects/PRJ-{project}/comms_inbox/{date_folder}/"
+        try:
+            sp.ensure_folder_tree(dest_folder)
+        except Exception as exc:
+            out["errors"].append(
+                {
+                    "file_ref": ref,
+                    "name": name,
+                    "sender_from": from_header.strip(),
+                    "project": project,
+                    "dest_folder": dest_folder,
+                    "error": f"ensure_folder failed: {exc}",
+                }
+            )
+            continue
+
+        try:
+            sp.move_file(ref, dest_folder, keep_both=False)
+        except Exception as exc:
+            out["errors"].append(
+                {
+                    "file_ref": ref,
+                    "name": name,
+                    "sender_from": from_header.strip(),
+                    "project": project,
+                    "dest_folder": dest_folder,
+                    "error": f"move_file failed: {exc}",
+                }
+            )
+            continue
+
+        out["moved"].append(
+            {
+                "file_ref": ref,
+                "name": name,
+                "sender_from": from_header.strip(),
+                "project": project,
+                "match": match,
+                "dest_folder": dest_folder,
+            }
+        )
+
+    out["ok"] = True
+    out["moved_count"] = len(out["moved"])
+    out["skipped_count"] = len(out["skipped"])
+    out["error_count"] = len(out["errors"])
+    return out
+
+
 def _op_list_inbox() -> Dict[str, Any]:
     args = _load_tool_args()
     library = str(args.get("library") or _optional_env("PITCHAI_SP_LIBRARY") or "Documenten")
@@ -910,6 +1304,8 @@ def main() -> int:
     op = sys.argv[1].strip()
     if op == "list_inbox":
         out = _op_list_inbox()
+    elif op == "route_eml_by_sender":
+        out = _op_route_eml_by_sender()
     elif op == "read_file":
         out = _op_read_file()
     elif op == "ensure_folder":

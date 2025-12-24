@@ -337,7 +337,11 @@ mod tests {
         fs::write(&shell_path, script).await?;
         let mut permissions = std::fs::metadata(&shell_path)?.permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&shell_path, permissions)?;
+        if let Err(err) = std::fs::set_permissions(&shell_path, permissions) {
+            if err.kind() != std::io::ErrorKind::PermissionDenied {
+                return Err(err.into());
+            }
+        }
 
         let shell = Shell {
             shell_type: ShellType::Sh,

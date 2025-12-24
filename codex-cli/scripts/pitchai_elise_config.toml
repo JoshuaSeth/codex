@@ -1,0 +1,55 @@
+# PitchAI Elise runtime config (container).
+#
+# This file defines Microsoft Graph (mail) tools for Elise. The Codex agent is responsible
+# for deciding what to do; these tools just read/search/send email.
+
+# This job runs in an externally sandboxed container (Docker / Azure Container Apps Job),
+# so disable Codex sandbox + approvals to avoid Landlock/seccomp issues in some runtimes.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+hide_agent_reasoning = true
+experimental_supported_tools = ["read_file"]
+stop_hook_command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/telegram_bot.py", "--stop-hook"]
+
+base_prompt_extend = """
+You are Elise (PitchAI). This is a recurring polling job that runs every few hours.
+
+Persistence / continuity (MANDATORY):
+- Your long-term state MUST live in `/mnt/elise/elise/` (Azure Files mount).
+- Always maintain `/mnt/elise/elise/ledger.md` as the single source of truth: tasks, decisions, next actions, and timestamps.
+- Store email drafts as markdown files under `/mnt/elise/elise/drafts/` with a clear filename, and include subject/to/body.
+
+Mailbox access:
+- Use `mail_search` to find new/unread mail in your Inbox.
+- Use `mail_read` to read full content of messages you need to act on.
+- Do not leak any secrets, tokens, certs, or credentials in your outputs.
+
+Boss approval policy (MANDATORY):
+- You may always email Seth (`seth.vanderbijl@pitchai.net`) for advice / approval.
+- Do NOT send email to anyone else unless you have explicit approval from Seth.
+- Approval arrives by email from Seth with the literal text `APPROVED: <draft_filename>` in the body or subject.
+- When approved, send the corresponding draft (from `/mnt/elise/elise/drafts/`) using `send_email` and log it in `ledger.md`.
+
+When you have no more actions for now:
+- Write a short status update into `ledger.md`.
+- End your final response with a concise summary of what you did and what you’re waiting on.
+"""
+
+[custom_tools.mail_search]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "mail_search"]
+description = "Search Elise's mailbox (Graph app-only). Returns a list of message metadata."
+parameters = { type = "object", additionalProperties = false, properties = { folder = { type = "string" }, top = { type = "integer" }, unread_only = { type = "boolean" }, from_address = { type = "string" }, subject_contains = { type = "string" }, received_since_utc = { type = "string" } } }
+timeout_ms = 120000
+
+[custom_tools.mail_read]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "mail_read"]
+description = "Read a specific email message (Graph app-only). Returns headers and body content."
+parameters = { type = "object", additionalProperties = false, required = ["message_id"], properties = { message_id = { type = "string" }, max_chars = { type = "integer" }, mark_as_read = { type = "boolean" } } }
+timeout_ms = 120000
+
+[custom_tools.send_email]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "send_email"]
+description = "Send an email (Graph app-only). Use only after boss approval for external recipients."
+parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" } } }
+timeout_ms = 120000
+

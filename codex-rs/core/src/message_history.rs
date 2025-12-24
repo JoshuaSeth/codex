@@ -272,7 +272,18 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
         perms.set_mode(0o600);
         let perms_clone = perms.clone();
         let file_clone = file.try_clone()?;
-        tokio::task::spawn_blocking(move || file_clone.set_permissions(perms_clone)).await??;
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = file_clone.set_permissions(perms_clone) {
+                // Some filesystems (e.g. Azure Files SMB/CIFS mounts) do not
+                // support chmod semantics. Codex can still operate safely with
+                // the mount-enforced permissions, so avoid failing the run.
+                if err.kind() != std::io::ErrorKind::PermissionDenied {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        })
+        .await??;
     }
     Ok(())
 }
