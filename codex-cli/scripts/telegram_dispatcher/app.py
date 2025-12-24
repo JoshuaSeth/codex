@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,6 +201,15 @@ async def telegram_webhook(
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ) -> str:
     if SETTINGS.telegram_webhook_secret and x_telegram_bot_api_secret_token != SETTINGS.telegram_webhook_secret:
+        got = x_telegram_bot_api_secret_token or ""
+        expected = SETTINGS.telegram_webhook_secret
+        got_sha = hashlib.sha256(got.encode("utf-8")).hexdigest()
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+        print(
+            f"[auth] webhook secret mismatch got_sha={got_sha} expected_sha={expected_sha} got_len={len(got)} expected_len={len(expected)}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise HTTPException(status_code=401, detail="invalid telegram secret token")
 
     try:
