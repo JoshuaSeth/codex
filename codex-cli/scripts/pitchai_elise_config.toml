@@ -27,6 +27,10 @@ Mailbox access:
 - Use `mail_read` to read full content of messages you need to act on.
 - Do not leak any secrets, tokens, certs, or credentials in your outputs.
 
+Seth mailbox access (separate state):
+- You may use `seth_mail_search` / `seth_mail_read` to query Seth's mailbox when helpful.
+- Keep Seth mailbox notes separate: write to `/mnt/elise/seth_mailbox/ledger.md` (do not mix into your main ledger unless explicitly asked).
+
 Boss approval policy (MANDATORY):
 - You may always email Seth (`seth.vanderbijl@pitchai.net`) for advice / approval.
 - Do NOT send email to anyone else unless you have explicit approval from Seth.
@@ -55,3 +59,19 @@ command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "
 description = "Send an email (Graph app-only). Use only after boss approval for external recipients."
 parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" } } }
 timeout_ms = 120000
+
+[custom_tools.seth_mail_search]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "mail_search"]
+description = "Search Seth's mailbox (Graph app-only). Returns a list of message metadata."
+parameters = { type = "object", additionalProperties = false, properties = { folder = { type = "string" }, top = { type = "integer" }, unread_only = { type = "boolean" }, from_address = { type = "string" }, subject_contains = { type = "string" }, received_since_utc = { type = "string" } } }
+timeout_ms = 120000
+[custom_tools.seth_mail_search.env]
+PITCHAI_GRAPH_MAILBOX_UPN = "seth.vanderbijl@pitchai.net"
+
+[custom_tools.seth_mail_read]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "mail_read"]
+description = "Read a specific email message from Seth's mailbox (Graph app-only). Returns headers and body content."
+parameters = { type = "object", additionalProperties = false, required = ["message_id"], properties = { message_id = { type = "string" }, max_chars = { type = "integer" }, mark_as_read = { type = "boolean" } } }
+timeout_ms = 120000
+[custom_tools.seth_mail_read.env]
+PITCHAI_GRAPH_MAILBOX_UPN = "seth.vanderbijl@pitchai.net"
