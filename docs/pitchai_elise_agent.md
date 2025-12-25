@@ -65,6 +65,8 @@ High-level:
    - Agent working directory + ledger (`/mnt/elise/elise/`)
    - Thread state (`/mnt/elise/state.json`)
 
+Related: for **ad-hoc** “Telegram message → run Elise immediately”, see `docs/pitchai_elise_telegram_dispatch.md`.
+
 ## Repo file map (what to copy/build)
 
 - `codex-cli/scripts/pitchai_elise_prompt.md` — the natural-language prompt for each scheduled run.
@@ -396,4 +398,3 @@ If you rebase onto upstream or port to another environment, re-verify this behav
 - Restrict the Graph app-only principal to Elise’s mailbox (Exchange Application Access Policy).
 - Reduce sensitive content in logs/telegrams: avoid echoing raw message bodies in final responses.
 - Consider using Key Vault references for secrets instead of raw ACA secrets.
-

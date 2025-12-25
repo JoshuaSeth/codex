@@ -79,7 +79,7 @@ Runner behavior:
 
 - Consume at most **one** pending prompt per run (keeps each job bounded).
 - If no prompts pending, fall back to the normal polling prompt file.
-- After reading a prompt file, move it to `_processed/` (or rename with a `.done` suffix).
+- After reading a prompt file, move it to `_processed/` on success (or `_failed/` on error).
 
 ## Concurrency & “eternal session”
 
@@ -128,19 +128,126 @@ Two approaches:
 
 ## Implementation checklist
 
-- [ ] Add this plan doc (done by committing it)
-- [ ] Update `codex-cli/scripts/pitchai_run_elise_job.py`:
-  - [ ] prompt queue support
-  - [ ] job lock to prevent concurrent runs
-- [ ] Update `codex-cli/scripts/pitchai_elise_config.toml`:
-  - [ ] add `seth_mail_search` / `seth_mail_read` with per-tool env override
-  - [ ] add guidance for `/mnt/elise/seth_mailbox/ledger.md`
-- [ ] Add dispatcher service code + Dockerfile
-- [ ] Local smoke test (prompt queue + stop-hook)
-- [ ] Azure deploy:
-  - [ ] Container app w/ ingress
-  - [ ] Mount `/mnt/elise`
-  - [ ] Managed identity RBAC
-  - [ ] Telegram webhook set
-- [ ] End-to-end test: Telegram → ACA Job → Telegram
+- [x] Add this plan doc (`docs/pitchai_elise_telegram_dispatch.md`)
+- [x] Update `codex-cli/scripts/pitchai_run_elise_job.py` (prompt queue + CIFS lock)
+- [x] Update `codex-cli/scripts/pitchai_elise_config.toml` (Seth mailbox tools + separate ledger guidance)
+- [x] Add dispatcher service code + Dockerfile (`codex-cli/scripts/telegram_dispatcher/`)
+- [x] Azure deploy:
+  - [x] Container app w/ ingress
+  - [x] Mount `/mnt/elise`
+  - [x] Managed identity RBAC (start ACA job)
+  - [x] Telegram webhook set (secret token header)
+- [x] End-to-end test: Telegram → prompt queue → ACA job → Telegram (verified via ACA logs)
 
+## Reproducible deployment (Azure)
+
+This section is a practical “copy/paste” guide to reproduce the setup in a new resource group / environment.
+
+### 1) Build + push the dispatcher image (ACR)
+
+From the `codex/` repo root:
+
+```bash
+ACR_NAME="<your_acr_name>"
+TAG="$(git rev-parse --short HEAD)-amd64"
+
+az acr login -n "$ACR_NAME"
+
+docker buildx build --platform linux/amd64 \
+  -f codex-cli/scripts/telegram_dispatcher/Dockerfile \
+  -t "$ACR_NAME.azurecr.io/pitchai/elise-telegram-dispatcher:$TAG" \
+  --push .
+```
+
+### 2) Create/update the dispatcher Container App
+
+Prereqs:
+
+- A Container Apps Environment with an Azure Files mount named `elise` (see `docs/pitchai_elise_agent.md`).
+- The Elise agent job already exists (example job name: `elise-agent-job`).
+
+Create the app (first time) or update it (subsequent):
+
+```bash
+RG="<resource-group>"
+ENV_NAME="<containerapps-env-name>"
+APP_NAME="elise-tg-dispatcher"
+JOB_NAME="elise-agent-job"
+SUB_ID="$(az account show --query id -o tsv)"
+IMAGE="$ACR_NAME.azurecr.io/pitchai/elise-telegram-dispatcher:$TAG"
+
+# Secrets (values omitted here on purpose)
+az containerapp secret set -g "$RG" -n "$APP_NAME" \
+  --secrets \
+    telegram-bot-token="<BOT_TOKEN>" \
+    tg-webhook-secret="<WEBHOOK_SECRET>" \
+  -o none
+
+az containerapp update -g "$RG" -n "$APP_NAME" \
+  --image "$IMAGE" \
+  --set-env-vars \
+    TELEGRAM_BOT_TOKEN=secretref:telegram-bot-token \
+    TELEGRAM_WEBHOOK_SECRET=secretref:tg-webhook-secret \
+    TELEGRAM_ALLOWED_CHAT_ID="<CHAT_ID>" \
+    ACA_SUBSCRIPTION_ID="$SUB_ID" \
+    ACA_RESOURCE_GROUP="$RG" \
+    ACA_JOB_NAME="$JOB_NAME" \
+    PITCHAI_DISPATCH_MODE="azure" \
+  -o none
+
+# Ensure the shared volume is mounted at /mnt/elise
+az containerapp update -g "$RG" -n "$APP_NAME" \
+  --set-env-vars PITCHAI_PROMPT_QUEUE_DIR="/mnt/elise/prompts/telegram" \
+  -o none
+```
+
+Mounting Azure Files (if creating from scratch) is usually easiest via:
+
+- `az containerapp create ... --storage-mounts ...` (or)
+- set it in the Portal once, then keep it stable.
+
+### 3) Give the dispatcher permission to start the job
+
+Assign managed identity to the dispatcher app and grant it access to the job resource scope.
+
+Role guidance:
+
+- simplest: `Contributor` on the Job resource (works)
+- tighter: a custom role that allows `Microsoft.App/jobs/start/action` and `Microsoft.App/jobs/executions/read`
+
+### 4) Set the Telegram webhook (secret token)
+
+Telegram uses the `X-Telegram-Bot-Api-Secret-Token` header to sign webhook calls. The dispatcher validates it.
+
+```bash
+FQDN="$(az containerapp show -g "$RG" -n "$APP_NAME" --query properties.configuration.ingress.fqdn -o tsv)"
+
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -d "url=https://${FQDN}/telegram/webhook" \
+  -d "secret_token=<WEBHOOK_SECRET>" \
+  -d 'allowed_updates=["message"]'
+```
+
+### 5) End-to-end test (without Telegram)
+
+You can simulate Telegram by POSTing a payload directly (use the same secret header Telegram would send):
+
+```bash
+curl -X POST "https://${FQDN}/telegram/webhook" \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: <WEBHOOK_SECRET>" \
+  --data '{"update_id":900000123,"message":{"message_id":1,"date":1735080000,"chat":{"id":<CHAT_ID>,"type":"private"},"from":{"id":<CHAT_ID>,"is_bot":false,"first_name":"Seth"},"text":"10+43"}}'
+```
+
+Then confirm:
+
+- Dispatcher returns HTTP 200.
+- An `elise-agent-job-*` execution starts.
+- Job logs include `[prompt] Using queued prompt: ...` and the agent’s response.
+
+### 6) Common gotcha: secrets + revisions
+
+If you update the dispatcher’s webhook secret in ACA, ensure the running revision uses the updated secret:
+
+- easiest: `az containerapp update` (creates a new revision in multiple-revisions mode; in single mode it updates the active template)
+- verify by sending a bad secret and confirming logs print `[auth] webhook secret mismatch ...`
