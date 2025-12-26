@@ -28,6 +28,7 @@ class Settings:
     telegram_webhook_secret: str
     allowed_chat_id: Optional[str]
     allowed_user_id: Optional[str]
+    telegram_bot_user_id: Optional[str]
 
     prompt_queue_dir: Path
     prompt_wrapper_template: str
@@ -96,6 +97,7 @@ def load_settings() -> Settings:
         telegram_webhook_secret=_require_env("TELEGRAM_WEBHOOK_SECRET"),
         allowed_chat_id=_optional_env("TELEGRAM_ALLOWED_CHAT_ID"),
         allowed_user_id=_optional_env("TELEGRAM_ALLOWED_USER_ID"),
+        telegram_bot_user_id=_optional_env("TELEGRAM_BOT_USER_ID"),
         prompt_queue_dir=prompt_queue_dir,
         prompt_wrapper_template=wrapper,
         dispatch_mode=dispatch_mode,
@@ -113,11 +115,20 @@ def _telegram_send_message(bot_token: str, chat_id: str, text: str) -> None:
     resp.raise_for_status()
 
 
-def _write_prompt_file(settings: Settings, *, update_id: int, chat_id: str, from_user_id: str, from_username: str, text: str) -> Path:
+def _write_prompt_file(
+    settings: Settings,
+    *,
+    update_id: int,
+    chat_id: str,
+    from_user_id: str,
+    from_username: str,
+    text: str,
+) -> tuple[Path, bool]:
     ts_utc = _now_utc()
-    ts_id = _now_utc_compact()
     settings.prompt_queue_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{ts_id}_{update_id}_{_sanitize_filename(from_username)}.md"
+    # Use a deterministic filename per update_id to avoid accidental duplicate processing
+    # when Telegram retries the same update (timeouts, transient network errors, etc).
+    filename = f"{update_id:012d}_{_sanitize_filename(from_username)}.md"
     path = settings.prompt_queue_dir / filename
 
     payload = settings.prompt_wrapper_template.format(
@@ -128,8 +139,12 @@ def _write_prompt_file(settings: Settings, *, update_id: int, chat_id: str, from
         from_username=from_username or "unknown",
         text=text.rstrip(),
     )
-    path.write_text(payload + "\n", encoding="utf-8")
-    return path
+    try:
+        with path.open("x", encoding="utf-8") as file_handle:
+            file_handle.write(payload + "\n")
+    except FileExistsError:
+        return (path, False)
+    return (path, True)
 
 
 def _aca_token() -> str:
@@ -231,10 +246,12 @@ async def telegram_webhook(
         return "ignored"
 
     sender = message.get("from") if isinstance(message.get("from"), dict) else {}
-    if sender.get("is_bot") is True:
-        return "ignored"
-
     from_user_id = str(sender.get("id", ""))
+    sender_is_bot = sender.get("is_bot")
+    if sender_is_bot is True:
+        return "ignored"
+    if SETTINGS.telegram_bot_user_id and from_user_id == SETTINGS.telegram_bot_user_id:
+        return "ignored"
     if SETTINGS.allowed_user_id and from_user_id != SETTINGS.allowed_user_id:
         return "ignored"
 
@@ -243,7 +260,7 @@ async def telegram_webhook(
     if not isinstance(text, str) or not text.strip():
         return "ignored"
 
-    prompt_path = _write_prompt_file(
+    prompt_path, created = _write_prompt_file(
         SETTINGS,
         update_id=update_id,
         chat_id=chat_id,
@@ -252,10 +269,11 @@ async def telegram_webhook(
         text=text,
     )
 
-    try:
-        _telegram_send_message(SETTINGS.telegram_bot_token, chat_id, f"Queued for Elise: {prompt_path.name}")
-    except Exception:
-        pass
+    if created:
+        try:
+            _telegram_send_message(SETTINGS.telegram_bot_token, chat_id, f"Queued for Elise: {prompt_path.name}")
+        except Exception:
+            pass
 
     if SETTINGS.dispatch_mode == "noop":
         return "ok"
@@ -268,12 +286,18 @@ async def telegram_webhook(
     if not (SETTINGS.aca_subscription_id and SETTINGS.aca_resource_group and SETTINGS.aca_job_name):
         raise HTTPException(status_code=500, detail="ACA_* env vars not configured")
 
+    # If this is a duplicate webhook delivery, don't start a new execution. The prompt is already queued.
+    if not created:
+        return "ok"
+
     try:
         if _aca_has_running_execution(SETTINGS):
             return "ok"
-    except Exception:
-        # If we can't check, still attempt a start (prompt stays queued regardless).
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Safety: if we can't check running state, do not attempt to start a new execution.
+        # The prompt remains queued and will be picked up by the scheduled run.
+        print(f"[dispatch] failed checking running executions: {exc}", file=sys.stderr, flush=True)
+        return "ok"
 
     try:
         _aca_start_job(SETTINGS)
