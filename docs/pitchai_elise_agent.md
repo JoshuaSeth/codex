@@ -67,6 +67,8 @@ High-level:
 
 Related: for **ad-hoc** “Telegram message → run Elise immediately”, see `docs/pitchai_elise_telegram_dispatch.md`.
 
+Related: for running **any** Codex config/prompt in the same image (not just Elise), see `docs/pitchai_generic_codex_job.md`.
+
 ## Repo file map (what to copy/build)
 
 - `codex-cli/scripts/pitchai_elise_prompt.md` — the natural-language prompt for each scheduled run.
