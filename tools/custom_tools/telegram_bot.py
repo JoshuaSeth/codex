@@ -9,7 +9,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -165,7 +165,7 @@ class TelegramNotifier:
 
     def _format_daily_report(self, report: dict[str, Any]) -> str:
         """Format daily report for Telegram."""
-        timestamp = report.get("timestamp", datetime.utcnow().isoformat())
+        timestamp = report.get("timestamp", datetime.now(timezone.utc).isoformat())
 
         # Overall status emoji
         status_emoji = "✅" if report.get("all_healthy", True) else "⚠️"
@@ -216,7 +216,7 @@ class TelegramNotifier:
             "",
             f"*Service:* {alert.get('service', 'Unknown')}",
             f"*Issue:* {alert.get('issue', 'Unknown error')}",
-            f"*Time:* {alert.get('timestamp', datetime.utcnow().isoformat())}",
+            f"*Time:* {alert.get('timestamp', datetime.now(timezone.utc).isoformat())}",
             "",
             "*Details:*",
             f"{alert.get('details', 'No additional details available')[:500]}",
@@ -306,7 +306,7 @@ class TelegramNotifier:
         """
         test_message = (
             "🔔 *PitchAI Monitoring Test*\n"
-            f"_Connection test at {datetime.utcnow().isoformat()}_\n"
+            f"_Connection test at {datetime.now(timezone.utc).isoformat()}_\n"
             "\n"
             "✅ Telegram notifications are working!"
         )
@@ -392,7 +392,7 @@ def _stop_hook_should_dedup_skip(
 
     state_path = Path(state_path_raw).expanduser()
     state = _read_dedup_state(state_path)
-    now_epoch = int(datetime.utcnow().timestamp())
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
 
     basis = payload.get("final_message") or _extract_last_assistant_message(payload.get("response_items"))
     if not isinstance(basis, str) or not basis.strip():
@@ -422,7 +422,7 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         project_name = Path(cwd).name or cwd
 
-    utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     execution_name = os.getenv("CONTAINER_APP_JOB_EXECUTION_NAME") or os.getenv("PITCHAI_JOB_EXECUTION_NAME")
     conversation_id = payload.get("conversation_id")
 
@@ -447,7 +447,7 @@ def _append_debug_log(payload: dict[str, Any], message: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(
-                f"{datetime.utcnow().isoformat()} | convo={payload.get('conversation_id')} | cwd={payload.get('cwd')}\n"
+                    f"{datetime.now(timezone.utc).isoformat()} | convo={payload.get('conversation_id')} | cwd={payload.get('cwd')}\n"
             )
             fh.write(message + "\n\n")
     except Exception as exc:  # noqa: BLE001
@@ -484,7 +484,7 @@ async def handle_stop_hook_event(payload: dict[str, Any], *, dry_run: bool = Fal
     if sent and state_path and basis_hash:
         _write_dedup_state(
             state_path,
-            {"last_basis_sha256": basis_hash, "last_sent_epoch": int(datetime.utcnow().timestamp())},
+            {"last_basis_sha256": basis_hash, "last_sent_epoch": int(datetime.now(timezone.utc).timestamp())},
         )
     return sent
 
