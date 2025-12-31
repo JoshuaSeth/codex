@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -356,6 +357,56 @@ def _escape_markdown(text: str) -> str:
     )
 
 
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_dedup_state(path: Path) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_dedup_state(path: Path, data: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _stop_hook_should_dedup_skip(
+    payload: dict[str, Any], formatted_message: str
+) -> tuple[bool, str | None, Path | None]:
+    state_path_raw = os.getenv("TELEGRAM_DEDUP_STATE_PATH", "").strip()
+    if not state_path_raw:
+        return (False, None, None)
+
+    ttl_s_raw = os.getenv("TELEGRAM_DEDUP_TTL_S", "").strip()
+    ttl_s = int(ttl_s_raw) if ttl_s_raw else 86400
+    if ttl_s <= 0:
+        return (False, None, Path(state_path_raw))
+
+    state_path = Path(state_path_raw).expanduser()
+    state = _read_dedup_state(state_path)
+    now_epoch = int(datetime.utcnow().timestamp())
+
+    basis = payload.get("final_message") or _extract_last_assistant_message(payload.get("response_items"))
+    if not isinstance(basis, str) or not basis.strip():
+        basis = formatted_message
+    basis_hash = _sha256_hex(basis.strip())
+
+    last_hash = state.get("last_basis_sha256")
+    last_sent_epoch = state.get("last_sent_epoch")
+    if isinstance(last_hash, str) and isinstance(last_sent_epoch, int):
+        if last_hash == basis_hash and (now_epoch - last_sent_epoch) < ttl_s:
+            return (True, basis_hash, state_path)
+
+    return (False, basis_hash, state_path)
+
 def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     cwd = payload.get("cwd", "(unknown cwd)")
     final_message = payload.get("final_message") or _extract_last_assistant_message(
@@ -371,9 +422,21 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001
         project_name = Path(cwd).name or cwd
 
+    utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    execution_name = os.getenv("CONTAINER_APP_JOB_EXECUTION_NAME") or os.getenv("PITCHAI_JOB_EXECUTION_NAME")
+    conversation_id = payload.get("conversation_id")
+
+    meta_parts = [utc]
+    if isinstance(execution_name, str) and execution_name.strip():
+        meta_parts.append(execution_name.strip())
+    if isinstance(conversation_id, str) and conversation_id.strip():
+        meta_parts.append(f"convo={conversation_id.strip()[:10]}")
+    meta = " | ".join(meta_parts)
+
     project_name = _escape_markdown(project_name)
+    meta = _escape_markdown(meta)
     final_message = _escape_markdown(final_message)
-    return f"*{project_name}:* {final_message}"
+    return f"*{project_name}* _{meta}_\n{final_message}"
 
 
 def _append_debug_log(payload: dict[str, Any], message: str) -> None:
@@ -403,12 +466,27 @@ async def handle_stop_hook_event(payload: dict[str, Any], *, dry_run: bool = Fal
         logger.warning("Telegram credentials missing; skipping stop-hook notification")
         return False
 
+    should_skip, basis_hash, state_path = _stop_hook_should_dedup_skip(payload, message)
+    if should_skip:
+        logger.info(
+            "Skipping duplicate stop-hook telegram notification",
+            conversation_id=payload.get("conversation_id"),
+            cwd=payload.get("cwd"),
+        )
+        return True
+
     logger.info(
         "Sending stop-hook telegram notification",
         conversation_id=payload.get("conversation_id"),
         cwd=payload.get("cwd"),
     )
-    return await notifier.send_plain_text(message)
+    sent = await notifier.send_plain_text(message)
+    if sent and state_path and basis_hash:
+        _write_dedup_state(
+            state_path,
+            {"last_basis_sha256": basis_hash, "last_sent_epoch": int(datetime.utcnow().timestamp())},
+        )
+    return sent
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
