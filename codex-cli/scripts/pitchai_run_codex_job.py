@@ -367,44 +367,61 @@ def main() -> int:
     if lock_dir is None:
         return 0
 
-    work_item: Optional[QueuedWorkItem] = None
     try:
-        selected_prompt, _, work_item = _pick_prompt_from_queue(cfg)
-        if work_item is not None:
-            state_dir = Path(os.getenv("PITCHAI_STATE_DIR", str(cfg.volume_root)))
-            state_key = work_item.state_key or _state_key_for_config(work_item.config_path)
-            state_path = Path(os.getenv("PITCHAI_STATE_PATH", str(state_dir / f"state_{state_key}.json")))
+        max_items = int(os.getenv("PITCHAI_MAX_ITEMS_PER_RUN", "1") or "1")
+        max_items = max(1, min(max_items, 50))
 
-            cfg = CodexRunConfig(
-                volume_root=cfg.volume_root,
-                codex_home=cfg.codex_home,
-                workdir=work_item.workdir,
-                state_path=state_path,
-                prompt_path=work_item.prompt_path,
-                config_path=work_item.config_path,
-                prompt_queue_dir=cfg.prompt_queue_dir,
-            )
-            if work_item.model:
-                os.environ["PITCHAI_CODEX_MODEL_OVERRIDE"] = work_item.model
-        else:
-            cfg = CodexRunConfig(
-                volume_root=cfg.volume_root,
-                codex_home=cfg.codex_home,
-                workdir=cfg.workdir,
-                state_path=cfg.state_path,
-                prompt_path=selected_prompt,
-                config_path=cfg.config_path,
-                prompt_queue_dir=cfg.prompt_queue_dir,
-            )
+        last_rc = 0
+        for _ in range(max_items):
+            work_item: Optional[QueuedWorkItem] = None
+            selected_prompt, _, work_item = _pick_prompt_from_queue(cfg)
+            if work_item is None:
+                # No queued work; optionally run the default prompt once.
+                if selected_prompt == cfg.prompt_path:
+                    break
 
-        state = _read_state(cfg.state_path)
-        thread_id = state.get("thread_id") if isinstance(state, dict) else None
-        if not isinstance(thread_id, str) or not thread_id.strip():
-            thread_id = None
+            if work_item is not None:
+                state_dir = Path(os.getenv("PITCHAI_STATE_DIR", str(cfg.volume_root)))
+                state_key = work_item.state_key or _state_key_for_config(work_item.config_path)
+                state_path = Path(os.getenv("PITCHAI_STATE_PATH", str(state_dir / f"state_{state_key}.json")))
 
-        rc = _spawn_codex(cfg, thread_id=thread_id)
-        _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
-        return rc
+                run_cfg = CodexRunConfig(
+                    volume_root=cfg.volume_root,
+                    codex_home=cfg.codex_home,
+                    workdir=work_item.workdir,
+                    state_path=state_path,
+                    prompt_path=work_item.prompt_path,
+                    config_path=work_item.config_path,
+                    prompt_queue_dir=cfg.prompt_queue_dir,
+                )
+                if work_item.model:
+                    os.environ["PITCHAI_CODEX_MODEL_OVERRIDE"] = work_item.model
+                else:
+                    os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
+            else:
+                run_cfg = CodexRunConfig(
+                    volume_root=cfg.volume_root,
+                    codex_home=cfg.codex_home,
+                    workdir=cfg.workdir,
+                    state_path=cfg.state_path,
+                    prompt_path=selected_prompt,
+                    config_path=cfg.config_path,
+                    prompt_queue_dir=cfg.prompt_queue_dir,
+                )
+                os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
+
+            state = _read_state(run_cfg.state_path)
+            thread_id = state.get("thread_id") if isinstance(state, dict) else None
+            if not isinstance(thread_id, str) or not thread_id.strip():
+                thread_id = None
+
+            rc = _spawn_codex(run_cfg, thread_id=thread_id)
+            last_rc = rc
+            _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
+            if rc != 0:
+                break
+
+        return int(last_rc)
     finally:
         _release_lock(lock_dir)
 
