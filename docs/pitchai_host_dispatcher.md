@@ -28,7 +28,9 @@ JSON body:
   "workdir_rel": "string (optional)",
   "model": "string (optional, e.g. gpt-5.2-medium or gpt-5.2-high)",
   "conversation_id": "string (optional UUID; resume this conversation)",
-  "fork": true
+  "fork": true,
+  "pre_commands": ["string shell command", "…"],
+  "post_commands": ["string shell command", "…"]
 }
 ```
 
@@ -145,4 +147,3 @@ Or build/run via Docker:
 ```bash
 docker build -t pitchai/codex-dispatcher:dev .
 ```
-

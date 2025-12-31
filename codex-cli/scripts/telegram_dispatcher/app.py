@@ -57,6 +57,8 @@ class DispatchRequest:
     model: Optional[str]
     conversation_id: Optional[str]
     fork: bool
+    pre_commands: list[str]
+    post_commands: list[str]
     job_name: Optional[str]
 
 
@@ -189,6 +191,8 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
     model = payload.get("model")
     conversation_id = payload.get("conversation_id")
     fork = payload.get("fork", False)
+    pre_commands = payload.get("pre_commands", [])
+    post_commands = payload.get("post_commands", [])
     job_name = payload.get("job_name")
 
     if state_key is not None and not isinstance(state_key, str):
@@ -201,6 +205,14 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         raise HTTPException(status_code=400, detail="conversation_id must be string")
     if fork is not None and not isinstance(fork, bool):
         raise HTTPException(status_code=400, detail="fork must be boolean")
+    if pre_commands is not None and not isinstance(pre_commands, list):
+        raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
+    if post_commands is not None and not isinstance(post_commands, list):
+        raise HTTPException(status_code=400, detail="post_commands must be list of strings")
+    if isinstance(pre_commands, list) and any((not isinstance(c, str)) for c in pre_commands):
+        raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
+    if isinstance(post_commands, list) and any((not isinstance(c, str)) for c in post_commands):
+        raise HTTPException(status_code=400, detail="post_commands must be list of strings")
     if job_name is not None and not isinstance(job_name, str):
         raise HTTPException(status_code=400, detail="job_name must be string")
 
@@ -214,6 +226,8 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         if isinstance(conversation_id, str) and conversation_id.strip()
         else None,
         fork=bool(fork) if isinstance(fork, bool) else False,
+        pre_commands=[c.strip() for c in pre_commands if isinstance(c, str) and c.strip()] if isinstance(pre_commands, list) else [],
+        post_commands=[c.strip() for c in post_commands if isinstance(c, str) and c.strip()] if isinstance(post_commands, list) else [],
         job_name=job_name.strip() if isinstance(job_name, str) and job_name.strip() else None,
     )
 
@@ -235,6 +249,8 @@ def _write_http_dispatch_bundle(settings: Settings, req: DispatchRequest) -> Pat
         "model": req.model,
         "conversation_id": req.conversation_id,
         "fork": req.fork,
+        "pre_commands": req.pre_commands,
+        "post_commands": req.post_commands,
     }
     (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return bundle

@@ -33,6 +33,8 @@ class QueuedWorkItem:
     model: Optional[str]
     conversation_id: Optional[str]
     fork: bool
+    pre_commands: list[str]
+    post_commands: list[str]
     queue_processing_path: Path
 
 
@@ -167,6 +169,24 @@ def _load_meta(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
 
+def _sanitize_commands(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        cmd = item.strip()
+        if not cmd:
+            continue
+        # prevent huge payloads / accidental blobs
+        if len(cmd) > 4000:
+            cmd = cmd[:4000]
+        out.append(cmd)
+        if len(out) >= 25:
+            break
+    return out
+
 
 def _resolve_workdir(cfg: CodexRunConfig, *, meta: dict[str, Any]) -> Path:
     workdir_rel = meta.get("workdir_rel")
@@ -218,6 +238,8 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
         model = meta.get("model")
         conversation_id = meta.get("conversation_id")
         fork = meta.get("fork", False)
+        pre_commands = _sanitize_commands(meta.get("pre_commands"))
+        post_commands = _sanitize_commands(meta.get("post_commands"))
         item = QueuedWorkItem(
             prompt_path=prompt_path,
             config_path=config_path,
@@ -228,6 +250,8 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             if isinstance(conversation_id, str) and conversation_id.strip()
             else None,
             fork=bool(fork) if isinstance(fork, bool) else False,
+            pre_commands=pre_commands,
+            post_commands=post_commands,
             queue_processing_path=processing_path,
         )
         print(f"[prompt] Using queued bundle: {processing_path}", file=sys.stderr)
@@ -253,6 +277,8 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             model=None,
             conversation_id=None,
             fork=False,
+            pre_commands=[],
+            post_commands=[],
             queue_processing_path=selected,
         )
         return (selected, selected, item)
@@ -377,6 +403,36 @@ def _spawn_codex(
 
     return int(rc)
 
+def _run_hook_commands(
+    commands: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+) -> int:
+    if not commands:
+        return 0
+    rc = 0
+    for i, cmd in enumerate(commands, start=1):
+        print(f"[hook {label}] ({i}/{len(commands)}) {cmd}", file=sys.stderr, flush=True)
+        try:
+            proc = subprocess.run(
+                ["sh", "-lc", cmd],
+                cwd=str(cwd),
+                env=env,
+                text=True,
+                stdout=sys.stderr,
+                stderr=sys.stderr,
+            )
+            rc = int(proc.returncode)
+        except Exception as exc:
+            print(f"[hook {label}] failed: {exc}", file=sys.stderr, flush=True)
+            return 1
+        if rc != 0:
+            print(f"[hook {label}] command failed rc={rc}", file=sys.stderr, flush=True)
+            return rc
+    return 0
+
 
 def main() -> int:
     cfg = _resolve_config()
@@ -435,6 +491,8 @@ def main() -> int:
 
             fork = False
             persist_thread_id = True
+            pre_commands: list[str] = []
+            post_commands: list[str] = []
             if work_item is not None and work_item.conversation_id:
                 resume_id = work_item.conversation_id
             if work_item is not None and work_item.fork:
@@ -442,10 +500,31 @@ def main() -> int:
                 # Preserve the original `conversation_id` for future "fork again"
                 # runs by not persisting the newly created fork session id.
                 persist_thread_id = False
+            if work_item is not None:
+                pre_commands = list(work_item.pre_commands or [])
+                post_commands = list(work_item.post_commands or [])
+
+            hook_env = dict(os.environ)
+            hook_env["PITCHAI_CODEX_PHASE"] = "pre"
+            hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
+
+            pre_rc = _run_hook_commands(pre_commands, cwd=run_cfg.workdir, env=hook_env, label="pre")
+            if pre_rc != 0:
+                last_rc = int(pre_rc)
+                _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
+                # Best effort: run post even if pre failed.
+                hook_env["PITCHAI_CODEX_PHASE"] = "post"
+                hook_env["PITCHAI_CODEX_LAST_RC"] = str(last_rc)
+                _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
+                break
 
             rc = _spawn_codex(run_cfg, resume_id=resume_id, fork=fork, persist_thread_id=persist_thread_id)
             last_rc = rc
             _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
+
+            hook_env["PITCHAI_CODEX_PHASE"] = "post"
+            hook_env["PITCHAI_CODEX_LAST_RC"] = str(rc)
+            _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
             if rc != 0:
                 break
 

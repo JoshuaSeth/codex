@@ -105,6 +105,8 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
     model = payload.get("model")
     conversation_id = payload.get("conversation_id")
     fork = payload.get("fork", False)
+    pre_commands = payload.get("pre_commands", [])
+    post_commands = payload.get("post_commands", [])
 
     if state_key is not None and not isinstance(state_key, str):
         raise HTTPException(status_code=400, detail="state_key must be string")
@@ -116,6 +118,14 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="conversation_id must be string")
     if fork is not None and not isinstance(fork, bool):
         raise HTTPException(status_code=400, detail="fork must be boolean")
+    if pre_commands is not None and not isinstance(pre_commands, list):
+        raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
+    if post_commands is not None and not isinstance(post_commands, list):
+        raise HTTPException(status_code=400, detail="post_commands must be list of strings")
+    if isinstance(pre_commands, list) and any((not isinstance(c, str)) for c in pre_commands):
+        raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
+    if isinstance(post_commands, list) and any((not isinstance(c, str)) for c in post_commands):
+        raise HTTPException(status_code=400, detail="post_commands must be list of strings")
 
     return {
         "prompt": prompt.strip(),
@@ -125,6 +135,12 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
         "model": model.strip() if isinstance(model, str) and model.strip() else None,
         "conversation_id": conversation_id.strip() if isinstance(conversation_id, str) and conversation_id.strip() else None,
         "fork": bool(fork) if isinstance(fork, bool) else False,
+        "pre_commands": [c.strip() for c in pre_commands if isinstance(c, str) and c.strip()]
+        if isinstance(pre_commands, list)
+        else [],
+        "post_commands": [c.strip() for c in post_commands if isinstance(c, str) and c.strip()]
+        if isinstance(post_commands, list)
+        else [],
     }
 
 
@@ -150,6 +166,8 @@ def _write_bundle(settings: Settings, req: dict[str, Any]) -> Path:
         "model": req.get("model"),
         "conversation_id": req.get("conversation_id"),
         "fork": bool(req.get("fork") or False),
+        "pre_commands": req.get("pre_commands") or [],
+        "post_commands": req.get("post_commands") or [],
     }
     (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return bundle
@@ -160,6 +178,12 @@ def _spawn_runner(settings: Settings, *, bundle_name: str) -> str:
     container_name = f"{settings.runner_name_prefix}-{_now_utc_compact()}-{uuid4().hex[:6]}"
 
     env = dict(settings.runner_env)
+
+    # Best-effort: ensure we run the latest runner image.
+    try:
+        client.images.pull(settings.runner_image)
+    except Exception:
+        pass
 
     # Mount the host queue dir and codex home/workdir volumes.
     # - Queue dir: /data/queue on host -> /mnt/elise/prompts/http in runner
