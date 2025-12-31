@@ -583,9 +583,10 @@ fn write_fallback_file(store: &FallbackFile) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o600);
         if let Err(err) = fs::set_permissions(&path, perms)
-            && err.kind() != std::io::ErrorKind::PermissionDenied {
-                return Err(err.into());
-            }
+            && err.kind() != std::io::ErrorKind::PermissionDenied
+        {
+            return Err(err.into());
+        }
     }
 
     Ok(())

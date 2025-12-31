@@ -55,6 +55,8 @@ class DispatchRequest:
     state_key: Optional[str]
     workdir_rel: Optional[str]
     model: Optional[str]
+    conversation_id: Optional[str]
+    fork: bool
     job_name: Optional[str]
 
 
@@ -185,6 +187,8 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
     state_key = payload.get("state_key")
     workdir_rel = payload.get("workdir_rel")
     model = payload.get("model")
+    conversation_id = payload.get("conversation_id")
+    fork = payload.get("fork", False)
     job_name = payload.get("job_name")
 
     if state_key is not None and not isinstance(state_key, str):
@@ -193,6 +197,10 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         raise HTTPException(status_code=400, detail="workdir_rel must be string")
     if model is not None and not isinstance(model, str):
         raise HTTPException(status_code=400, detail="model must be string")
+    if conversation_id is not None and not isinstance(conversation_id, str):
+        raise HTTPException(status_code=400, detail="conversation_id must be string")
+    if fork is not None and not isinstance(fork, bool):
+        raise HTTPException(status_code=400, detail="fork must be boolean")
     if job_name is not None and not isinstance(job_name, str):
         raise HTTPException(status_code=400, detail="job_name must be string")
 
@@ -202,6 +210,10 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         state_key=state_key.strip() if isinstance(state_key, str) and state_key.strip() else None,
         workdir_rel=workdir_rel.strip() if isinstance(workdir_rel, str) and workdir_rel.strip() else None,
         model=model.strip() if isinstance(model, str) and model.strip() else None,
+        conversation_id=conversation_id.strip()
+        if isinstance(conversation_id, str) and conversation_id.strip()
+        else None,
+        fork=bool(fork) if isinstance(fork, bool) else False,
         job_name=job_name.strip() if isinstance(job_name, str) and job_name.strip() else None,
     )
 
@@ -221,6 +233,8 @@ def _write_http_dispatch_bundle(settings: Settings, req: DispatchRequest) -> Pat
         "state_key": req.state_key,
         "workdir_rel": req.workdir_rel,
         "model": req.model,
+        "conversation_id": req.conversation_id,
+        "fork": req.fork,
     }
     (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return bundle

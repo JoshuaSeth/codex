@@ -1366,6 +1366,7 @@ dependencies = [
  "shlex",
  "supports-color 3.0.2",
  "tempfile",
+ "time",
  "tokio",
  "toml 0.9.5",
  "tracing",

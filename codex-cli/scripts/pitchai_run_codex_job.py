@@ -31,6 +31,8 @@ class QueuedWorkItem:
     workdir: Path
     state_key: Optional[str]
     model: Optional[str]
+    conversation_id: Optional[str]
+    fork: bool
     queue_processing_path: Path
 
 
@@ -214,12 +216,18 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
         workdir = _resolve_workdir(cfg, meta=meta)
         state_key = meta.get("state_key")
         model = meta.get("model")
+        conversation_id = meta.get("conversation_id")
+        fork = meta.get("fork", False)
         item = QueuedWorkItem(
             prompt_path=prompt_path,
             config_path=config_path,
             workdir=workdir,
             state_key=_sanitize_key(state_key) if isinstance(state_key, str) and state_key.strip() else None,
             model=str(model).strip() if isinstance(model, str) and model.strip() else None,
+            conversation_id=str(conversation_id).strip()
+            if isinstance(conversation_id, str) and conversation_id.strip()
+            else None,
+            fork=bool(fork) if isinstance(fork, bool) else False,
             queue_processing_path=processing_path,
         )
         print(f"[prompt] Using queued bundle: {processing_path}", file=sys.stderr)
@@ -243,6 +251,8 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             workdir=cfg.workdir,
             state_key=None,
             model=None,
+            conversation_id=None,
+            fork=False,
             queue_processing_path=selected,
         )
         return (selected, selected, item)
@@ -301,7 +311,13 @@ def _resolve_config() -> CodexRunConfig:
     )
 
 
-def _spawn_codex(cfg: CodexRunConfig, *, thread_id: Optional[str]) -> int:
+def _spawn_codex(
+    cfg: CodexRunConfig,
+    *,
+    resume_id: Optional[str],
+    fork: bool,
+    persist_thread_id: bool,
+) -> int:
     cfg.codex_home.mkdir(parents=True, exist_ok=True)
     cfg.workdir.mkdir(parents=True, exist_ok=True)
     _decode_auth_json(cfg.codex_home)
@@ -322,8 +338,10 @@ def _spawn_codex(cfg: CodexRunConfig, *, thread_id: Optional[str]) -> int:
         *model_args,
         *config_overrides,
     ]
-    if thread_id:
-        base_cmd.extend(["resume", thread_id])
+    if resume_id:
+        base_cmd.extend(["resume", resume_id])
+        if fork:
+            base_cmd.append("--fork")
 
     with cfg.prompt_path.open("rb") as prompt_fh:
         proc = subprocess.Popen(
@@ -351,7 +369,7 @@ def _spawn_codex(cfg: CodexRunConfig, *, thread_id: Optional[str]) -> int:
 
         rc = proc.wait()
 
-    if captured_thread_id:
+    if captured_thread_id and persist_thread_id:
         state = _read_state(cfg.state_path)
         if state.get("thread_id") != captured_thread_id:
             state["thread_id"] = captured_thread_id
@@ -411,11 +429,21 @@ def main() -> int:
                 os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
 
             state = _read_state(run_cfg.state_path)
-            thread_id = state.get("thread_id") if isinstance(state, dict) else None
-            if not isinstance(thread_id, str) or not thread_id.strip():
-                thread_id = None
+            resume_id = state.get("thread_id") if isinstance(state, dict) else None
+            if not isinstance(resume_id, str) or not resume_id.strip():
+                resume_id = None
 
-            rc = _spawn_codex(run_cfg, thread_id=thread_id)
+            fork = False
+            persist_thread_id = True
+            if work_item is not None and work_item.conversation_id:
+                resume_id = work_item.conversation_id
+            if work_item is not None and work_item.fork:
+                fork = True
+                # Preserve the original `conversation_id` for future "fork again"
+                # runs by not persisting the newly created fork session id.
+                persist_thread_id = False
+
+            rc = _spawn_codex(run_cfg, resume_id=resume_id, fork=fork, persist_thread_id=persist_thread_id)
             last_rc = rc
             _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
             if rc != 0:

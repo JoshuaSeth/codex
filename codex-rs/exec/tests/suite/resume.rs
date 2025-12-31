@@ -124,6 +124,77 @@ fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
 }
 
 #[test]
+fn exec_resume_fork_creates_new_file_and_preserves_original() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli_responses_fixture.sse");
+
+    // 1) First run: create a session with a unique marker in the content.
+    let marker = format!("resume-fork-{}", Uuid::new_v4());
+    let prompt = format!("echo {marker}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&prompt)
+        .assert()
+        .success();
+
+    // Find the created session file containing the marker.
+    let sessions_dir = test.home_path().join("sessions");
+    let original_path = find_session_file_containing_marker(&sessions_dir, &marker)
+        .expect("no session file found after first run");
+    let original_id = extract_conversation_id(&original_path);
+
+    // 2) Second run: fork + resume the original session id with a new marker.
+    let marker2 = format!("resume-fork-2-{}", Uuid::new_v4());
+    let prompt2 = format!("echo {marker2}");
+
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&prompt2)
+        .arg("resume")
+        .arg(&original_id)
+        .arg("--fork")
+        .assert()
+        .success();
+
+    // The forked session should be a different file, but contain both markers.
+    let forked_path = find_session_file_containing_marker(&sessions_dir, &marker2)
+        .expect("no forked session file containing marker2");
+    assert_ne!(
+        forked_path, original_path,
+        "resume --fork should create a new rollout file"
+    );
+
+    let forked_content = std::fs::read_to_string(&forked_path)?;
+    assert!(
+        forked_content.contains(&marker),
+        "forked session should preserve the original history"
+    );
+    assert!(
+        forked_content.contains(&marker2),
+        "forked session should contain the new appended content"
+    );
+
+    // The original file should NOT have marker2 appended.
+    let original_content = std::fs::read_to_string(&original_path)?;
+    assert!(
+        !original_content.contains(&marker2),
+        "original rollout should remain unchanged after --fork resume"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Result<()> {
     let test = test_codex_exec();
     let fixture =

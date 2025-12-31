@@ -198,9 +198,10 @@ mod tests {
             let mut perms = fs::metadata(path)?.permissions();
             perms.set_mode(0o755);
             if let Err(err) = fs::set_permissions(path, perms)
-                && err.kind() != std::io::ErrorKind::PermissionDenied {
-                    return Err(err.into());
-                }
+                && err.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                return Err(err.into());
+            }
             Ok(())
         }
 

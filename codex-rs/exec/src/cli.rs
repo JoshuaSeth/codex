@@ -114,6 +114,11 @@ pub struct ResumeArgs {
     #[arg(long = "last", default_value_t = false)]
     pub last: bool,
 
+    /// Fork the selected session into a new session id before resuming.
+    /// This preserves the original rollout file so it can be reused later.
+    #[arg(long = "fork", default_value_t = false)]
+    pub fork: bool,
+
     /// Replace the last tool call output before resuming (useful after pending flows).
     #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
     pub replace_last_tool_result: Option<String>,

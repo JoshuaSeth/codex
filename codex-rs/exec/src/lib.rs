@@ -47,9 +47,14 @@ use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 use supports_color::Stream;
+use time::OffsetDateTime;
+use time::format_description::FormatItem;
+use time::macros::format_description;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -657,7 +662,7 @@ async fn resolve_resume_path(
     config: &Config,
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<PathBuf>> {
-    if args.last {
+    let resolved = if args.last {
         let default_provider_filter = vec![config.model_provider_id.clone()];
         match codex_core::RolloutRecorder::list_conversations(
             &config.codex_home,
@@ -669,18 +674,79 @@ async fn resolve_resume_path(
         )
         .await
         {
-            Ok(page) => Ok(page.items.first().map(|it| it.path.clone())),
+            Ok(page) => page.items.first().map(|it| it.path.clone()),
             Err(e) => {
                 error!("Error listing conversations: {e}");
-                Ok(None)
+                None
             }
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
-        let path = find_conversation_path_by_id_str(&config.codex_home, id_str).await?;
-        Ok(path)
+        find_conversation_path_by_id_str(&config.codex_home, id_str).await?
     } else {
-        Ok(None)
+        None
+    };
+
+    if args.fork {
+        let Some(path) = resolved.as_ref() else {
+            return Ok(None);
+        };
+        return Ok(Some(fork_rollout_file(&config.codex_home, path).await?));
     }
+
+    Ok(resolved)
+}
+
+async fn fork_rollout_file(codex_home: &Path, source_path: &Path) -> anyhow::Result<PathBuf> {
+    let content = fs::read_to_string(source_path)
+        .await
+        .with_context(|| format!("failed to read {}", source_path.display()))?;
+    let mut lines = content.lines();
+    let first = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("rollout file missing session meta line"))?;
+    let mut first_json: Value = serde_json::from_str(first)
+        .with_context(|| format!("invalid session meta json in {}", source_path.display()))?;
+
+    let new_id = codex_protocol::ConversationId::default();
+
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+    let ts_str = now
+        .format(format)
+        .with_context(|| "failed to format fork timestamp")?;
+
+    let payload = first_json
+        .get_mut("payload")
+        .ok_or_else(|| anyhow::anyhow!("session meta line missing payload"))?;
+    payload["id"] = Value::String(new_id.to_string());
+    payload["timestamp"] = Value::String(ts_str.clone());
+    first_json["timestamp"] = Value::String(ts_str.clone());
+
+    let mut dir = codex_home.to_path_buf();
+    dir.push("sessions");
+    dir.push(format!("{:04}", now.year()));
+    dir.push(format!("{:02}", u8::from(now.month())));
+    dir.push(format!("{:02}", now.day()));
+    fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+
+    let filename = format!("rollout-{ts_str}-{new_id}.jsonl");
+    let dest_path = dir.join(filename);
+    let mut out = fs::File::create(&dest_path)
+        .await
+        .with_context(|| format!("failed to create {}", dest_path.display()))?;
+    out.write_all(serde_json::to_string(&first_json)?.as_bytes())
+        .await?;
+    out.write_all(b"\n").await?;
+
+    for line in lines {
+        out.write_all(line.as_bytes()).await?;
+        out.write_all(b"\n").await?;
+    }
+    out.flush().await?;
+    Ok(dest_path)
 }
 
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
