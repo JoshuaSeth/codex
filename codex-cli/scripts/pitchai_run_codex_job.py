@@ -61,9 +61,14 @@ def _write_state(path: Path, data: dict[str, Any]) -> None:
 
 
 def _decode_auth_json(config_home: Path) -> None:
-    b64 = _require_env("CODEX_AUTH_JSON_B64")
     config_home.mkdir(parents=True, exist_ok=True)
     auth_path = config_home / "auth.json"
+    b64 = os.getenv("CODEX_AUTH_JSON_B64", "").strip()
+    if not b64:
+        if auth_path.exists():
+            return
+        raise RuntimeError("Missing required environment variable: CODEX_AUTH_JSON_B64")
+
     auth_path.write_bytes(base64.b64decode(b64.encode("utf-8")))
     try:
         os.chmod(auth_path, 0o600)
