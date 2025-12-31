@@ -1,0 +1,5 @@
+data/
+_local_queue/
+_local_volume_root/
+.venv/
+.env
