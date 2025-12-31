@@ -104,7 +104,12 @@ COPY codex-cli/scripts/pitchai_elise_prompt.md /opt/pitchai/elise_prompt.md
 COPY codex-cli/scripts/pitchai_elise_graph_tool.py /opt/pitchai/elise_graph_tool.py
 COPY codex-cli/scripts/pitchai_run_elise_job.py /opt/pitchai/run_elise_job.py
 COPY docs/pitchai_elise_agent.md /opt/pitchai/elise_agent.md
-RUN chmod 755 /opt/pitchai/sharepoint_tool.py /opt/pitchai/elise_graph_tool.py /opt/pitchai/run_sharepoint_inbox_job.sh /opt/pitchai/run_elise_job.py /opt/pitchai/telegram_bot.py
+RUN chmod 755 \
+  /opt/pitchai/sharepoint_tool.py \
+  /opt/pitchai/elise_graph_tool.py \
+  /opt/pitchai/run_sharepoint_inbox_job.sh \
+  /opt/pitchai/run_elise_job.py \
+  /opt/pitchai/telegram_bot.py
 USER node
 
 # Inside the container we consider the environment already sufficiently locked
