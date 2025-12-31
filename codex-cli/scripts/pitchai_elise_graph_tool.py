@@ -283,6 +283,68 @@ class GraphMailClient:
         }
 
 
+def _normalize_email(addr: str) -> str:
+    return addr.strip().lower()
+
+
+def _boss_email() -> str:
+    # Default to Seth unless overridden in the container job env.
+    return _normalize_email(os.getenv("PITCHAI_BOSS_EMAIL", "seth.vanderbijl@pitchai.net"))
+
+
+def _recipient_set(
+    to_addrs: List[str],
+    cc_addrs: Optional[List[str]],
+    bcc_addrs: Optional[List[str]],
+) -> set[str]:
+    out: set[str] = {_normalize_email(a) for a in to_addrs if _normalize_email(a)}
+    if cc_addrs:
+        out.update({_normalize_email(a) for a in cc_addrs if _normalize_email(a)})
+    if bcc_addrs:
+        out.update({_normalize_email(a) for a in bcc_addrs if _normalize_email(a)})
+    return {a for a in out if a}
+
+
+def _enforce_boss_approval(
+    client: GraphMailClient,
+    *,
+    recipients: set[str],
+    approved_draft_filename: Optional[str],
+) -> None:
+    # Tool-side enforcement: never allow sending to anyone other than boss/sender
+    # without a real approval email present in the mailbox.
+    boss = _boss_email()
+    sender = _normalize_email(client.sender_upn)
+    allowlist = {boss, sender}
+
+    external = sorted([r for r in recipients if r not in allowlist])
+    if not external:
+        return
+
+    if not approved_draft_filename or not approved_draft_filename.strip():
+        raise RuntimeError(
+            "Refusing to send email to non-boss recipients without explicit approval. "
+            "Provide approved_draft_filename and ensure Seth sent an email with subject "
+            f"APPROVED: {approved_draft_filename}"
+        )
+
+    draft = approved_draft_filename.strip()
+    needle = f"APPROVED: {draft}"
+
+    approval = client.search_messages(
+        folder="Inbox",
+        top=25,
+        unread_only=False,
+        from_address=boss,
+        subject_contains=needle,
+    )
+    if not approval.get("count"):
+        raise RuntimeError(
+            "Refusing to send email: approval not found in Inbox. "
+            f"Expected an approval email from {boss} with subject containing: {needle}"
+        )
+
+
 def _op_mail_search() -> Dict[str, Any]:
     args = _load_tool_args()
     folder = str(args.get("folder") or "Inbox")
@@ -342,6 +404,7 @@ def _op_send_email() -> Dict[str, Any]:
     bcc = args.get("bcc")
     reply_to = args.get("reply_to")
     body_type = str(args.get("body_type") or "HTML")
+    approved_draft_filename = args.get("approved_draft_filename")
 
     if "save_to_sent" in args:
         save_to_sent = bool(args.get("save_to_sent"))
@@ -349,10 +412,25 @@ def _op_send_email() -> Dict[str, Any]:
         save_to_sent = True
 
     client = GraphMailClient()
+    cc_addrs = (
+        [str(x).strip() for x in cc if isinstance(cc, list) and isinstance(x, str) and x.strip()]
+        if isinstance(cc, list)
+        else None
+    )
+    bcc_addrs = (
+        [str(x).strip() for x in bcc if isinstance(bcc, list) and isinstance(x, str) and x.strip()]
+        if isinstance(bcc, list)
+        else None
+    )
+    _enforce_boss_approval(
+        client,
+        recipients=_recipient_set(to_addrs, cc_addrs, bcc_addrs),
+        approved_draft_filename=approved_draft_filename if isinstance(approved_draft_filename, str) else None,
+    )
     return client.send_email(
         to=to_addrs,
-        cc=[str(x).strip() for x in cc if isinstance(cc, list) and isinstance(x, str) and x.strip()] if isinstance(cc, list) else None,
-        bcc=[str(x).strip() for x in bcc if isinstance(bcc, list) and isinstance(x, str) and x.strip()] if isinstance(bcc, list) else None,
+        cc=cc_addrs,
+        bcc=bcc_addrs,
         reply_to=[str(x).strip() for x in reply_to if isinstance(reply_to, list) and isinstance(x, str) and x.strip()]
         if isinstance(reply_to, list)
         else None,
@@ -392,4 +470,3 @@ def main(argv: List[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

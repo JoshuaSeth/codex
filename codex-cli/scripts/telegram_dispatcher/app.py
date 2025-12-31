@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -40,6 +41,21 @@ class Settings:
     aca_api_version: str
 
     local_dispatch_command: Optional[str]
+
+    dispatch_api_token: Optional[str]
+    http_queue_dir: Path
+    http_default_job_name: Optional[str]
+    http_allowed_job_names: set[str]
+
+
+@dataclass(frozen=True)
+class DispatchRequest:
+    prompt: str
+    config_toml: str
+    state_key: Optional[str]
+    workdir_rel: Optional[str]
+    model: Optional[str]
+    job_name: Optional[str]
 
 
 def _require_env(name: str) -> str:
@@ -72,6 +88,7 @@ def _sanitize_filename(value: str) -> str:
 
 def load_settings() -> Settings:
     prompt_queue_dir = Path(os.getenv("PITCHAI_PROMPT_QUEUE_DIR", "/mnt/elise/prompts/telegram"))
+    http_queue_dir = Path(os.getenv("PITCHAI_HTTP_QUEUE_DIR", "/mnt/elise/prompts/http"))
 
     wrapper = os.getenv(
         "PITCHAI_PROMPT_WRAPPER",
@@ -92,6 +109,9 @@ def load_settings() -> Settings:
     if dispatch_mode not in ("azure", "local", "noop"):
         raise RuntimeError("PITCHAI_DISPATCH_MODE must be one of: azure, local, noop")
 
+    allowed_jobs_raw = os.getenv("PITCHAI_HTTP_ALLOWED_JOB_NAMES", "").strip()
+    allowed_jobs = {j.strip() for j in allowed_jobs_raw.split(",") if j.strip()} if allowed_jobs_raw else set()
+
     return Settings(
         telegram_bot_token=_require_env("TELEGRAM_BOT_TOKEN"),
         telegram_webhook_secret=_require_env("TELEGRAM_WEBHOOK_SECRET"),
@@ -106,6 +126,10 @@ def load_settings() -> Settings:
         aca_job_name=_optional_env("ACA_JOB_NAME"),
         aca_api_version=os.getenv("ACA_API_VERSION", "2025-01-01").strip() or "2025-01-01",
         local_dispatch_command=_optional_env("PITCHAI_LOCAL_DISPATCH_COMMAND"),
+        dispatch_api_token=_optional_env("PITCHAI_DISPATCH_API_TOKEN"),
+        http_queue_dir=http_queue_dir,
+        http_default_job_name=_optional_env("PITCHAI_HTTP_DEFAULT_JOB_NAME"),
+        http_allowed_job_names=allowed_jobs,
     )
 
 
@@ -145,6 +169,77 @@ def _write_prompt_file(
     except FileExistsError:
         return (path, False)
     return (path, True)
+
+
+def _parse_dispatch_request(payload: Any) -> DispatchRequest:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid json body")
+
+    prompt = payload.get("prompt")
+    config_toml = payload.get("config_toml")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="missing prompt")
+    if not isinstance(config_toml, str) or not config_toml.strip():
+        raise HTTPException(status_code=400, detail="missing config_toml")
+
+    state_key = payload.get("state_key")
+    workdir_rel = payload.get("workdir_rel")
+    model = payload.get("model")
+    job_name = payload.get("job_name")
+
+    if state_key is not None and not isinstance(state_key, str):
+        raise HTTPException(status_code=400, detail="state_key must be string")
+    if workdir_rel is not None and not isinstance(workdir_rel, str):
+        raise HTTPException(status_code=400, detail="workdir_rel must be string")
+    if model is not None and not isinstance(model, str):
+        raise HTTPException(status_code=400, detail="model must be string")
+    if job_name is not None and not isinstance(job_name, str):
+        raise HTTPException(status_code=400, detail="job_name must be string")
+
+    return DispatchRequest(
+        prompt=prompt.strip(),
+        config_toml=config_toml.strip(),
+        state_key=state_key.strip() if isinstance(state_key, str) and state_key.strip() else None,
+        workdir_rel=workdir_rel.strip() if isinstance(workdir_rel, str) and workdir_rel.strip() else None,
+        model=model.strip() if isinstance(model, str) and model.strip() else None,
+        job_name=job_name.strip() if isinstance(job_name, str) and job_name.strip() else None,
+    )
+
+
+def _write_http_dispatch_bundle(settings: Settings, req: DispatchRequest) -> Path:
+    settings.http_queue_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = _now_utc_compact()
+    rid = uuid4().hex[:12]
+    bundle = settings.http_queue_dir / f"{ts}_{rid}"
+    bundle.mkdir(parents=False, exist_ok=False)
+
+    (bundle / "prompt.md").write_text(req.prompt.rstrip() + "\n", encoding="utf-8")
+    (bundle / "config.toml").write_text(req.config_toml.rstrip() + "\n", encoding="utf-8")
+    meta = {
+        "ts_utc": _now_utc(),
+        "state_key": req.state_key,
+        "workdir_rel": req.workdir_rel,
+        "model": req.model,
+    }
+    (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return bundle
+
+
+def _aca_start_job_named(settings: Settings, job_name: str) -> str:
+    assert settings.aca_subscription_id and settings.aca_resource_group
+    url = (
+        "https://management.azure.com/subscriptions/"
+        f"{settings.aca_subscription_id}/resourceGroups/{settings.aca_resource_group}"
+        f"/providers/Microsoft.App/jobs/{job_name}/start"
+        f"?api-version={settings.aca_api_version}"
+    )
+    token = _aca_token()
+    resp = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    name = data.get("name")
+    return str(name) if isinstance(name, str) else "unknown"
 
 
 def _aca_token() -> str:
@@ -208,6 +303,60 @@ SETTINGS = load_settings()
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz() -> str:
     return "ok"
+
+
+@app.post("/dispatch", response_class=PlainTextResponse)
+async def dispatch(
+    request: Request,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> str:
+    expected = SETTINGS.dispatch_api_token
+    if expected:
+        got = (x_pitchai_dispatch_token or "").strip()
+        if got != expected:
+            raise HTTPException(status_code=401, detail="invalid dispatch token")
+    else:
+        raise HTTPException(status_code=500, detail="dispatch not configured")
+
+    try:
+        payload = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
+
+    req = _parse_dispatch_request(payload)
+    bundle = _write_http_dispatch_bundle(SETTINGS, req)
+
+    if SETTINGS.dispatch_mode == "noop":
+        return "queued"
+    if SETTINGS.dispatch_mode == "local":
+        _local_dispatch(SETTINGS)
+        return "queued"
+
+    if not (SETTINGS.aca_subscription_id and SETTINGS.aca_resource_group):
+        raise HTTPException(status_code=500, detail="ACA_* env vars not configured")
+
+    job_name = req.job_name or SETTINGS.http_default_job_name or SETTINGS.aca_job_name
+    if not job_name:
+        raise HTTPException(status_code=500, detail="no job configured to start")
+
+    if SETTINGS.http_allowed_job_names and job_name not in SETTINGS.http_allowed_job_names:
+        raise HTTPException(status_code=403, detail="job_name not allowed")
+
+    # Best-effort: avoid duplicate running executions if we can.
+    try:
+        SETTINGS_JOB = Settings(**{**SETTINGS.__dict__, "aca_job_name": job_name})  # type: ignore[arg-type]
+        if _aca_has_running_execution(SETTINGS_JOB):
+            return f"queued:{bundle.name}"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dispatch] failed checking running executions: {exc}", file=sys.stderr, flush=True)
+        return f"queued:{bundle.name}"
+
+    try:
+        _aca_start_job_named(SETTINGS, job_name)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"failed to start job: {exc}") from exc
+
+    return f"queued:{bundle.name}"
 
 
 @app.post("/telegram/webhook", response_class=PlainTextResponse)

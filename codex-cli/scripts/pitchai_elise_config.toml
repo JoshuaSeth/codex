@@ -57,7 +57,7 @@ timeout_ms = 120000
 [custom_tools.send_email]
 command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "send_email"]
 description = "Send an email (Graph app-only). Use only after boss approval for external recipients."
-parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" } } }
+parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" }, approved_draft_filename = { type = "string" } } }
 timeout_ms = 120000
 
 [custom_tools.seth_mail_search]
