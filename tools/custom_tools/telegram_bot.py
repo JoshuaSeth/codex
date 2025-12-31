@@ -447,7 +447,7 @@ def _append_debug_log(payload: dict[str, Any], message: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(
-                    f"{datetime.now(timezone.utc).isoformat()} | convo={payload.get('conversation_id')} | cwd={payload.get('cwd')}\n"
+                f"{datetime.now(timezone.utc).isoformat()} | convo={payload.get('conversation_id')} | cwd={payload.get('cwd')}\n"
             )
             fh.write(message + "\n\n")
     except Exception as exc:  # noqa: BLE001
