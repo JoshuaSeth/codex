@@ -59,6 +59,10 @@ class DispatchRequest:
     fork: bool
     pre_commands: list[str]
     post_commands: list[str]
+    git_repo: Optional[str]
+    git_branch: Optional[str]
+    git_base: Optional[str]
+    git_clone_dir_rel: Optional[str]
     job_name: Optional[str]
 
 
@@ -193,6 +197,10 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
     fork = payload.get("fork", False)
     pre_commands = payload.get("pre_commands", [])
     post_commands = payload.get("post_commands", [])
+    git_repo = payload.get("git_repo")
+    git_branch = payload.get("git_branch")
+    git_base = payload.get("git_base")
+    git_clone_dir_rel = payload.get("git_clone_dir_rel")
     job_name = payload.get("job_name")
 
     if state_key is not None and not isinstance(state_key, str):
@@ -213,6 +221,14 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
     if isinstance(post_commands, list) and any((not isinstance(c, str)) for c in post_commands):
         raise HTTPException(status_code=400, detail="post_commands must be list of strings")
+    if git_repo is not None and not isinstance(git_repo, str):
+        raise HTTPException(status_code=400, detail="git_repo must be string")
+    if git_branch is not None and not isinstance(git_branch, str):
+        raise HTTPException(status_code=400, detail="git_branch must be string")
+    if git_base is not None and not isinstance(git_base, str):
+        raise HTTPException(status_code=400, detail="git_base must be string")
+    if git_clone_dir_rel is not None and not isinstance(git_clone_dir_rel, str):
+        raise HTTPException(status_code=400, detail="git_clone_dir_rel must be string")
     if job_name is not None and not isinstance(job_name, str):
         raise HTTPException(status_code=400, detail="job_name must be string")
 
@@ -228,6 +244,12 @@ def _parse_dispatch_request(payload: Any) -> DispatchRequest:
         fork=bool(fork) if isinstance(fork, bool) else False,
         pre_commands=[c.strip() for c in pre_commands if isinstance(c, str) and c.strip()] if isinstance(pre_commands, list) else [],
         post_commands=[c.strip() for c in post_commands if isinstance(c, str) and c.strip()] if isinstance(post_commands, list) else [],
+        git_repo=git_repo.strip() if isinstance(git_repo, str) and git_repo.strip() else None,
+        git_branch=git_branch.strip() if isinstance(git_branch, str) and git_branch.strip() else None,
+        git_base=git_base.strip() if isinstance(git_base, str) and git_base.strip() else None,
+        git_clone_dir_rel=git_clone_dir_rel.strip()
+        if isinstance(git_clone_dir_rel, str) and git_clone_dir_rel.strip()
+        else None,
         job_name=job_name.strip() if isinstance(job_name, str) and job_name.strip() else None,
     )
 
@@ -251,6 +273,10 @@ def _write_http_dispatch_bundle(settings: Settings, req: DispatchRequest) -> Pat
         "fork": req.fork,
         "pre_commands": req.pre_commands,
         "post_commands": req.post_commands,
+        "git_repo": req.git_repo,
+        "git_branch": req.git_branch,
+        "git_base": req.git_base,
+        "git_clone_dir_rel": req.git_clone_dir_rel,
     }
     (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return bundle

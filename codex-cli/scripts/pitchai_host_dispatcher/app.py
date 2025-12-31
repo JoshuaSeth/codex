@@ -107,6 +107,10 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
     fork = payload.get("fork", False)
     pre_commands = payload.get("pre_commands", [])
     post_commands = payload.get("post_commands", [])
+    git_repo = payload.get("git_repo")
+    git_branch = payload.get("git_branch")
+    git_base = payload.get("git_base")
+    git_clone_dir_rel = payload.get("git_clone_dir_rel")
 
     if state_key is not None and not isinstance(state_key, str):
         raise HTTPException(status_code=400, detail="state_key must be string")
@@ -126,6 +130,14 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="pre_commands must be list of strings")
     if isinstance(post_commands, list) and any((not isinstance(c, str)) for c in post_commands):
         raise HTTPException(status_code=400, detail="post_commands must be list of strings")
+    if git_repo is not None and not isinstance(git_repo, str):
+        raise HTTPException(status_code=400, detail="git_repo must be string")
+    if git_branch is not None and not isinstance(git_branch, str):
+        raise HTTPException(status_code=400, detail="git_branch must be string")
+    if git_base is not None and not isinstance(git_base, str):
+        raise HTTPException(status_code=400, detail="git_base must be string")
+    if git_clone_dir_rel is not None and not isinstance(git_clone_dir_rel, str):
+        raise HTTPException(status_code=400, detail="git_clone_dir_rel must be string")
 
     return {
         "prompt": prompt.strip(),
@@ -141,6 +153,12 @@ def _parse_dispatch_request(payload: Any) -> dict[str, Any]:
         "post_commands": [c.strip() for c in post_commands if isinstance(c, str) and c.strip()]
         if isinstance(post_commands, list)
         else [],
+        "git_repo": git_repo.strip() if isinstance(git_repo, str) and git_repo.strip() else None,
+        "git_branch": git_branch.strip() if isinstance(git_branch, str) and git_branch.strip() else None,
+        "git_base": git_base.strip() if isinstance(git_base, str) and git_base.strip() else None,
+        "git_clone_dir_rel": git_clone_dir_rel.strip()
+        if isinstance(git_clone_dir_rel, str) and git_clone_dir_rel.strip()
+        else None,
     }
 
 
@@ -168,6 +186,10 @@ def _write_bundle(settings: Settings, req: dict[str, Any]) -> Path:
         "fork": bool(req.get("fork") or False),
         "pre_commands": req.get("pre_commands") or [],
         "post_commands": req.get("post_commands") or [],
+        "git_repo": req.get("git_repo"),
+        "git_branch": req.get("git_branch"),
+        "git_base": req.get("git_base"),
+        "git_clone_dir_rel": req.get("git_clone_dir_rel"),
     }
     (bundle / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return bundle

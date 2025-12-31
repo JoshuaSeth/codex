@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -35,6 +36,10 @@ class QueuedWorkItem:
     fork: bool
     pre_commands: list[str]
     post_commands: list[str]
+    git_repo: Optional[str]
+    git_branch: Optional[str]
+    git_base: Optional[str]
+    git_clone_dir_rel: Optional[str]
     queue_processing_path: Path
 
 
@@ -240,6 +245,10 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
         fork = meta.get("fork", False)
         pre_commands = _sanitize_commands(meta.get("pre_commands"))
         post_commands = _sanitize_commands(meta.get("post_commands"))
+        git_repo = meta.get("git_repo")
+        git_branch = meta.get("git_branch")
+        git_base = meta.get("git_base")
+        git_clone_dir_rel = meta.get("git_clone_dir_rel")
         item = QueuedWorkItem(
             prompt_path=prompt_path,
             config_path=config_path,
@@ -252,6 +261,12 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             fork=bool(fork) if isinstance(fork, bool) else False,
             pre_commands=pre_commands,
             post_commands=post_commands,
+            git_repo=str(git_repo).strip() if isinstance(git_repo, str) and git_repo.strip() else None,
+            git_branch=str(git_branch).strip() if isinstance(git_branch, str) and git_branch.strip() else None,
+            git_base=str(git_base).strip() if isinstance(git_base, str) and git_base.strip() else None,
+            git_clone_dir_rel=str(git_clone_dir_rel).strip()
+            if isinstance(git_clone_dir_rel, str) and git_clone_dir_rel.strip()
+            else None,
             queue_processing_path=processing_path,
         )
         print(f"[prompt] Using queued bundle: {processing_path}", file=sys.stderr)
@@ -279,6 +294,10 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             fork=False,
             pre_commands=[],
             post_commands=[],
+            git_repo=None,
+            git_branch=None,
+            git_base=None,
+            git_clone_dir_rel=None,
             queue_processing_path=selected,
         )
         return (selected, selected, item)
@@ -434,6 +453,100 @@ def _run_hook_commands(
     return 0
 
 
+def _sanitize_relpath(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    rel = Path(s)
+    if rel.is_absolute() or ".." in rel.parts:
+        return None
+    return rel
+
+
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+) -> None:
+    print(f"[git {label}] {' '.join(args)}", file=sys.stderr, flush=True)
+    subprocess.run(args, cwd=str(cwd), env=env, check=True, stdout=sys.stderr, stderr=sys.stderr, text=True)
+
+
+def _prepare_git_repo(
+    workdir: Path,
+    *,
+    repo_url: str,
+    branch: str,
+    base: str,
+    clone_dir_rel: Optional[str],
+) -> Path:
+    """
+    Clone/fetch `repo_url` into a subdir of `workdir`, then create/force-reset
+    local branch `branch` from `origin/<base>`.
+
+    Credentials:
+    - If `PITCHAI_GIT_TOKEN` is set, use GIT_ASKPASS so the token is never placed
+      into the command line arguments.
+    """
+    clone_rel = _sanitize_relpath(clone_dir_rel) or Path("repo")
+    repo_dir = workdir / clone_rel
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    token = (os.getenv("PITCHAI_GIT_TOKEN") or "").strip()
+    askpass_path = workdir / ".git-askpass.sh"
+    if token:
+        askpass_path.write_text(
+            "#!/usr/bin/env sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) echo \"x-access-token\" ;;\n"
+            "  *Password*) echo \"$PITCHAI_GIT_TOKEN\" ;;\n"
+            "  *) echo \"\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        askpass_path.chmod(0o700)
+        env["GIT_ASKPASS"] = str(askpass_path)
+        env["PITCHAI_GIT_TOKEN"] = token
+
+    if not (repo_dir / ".git").exists():
+        if repo_dir.exists():
+            # Clean non-git directory.
+            _safe_remove_dir(repo_dir)
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(["git", "clone", "--no-tags", repo_url, str(repo_dir)], cwd=repo_dir.parent, env=env, label="clone")
+    else:
+        # Verify origin matches, otherwise reclone.
+        try:
+            out = subprocess.check_output(["git", "remote", "get-url", "origin"], cwd=str(repo_dir), env=env, text=True)
+            origin = out.strip()
+        except Exception:
+            origin = ""
+        if origin and origin != repo_url:
+            print(f"[git] origin mismatch; recloning into {repo_dir}", file=sys.stderr, flush=True)
+            _safe_remove_dir(repo_dir)
+            _run_git(["git", "clone", "--no-tags", repo_url, str(repo_dir)], cwd=repo_dir.parent, env=env, label="reclone")
+        else:
+            _run_git(["git", "fetch", "--prune", "origin"], cwd=repo_dir, env=env, label="fetch")
+
+    # Determine base ref.
+    base_ref = f"origin/{base}"
+    try:
+        subprocess.run(["git", "rev-parse", "--verify", base_ref], cwd=str(repo_dir), env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        base_ref = "origin/main"
+
+    # Reset local branch from base.
+    _run_git(["git", "checkout", "-B", branch, base_ref], cwd=repo_dir, env=env, label="checkout")
+    return repo_dir
+
+
 def main() -> int:
     cfg = _resolve_config()
     key = _state_key_for_config(cfg.config_path)
@@ -459,10 +572,19 @@ def main() -> int:
                 state_key = work_item.state_key or _state_key_for_config(work_item.config_path)
                 state_path = Path(os.getenv("PITCHAI_STATE_PATH", str(state_dir / f"state_{state_key}.json")))
 
+                # Default per-item workdir: isolate runs by queue bundle name.
+                if work_item.workdir == cfg.workdir:
+                    bundle_name = work_item.queue_processing_path.name
+                    run_root = cfg.volume_root / "workdir" / _sanitize_key(state_key) / _sanitize_key(bundle_name)
+                    run_root.mkdir(parents=True, exist_ok=True)
+                    workdir = run_root
+                else:
+                    workdir = work_item.workdir
+
                 run_cfg = CodexRunConfig(
                     volume_root=cfg.volume_root,
                     codex_home=cfg.codex_home,
-                    workdir=work_item.workdir,
+                    workdir=workdir,
                     state_path=state_path,
                     prompt_path=work_item.prompt_path,
                     config_path=work_item.config_path,
@@ -493,6 +615,10 @@ def main() -> int:
             persist_thread_id = True
             pre_commands: list[str] = []
             post_commands: list[str] = []
+            git_repo: Optional[str] = None
+            git_branch: Optional[str] = None
+            git_base: Optional[str] = None
+            git_clone_dir_rel: Optional[str] = None
             if work_item is not None and work_item.conversation_id:
                 resume_id = work_item.conversation_id
             if work_item is not None and work_item.fork:
@@ -503,10 +629,35 @@ def main() -> int:
             if work_item is not None:
                 pre_commands = list(work_item.pre_commands or [])
                 post_commands = list(work_item.post_commands or [])
+                git_repo = work_item.git_repo
+                git_branch = work_item.git_branch
+                git_base = work_item.git_base
+                git_clone_dir_rel = work_item.git_clone_dir_rel
 
             hook_env = dict(os.environ)
             hook_env["PITCHAI_CODEX_PHASE"] = "pre"
             hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
+
+            # Optional: clone repo + create branch before running Codex/prompt.
+            if git_repo and git_branch:
+                base = git_base or "main"
+                repo_dir = _prepare_git_repo(
+                    run_cfg.workdir,
+                    repo_url=git_repo,
+                    branch=git_branch,
+                    base=base,
+                    clone_dir_rel=git_clone_dir_rel,
+                )
+                run_cfg = CodexRunConfig(
+                    volume_root=run_cfg.volume_root,
+                    codex_home=run_cfg.codex_home,
+                    workdir=repo_dir,
+                    state_path=run_cfg.state_path,
+                    prompt_path=run_cfg.prompt_path,
+                    config_path=run_cfg.config_path,
+                    prompt_queue_dir=run_cfg.prompt_queue_dir,
+                )
+                hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
 
             pre_rc = _run_hook_commands(pre_commands, cwd=run_cfg.workdir, env=hook_env, label="pre")
             if pre_rc != 0:

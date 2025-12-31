@@ -30,7 +30,12 @@ JSON body:
   "conversation_id": "string (optional UUID; resume this conversation)",
   "fork": true,
   "pre_commands": ["string shell command", "…"],
-  "post_commands": ["string shell command", "…"]
+  "post_commands": ["string shell command", "…"],
+
+  "git_repo": "https://github.com/org/repo.git",
+  "git_branch": "pitchai-work-<id>",
+  "git_base": "main",
+  "git_clone_dir_rel": "repo"
 }
 ```
 
@@ -58,6 +63,19 @@ Key behaviors:
   - `state_key` to isolate state per workflow
   - `conversation_id` to resume a specific session id
   - `fork=true` to call `codex exec resume <id> --fork` (preserves original rollout)
+  - `git_repo` + `git_branch` (+ optional `git_base`) to clone + branch before running Codex
+  - `pre_commands` and `post_commands` to run arbitrary shell commands in the final working directory
+
+### Git clone + branch
+
+If `git_repo` and `git_branch` are set, the runner will:
+- Clone the repo into `<workdir>/<git_clone_dir_rel>` (default `repo`)
+- Create/reset local branch `git_branch` from `origin/<git_base>` (default `main`)
+- Run Codex + hooks inside the cloned repo directory
+
+Credentials:
+- For private HTTPS repos, set `PITCHAI_GIT_TOKEN` in runner env.
+- The token is used via `GIT_ASKPASS` (not embedded in the git command line).
 
 ## `--fork` semantics
 
