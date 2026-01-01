@@ -51,6 +51,29 @@ Notes:
 ### `GET /ui`
 - Simple HTML view of queued/processed/failed bundles + recent runs.
 
+## Polling / live status API
+
+All endpoints below require the same header as `/dispatch`:
+- `X-PitchAI-Dispatch-Token: <token>`
+
+### `GET /runs`
+- Returns recent run records (JSON).
+
+### `GET /runs/<bundle>/record`
+- Returns the stored run record for that bundle.
+
+### `GET /runs/<bundle>/log?offset=0&max_bytes=20000`
+- Offset-based tail of the growing runner log at `data/runs/<bundle>.log`.
+- Response includes:
+  - `offset`, `next_offset`, `size`, `eof`, `content`
+
+### `GET /runs/<bundle>/events?offset=0&max_bytes=20000`
+- Same as `/log`, but also includes `events` parsed from JSON lines in the log (Codex JSONL events).
+
+### `GET /runs/<bundle>/rollout?offset=0&max_bytes=20000`
+- Offset-based tail of the Codex rollout JSONL (once the run has emitted `thread.started`).
+- Response includes `thread_id` and `rollout_path`.
+
 ## Codex runner behavior
 
 The runner is `registry.pitchai.net:5000/pitchai/codex-runner:latest` and runs:

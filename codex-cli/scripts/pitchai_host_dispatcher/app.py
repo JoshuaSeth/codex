@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import docker
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 
@@ -20,6 +21,7 @@ class Settings:
     dispatch_token: str
     queue_dir: Path
     runs_dir: Path
+    data_root: Path
     docker_host_volume_root_dir: Path
     runner_image: str
     runner_max_items_per_run: int
@@ -52,6 +54,7 @@ def _sanitize_filename(value: str) -> str:
 def _load_settings() -> Settings:
     queue_dir = Path(os.getenv("PITCHAI_HOST_QUEUE_DIR", "/data/queue"))
     runs_dir = Path(os.getenv("PITCHAI_HOST_RUNS_DIR", "/data/runs"))
+    data_root = runs_dir.parent
 
     docker_host_volume_root_dir = Path(_require_env("PITCHAI_DOCKER_HOST_VOLUME_ROOT_DIR"))
 
@@ -81,6 +84,7 @@ def _load_settings() -> Settings:
         dispatch_token=_require_env("PITCHAI_DISPATCH_TOKEN"),
         queue_dir=queue_dir,
         runs_dir=runs_dir,
+        data_root=data_root,
         docker_host_volume_root_dir=docker_host_volume_root_dir,
         runner_image=runner_image,
         runner_max_items_per_run=runner_max_items_per_run,
@@ -290,6 +294,114 @@ def _list_runs(runs_dir: Path) -> list[dict[str, Any]]:
 SETTINGS = _load_settings()
 app = FastAPI()
 
+def _auth_or_401(x_pitchai_dispatch_token: Optional[str]) -> None:
+    got = (x_pitchai_dispatch_token or "").strip()
+    if got != SETTINGS.dispatch_token:
+        raise HTTPException(status_code=401, detail="invalid dispatch token")
+
+
+def _read_tail(path: Path, *, offset: int, max_bytes: int) -> dict[str, Any]:
+    if offset < 0:
+        offset = 0
+    max_bytes = max(1, min(int(max_bytes), 200_000))
+
+    if not path.exists():
+        return {"exists": False, "offset": offset, "next_offset": offset, "size": 0, "eof": True, "content": ""}
+
+    data = path.read_bytes()
+    size = len(data)
+    if offset > size:
+        offset = size
+    chunk = data[offset : offset + max_bytes]
+    next_offset = offset + len(chunk)
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        text = ""
+    return {
+        "exists": True,
+        "offset": offset,
+        "next_offset": next_offset,
+        "size": size,
+        "eof": next_offset >= size,
+        "content": text,
+    }
+
+
+def _run_record_path(bundle: str) -> Path:
+    safe = _sanitize_filename(bundle)
+    return SETTINGS.runs_dir / f"{safe}.json"
+
+
+def _run_log_path(bundle: str) -> Path:
+    safe = _sanitize_filename(bundle)
+    return SETTINGS.runs_dir / f"{safe}.log"
+
+
+def _extract_thread_id_from_log_text(text: str) -> Optional[str]:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(evt, dict) and evt.get("type") == "thread.started":
+            tid = evt.get("thread_id")
+            if isinstance(tid, str) and tid.strip():
+                return tid.strip()
+    return None
+
+
+def _load_run_record(bundle: str) -> dict[str, Any]:
+    record_path = _run_record_path(bundle)
+    if not record_path.exists():
+        raise HTTPException(status_code=404, detail="unknown bundle")
+    try:
+        data = json.loads(record_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("record must be dict")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"invalid record: {exc}") from exc
+    return data
+
+
+def _get_thread_id_for_bundle(bundle: str) -> Optional[str]:
+    record = _load_run_record(bundle)
+    tid = record.get("thread_id")
+    if isinstance(tid, str) and tid.strip():
+        return tid.strip()
+
+    # Best-effort: parse from log tail if available and persist back to record.
+    log_path = _run_log_path(bundle)
+    if not log_path.exists():
+        return None
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    tid2 = _extract_thread_id_from_log_text(text)
+    if not tid2:
+        return None
+    try:
+        record["thread_id"] = tid2
+        record_path = _run_record_path(bundle)
+        record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return tid2
+
+
+def _find_rollout_for_thread_id(thread_id: str) -> Optional[Path]:
+    # Read from the dispatcher container's mounted data volume (e.g. /data).
+    sessions_dir = SETTINGS.data_root / "codex_home" / "sessions"
+    if not sessions_dir.exists():
+        return None
+    # Filename convention includes the conversation id at the end.
+    matches = list(sessions_dir.rglob(f"*{thread_id}.jsonl"))
+    if not matches:
+        return None
+    # Prefer newest by mtime.
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
 
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz() -> str:
@@ -308,9 +420,75 @@ def ui() -> str:
     return (
         "<html><head><title>PitchAI Codex Dispatcher</title></head><body>"
         "<h2>PitchAI Codex Dispatcher</h2>"
+        "<p>Polling API: <code>GET /runs</code>, <code>GET /runs/&lt;bundle&gt;/log</code>, <code>GET /runs/&lt;bundle&gt;/rollout</code></p>"
         + "".join(rows)
         + "</body></html>"
     )
+
+@app.get("/runs", response_class=JSONResponse)
+def list_runs(x_pitchai_dispatch_token: Optional[str] = Header(default=None)) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    return _list_runs(SETTINGS.runs_dir)
+
+
+@app.get("/runs/{bundle}/record", response_class=JSONResponse)
+def run_record(bundle: str, x_pitchai_dispatch_token: Optional[str] = Header(default=None)) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    return _load_run_record(bundle)
+
+
+@app.get("/runs/{bundle}/log", response_class=JSONResponse)
+def run_log(
+    bundle: str,
+    offset: int = 0,
+    max_bytes: int = 20000,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    return _read_tail(_run_log_path(bundle), offset=offset, max_bytes=max_bytes)
+
+
+@app.get("/runs/{bundle}/events", response_class=JSONResponse)
+def run_events(
+    bundle: str,
+    offset: int = 0,
+    max_bytes: int = 20000,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    tail = _read_tail(_run_log_path(bundle), offset=offset, max_bytes=max_bytes)
+    events: list[dict[str, Any]] = []
+    for line in str(tail.get("content") or "").splitlines():
+        if not line.strip().startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    tail["events"] = events
+    return tail
+
+
+@app.get("/runs/{bundle}/rollout", response_class=JSONResponse)
+def run_rollout(
+    bundle: str,
+    offset: int = 0,
+    max_bytes: int = 20000,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    tid = _get_thread_id_for_bundle(bundle)
+    if not tid:
+        raise HTTPException(status_code=404, detail="thread_id not known yet")
+    rollout = _find_rollout_for_thread_id(tid)
+    if not rollout:
+        raise HTTPException(status_code=404, detail="rollout not found")
+    out = _read_tail(rollout, offset=offset, max_bytes=max_bytes)
+    out["thread_id"] = tid
+    out["rollout_path"] = str(rollout)
+    return out
 
 
 @app.post("/dispatch", response_class=PlainTextResponse)
@@ -318,9 +496,7 @@ async def dispatch(
     request: Request,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
 ) -> str:
-    got = (x_pitchai_dispatch_token or "").strip()
-    if got != SETTINGS.dispatch_token:
-        raise HTTPException(status_code=401, detail="invalid dispatch token")
+    _auth_or_401(x_pitchai_dispatch_token)
 
     try:
         payload = await request.json()
