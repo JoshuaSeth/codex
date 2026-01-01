@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import html
 import json
 import os
 import re
@@ -27,6 +29,8 @@ class Settings:
     runner_max_items_per_run: int
     runner_env: dict[str, str]
     runner_name_prefix: str
+    ui_basic_user: Optional[str]
+    ui_basic_pass: Optional[str]
 
 
 def _require_env(name: str) -> str:
@@ -90,6 +94,8 @@ def _load_settings() -> Settings:
         runner_max_items_per_run=runner_max_items_per_run,
         runner_env=runner_env,
         runner_name_prefix=os.getenv("PITCHAI_RUNNER_NAME_PREFIX", "pitchai-codex-runner").strip() or "pitchai-codex-runner",
+        ui_basic_user=_optional_env("PITCHAI_UI_BASIC_USER"),
+        ui_basic_pass=_optional_env("PITCHAI_UI_BASIC_PASS"),
     )
 
 
@@ -299,6 +305,48 @@ def _auth_or_401(x_pitchai_dispatch_token: Optional[str]) -> None:
     if got != SETTINGS.dispatch_token:
         raise HTTPException(status_code=401, detail="invalid dispatch token")
 
+def _parse_basic_auth(authorization: Optional[str]) -> Optional[tuple[str, str]]:
+    if not authorization:
+        return None
+    s = authorization.strip()
+    if not s.lower().startswith("basic "):
+        return None
+    token = s.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        raw = base64.b64decode(token).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    if ":" not in raw:
+        return None
+    user, pwd = raw.split(":", 1)
+    return user, pwd
+
+
+def _auth_any_or_401(x_pitchai_dispatch_token: Optional[str], authorization: Optional[str]) -> None:
+    got = (x_pitchai_dispatch_token or "").strip()
+    if got and got == SETTINGS.dispatch_token:
+        return
+
+    if SETTINGS.ui_basic_user and SETTINGS.ui_basic_pass:
+        parsed = _parse_basic_auth(authorization)
+        if parsed and parsed[0] == SETTINGS.ui_basic_user and parsed[1] == SETTINGS.ui_basic_pass:
+            return
+
+        raise HTTPException(
+            status_code=401,
+            detail="basic auth required",
+            headers={"WWW-Authenticate": 'Basic realm="PitchAI Codex Dispatcher"'},
+        )
+
+    raise HTTPException(status_code=401, detail="invalid dispatch token")
+
+
+def _auth_ui_if_enabled(authorization: Optional[str]) -> None:
+    if SETTINGS.ui_basic_user and SETTINGS.ui_basic_pass:
+        _auth_any_or_401(None, authorization)
+
 
 def _read_tail(path: Path, *, offset: int, max_bytes: int) -> dict[str, Any]:
     if offset < 0:
@@ -432,31 +480,126 @@ def healthz() -> str:
 
 
 @app.get("/ui", response_class=HTMLResponse)
-def ui() -> str:
+def ui(authorization: Optional[str] = Header(default=None)) -> str:
+    _auth_ui_if_enabled(authorization)
     bundles = _list_bundles(SETTINGS.queue_dir)
     runs = _list_runs(SETTINGS.runs_dir)
+
+    running_containers: list[dict[str, Any]] = []
+    try:
+        client = docker.from_env()
+        containers = client.containers.list(all=False, filters={"label": "pitchai.kind=codex-runner"})
+        for c in containers:
+            try:
+                running_containers.append(
+                    {
+                        "name": c.name,
+                        "status": c.status,
+                        "labels": dict(getattr(c, "labels", {}) or {}),
+                        "id": c.short_id,
+                    }
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    def _run_link(run: dict[str, Any]) -> str:
+        bundle = str(run.get("bundle") or "").strip()
+        if not bundle:
+            return html.escape(json.dumps(run))
+        safe_bundle = html.escape(bundle)
+        return f'<a href="/ui/runs/{safe_bundle}">{safe_bundle}</a>'
+
     rows = []
+    rows.append(f"<h3>running ({len(running_containers)})</h3><pre>{html.escape(json.dumps(running_containers, indent=2))}</pre>")
     for key in ("queued", "processing", "processed", "failed"):
         items = bundles.get(key, [])
-        rows.append(f"<h3>{key} ({len(items)})</h3><pre>{json.dumps(items, indent=2)}</pre>")
-    rows.append(f"<h3>runs ({len(runs)})</h3><pre>{json.dumps(runs, indent=2)}</pre>")
+        links = [f'<a href="/ui/runs/{html.escape(name)}">{html.escape(name)}</a>' for name in items]
+        rows.append(f"<h3>{key} ({len(items)})</h3><div>{' '.join(links) if links else '<em>none</em>'}</div>")
+    rows.append(
+        "<h3>runs</h3>"
+        + "<ol>"
+        + "".join([f"<li>{_run_link(r)}</li>" for r in runs])
+        + "</ol>"
+    )
+
     return (
         "<html><head><title>PitchAI Codex Dispatcher</title></head><body>"
         "<h2>PitchAI Codex Dispatcher</h2>"
-        "<p>Polling API: <code>GET /runs</code>, <code>GET /runs/&lt;bundle&gt;/log</code>, <code>GET /runs/&lt;bundle&gt;/rollout</code></p>"
+        "<p>Polling API: <code>GET /runs</code>, <code>GET /runs/&lt;bundle&gt;/events</code>, <code>GET /runs/&lt;bundle&gt;/rollout</code></p>"
+        "<p>This UI can use either browser Basic Auth (recommended) or a dispatch token saved in localStorage.</p>"
+        "<label>Dispatch token: <input id='token' type='password' size='64' /></label> "
+        "<button onclick='window.__saveToken()'>Save</button> "
+        "<button onclick='window.__clearToken()'>Clear</button>"
+        "<script>\n"
+        "window.__saveToken = () => { localStorage.setItem('pitchai_dispatch_token', document.getElementById('token').value || ''); };\n"
+        "window.__clearToken = () => { localStorage.removeItem('pitchai_dispatch_token'); document.getElementById('token').value=''; };\n"
+        "window.addEventListener('load', () => { document.getElementById('token').value = localStorage.getItem('pitchai_dispatch_token') || ''; });\n"
+        "</script>"
         + "".join(rows)
         + "</body></html>"
     )
 
+@app.get("/ui/runs/{bundle}", response_class=HTMLResponse)
+def ui_run(bundle: str, authorization: Optional[str] = Header(default=None)) -> str:
+    _auth_ui_if_enabled(authorization)
+    safe_bundle = html.escape(bundle)
+    return (
+        "<html><head><title>PitchAI Codex Run</title>"
+        "<style>body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;max-width:1100px;margin:16px auto;padding:0 12px} "
+        "pre{background:#111;color:#eee;padding:12px;overflow:auto;border-radius:8px;white-space:pre-wrap} "
+        ".grid{display:grid;grid-template-columns:1fr;gap:12px} "
+        ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap} "
+        "code{background:#f2f2f2;padding:2px 6px;border-radius:6px}</style>"
+        "</head><body>"
+        f"<h2>Run: <code>{safe_bundle}</code></h2>"
+        "<div class='row'>"
+        "<a href='/ui'>← back</a>"
+        "</div>"
+        "<div class='row'>"
+        "<label>Dispatch token (optional if using Basic Auth): <input id='token' type='password' size='64'/></label>"
+        "<button onclick='window.__saveToken()'>Save</button>"
+        "<button onclick='window.__clearToken()'>Clear</button>"
+        "</div>"
+        "<div class='grid'>"
+        "<div><h3>Record</h3><pre id='record'>(loading)</pre></div>"
+        "<div><h3>Events (parsed JSON)</h3><pre id='events'>(loading)</pre></div>"
+        "<div><h3>Log (raw)</h3><pre id='log'>(loading)</pre></div>"
+        "<div><h3>Rollout (raw)</h3><pre id='rollout'>(loading)</pre></div>"
+        "</div>"
+        "<script>\n"
+        "const BUNDLE = " + json.dumps(bundle) + ";\n"
+        "window.__saveToken = () => { localStorage.setItem('pitchai_dispatch_token', document.getElementById('token').value || ''); };\n"
+        "window.__clearToken = () => { localStorage.removeItem('pitchai_dispatch_token'); document.getElementById('token').value=''; };\n"
+        "function hdrs(){ const t = localStorage.getItem('pitchai_dispatch_token') || ''; return t ? {'X-PitchAI-Dispatch-Token': t} : {}; }\n"
+        "async function jget(url){ const res = await fetch(url, {headers: hdrs(), credentials: 'same-origin'}); if(!res.ok){ throw new Error(res.status + ' ' + await res.text()); } return await res.json(); }\n"
+        "async function loadRecord(){ try{ const r = await jget(`/runs/${encodeURIComponent(BUNDLE)}/record`); document.getElementById('record').textContent = JSON.stringify(r, null, 2); }catch(e){ document.getElementById('record').textContent = String(e); } }\n"
+        "let logOff=0, evtOff=0, rolOff=0;\n"
+        "async function pollLog(){ try{ const r = await jget(`/runs/${encodeURIComponent(BUNDLE)}/log?offset=${logOff}&max_bytes=50000`); if(r && r.content){ document.getElementById('log').textContent += r.content; } logOff = r.next_offset || logOff; }catch(e){ document.getElementById('log').textContent = String(e); } }\n"
+        "async function pollEvents(){ try{ const r = await jget(`/runs/${encodeURIComponent(BUNDLE)}/events?offset=${evtOff}&max_bytes=50000`); const pre = document.getElementById('events'); for(const ev of (r.events||[])){ pre.textContent += JSON.stringify(ev) + '\\n'; } evtOff = r.next_offset || evtOff; }catch(e){ document.getElementById('events').textContent = String(e); } }\n"
+        "async function pollRollout(){ try{ const r = await jget(`/runs/${encodeURIComponent(BUNDLE)}/rollout?offset=${rolOff}&max_bytes=50000`); if(r && r.content){ document.getElementById('rollout').textContent += r.content; } rolOff = r.next_offset || rolOff; }catch(e){ const msg = String(e); if(msg.includes('404')){ document.getElementById('rollout').textContent = '(rollout not available yet)'; return; } document.getElementById('rollout').textContent = msg; } }\n"
+        "window.addEventListener('load', () => { document.getElementById('token').value = localStorage.getItem('pitchai_dispatch_token') || ''; loadRecord(); pollEvents(); pollLog(); pollRollout(); setInterval(pollEvents, 1500); setInterval(pollLog, 1500); setInterval(pollRollout, 3000); });\n"
+        "</script>"
+        "</body></html>"
+    )
+
 @app.get("/runs", response_class=JSONResponse)
-def list_runs(x_pitchai_dispatch_token: Optional[str] = Header(default=None)) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+def list_runs(
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     return _list_runs(SETTINGS.runs_dir)
 
 
 @app.get("/runs/{bundle}/record", response_class=JSONResponse)
-def run_record(bundle: str, x_pitchai_dispatch_token: Optional[str] = Header(default=None)) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+def run_record(
+    bundle: str,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     return _load_run_record(bundle)
 
 
@@ -466,8 +609,9 @@ def run_log(
     offset: int = 0,
     max_bytes: int = 20000,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     return _read_tail(_run_log_path(bundle), offset=offset, max_bytes=max_bytes)
 
 
@@ -477,8 +621,9 @@ def run_events(
     offset: int = 0,
     max_bytes: int = 20000,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     tail = _read_tail(_run_log_path(bundle), offset=offset, max_bytes=max_bytes)
     events: list[dict[str, Any]] = []
     for line in str(tail.get("content") or "").splitlines():
@@ -499,8 +644,9 @@ def run_latest_event(
     bundle: str,
     max_bytes: int = 50000,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     raw = _read_last_bytes(_run_log_path(bundle), max_bytes=max_bytes)
     text = raw.decode("utf-8", errors="replace")
     event = _extract_last_json_line(text)
@@ -516,8 +662,9 @@ def run_rollout(
     offset: int = 0,
     max_bytes: int = 20000,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     tid = _get_thread_id_for_bundle(bundle)
     if not tid:
         raise HTTPException(status_code=404, detail="thread_id not known yet")
@@ -535,8 +682,9 @@ def run_latest_rollout_event(
     bundle: str,
     max_bytes: int = 50000,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> Any:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
     tid = _get_thread_id_for_bundle(bundle)
     if not tid:
         raise HTTPException(status_code=404, detail="thread_id not known yet")
@@ -558,8 +706,9 @@ def run_latest_rollout_event(
 async def dispatch(
     request: Request,
     x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ) -> str:
-    _auth_or_401(x_pitchai_dispatch_token)
+    _auth_any_or_401(x_pitchai_dispatch_token, authorization)
 
     try:
         payload = await request.json()

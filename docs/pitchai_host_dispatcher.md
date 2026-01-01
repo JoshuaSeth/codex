@@ -49,12 +49,18 @@ Notes:
 - Returns `ok`
 
 ### `GET /ui`
-- Simple HTML view of queued/processed/failed bundles + recent runs.
+- HTML view of queued/processed/failed bundles + recent runs.
+- Includes links to per-run pages at `GET /ui/runs/<bundle>`.
+
+UI auth:
+- If `PITCHAI_UI_BASIC_USER` and `PITCHAI_UI_BASIC_PASS` are set, the UI will require browser Basic Auth.
+- Otherwise the UI is open, and you can paste/save the dispatch token in the UI (localStorage) to enable API calls.
 
 ## Polling / live status API
 
-All endpoints below require the same header as `/dispatch`:
-- `X-PitchAI-Dispatch-Token: <token>`
+All endpoints below accept either:
+- `X-PitchAI-Dispatch-Token: <token>` (always supported), or
+- `Authorization: Basic ...` (only if `PITCHAI_UI_BASIC_USER/PITCHAI_UI_BASIC_PASS` are configured)
 
 ### `GET /runs`
 - Returns recent run records (JSON).
@@ -143,6 +149,10 @@ Contains:
 - `PITCHAI_RUNNER_IMAGE=registry.pitchai.net:5000/pitchai/codex-runner:latest`
 - `PITCHAI_MAX_ITEMS_PER_RUN=10`
 - `PITCHAI_RUNNER_ENV_JSON={}` (can inject extra env into runner)
+
+Optional (recommended for browser UI):
+- `PITCHAI_UI_BASIC_USER=...`
+- `PITCHAI_UI_BASIC_PASS=...`
 
 Credentials:
 - Codex auth is stored at `/root/.codex/auth.json`
