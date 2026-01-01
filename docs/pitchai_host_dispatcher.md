@@ -70,9 +70,16 @@ All endpoints below require the same header as `/dispatch`:
 ### `GET /runs/<bundle>/events?offset=0&max_bytes=20000`
 - Same as `/log`, but also includes `events` parsed from JSON lines in the log (Codex JSONL events).
 
+### `GET /runs/<bundle>/events/latest?max_bytes=50000`
+- Returns the latest *complete* JSON event object found near the end of the log.
+- Useful when you only want the most recent event without managing offsets.
+
 ### `GET /runs/<bundle>/rollout?offset=0&max_bytes=20000`
 - Offset-based tail of the Codex rollout JSONL (once the run has emitted `thread.started`).
 - Response includes `thread_id` and `rollout_path`.
+
+### `GET /runs/<bundle>/rollout/latest?max_bytes=50000`
+- Returns the latest *complete* JSON event object found near the end of the rollout file.
 
 ## Codex runner behavior
 

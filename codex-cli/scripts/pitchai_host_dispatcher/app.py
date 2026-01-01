@@ -327,6 +327,29 @@ def _read_tail(path: Path, *, offset: int, max_bytes: int) -> dict[str, Any]:
         "content": text,
     }
 
+def _read_last_bytes(path: Path, *, max_bytes: int) -> bytes:
+    max_bytes = max(1, min(int(max_bytes), 200_000))
+    if not path.exists():
+        return b""
+    data = path.read_bytes()
+    if len(data) <= max_bytes:
+        return data
+    return data[-max_bytes:]
+
+
+def _extract_last_json_line(text: str) -> Optional[dict[str, Any]]:
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            obj = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
 
 def _run_record_path(bundle: str) -> Path:
     safe = _sanitize_filename(bundle)
@@ -471,6 +494,22 @@ def run_events(
     return tail
 
 
+@app.get("/runs/{bundle}/events/latest", response_class=JSONResponse)
+def run_latest_event(
+    bundle: str,
+    max_bytes: int = 50000,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    raw = _read_last_bytes(_run_log_path(bundle), max_bytes=max_bytes)
+    text = raw.decode("utf-8", errors="replace")
+    event = _extract_last_json_line(text)
+    return {
+        "exists": bool(raw),
+        "event": event,
+    }
+
+
 @app.get("/runs/{bundle}/rollout", response_class=JSONResponse)
 def run_rollout(
     bundle: str,
@@ -489,6 +528,30 @@ def run_rollout(
     out["thread_id"] = tid
     out["rollout_path"] = str(rollout)
     return out
+
+
+@app.get("/runs/{bundle}/rollout/latest", response_class=JSONResponse)
+def run_latest_rollout_event(
+    bundle: str,
+    max_bytes: int = 50000,
+    x_pitchai_dispatch_token: Optional[str] = Header(default=None),
+) -> Any:
+    _auth_or_401(x_pitchai_dispatch_token)
+    tid = _get_thread_id_for_bundle(bundle)
+    if not tid:
+        raise HTTPException(status_code=404, detail="thread_id not known yet")
+    rollout = _find_rollout_for_thread_id(tid)
+    if not rollout:
+        raise HTTPException(status_code=404, detail="rollout not found")
+    raw = _read_last_bytes(rollout, max_bytes=max_bytes)
+    text = raw.decode("utf-8", errors="replace")
+    event = _extract_last_json_line(text)
+    return {
+        "thread_id": tid,
+        "rollout_path": str(rollout),
+        "exists": bool(raw),
+        "event": event,
+    }
 
 
 @app.post("/dispatch", response_class=PlainTextResponse)
