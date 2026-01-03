@@ -40,6 +40,7 @@ class QueuedWorkItem:
     git_branch: Optional[str]
     git_base: Optional[str]
     git_clone_dir_rel: Optional[str]
+    git_prepared: bool
     queue_processing_path: Path
 
 
@@ -249,6 +250,7 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
         git_branch = meta.get("git_branch")
         git_base = meta.get("git_base")
         git_clone_dir_rel = meta.get("git_clone_dir_rel")
+        git_prepared = meta.get("git_prepared")
         item = QueuedWorkItem(
             prompt_path=prompt_path,
             config_path=config_path,
@@ -267,6 +269,7 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             git_clone_dir_rel=str(git_clone_dir_rel).strip()
             if isinstance(git_clone_dir_rel, str) and git_clone_dir_rel.strip()
             else None,
+            git_prepared=bool(git_prepared) if isinstance(git_prepared, bool) else False,
             queue_processing_path=processing_path,
         )
         print(f"[prompt] Using queued bundle: {processing_path}", file=sys.stderr)
@@ -298,6 +301,7 @@ def _pick_prompt_from_queue(cfg: CodexRunConfig) -> tuple[Path, Optional[Path], 
             git_branch=None,
             git_base=None,
             git_clone_dir_rel=None,
+            git_prepared=False,
             queue_processing_path=selected,
         )
         return (selected, selected, item)
@@ -619,6 +623,7 @@ def main() -> int:
             git_branch: Optional[str] = None
             git_base: Optional[str] = None
             git_clone_dir_rel: Optional[str] = None
+            git_prepared = False
             if work_item is not None and work_item.conversation_id:
                 resume_id = work_item.conversation_id
             if work_item is not None and work_item.fork:
@@ -633,13 +638,14 @@ def main() -> int:
                 git_branch = work_item.git_branch
                 git_base = work_item.git_base
                 git_clone_dir_rel = work_item.git_clone_dir_rel
+                git_prepared = bool(work_item.git_prepared)
 
             hook_env = dict(os.environ)
             hook_env["PITCHAI_CODEX_PHASE"] = "pre"
             hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
 
             # Optional: clone repo + create branch before running Codex/prompt.
-            if git_repo and git_branch:
+            if git_repo and git_branch and not git_prepared:
                 base = git_base or "main"
                 repo_dir = _prepare_git_repo(
                     run_cfg.workdir,
@@ -658,6 +664,11 @@ def main() -> int:
                     prompt_queue_dir=run_cfg.prompt_queue_dir,
                 )
                 hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
+            elif git_prepared and not (run_cfg.workdir / ".git").exists():
+                print("[git] git_prepared=true but no .git found in workdir", file=sys.stderr, flush=True)
+                last_rc = 1
+                _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
+                break
 
             pre_rc = _run_hook_commands(pre_commands, cwd=run_cfg.workdir, env=hook_env, label="pre")
             if pre_rc != 0:
