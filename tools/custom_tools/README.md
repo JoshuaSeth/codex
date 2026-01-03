@@ -21,3 +21,10 @@ Each script reads tool arguments from the `CODEX_TOOL_ARGS_JSON` environment var
 If your helper only queues work (for example, kicking off a CI pipeline or waiting for a webhook), set `hibernate_after_call = true` in the corresponding config stanza. Codex will mark the tool call as pending (the CLI prints a spinner plus the tool call id) and keep the turn alive. When the webhook has the final payload, call `codex-dev exec deliver-pending <conversation_id> --call-id <tool_call_id> --output "answer"` (or hit the socket advertised in `~/.codex/live/<conversation_id>.json`) so the agent resumes automatically without a manual resume prompt. In Elise’s workflow this pattern is implemented as “send immediately” (`send_graph_email.py`) followed by “wait for reply” (`wait_for_email_response.py`).
 
 Additions are welcome—drop new scripts in this directory when you find reusable patterns.
+
+## Path resolution note
+
+Codex resolves relative paths in `config.toml` **relative to the folder containing that config file** (for each config layer). In practice:
+
+- If you define tools in `.codex/config.toml` (recommended for repo-local tooling), `./tools/custom_tools/...` works because `.codex/` lives under your repo.
+- If you define tools in `~/.codex/config.toml`, prefer absolute paths or adjust relative paths accordingly (because `./tools/...` would resolve under `~/.codex/`).

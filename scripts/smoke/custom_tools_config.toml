@@ -1,0 +1,23 @@
+# Smoke config to validate PitchAI extensions on top of upstream Codex.
+#
+# Usage:
+#   export CODEX_STOP_HOOK_LOG=/tmp/codex_stop_hook.jsonl
+#   ./codex-rs/target/debug/codex exec --config-file ./scripts/smoke/custom_tools_config.toml "Call the echo tool."
+
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+hide_agent_reasoning = true
+
+# Tool hook: append JSON payloads to a JSONL file. The output path is injected
+# as argv[1] by the smoke runner script.
+tool_hook_command = ["python3", "../../tool_hook_logger.py"]
+
+# Stop hook: uses the PitchAI telegram hook bridge, but can run in log-only mode
+# when TELEGRAM_BOT_TOKEN is missing. Always set CODEX_STOP_HOOK_LOG to capture.
+stop_hook_command = ["python3", "../../tools/custom_tools/telegram_bot.py", "--stop-hook"]
+
+[custom_tools.echo_tool]
+command = ["python3", "../../tools/custom_tools/echo_tool.py"]
+description = "Echo back provided text (PitchAI smoke tool)."
+parameters = { type = "object", additionalProperties = false, required = ["text"], properties = { text = { type = "string" } } }
+timeout_ms = 60000
