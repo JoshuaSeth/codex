@@ -18,7 +18,7 @@ use serde_json::Value as JsonValue;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CustomToolToml {
     pub command: Vec<String>,
     #[serde(default)]
