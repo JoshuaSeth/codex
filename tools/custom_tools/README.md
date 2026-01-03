@@ -24,7 +24,8 @@ Additions are welcome—drop new scripts in this directory when you find reusabl
 
 ## Path resolution note
 
-Codex resolves relative paths in `config.toml` **relative to the folder containing that config file** (for each config layer). In practice:
+Codex resolves **path-typed** fields in `config.toml` (for example MCP server `cwd` entries) relative to the folder containing that config file (for each config layer). In practice:
 
 - If you define tools in `.codex/config.toml` (recommended for repo-local tooling), `./tools/custom_tools/...` works because `.codex/` lives under your repo.
-- If you define tools in `~/.codex/config.toml`, prefer absolute paths or adjust relative paths accordingly (because `./tools/...` would resolve under `~/.codex/`).
+
+For `custom_tools.*.command`, Codex does **not** rewrite command argv values: relative command paths are resolved by the OS relative to the tool’s working directory (the tool’s configured `cwd`, otherwise the session `cwd`).
