@@ -90,6 +90,7 @@ pub use rollout::SESSIONS_SUBDIR;
 pub use rollout::SessionMeta;
 pub use rollout::ToolResultKind;
 pub use rollout::find_conversation_path_by_id_str;
+pub use rollout::find_conversation_path_by_selector_str;
 pub use rollout::list::ConversationItem;
 pub use rollout::list::ConversationsPage;
 pub use rollout::list::Cursor;

@@ -150,6 +150,7 @@ async fn traverse_directories_for_paths(
     provider_matcher: Option<&ProviderMatcher<'_>>,
 ) -> io::Result<ConversationsPage> {
     let mut items: Vec<ConversationItem> = Vec::with_capacity(page_size);
+    let mut item_keys: Vec<Cursor> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
     let mut anchor_passed = anchor.is_none();
     let (anchor_ts, anchor_id) = match anchor {
@@ -174,18 +175,10 @@ async fn traverse_directories_for_paths(
                 if scanned_files >= MAX_SCAN_FILES {
                     break 'outer;
                 }
-                let mut day_files = collect_files(day_path, |name_str, path| {
-                    if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-                        return None;
-                    }
-
-                    parse_timestamp_uuid_from_filename(name_str)
-                        .map(|(ts, id)| (ts, id, name_str.to_string(), path.to_path_buf()))
-                })
-                .await?;
+                let mut day_files = collect_session_files_for_day(day_path).await?;
                 // Stable ordering within the same second: (timestamp desc, uuid desc)
-                day_files.sort_by_key(|(ts, sid, _name_str, _path)| (Reverse(*ts), Reverse(*sid)));
-                for (ts, sid, _name_str, path) in day_files.into_iter() {
+                day_files.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
+                for (ts, sid, path) in day_files.into_iter() {
                     scanned_files += 1;
                     if scanned_files >= MAX_SCAN_FILES && items.len() >= page_size {
                         more_matches_available = true;
@@ -238,6 +231,7 @@ async fn traverse_directories_for_paths(
                             created_at,
                             updated_at,
                         });
+                        item_keys.push(Cursor::new(ts, sid));
                     }
                 }
             }
@@ -250,7 +244,7 @@ async fn traverse_directories_for_paths(
     }
 
     let next = if more_matches_available {
-        build_next_cursor(&items)
+        item_keys.last().cloned()
     } else {
         None
     };
@@ -279,13 +273,6 @@ pub fn parse_cursor(token: &str) -> Option<Cursor> {
     Some(Cursor::new(ts, uuid))
 }
 
-fn build_next_cursor(items: &[ConversationItem]) -> Option<Cursor> {
-    let last = items.last()?;
-    let file_name = last.path.file_name()?.to_string_lossy();
-    let (ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
-    Some(Cursor::new(ts, id))
-}
-
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
 /// and returns them sorted descending by the parsed key.
 async fn collect_dirs_desc<T, F>(parent: &Path, parse: F) -> io::Result<Vec<(T, PathBuf)>>
@@ -311,26 +298,102 @@ where
     Ok(vec)
 }
 
-/// Collects files in a directory and parses them with `parse`.
-async fn collect_files<T, F>(parent: &Path, parse: F) -> io::Result<Vec<T>>
-where
-    F: Fn(&str, &Path) -> Option<T>,
-{
-    let mut dir = tokio::fs::read_dir(parent).await?;
-    let mut collected: Vec<T> = Vec::new();
+/// Collects JSONL session files in `day_dir` and derives their ordering key.
+///
+/// Most rollout files encode `<timestamp>-<uuid>` in their filename (fast path). For any `.jsonl`
+/// file that does not match the rollout filename format, fall back to parsing the SessionMeta line
+/// from the file head to recover a stable ordering key.
+async fn collect_session_files_for_day(
+    day_dir: &Path,
+) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
+    let mut dir = tokio::fs::read_dir(day_dir).await?;
+    let mut collected: Vec<(OffsetDateTime, Uuid, PathBuf)> = Vec::new();
     while let Some(entry) = dir.next_entry().await? {
-        if entry
+        if !entry
             .file_type()
             .await
             .map(|ft| ft.is_file())
             .unwrap_or(false)
-            && let Some(s) = entry.file_name().to_str()
-            && let Some(v) = parse(s, &entry.path())
         {
-            collected.push(v);
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            continue;
+        };
+        if !name_str.ends_with(".jsonl") {
+            continue;
+        }
+        let path = entry.path();
+
+        if let Some((ts, id)) = parse_timestamp_uuid_from_filename(name_str) {
+            collected.push((ts, id, path));
+            continue;
+        }
+
+        if let Ok(Some((ts, id))) = read_timestamp_uuid_from_session_meta(&path).await {
+            collected.push((ts, id, path));
         }
     }
     Ok(collected)
+}
+
+async fn read_timestamp_uuid_from_session_meta(
+    path: &Path,
+) -> io::Result<Option<(OffsetDateTime, Uuid)>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut non_empty = 0usize;
+
+    while non_empty < HEAD_RECORD_LIMIT {
+        let line_opt = lines.next_line().await?;
+        let Some(line) = line_opt else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+
+        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
+        let Ok(rollout_line) = parsed else { continue };
+
+        if let RolloutItem::SessionMeta(session_meta_line) = rollout_line.item {
+            let Ok(id) = Uuid::parse_str(&session_meta_line.meta.id.to_string()) else {
+                continue;
+            };
+            let Some(ts) = parse_timestamp_for_cursor(&session_meta_line.meta.timestamp)
+                .or_else(|| parse_timestamp_for_cursor(&rollout_line.timestamp))
+            else {
+                continue;
+            };
+            return Ok(Some((ts, id)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_timestamp_for_cursor(ts: &str) -> Option<OffsetDateTime> {
+    let format: &[FormatItem] =
+        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
+
+    if let Ok(parsed) = OffsetDateTime::parse(ts, &Rfc3339) {
+        let parsed = parsed.to_offset(time::UtcOffset::UTC);
+        let ts_str = parsed.format(format).ok()?;
+        return PrimitiveDateTime::parse(&ts_str, format)
+            .ok()
+            .map(time::PrimitiveDateTime::assume_utc);
+    }
+
+    PrimitiveDateTime::parse(ts, format)
+        .ok()
+        .map(time::PrimitiveDateTime::assume_utc)
 }
 
 fn parse_timestamp_uuid_from_filename(name: &str) -> Option<(OffsetDateTime, Uuid)> {
@@ -462,10 +525,9 @@ pub async fn find_conversation_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
 ) -> io::Result<Option<PathBuf>> {
-    // Validate UUID format early.
-    if Uuid::parse_str(id_str).is_err() {
+    let Ok(target_id) = Uuid::parse_str(id_str) else {
         return Ok(None);
-    }
+    };
 
     let mut root = codex_home.to_path_buf();
     root.push(SESSIONS_SUBDIR);
@@ -494,9 +556,127 @@ pub async fn find_conversation_path_by_id_str(
     )
     .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
-    Ok(results
+    let best_match = results
         .matches
         .into_iter()
         .next()
-        .map(|m| root.join(m.path)))
+        .map(|m| root.join(m.path));
+
+    if best_match.is_some() {
+        return Ok(best_match);
+    }
+
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u16>().ok()).await?;
+    for (_year, year_path) in year_dirs.into_iter() {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs.into_iter() {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs.into_iter() {
+                let mut dir = tokio::fs::read_dir(&day_path).await?;
+                while let Some(entry) = dir.next_entry().await? {
+                    if !entry
+                        .file_type()
+                        .await
+                        .map(|ft| ft.is_file())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let file_name = entry.file_name();
+                    let Some(name_str) = file_name.to_str() else {
+                        continue;
+                    };
+                    if !name_str.ends_with(".jsonl") {
+                        continue;
+                    }
+
+                    if let Some((_ts, candidate_id)) = parse_timestamp_uuid_from_filename(name_str)
+                    {
+                        if candidate_id == target_id {
+                            return Ok(Some(entry.path()));
+                        }
+                        continue;
+                    }
+
+                    let path = entry.path();
+                    if let Ok(Some((_ts, candidate_id))) =
+                        read_timestamp_uuid_from_session_meta(&path).await
+                        && candidate_id == target_id
+                    {
+                        return Ok(Some(path));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Locate a recorded conversation rollout file by a user-provided selector.
+///
+/// The selector may be:
+/// - A full session UUID (preferred)
+/// - A path to a `.jsonl` file
+/// - A plain filename (with or without `.jsonl`) under `~/.codex/sessions/**`
+pub async fn find_conversation_path_by_selector_str(
+    codex_home: &Path,
+    selector: &str,
+) -> io::Result<Option<PathBuf>> {
+    if Uuid::parse_str(selector).is_ok() {
+        return find_conversation_path_by_id_str(codex_home, selector).await;
+    }
+
+    let selector_path = Path::new(selector);
+    if tokio::fs::metadata(selector_path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(Some(selector_path.to_path_buf()));
+    }
+
+    let mut root = codex_home.to_path_buf();
+    root.push(SESSIONS_SUBDIR);
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::with_capacity(2);
+    if selector.ends_with(".jsonl") {
+        candidates.push(selector.to_string());
+    } else {
+        candidates.push(format!("{selector}.jsonl"));
+        candidates.push(selector.to_string());
+    }
+
+    let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u16>().ok()).await?;
+    for (_year, year_path) in year_dirs.into_iter() {
+        let month_dirs = collect_dirs_desc(&year_path, |s| s.parse::<u8>().ok()).await?;
+        for (_month, month_path) in month_dirs.into_iter() {
+            let day_dirs = collect_dirs_desc(&month_path, |s| s.parse::<u8>().ok()).await?;
+            for (_day, day_path) in day_dirs.into_iter() {
+                let mut dir = tokio::fs::read_dir(&day_path).await?;
+                while let Some(entry) = dir.next_entry().await? {
+                    if !entry
+                        .file_type()
+                        .await
+                        .map(|ft| ft.is_file())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let file_name = entry.file_name();
+                    let Some(name_str) = file_name.to_str() else {
+                        continue;
+                    };
+                    if candidates.iter().any(|candidate| candidate == name_str) {
+                        return Ok(Some(entry.path()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }

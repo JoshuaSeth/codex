@@ -249,6 +249,7 @@ struct Row {
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
     git_branch: Option<String>,
+    session_id: Option<String>,
 }
 
 impl PickerState {
@@ -643,7 +644,7 @@ fn head_to_row(item: &ConversationItem) -> Row {
         .and_then(parse_timestamp_str)
         .or(created_at);
 
-    let (cwd, git_branch) = extract_session_meta_from_head(&item.head);
+    let (cwd, git_branch, session_id) = extract_session_meta_from_head(&item.head);
     let preview = preview_from_head(&item.head)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -656,18 +657,22 @@ fn head_to_row(item: &ConversationItem) -> Row {
         updated_at,
         cwd,
         git_branch,
+        session_id,
     }
 }
 
-fn extract_session_meta_from_head(head: &[serde_json::Value]) -> (Option<PathBuf>, Option<String>) {
+fn extract_session_meta_from_head(
+    head: &[serde_json::Value],
+) -> (Option<PathBuf>, Option<String>, Option<String>) {
     for value in head {
         if let Ok(meta_line) = serde_json::from_value::<SessionMetaLine>(value.clone()) {
             let cwd = Some(meta_line.meta.cwd);
             let git_branch = meta_line.git.and_then(|git| git.branch);
-            return (cwd, git_branch);
+            let session_id = Some(meta_line.meta.id.to_string());
+            return (cwd, git_branch, session_id);
         }
     }
-    (None, None)
+    (None, None, None)
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
@@ -785,6 +790,7 @@ fn render_list(
     let max_branch_width = metrics.max_branch_width;
     let max_cwd_width = metrics.max_cwd_width;
 
+    let show_ids = state.show_all;
     for (idx, (row, (updated_label, branch_label, cwd_label))) in rows[start..end]
         .iter()
         .zip(labels[start..end].iter())
@@ -842,6 +848,17 @@ fn render_list(
         if add_leading_gap {
             preview_width = preview_width.saturating_sub(2);
         }
+        let id_prefix = if show_ids {
+            row.session_id.as_deref().map(|id| {
+                let short = id.get(..8).unwrap_or(id);
+                format!("[{short}] ")
+            })
+        } else {
+            None
+        };
+        if let Some(prefix) = id_prefix.as_deref() {
+            preview_width = preview_width.saturating_sub(UnicodeWidthStr::width(prefix));
+        }
         let preview = truncate_text(&row.preview, preview_width);
         let mut spans: Vec<Span> = vec![marker];
         if let Some(updated) = updated_span {
@@ -858,6 +875,9 @@ fn render_list(
         }
         if add_leading_gap {
             spans.push("  ".into());
+        }
+        if let Some(prefix) = id_prefix {
+            spans.push(Span::from(prefix).dim());
         }
         spans.push(preview.into());
 
@@ -982,7 +1002,12 @@ fn render_column_headers(
         spans.push(Span::from(label).bold());
         spans.push("  ".into());
     }
-    spans.push("Conversation".bold());
+    let label = if metrics.max_cwd_width > 0 {
+        "Conversation (id)"
+    } else {
+        "Conversation"
+    };
+    spans.push(label.bold());
     frame.render_widget_ref(Line::from(spans), area);
 }
 
@@ -1211,6 +1236,7 @@ mod tests {
                 updated_at: Some(now - Duration::seconds(42)),
                 cwd: None,
                 git_branch: None,
+                session_id: Some(String::from("019b9823-e360-7e03-a1b6-f9e1972d1d9e")),
             },
             Row {
                 path: PathBuf::from("/tmp/b.jsonl"),
@@ -1219,6 +1245,7 @@ mod tests {
                 updated_at: Some(now - Duration::minutes(35)),
                 cwd: None,
                 git_branch: None,
+                session_id: Some(String::from("dbfeba26-c106-43bc-a548-79732e07fcda")),
             },
             Row {
                 path: PathBuf::from("/tmp/c.jsonl"),
@@ -1227,6 +1254,7 @@ mod tests {
                 updated_at: Some(now - Duration::hours(2)),
                 cwd: None,
                 git_branch: None,
+                session_id: Some(String::from("123e4567-e89b-12d3-a456-426614174000")),
             },
         ];
         state.all_rows = rows.clone();

@@ -142,9 +142,13 @@ struct CompletionCommand {
 
 #[derive(Debug, Parser)]
 struct ResumeCommand {
-    /// Conversation/session id (UUID). When provided, resumes this session.
+    /// Conversation/session selector. When provided, resumes this session.
+    ///
+    /// Accepts a session UUID, a path to a `.jsonl` file, or a plain filename (with or without
+    /// `.jsonl`) under `~/.codex/sessions/**`.
+    ///
     /// If omitted, use --last to pick the most recent recorded session.
-    #[arg(value_name = "SESSION_ID")]
+    #[arg(value_name = "SESSION")]
     session_id: Option<String>,
 
     /// Continue the most recent session without showing the picker.

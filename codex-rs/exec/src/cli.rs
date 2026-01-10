@@ -105,9 +105,13 @@ pub enum Command {
 
 #[derive(Parser, Debug)]
 pub struct ResumeArgs {
-    /// Conversation/session id (UUID). When provided, resumes this session.
+    /// Conversation/session selector. When provided, resumes this session.
+    ///
+    /// Accepts a session UUID, a path to a `.jsonl` file, or a plain filename (with or without
+    /// `.jsonl`) under `~/.codex/sessions/**`.
+    ///
     /// If omitted, use --last to pick the most recent recorded session.
-    #[arg(value_name = "SESSION_ID")]
+    #[arg(value_name = "SESSION")]
     pub session_id: Option<String>,
 
     /// Resume the most recent recorded session (newest) without specifying an id.

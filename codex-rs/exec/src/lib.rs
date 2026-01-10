@@ -72,7 +72,7 @@ use crate::pending_tool_ipc::load_metadata;
 use crate::pending_tool_ipc::send_pending_result;
 use crate::prompt_sequence::PromptSequenceRunner;
 use codex_core::default_client::set_default_originator;
-use codex_core::find_conversation_path_by_id_str;
+use codex_core::find_conversation_path_by_selector_str;
 use codex_core::replace_last_tool_result as patch_last_tool_result;
 
 enum InitialOperation {
@@ -681,7 +681,7 @@ async fn resolve_resume_path(
             }
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
-        find_conversation_path_by_id_str(&config.codex_home, id_str).await?
+        find_conversation_path_by_selector_str(&config.codex_home, id_str).await?
     } else {
         None
     };
