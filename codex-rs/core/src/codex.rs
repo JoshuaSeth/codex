@@ -564,6 +564,25 @@ impl Session {
         metadata
     }
 
+    pub(crate) async fn cancel_pending_tool(&self, call_id: &str) -> Option<PendingToolMetadata> {
+        let metadata = self.pending_tools.cancel(call_id).await;
+        if let Some(meta) = &metadata {
+            let event = EventMsg::PendingToolState(PendingToolStateEvent {
+                call_id: meta.call_id.clone(),
+                tool_name: meta.tool_name.clone(),
+                turn_id: meta.turn_id.clone(),
+                status: PendingToolStatus::Cancelled,
+                note: None,
+            });
+            self.send_event_raw(Event {
+                id: meta.turn_id.clone(),
+                msg: event,
+            })
+            .await;
+        }
+        metadata
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_turn_context(
         auth_manager: Option<Arc<AuthManager>>,
@@ -2799,10 +2818,38 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
+                let response_input = match response_input {
+                    ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                        let Some((_meta, rx)) =
+                            sess.take_pending_tool_receiver(call_id.as_str()).await
+                        else {
+                            let response =
+                                ResponseInputItem::FunctionCallOutput { call_id, output };
+                            sess.record_conversation_items(&turn_context, &[response.into()])
+                                .await;
+                            continue;
+                        };
+
+                        let resolved_output = tokio::select! {
+                            _ = cancellation_token.cancelled() => {
+                                sess.cancel_pending_tool(call_id.as_str()).await;
+                                return Err(CodexErr::TurnAborted);
+                            }
+                            result = rx => result.map_err(|_| CodexErr::TurnAborted)?,
+                        };
+                        ResponseInputItem::FunctionCallOutput {
+                            call_id,
+                            output: resolved_output,
+                        }
+                    }
+                    other => other,
+                };
+
                 sess.record_conversation_items(&turn_context, &[response_input.into()])
                     .await;
             }
@@ -3030,7 +3077,13 @@ async fn try_run_turn(
         }
     };
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    drain_in_flight(
+        &mut in_flight,
+        sess.clone(),
+        turn_context.clone(),
+        cancellation_token.clone(),
+    )
+    .await?;
 
     if should_emit_turn_diff {
         let unified_diff = {

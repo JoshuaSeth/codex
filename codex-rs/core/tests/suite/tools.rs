@@ -17,6 +17,7 @@ use codex_core::protocol::PendingToolStatus;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
@@ -31,6 +32,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
@@ -243,13 +245,20 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
     let call_id = "custom-pending";
     let args = json!({ "ticket": "sync-42" });
 
-    mount_sse_once(
+    let mock = mount_sse_sequence(
         &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "custom.pending", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "custom.pending", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
     )
     .await;
 
@@ -294,6 +303,49 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
         assert_eq!("custom.pending", evt.tool_name);
         assert!(evt.note.unwrap_or_default().contains("sync-42"));
     }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "turn should wait for pending result"
+    );
+
+    let delivered_content = "resolved ticket=sync-42";
+    test.codex
+        .submit(Op::DeliverPendingToolResult {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload {
+                content: delivered_content.to_string(),
+                content_items: None,
+                success: None,
+            },
+        })
+        .await?;
+
+    let resolved = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::PendingToolState(evt) if evt.status == PendingToolStatus::Resolved
+        )
+    })
+    .await;
+    if let EventMsg::PendingToolState(evt) = resolved {
+        assert_eq!(PendingToolStatus::Resolved, evt.status);
+        assert_eq!("custom.pending", evt.tool_name);
+    }
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].function_call_output_content_and_success(call_id),
+        Some((Some(delivered_content.to_string()), None)),
+    );
 
     Ok(())
 }

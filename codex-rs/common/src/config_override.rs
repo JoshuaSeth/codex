@@ -197,6 +197,9 @@ mod config_file_resolution_tests {
     use tempfile::tempdir;
 
     fn with_cwd<F: FnOnce()>(dir: &Path, func: F) {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_LOCK.lock().expect("cwd lock");
+
         let original = env::current_dir().expect("current dir");
         env::set_current_dir(dir).expect("set cwd");
         func();

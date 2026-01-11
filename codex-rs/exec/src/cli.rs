@@ -16,7 +16,7 @@ pub struct Cli {
         short = 'i',
         value_name = "FILE",
         value_delimiter = ',',
-        num_args = 1..
+        num_args = 1
     )]
     pub images: Vec<PathBuf>,
 
@@ -145,7 +145,7 @@ pub struct ResumeArgs {
         short = 'i',
         value_name = "FILE",
         value_delimiter = ',',
-        num_args = 1..
+        num_args = 1
     )]
     pub images: Vec<PathBuf>,
 
