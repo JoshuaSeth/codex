@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use codex_core::CodexConversation;
+use codex_core::CodexThread;
 use codex_core::protocol::Op;
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use serde::Deserialize;
 use serde::Serialize;
@@ -37,7 +37,7 @@ pub struct PendingToolSocketMetadata {
     pub port: u16,
 }
 
-pub fn metadata_path_for(codex_home: &Path, conversation_id: &ConversationId) -> PathBuf {
+pub fn metadata_path_for(codex_home: &Path, conversation_id: &ThreadId) -> PathBuf {
     codex_home
         .join("live")
         .join(format!("{conversation_id}.json"))
@@ -46,8 +46,8 @@ pub fn metadata_path_for(codex_home: &Path, conversation_id: &ConversationId) ->
 impl PendingToolServer {
     pub async fn start(
         codex_home: &Path,
-        conversation_id: &ConversationId,
-        conversation: Arc<CodexConversation>,
+        conversation_id: &ThreadId,
+        conversation: Arc<CodexThread>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -112,7 +112,7 @@ impl Drop for PendingToolServer {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    conversation: Arc<CodexConversation>,
+    conversation: Arc<CodexThread>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;

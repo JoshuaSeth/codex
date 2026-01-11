@@ -1,9 +1,12 @@
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
+#[cfg(target_os = "windows")]
+use crate::app_event::WindowsSandboxEnableMode;
+#[cfg(target_os = "windows")]
+use crate::app_event::WindowsSandboxFallbackReason;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::chatwidget::ChatWidget;
-use crate::clipboard_copy;
 use crate::custom_terminal::Frame;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -17,8 +20,15 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::ResumeSelection;
+use crate::transcript_copy_action::TranscriptCopyAction;
+use crate::transcript_copy_action::TranscriptCopyFeedback;
 use crate::transcript_copy_ui::TranscriptCopyUi;
 use crate::transcript_multi_click::TranscriptMultiClick;
+use crate::transcript_scrollbar::render_transcript_scrollbar_if_active;
+use crate::transcript_scrollbar::split_transcript_area;
+use crate::transcript_scrollbar_ui::TranscriptScrollbarMouseEvent;
+use crate::transcript_scrollbar_ui::TranscriptScrollbarMouseHandling;
+use crate::transcript_scrollbar_ui::TranscriptScrollbarUi;
 use crate::transcript_selection::TRANSCRIPT_GUTTER_COLS;
 use crate::transcript_selection::TranscriptSelection;
 use crate::transcript_selection::TranscriptSelectionPoint;
@@ -34,7 +44,7 @@ use crate::tui::scrolling::TranscriptScroll;
 use crate::update_action::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
 use codex_core::AuthManager;
-use codex_core::ConversationManager;
+use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::edit::ConfigEditsBuilder;
 #[cfg(target_os = "windows")]
@@ -50,7 +60,7 @@ use codex_core::protocol::SessionSource;
 use codex_core::protocol::SkillErrorInfo;
 use codex_core::protocol::TokenUsage;
 use codex_core::terminal::terminal_info;
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -85,7 +95,7 @@ use crate::history_cell::UpdateAvailableHistoryCell;
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
     pub token_usage: TokenUsage,
-    pub conversation_id: Option<ConversationId>,
+    pub conversation_id: Option<ThreadId>,
     pub update_action: Option<UpdateAction>,
     /// ANSI-styled transcript lines to print after the TUI exits.
     ///
@@ -99,7 +109,7 @@ impl From<AppExitInfo> for codex_tui::AppExitInfo {
     fn from(info: AppExitInfo) -> Self {
         codex_tui::AppExitInfo {
             token_usage: info.token_usage,
-            conversation_id: info.conversation_id,
+            thread_id: info.conversation_id,
             update_action: info.update_action.map(Into::into),
         }
     }
@@ -107,7 +117,7 @@ impl From<AppExitInfo> for codex_tui::AppExitInfo {
 
 fn session_summary(
     token_usage: TokenUsage,
-    conversation_id: Option<ConversationId>,
+    conversation_id: Option<ThreadId>,
 ) -> Option<SessionSummary> {
     if token_usage.is_zero() {
         return None;
@@ -314,7 +324,7 @@ async fn handle_model_migration_prompt_if_needed(
 }
 
 pub(crate) struct App {
-    pub(crate) server: Arc<ConversationManager>,
+    pub(crate) server: Arc<ThreadManager>,
     pub(crate) app_event_tx: AppEventSender,
     pub(crate) chat_widget: ChatWidget,
     pub(crate) auth_manager: Arc<AuthManager>,
@@ -335,11 +345,25 @@ pub(crate) struct App {
     transcript_view_top: usize,
     transcript_total_lines: usize,
     transcript_copy_ui: TranscriptCopyUi,
+    transcript_copy_action: TranscriptCopyAction,
+    transcript_scrollbar_ui: TranscriptScrollbarUi,
 
-    // Pager overlay state (Transcript or Static like Diff)
+    // Pager overlay state (Transcript or Static like Diff).
     pub(crate) overlay: Option<Overlay>,
-    pub(crate) deferred_history_lines: Vec<Line<'static>>,
-    has_emitted_history_lines: bool,
+    /// History cells received while an overlay is active.
+    ///
+    /// While in an alt-screen overlay, the normal terminal buffer is not visible.
+    /// Instead we queue the incoming cells here and, on overlay close, render them at the *current*
+    /// width and queue them in one batch via `Tui::insert_history_lines`.
+    ///
+    /// This matters for correctness if/when scrollback printing is enabled: if we deferred
+    /// already-rendered `Vec<Line>`, we'd bake viewport-width wrapping based on the width at the
+    /// time the cell arrived (which may differ from the width when the overlay closes).
+    pub(crate) deferred_history_cells: Vec<Arc<dyn HistoryCell>>,
+    /// True once at least one history cell has been inserted into terminal scrollback.
+    ///
+    /// Used to decide whether to insert an extra blank separator line when flushing deferred cells.
+    pub(crate) has_emitted_history_lines: bool,
 
     pub(crate) enhanced_keys_supported: bool,
 
@@ -367,7 +391,7 @@ impl App {
         if let Some(conversation_id) = self.chat_widget.conversation_id() {
             self.suppress_shutdown_complete = true;
             self.chat_widget.submit_op(Op::Shutdown);
-            self.server.remove_conversation(&conversation_id).await;
+            self.server.remove_thread(&conversation_id).await;
         }
     }
 
@@ -387,11 +411,12 @@ impl App {
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
 
-        let conversation_manager = Arc::new(ConversationManager::new(
+        let thread_manager = Arc::new(ThreadManager::new(
+            config.codex_home.clone(),
             auth_manager.clone(),
             SessionSource::Cli,
         ));
-        let mut model = conversation_manager
+        let mut model = thread_manager
             .get_models_manager()
             .get_model(&config.model, &config)
             .await;
@@ -400,7 +425,7 @@ impl App {
             &mut config,
             model.as_str(),
             &app_event_tx,
-            conversation_manager.get_models_manager(),
+            thread_manager.get_models_manager(),
         )
         .await;
         if let Some(exit_info) = exit_info {
@@ -421,20 +446,16 @@ impl App {
                     initial_images: initial_images.clone(),
                     enhanced_keys_supported,
                     auth_manager: auth_manager.clone(),
-                    models_manager: conversation_manager.get_models_manager(),
+                    models_manager: thread_manager.get_models_manager(),
                     feedback: feedback.clone(),
                     is_first_run,
                     model: model.clone(),
                 };
-                ChatWidget::new(init, conversation_manager.clone())
+                ChatWidget::new(init, thread_manager.clone())
             }
             ResumeSelection::Resume(path) => {
-                let resumed = conversation_manager
-                    .resume_conversation_from_rollout(
-                        config.clone(),
-                        path.clone(),
-                        auth_manager.clone(),
-                    )
+                let resumed = thread_manager
+                    .resume_thread_from_rollout(config.clone(), path.clone(), auth_manager.clone())
                     .await
                     .wrap_err_with(|| {
                         format!("Failed to resume session from {}", path.display())
@@ -447,16 +468,12 @@ impl App {
                     initial_images: initial_images.clone(),
                     enhanced_keys_supported,
                     auth_manager: auth_manager.clone(),
-                    models_manager: conversation_manager.get_models_manager(),
+                    models_manager: thread_manager.get_models_manager(),
                     feedback: feedback.clone(),
                     is_first_run,
                     model: model.clone(),
                 };
-                ChatWidget::new_from_existing(
-                    init,
-                    resumed.conversation,
-                    resumed.session_configured,
-                )
+                ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
             }
         };
 
@@ -483,7 +500,7 @@ impl App {
         let copy_selection_shortcut = crate::transcript_copy_ui::detect_copy_selection_shortcut();
 
         let mut app = Self {
-            server: conversation_manager.clone(),
+            server: thread_manager.clone(),
             app_event_tx,
             chat_widget,
             auth_manager: auth_manager.clone(),
@@ -500,8 +517,10 @@ impl App {
             transcript_view_top: 0,
             transcript_total_lines: 0,
             transcript_copy_ui: TranscriptCopyUi::new_with_shortcut(copy_selection_shortcut),
+            transcript_copy_action: TranscriptCopyAction::default(),
+            transcript_scrollbar_ui: TranscriptScrollbarUi::default(),
             overlay: None,
-            deferred_history_lines: Vec::new(),
+            deferred_history_cells: Vec::new(),
             has_emitted_history_lines: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             scroll_config,
@@ -667,11 +686,14 @@ impl App {
                             self.transcript_total_lines,
                         ))
                     };
+                    let copy_selection_key = self.copy_selection_key();
+                    let copy_feedback = self.transcript_copy_feedback_for_footer();
                     self.chat_widget.set_transcript_ui_state(
                         transcript_scrolled,
                         selection_active,
                         scroll_position,
-                        self.copy_selection_key(),
+                        copy_selection_key,
+                        copy_feedback,
                     );
                 }
             }
@@ -702,18 +724,19 @@ impl App {
             return area.y;
         }
 
-        let transcript_area = Rect {
+        let transcript_full_area = Rect {
             x: area.x,
             y: area.y,
             width: area.width,
             height: max_transcript_height,
         };
+        let (transcript_area, _) = split_transcript_area(transcript_full_area);
 
         self.transcript_view_cache
             .ensure_wrapped(cells, transcript_area.width);
         let total_lines = self.transcript_view_cache.lines().len();
         if total_lines == 0 {
-            Clear.render_ref(transcript_area, frame.buffer);
+            Clear.render_ref(transcript_full_area, frame.buffer);
             self.transcript_scroll = TranscriptScroll::default();
             self.transcript_view_top = 0;
             self.transcript_total_lines = 0;
@@ -754,12 +777,14 @@ impl App {
             );
         }
 
-        let transcript_area = Rect {
+        let transcript_full_area = Rect {
             x: area.x,
             y: area.y,
             width: area.width,
             height: transcript_visible_height,
         };
+        let (transcript_area, transcript_scrollbar_area) =
+            split_transcript_area(transcript_full_area);
 
         // Cache a few viewports worth of rasterized rows so redraws during streaming can cheaply
         // copy already-rendered `Cell`s instead of re-running grapheme segmentation.
@@ -800,6 +825,13 @@ impl App {
         } else {
             self.transcript_copy_ui.clear_affordance();
         }
+        render_transcript_scrollbar_if_active(
+            frame.buffer,
+            transcript_scrollbar_area,
+            total_lines,
+            max_visible,
+            top_offset,
+        );
         chat_top
     }
 
@@ -848,21 +880,45 @@ impl App {
             return;
         }
 
-        let transcript_area = Rect {
+        let transcript_full_area = Rect {
             x: 0,
             y: 0,
             width,
             height: transcript_height,
         };
+        let (transcript_area, transcript_scrollbar_area) =
+            split_transcript_area(transcript_full_area);
         let base_x = transcript_area.x.saturating_add(TRANSCRIPT_GUTTER_COLS);
         let max_x = transcript_area.right().saturating_sub(1);
+
+        if matches!(
+            self.transcript_scrollbar_ui
+                .handle_mouse_event(TranscriptScrollbarMouseEvent {
+                    tui,
+                    mouse_event,
+                    transcript_area,
+                    scrollbar_area: transcript_scrollbar_area,
+                    transcript_cells: &self.transcript_cells,
+                    transcript_view_cache: &mut self.transcript_view_cache,
+                    transcript_scroll: &mut self.transcript_scroll,
+                    transcript_view_top: &mut self.transcript_view_top,
+                    transcript_total_lines: &mut self.transcript_total_lines,
+                    mouse_scroll_state: &mut self.scroll_state,
+                }),
+            TranscriptScrollbarMouseHandling::Handled
+        ) {
+            return;
+        }
 
         // Treat the transcript as the only interactive region for transcript selection.
         //
         // This prevents clicks in the composer/footer from starting or extending a transcript
         // selection, while still allowing a left-click outside the transcript to clear an
         // existing highlight.
-        if mouse_event.row < transcript_area.y || mouse_event.row >= transcript_area.bottom() {
+        if !self.transcript_scrollbar_ui.pointer_capture_active()
+            && (mouse_event.row < transcript_full_area.y
+                || mouse_event.row >= transcript_full_area.bottom())
+        {
             if matches!(
                 mouse_event.kind,
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
@@ -893,7 +949,14 @@ impl App {
                 .transcript_copy_ui
                 .hit_test(mouse_event.column, mouse_event.row)
         {
-            self.copy_transcript_selection(tui);
+            if self.transcript_copy_action.copy_and_handle(
+                tui,
+                chat_height,
+                &self.transcript_cells,
+                self.transcript_selection,
+            ) {
+                self.transcript_selection = TranscriptSelection::default();
+            }
             return;
         }
 
@@ -1069,7 +1132,15 @@ impl App {
             return None;
         }
 
-        Some((transcript_height as usize, width))
+        let transcript_full_area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: transcript_height,
+        };
+        let (transcript_area, _) = split_transcript_area(transcript_full_area);
+
+        Some((transcript_height as usize, transcript_area.width))
     }
 
     /// Scroll the transcript by a number of visual lines.
@@ -1239,46 +1310,8 @@ impl App {
         }
     }
 
-    /// Copy the currently selected transcript region to the system clipboard.
-    ///
-    /// The selection is defined in terms of flattened wrapped transcript line
-    /// indices and columns, and this method reconstructs the same wrapped
-    /// transcript used for on-screen rendering so the copied text closely
-    /// matches the highlighted region.
-    ///
-    /// Important: copy operates on the selection's full content-relative range,
-    /// not just the current viewport. A selection can extend outside the visible
-    /// region (for example, by scrolling after selecting, or by selecting while
-    /// autoscrolling), and we still want the clipboard payload to reflect the
-    /// entire selected transcript.
-    fn copy_transcript_selection(&mut self, tui: &tui::Tui) {
-        let size = tui.terminal.last_known_screen_size;
-        let width = size.width;
-        let height = size.height;
-        if width == 0 || height == 0 {
-            return;
-        }
-
-        let chat_height = self.chat_widget.desired_height(width);
-        if chat_height >= height {
-            return;
-        }
-
-        let transcript_height = height.saturating_sub(chat_height);
-        if transcript_height == 0 {
-            return;
-        }
-
-        let Some(text) = crate::transcript_copy::selection_to_copy_text_for_cells(
-            &self.transcript_cells,
-            self.transcript_selection,
-            width,
-        ) else {
-            return;
-        };
-        if let Err(err) = clipboard_copy::copy_text(text) {
-            tracing::error!(error = %err, "failed to copy selection to clipboard");
-        }
+    fn transcript_copy_feedback_for_footer(&mut self) -> Option<TranscriptCopyFeedback> {
+        self.transcript_copy_action.footer_feedback()
     }
 
     fn copy_selection_key(&self) -> crate::key_hint::KeyBinding {
@@ -1364,7 +1397,7 @@ impl App {
                         );
                         match self
                             .server
-                            .resume_conversation_from_rollout(
+                            .resume_thread_from_rollout(
                                 self.config.clone(),
                                 path.clone(),
                                 self.auth_manager.clone(),
@@ -1388,7 +1421,7 @@ impl App {
                                 };
                                 self.chat_widget = ChatWidget::new_from_existing(
                                     init,
-                                    resumed.conversation,
+                                    resumed.thread,
                                     resumed.session_configured,
                                 );
                                 if let Some(summary) = summary {
@@ -1425,21 +1458,8 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
-                if !display.is_empty() {
-                    // Only insert a separating blank line for new cells that are not
-                    // part of an ongoing stream. Streaming continuations should not
-                    // accrue extra blank lines between chunks.
-                    if !cell.is_stream_continuation() {
-                        if self.has_emitted_history_lines {
-                            display.insert(0, Line::from(""));
-                        } else {
-                            self.has_emitted_history_lines = true;
-                        }
-                    }
-                    if self.overlay.is_some() {
-                        self.deferred_history_lines.extend(display);
-                    }
+                if self.overlay.is_some() {
+                    self.deferred_history_cells.push(cell);
                 }
             }
             AppEvent::StartCommitAnimation => {
@@ -1553,19 +1573,91 @@ impl App {
             AppEvent::OpenWindowsSandboxEnablePrompt { preset } => {
                 self.chat_widget.open_windows_sandbox_enable_prompt(preset);
             }
-            AppEvent::EnableWindowsSandboxForAgentMode { preset } => {
+            AppEvent::OpenWindowsSandboxFallbackPrompt { preset, reason } => {
+                self.chat_widget.clear_windows_sandbox_setup_status();
+                self.chat_widget
+                    .open_windows_sandbox_fallback_prompt(preset, reason);
+            }
+            AppEvent::BeginWindowsSandboxElevatedSetup { preset } => {
                 #[cfg(target_os = "windows")]
                 {
+                    let policy = preset.sandbox.clone();
+                    let policy_cwd = self.config.cwd.clone();
+                    let command_cwd = policy_cwd.clone();
+                    let env_map: std::collections::HashMap<String, String> =
+                        std::env::vars().collect();
+                    let codex_home = self.config.codex_home.clone();
+                    let tx = self.app_event_tx.clone();
+
+                    // If the elevated setup already ran on this machine, don't prompt for
+                    // elevation again - just flip the config to use the elevated path.
+                    if codex_core::windows_sandbox::sandbox_setup_is_complete(codex_home.as_path())
+                    {
+                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
+                            preset,
+                            mode: WindowsSandboxEnableMode::Elevated,
+                        });
+                        return Ok(true);
+                    }
+
+                    self.chat_widget.show_windows_sandbox_setup_status();
+                    tokio::task::spawn_blocking(move || {
+                        let result = codex_core::windows_sandbox::run_elevated_setup(
+                            &policy,
+                            policy_cwd.as_path(),
+                            command_cwd.as_path(),
+                            &env_map,
+                            codex_home.as_path(),
+                        );
+                        let event = match result {
+                            Ok(()) => AppEvent::EnableWindowsSandboxForAgentMode {
+                                preset: preset.clone(),
+                                mode: WindowsSandboxEnableMode::Elevated,
+                            },
+                            Err(err) => {
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to run elevated Windows sandbox setup"
+                                );
+                                AppEvent::OpenWindowsSandboxFallbackPrompt {
+                                    preset,
+                                    reason: WindowsSandboxFallbackReason::ElevationFailed,
+                                }
+                            }
+                        };
+                        tx.send(event);
+                    });
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = preset;
+                }
+            }
+            AppEvent::EnableWindowsSandboxForAgentMode { preset, mode } => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.chat_widget.clear_windows_sandbox_setup_status();
                     let profile = self.active_profile.as_deref();
                     let feature_key = Feature::WindowsSandbox.key();
+                    let elevated_key = Feature::WindowsSandboxElevated.key();
+                    let elevated_enabled = matches!(mode, WindowsSandboxEnableMode::Elevated);
                     match ConfigEditsBuilder::new(&self.config.codex_home)
                         .with_profile(profile)
                         .set_feature_enabled(feature_key, true)
+                        .set_feature_enabled(elevated_key, elevated_enabled)
                         .apply()
                         .await
                     {
                         Ok(()) => {
                             self.config.set_windows_sandbox_globally(true);
+                            self.config
+                                .set_windows_elevated_sandbox_globally(elevated_enabled);
+                            self.chat_widget
+                                .set_feature_enabled(Feature::WindowsSandbox, true);
+                            self.chat_widget.set_feature_enabled(
+                                Feature::WindowsSandboxElevated,
+                                elevated_enabled,
+                            );
                             self.chat_widget.clear_forced_auto_mode_downgrade();
                             if let Some((sample_paths, extra_count, failed_scan)) =
                                 self.chat_widget.world_writable_warning_details()
@@ -1594,7 +1686,14 @@ impl App {
                                 self.app_event_tx
                                     .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
                                 self.chat_widget.add_info_message(
-                                    "Enabled experimental Windows sandbox.".to_string(),
+                                    match mode {
+                                        WindowsSandboxEnableMode::Elevated => {
+                                            "Enabled elevated agent sandbox.".to_string()
+                                        }
+                                        WindowsSandboxEnableMode::Legacy => {
+                                            "Enabled non-elevated agent sandbox.".to_string()
+                                        }
+                                    },
                                     None,
                                 );
                             }
@@ -1612,7 +1711,7 @@ impl App {
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let _ = preset;
+                    let _ = (preset, mode);
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
@@ -1902,7 +2001,22 @@ impl App {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } if self.transcript_copy_ui.is_copy_key(ch, modifiers) => {
-                self.copy_transcript_selection(tui);
+                let size = tui.terminal.last_known_screen_size;
+                let width = size.width;
+                let height = size.height;
+                if width == 0 || height == 0 {
+                    return;
+                }
+
+                let chat_height = self.chat_widget.desired_height(width);
+                if self.transcript_copy_action.copy_and_handle(
+                    tui,
+                    chat_height,
+                    &self.transcript_cells,
+                    self.transcript_selection,
+                ) {
+                    self.transcript_selection = TranscriptSelection::default();
+                }
             }
             KeyEvent {
                 code: KeyCode::PageUp,
@@ -2049,24 +2163,27 @@ mod tests {
     use crate::tui::scrolling::TranscriptLineMeta;
     use codex_core::AuthManager;
     use codex_core::CodexAuth;
-    use codex_core::ConversationManager;
+    use codex_core::ThreadManager;
+    use codex_core::config::ConfigBuilder;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
     use codex_core::protocol::EventMsg;
     use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
-    use codex_protocol::ConversationId;
+    use codex_protocol::ThreadId;
+    use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
 
     async fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
         let current_model = "gpt-5.2-codex".to_string();
-        let server = Arc::new(ConversationManager::with_models_provider(
+        let server = Arc::new(ThreadManager::with_models_provider(
             CodexAuth::from_api_key("Test API Key"),
             config.model_provider.clone(),
         ));
@@ -2093,8 +2210,10 @@ mod tests {
             transcript_copy_ui: TranscriptCopyUi::new_with_shortcut(
                 CopySelectionShortcut::CtrlShiftC,
             ),
+            transcript_copy_action: TranscriptCopyAction::default(),
+            transcript_scrollbar_ui: TranscriptScrollbarUi::default(),
             overlay: None,
-            deferred_history_lines: Vec::new(),
+            deferred_history_cells: Vec::new(),
             has_emitted_history_lines: false,
             enhanced_keys_supported: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
@@ -2116,7 +2235,7 @@ mod tests {
         let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
         let current_model = "gpt-5.2-codex".to_string();
-        let server = Arc::new(ConversationManager::with_models_provider(
+        let server = Arc::new(ThreadManager::with_models_provider(
             CodexAuth::from_api_key("Test API Key"),
             config.model_provider.clone(),
         ));
@@ -2144,8 +2263,10 @@ mod tests {
                 transcript_copy_ui: TranscriptCopyUi::new_with_shortcut(
                     CopySelectionShortcut::CtrlShiftC,
                 ),
+                transcript_copy_action: TranscriptCopyAction::default(),
+                transcript_scrollbar_ui: TranscriptScrollbarUi::default(),
                 overlay: None,
-                deferred_history_lines: Vec::new(),
+                deferred_history_cells: Vec::new(),
                 has_emitted_history_lines: false,
                 enhanced_keys_supported: false,
                 commit_anim_running: Arc::new(AtomicBool::new(false)),
@@ -2164,6 +2285,24 @@ mod tests {
 
     fn all_model_presets() -> Vec<ModelPreset> {
         codex_core::models_manager::model_presets::all_model_presets().clone()
+    }
+
+    fn model_migration_copy_to_plain_text(
+        copy: &crate::model_migration::ModelMigrationCopy,
+    ) -> String {
+        let mut s = String::new();
+        for span in &copy.heading {
+            s.push_str(&span.content);
+        }
+        s.push('\n');
+        s.push('\n');
+        for line in &copy.content {
+            for span in &line.spans {
+                s.push_str(&span.content);
+            }
+            s.push('\n');
+        }
+        s
     }
 
     #[tokio::test]
@@ -2199,6 +2338,59 @@ mod tests {
             &seen,
             &all_model_presets()
         ));
+    }
+
+    #[tokio::test]
+    async fn model_migration_prompt_shows_for_hidden_model() {
+        let codex_home = tempdir().expect("temp codex home");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+
+        let available_models = all_model_presets();
+        let current = available_models
+            .iter()
+            .find(|preset| preset.model == "gpt-5.1-codex")
+            .cloned()
+            .expect("gpt-5.1-codex preset present");
+        assert!(
+            !current.show_in_picker,
+            "expected gpt-5.1-codex to be hidden from picker for this test"
+        );
+
+        let upgrade = current.upgrade.as_ref().expect("upgrade configured");
+        assert!(
+            should_show_model_migration_prompt(
+                &current.model,
+                &upgrade.id,
+                &config.notices.model_migrations,
+                &available_models,
+            ),
+            "expected migration prompt to be eligible for hidden model"
+        );
+
+        let target = available_models
+            .iter()
+            .find(|preset| preset.model == upgrade.id)
+            .cloned()
+            .expect("upgrade target present");
+        let target_description =
+            (!target.description.is_empty()).then(|| target.description.clone());
+        let can_opt_out = true;
+        let copy = migration_copy_for_models(
+            &current.model,
+            &upgrade.id,
+            target.display_name,
+            target_description,
+            can_opt_out,
+        );
+
+        assert_snapshot!(
+            "model_migration_prompt_shows_for_hidden_model",
+            model_migration_copy_to_plain_text(&copy)
+        );
     }
 
     #[tokio::test]
@@ -2288,7 +2480,7 @@ mod tests {
 
         let make_header = |is_first| {
             let event = SessionConfiguredEvent {
-                session_id: ConversationId::new(),
+                session_id: ThreadId::new(),
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
                 approval_policy: AskForApproval::Never,
@@ -2326,7 +2518,7 @@ mod tests {
 
         assert_eq!(user_count(&app.transcript_cells), 2);
 
-        app.backtrack.base_id = Some(ConversationId::new());
+        app.backtrack.base_id = Some(ThreadId::new());
         app.backtrack.primed = true;
         app.backtrack.nth_user_message = user_count(&app.transcript_cells).saturating_sub(1);
 
@@ -2581,7 +2773,7 @@ mod tests {
     async fn new_session_requests_shutdown_for_previous_conversation() {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
 
-        let conversation_id = ConversationId::new();
+        let conversation_id = ThreadId::new();
         let event = SessionConfiguredEvent {
             session_id: conversation_id,
             model: "gpt-test".to_string(),
@@ -2647,8 +2839,7 @@ mod tests {
             total_tokens: 12,
             ..Default::default()
         };
-        let conversation =
-            ConversationId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
 
         let summary = session_summary(usage, Some(conversation)).expect("summary");
         assert_eq!(

@@ -22,6 +22,8 @@ use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_selector_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
+use codex_core::terminal::Multiplexer;
+use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::fs::OpenOptions;
@@ -77,9 +79,12 @@ mod terminal_palette;
 mod text_formatting;
 mod tooltips;
 mod transcript_copy;
+mod transcript_copy_action;
 mod transcript_copy_ui;
 mod transcript_multi_click;
 mod transcript_render;
+mod transcript_scrollbar;
+mod transcript_scrollbar_ui;
 mod transcript_selection;
 mod transcript_view_cache;
 mod tui;
@@ -246,7 +251,7 @@ pub async fn run_main(
     }
 
     #[allow(clippy::print_stderr)]
-    if let Err(err) = enforce_login_restrictions(&config).await {
+    if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -309,7 +314,8 @@ pub async fn run_main(
         ensure_oss_provider_ready(provider_id, &config).await?;
     }
 
-    let otel = codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"));
+    let otel =
+        codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, true);
 
     #[allow(clippy::print_stderr)]
     let otel = match otel {
@@ -356,6 +362,8 @@ async fn run_ratatui_app(
     feedback: codex_feedback::CodexFeedback,
 ) -> color_eyre::Result<AppExitInfo> {
     color_eyre::install()?;
+
+    tooltips::announcement::prewarm();
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
@@ -467,7 +475,7 @@ async fn run_ratatui_app(
         }
     } else if cli.resume_last {
         let provider_filter = vec![config.model_provider_id.clone()];
-        match RolloutRecorder::list_conversations(
+        match RolloutRecorder::list_threads(
             &config.codex_home,
             1,
             None,
@@ -509,12 +517,39 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    let Cli { prompt, images, .. } = cli;
+    let Cli {
+        prompt,
+        images,
+        no_alt_screen,
+        ..
+    } = cli;
 
     // Run the main chat + transcript UI on the terminal's alternate screen so
     // the entire viewport can be used without polluting normal scrollback. This
     // mirrors the behavior of the legacy TUI but keeps inline mode available
     // for smaller prompts like onboarding and model migration.
+    //
+    // However, alternate screen prevents scrollback in terminal multiplexers like
+    // Zellij that strictly follow the xterm spec (which disallows scrollback in
+    // alternate screen buffers). This auto-detects the terminal and disables
+    // alternate screen in Zellij while keeping it enabled elsewhere.
+    let use_alt_screen = if no_alt_screen {
+        // CLI flag explicitly disables alternate screen
+        false
+    } else {
+        match config.tui_alternate_screen {
+            AltScreenMode::Always => true,
+            AltScreenMode::Never => false,
+            AltScreenMode::Auto => {
+                // Auto-detect: disable in Zellij, enable elsewhere
+                let terminal_info = codex_core::terminal::terminal_info();
+                !matches!(terminal_info.multiplexer, Some(Multiplexer::Zellij { .. }))
+            }
+        }
+    };
+
+    // Set flag on Tui so all enter_alt_screen() calls respect the setting
+    tui.set_alt_screen_enabled(use_alt_screen);
     let _ = tui.enter_alt_screen();
 
     let app_result = App::run(

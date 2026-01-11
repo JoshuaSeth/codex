@@ -91,6 +91,11 @@ pub struct Cli {
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 
+    /// Disable alternate screen mode for better scrollback in terminal multiplexers like Zellij.
+    /// This runs the TUI in inline mode, preserving terminal scrollback history.
+    #[arg(long = "no-alt-screen", default_value_t = false)]
+    pub no_alt_screen: bool,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }
@@ -116,6 +121,7 @@ impl From<codex_tui::Cli> for Cli {
             git_branch: cli.git_branch,
             web_search: cli.web_search,
             add_dir: cli.add_dir,
+            no_alt_screen: cli.no_alt_screen,
             config_overrides: cli.config_overrides,
         }
     }

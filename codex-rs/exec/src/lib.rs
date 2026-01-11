@@ -19,10 +19,10 @@ pub use cli::ReviewArgs;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
-use codex_core::ConversationManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
-use codex_core::NewConversation;
+use codex_core::NewThread;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
+use codex_core::ThreadManager;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -264,12 +264,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
 
-    if let Err(err) = enforce_login_restrictions(&config).await {
+    if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
 
-    let otel = codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"));
+    let otel =
+        codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, true);
 
     #[allow(clippy::print_stderr)]
     let otel = match otel {
@@ -332,16 +333,20 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         true,
         config.cli_auth_credentials_store_mode,
     );
-    let conversation_manager = ConversationManager::new(auth_manager.clone(), SessionSource::Exec);
-    let default_model = conversation_manager
+    let thread_manager = ThreadManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        SessionSource::Exec,
+    );
+    let default_model = thread_manager
         .get_models_manager()
         .get_model(&config.model, &config)
         .await;
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
-    let NewConversation {
-        conversation_id,
-        conversation,
+    let NewThread {
+        thread_id: conversation_id,
+        thread: conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
         let mut resume_path = resolve_resume_path(&config, args).await?;
@@ -360,18 +365,14 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
 
         if let Some(path) = resume_path.take() {
-            conversation_manager
-                .resume_conversation_from_rollout(config.clone(), path, auth_manager.clone())
+            thread_manager
+                .resume_thread_from_rollout(config.clone(), path, auth_manager.clone())
                 .await?
         } else {
-            conversation_manager
-                .new_conversation(config.clone())
-                .await?
+            thread_manager.start_thread(config.clone()).await?
         }
     } else {
-        conversation_manager
-            .new_conversation(config.clone())
-            .await?
+        thread_manager.start_thread(config.clone()).await?
     };
     let _pending_tool_server =
         match PendingToolServer::start(&config.codex_home, &conversation_id, conversation.clone())
@@ -433,6 +434,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 if args.no_prompt {
                     let items: Vec<UserInput> = imgs
                         .into_iter()
+                        .chain(args.images.into_iter())
                         .map(|path| UserInput::LocalImage { path })
                         .collect();
                     (
@@ -457,6 +459,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     let prompt_text = resolve_prompt(prompt_arg);
                     let mut items: Vec<UserInput> = imgs
                         .into_iter()
+                        .chain(args.images.into_iter())
                         .map(|path| UserInput::LocalImage { path })
                         .collect();
                     items.push(UserInput::Text {
@@ -573,7 +576,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     while let Some(event) = rx.recv().await {
         let mut queued_sequence_step = None;
         if let Some(runner) = prompt_sequence_runner.as_mut()
-            && matches!(&event.msg, EventMsg::TaskComplete(_))
+            && matches!(&event.msg, EventMsg::TurnComplete(_))
             && runner.has_remaining()
         {
             queued_sequence_step = runner.next_entry();
@@ -664,7 +667,7 @@ async fn resolve_resume_path(
 ) -> anyhow::Result<Option<PathBuf>> {
     let resolved = if args.last {
         let default_provider_filter = vec![config.model_provider_id.clone()];
-        match codex_core::RolloutRecorder::list_conversations(
+        match codex_core::RolloutRecorder::list_threads(
             &config.codex_home,
             1,
             None,
@@ -676,7 +679,7 @@ async fn resolve_resume_path(
         {
             Ok(page) => page.items.first().map(|it| it.path.clone()),
             Err(e) => {
-                error!("Error listing conversations: {e}");
+                error!("Error listing threads: {e}");
                 None
             }
         }
@@ -707,7 +710,7 @@ async fn fork_rollout_file(codex_home: &Path, source_path: &Path) -> anyhow::Res
     let mut first_json: Value = serde_json::from_str(first)
         .with_context(|| format!("invalid session meta json in {}", source_path.display()))?;
 
-    let new_id = codex_protocol::ConversationId::default();
+    let new_id = codex_protocol::ThreadId::default();
 
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     let format: &[FormatItem] =

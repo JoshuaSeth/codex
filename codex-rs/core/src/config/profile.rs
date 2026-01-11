@@ -38,6 +38,7 @@ pub struct ConfigProfile {
     pub experimental_supported_tools: Option<Vec<String>>,
     /// Optional default cwd used when this profile is active.
     pub default_cwd: Option<PathBuf>,
+    pub analytics: Option<crate::config::types::AnalyticsConfigToml>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
     pub features: Option<crate::features::FeaturesToml>,

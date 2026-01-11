@@ -100,7 +100,7 @@ fn session_meta_line() -> RolloutLine {
         timestamp: ts(0),
         item: RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
-                id: codex_protocol::ConversationId::new(),
+                id: codex_protocol::ThreadId::new(),
                 timestamp: ts(0),
                 cwd: "/tmp".into(),
                 originator: "test".into(),

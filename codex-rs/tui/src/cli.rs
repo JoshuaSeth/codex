@@ -94,6 +94,13 @@ pub struct Cli {
     /// Replace the last tool call output in the rollout before resuming a session.
     #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
     pub replace_last_tool_result: Option<String>,
+    /// Disable alternate screen mode
+    ///
+    /// Runs the TUI in inline mode, preserving terminal scrollback history. This is useful
+    /// in terminal multiplexers like Zellij that follow the xterm spec strictly and disable
+    /// scrollback in alternate screen buffers.
+    #[arg(long = "no-alt-screen", default_value_t = false)]
+    pub no_alt_screen: bool,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
