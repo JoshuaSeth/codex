@@ -890,6 +890,58 @@ impl Session {
                         .await;
                 }
 
+                let mut cwd_changed = false;
+                let mut approval_policy_changed = false;
+                let mut sandbox_policy_changed = false;
+
+                if let Some(prev_turn_context) = rollout_items.iter().rev().find_map(|item| {
+                    if let RolloutItem::TurnContext(ctx) = item {
+                        Some(ctx)
+                    } else {
+                        None
+                    }
+                }) {
+                    cwd_changed = prev_turn_context.cwd != turn_context.cwd;
+                    approval_policy_changed =
+                        prev_turn_context.approval_policy != turn_context.approval_policy;
+                    sandbox_policy_changed =
+                        prev_turn_context.sandbox_policy != turn_context.sandbox_policy;
+                } else if let Some(prev_cwd) = rollout_items.iter().rev().find_map(|item| {
+                    let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
+                        item
+                    else {
+                        return None;
+                    };
+                    if role != "user" {
+                        return None;
+                    }
+                    let text = content.iter().find_map(|content_item| match content_item {
+                        ContentItem::InputText { text } => Some(text.as_str()),
+                        _ => None,
+                    })?;
+                    if !text.starts_with(crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG) {
+                        return None;
+                    }
+                    let start = text.find("<cwd>")? + "<cwd>".len();
+                    let end = text[start..].find("</cwd>")? + start;
+                    Some(PathBuf::from(&text[start..end]))
+                }) {
+                    cwd_changed = prev_cwd != turn_context.cwd;
+                }
+
+                if cwd_changed || approval_policy_changed || sandbox_policy_changed {
+                    let shell = self.user_shell();
+                    let env_update = EnvironmentContext::new(
+                        cwd_changed.then(|| turn_context.cwd.clone()),
+                        approval_policy_changed.then(|| turn_context.approval_policy),
+                        sandbox_policy_changed.then(|| turn_context.sandbox_policy.clone()),
+                        shell.as_ref().clone(),
+                    );
+                    let item = ResponseItem::from(env_update);
+                    self.record_into_history(std::slice::from_ref(&item), &turn_context)
+                        .await;
+                }
+
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
                 if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
@@ -2922,6 +2974,7 @@ mod tests {
     use super::*;
     use crate::CodexAuth;
     use crate::config::ConfigBuilder;
+    use crate::config::ConfigOverrides;
     use crate::exec::ExecToolCallOutput;
     use crate::function_tool::FunctionCallError;
     use crate::shell::default_user_shell;
@@ -2952,6 +3005,7 @@ mod tests {
     use codex_app_server_protocol::AuthMode;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -2961,6 +3015,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -3020,6 +3075,67 @@ mod tests {
 
         let actual = session.state.lock().await.clone_history().get_history();
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_refreshes_environment_context_when_cwd_changes_on_resume_without_compactions()
+     {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let old_cwd = temp_dir.path().join("old");
+        let new_cwd = temp_dir.path().join("new");
+        fs::create_dir_all(&old_cwd).expect("create old cwd");
+        fs::create_dir_all(&new_cwd).expect("create new cwd");
+
+        let (old_session, old_turn_context) =
+            make_session_and_context_with_cwd(old_cwd.clone()).await;
+        let mut rollout_items = Vec::new();
+        for item in old_session.build_initial_context(&old_turn_context) {
+            rollout_items.push(RolloutItem::ResponseItem(item));
+        }
+        rollout_items.push(RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+        }));
+
+        let (new_session, _new_turn_context) =
+            make_session_and_context_with_cwd(new_cwd.clone()).await;
+
+        new_session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ConversationId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        let actual = new_session.state.lock().await.clone_history().get_history();
+        let env_contexts: Vec<String> = actual
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    content.iter().find_map(|content_item| match content_item {
+                        ContentItem::InputText { text } => text
+                            .starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG)
+                            .then(|| text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !env_contexts.is_empty(),
+            "expected environment_context items"
+        );
+        let last_env_context = env_contexts.last().expect("last env context");
+        assert!(
+            last_env_context.contains(&format!("<cwd>{}</cwd>", new_cwd.to_string_lossy())),
+            "expected last environment_context to contain updated cwd"
+        );
     }
 
     #[tokio::test]
@@ -3361,6 +3477,18 @@ mod tests {
             .expect("load default test config")
     }
 
+    async fn build_test_config_with_cwd(codex_home: &Path, cwd: PathBuf) -> Config {
+        ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(cwd),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .expect("load test config with cwd override")
+    }
+
     fn otel_manager(
         conversation_id: ConversationId,
         config: &Config,
@@ -3384,6 +3512,88 @@ mod tests {
         let (tx_event, _rx_event) = async_channel::unbounded();
         let codex_home = tempfile::tempdir().expect("create temp dir");
         let config = build_test_config(codex_home.path()).await;
+        let config = Arc::new(config);
+        let conversation_id = ConversationId::default();
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let models_manager = Arc::new(ModelsManager::new(auth_manager.clone()));
+        let exec_policy = ExecPolicyManager::default();
+        let model = ModelsManager::get_model_offline(config.model.as_deref());
+        let session_configuration = SessionConfiguration {
+            provider: config.model_provider.clone(),
+            model,
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
+            developer_instructions: config.developer_instructions.clone(),
+            user_instructions: config.user_instructions.clone(),
+            base_instructions: config.base_instructions.clone(),
+            compact_prompt: config.compact_prompt.clone(),
+            approval_policy: config.approval_policy.clone(),
+            sandbox_policy: config.sandbox_policy.clone(),
+            cwd: config.cwd.clone(),
+            original_config_do_not_use: Arc::clone(&config),
+            session_source: SessionSource::Exec,
+        };
+        let per_turn_config = Session::build_per_turn_config(&session_configuration);
+        let model_family = ModelsManager::construct_model_family_offline(
+            session_configuration.model.as_str(),
+            &per_turn_config,
+        );
+        let otel_manager = otel_manager(
+            conversation_id,
+            config.as_ref(),
+            &model_family,
+            session_configuration.session_source.clone(),
+        );
+
+        let state = SessionState::new(session_configuration.clone());
+        let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
+
+        let services = SessionServices {
+            mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
+            mcp_startup_cancellation_token: CancellationToken::new(),
+            unified_exec_manager: UnifiedExecSessionManager::default(),
+            notifier: UserNotifier::new(None),
+            rollout: Mutex::new(None),
+            user_shell: Arc::new(default_user_shell()),
+            show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+            exec_policy,
+            auth_manager: auth_manager.clone(),
+            otel_manager: otel_manager.clone(),
+            models_manager: Arc::clone(&models_manager),
+            tool_approvals: Mutex::new(ApprovalStore::default()),
+            skills_manager,
+        };
+
+        let turn_context = Session::make_turn_context(
+            Some(Arc::clone(&auth_manager)),
+            &otel_manager,
+            session_configuration.provider.clone(),
+            &session_configuration,
+            per_turn_config,
+            model_family,
+            conversation_id,
+            "turn_id".to_string(),
+        );
+
+        let session = Session {
+            conversation_id,
+            tx_event,
+            state: Mutex::new(state),
+            features: config.features.clone(),
+            active_turn: Mutex::new(None),
+            services,
+            next_internal_sub_id: AtomicU64::new(0),
+            pending_tools: PendingToolManager::new(),
+        };
+
+        (session, turn_context)
+    }
+
+    pub(crate) async fn make_session_and_context_with_cwd(cwd: PathBuf) -> (Session, TurnContext) {
+        let (tx_event, _rx_event) = async_channel::unbounded();
+        let codex_home = tempfile::tempdir().expect("create temp dir");
+        let config = build_test_config_with_cwd(codex_home.path(), cwd).await;
         let config = Arc::new(config);
         let conversation_id = ConversationId::default();
         let auth_manager =

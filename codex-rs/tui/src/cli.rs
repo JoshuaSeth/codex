@@ -77,6 +77,12 @@ pub struct Cli {
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     pub cwd: Option<PathBuf>,
 
+    /// Force Codex to run in the git worktree that has this branch checked out.
+    ///
+    /// This resolves the worktree path via `git worktree list --porcelain` and sets it as `--cd`.
+    #[arg(long = "branch", value_name = "BRANCH")]
+    pub git_branch: Option<String>,
+
     /// Enable web search (off by default). When enabled, the native Responses `web_search` tool is available to the model (no per‑call approval).
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,

@@ -596,6 +596,58 @@ pub async fn current_branch_name(cwd: &Path) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// Resolve the worktree path where the given branch is currently checked out.
+///
+/// Returns `None` when `cwd` is not in a git repository, the branch is not checked out in any
+/// worktree, or on error/timeout.
+pub async fn worktree_path_for_branch(cwd: &Path, branch: &str) -> Option<PathBuf> {
+    let branch = branch.trim();
+    let normalized_branch = branch
+        .strip_prefix("refs/heads/")
+        .or_else(|| branch.strip_prefix("refs/remotes/"))
+        .unwrap_or(branch)
+        .to_string();
+
+    let out = run_git_command_with_timeout(&["worktree", "list", "--porcelain"], cwd).await?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+    let mut entries: Vec<(PathBuf, Option<String>)> = Vec::new();
+
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(prev_path) = current_path.take() {
+                entries.push((prev_path, current_branch.take()));
+            } else {
+                current_branch = None;
+            }
+            current_path = Some(PathBuf::from(path.trim()));
+            continue;
+        }
+
+        if let Some(branch_ref) = line.strip_prefix("branch ") {
+            let branch_ref = branch_ref.trim();
+            let normalized = branch_ref
+                .strip_prefix("refs/heads/")
+                .or_else(|| branch_ref.strip_prefix("refs/remotes/"))
+                .unwrap_or(branch_ref);
+            current_branch = Some(normalized.to_string());
+        }
+    }
+
+    if let Some(path) = current_path {
+        entries.push((path, current_branch));
+    }
+
+    entries
+        .into_iter()
+        .find_map(|(path, branch)| (branch.as_deref()? == normalized_branch).then_some(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1090,39 @@ mod tests {
         let got_nested =
             resolve_root_git_project_for_trust(&nested).and_then(|p| std::fs::canonicalize(p).ok());
         assert_eq!(got_nested, expected);
+    }
+
+    #[tokio::test]
+    async fn worktree_path_for_branch_finds_linked_worktree() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_path = create_test_git_repo(&temp_dir).await;
+
+        let wt_root = temp_dir.path().join("wt");
+        let out = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                wt_root.to_str().expect("worktree path is valid utf-8"),
+                "-b",
+                "feature/x",
+            ])
+            .current_dir(&repo_path)
+            .output()
+            .expect("git worktree add");
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let got = worktree_path_for_branch(&repo_path, "feature/x").await;
+        let got = got.and_then(|p| std::fs::canonicalize(p).ok());
+        let expected = std::fs::canonicalize(&wt_root).ok();
+        assert_eq!(got, expected);
+
+        let got_prefixed = worktree_path_for_branch(&repo_path, "refs/heads/feature/x").await;
+        let got_prefixed = got_prefixed.and_then(|p| std::fs::canonicalize(p).ok());
+        assert_eq!(got_prefixed, expected);
     }
 
     #[test]

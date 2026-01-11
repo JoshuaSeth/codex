@@ -636,15 +636,42 @@ fn prepend_config_flags(
 /// Run the interactive Codex TUI, dispatching to either the legacy implementation or the
 /// experimental TUI v2 shim based on feature flags resolved from config.
 async fn run_interactive_tui(
-    interactive: TuiCli,
+    mut interactive: TuiCli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<AppExitInfo> {
+    resolve_git_branch_override(&mut interactive).await?;
     if is_tui2_enabled(&interactive).await? {
         let result = tui2::run_main(interactive.into(), codex_linux_sandbox_exe).await?;
         Ok(result.into())
     } else {
         codex_tui::run_main(interactive, codex_linux_sandbox_exe).await
     }
+}
+
+async fn resolve_git_branch_override(cli: &mut TuiCli) -> std::io::Result<()> {
+    let Some(branch) = cli.git_branch.as_deref() else {
+        return Ok(());
+    };
+
+    let base_dir = match cli.cwd.as_deref() {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+
+    let Some(worktree_path) =
+        codex_core::git_info::worktree_path_for_branch(&base_dir, branch).await
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "unable to find a git worktree with branch `{branch}` checked out (run from inside the repo, or pass `--cd` to the repo root)"
+            ),
+        ));
+    };
+
+    let resolved = std::fs::canonicalize(&worktree_path).unwrap_or(worktree_path);
+    cli.cwd = Some(resolved);
+    Ok(())
 }
 
 /// Returns `Ok(true)` when the resolved configuration enables the `tui2` feature flag.
@@ -725,6 +752,9 @@ fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
     }
     if let Some(cwd) = resume_cli.cwd {
         interactive.cwd = Some(cwd);
+    }
+    if let Some(branch) = resume_cli.git_branch {
+        interactive.git_branch = Some(branch);
     }
     if resume_cli.web_search {
         interactive.web_search = true;
