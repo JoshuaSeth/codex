@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +17,11 @@ use codex_core::config::types::Notifications;
 use codex_core::features::Feature;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::local_git_branches;
+use codex_core::live_status::LiveFrontend;
+use codex_core::live_status::LiveSessionStatus;
+use codex_core::live_status::LiveStatusDetail;
+use codex_core::live_status::LiveStatusWriter;
+use codex_core::live_status::LiveStatusWriterConfig;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::protocol::AgentMessageDeltaEvent;
@@ -43,9 +52,13 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::PendingToolStateEvent;
+use codex_core::protocol::PendingToolStatus;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
+use codex_core::protocol::RolloutItem;
+use codex_core::protocol::RolloutLine;
 use codex_core::protocol::SkillsListEntry;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TerminalInteractionEvent;
@@ -65,6 +78,9 @@ use codex_core::skills::model::SkillMetadata;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
@@ -128,7 +144,6 @@ use self::agent::spawn_agent_from_existing;
 mod session_header;
 use self::session_header::SessionHeader;
 use crate::streaming::controller::StreamController;
-use std::path::Path;
 
 use chrono::Local;
 use codex_common::approval_presets::ApprovalPreset;
@@ -316,6 +331,7 @@ pub(crate) struct ChatWidget {
     // Previous status header to restore after a transient stream retry.
     retry_status_header: Option<String>,
     conversation_id: Option<ThreadId>,
+    live_status: Option<LiveStatusWriter>,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
     show_welcome_banner: bool,
@@ -400,6 +416,35 @@ impl ChatWidget {
         }
     }
 
+    fn ensure_live_status_writer(&mut self) {
+        if self.live_status.is_some() {
+            return;
+        }
+
+        let Some(thread_id) = self.conversation_id else {
+            return;
+        };
+
+        let cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        match LiveStatusWriter::spawn(LiveStatusWriterConfig {
+            codex_home: self.config.codex_home.clone(),
+            thread_id,
+            frontend: LiveFrontend::Tui2,
+            status: LiveSessionStatus::WaitingUserInput,
+            detail: None,
+            cwd: Some(self.config.cwd.clone()),
+            cli_version,
+            heartbeat_interval: None,
+        }) {
+            Ok(writer) => {
+                self.live_status = Some(writer);
+            }
+            Err(err) => {
+                tracing::warn!("failed to start live status writer: {err:?}");
+            }
+        }
+    }
+
     // --- Small event handlers ---
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
@@ -408,6 +453,7 @@ impl ChatWidget {
         self.conversation_id = Some(event.session_id);
         self.current_rollout_path = Some(event.rollout_path.clone());
         let initial_messages = event.initial_messages.clone();
+        let rollout_path = event.rollout_path.clone();
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
         self.add_to_history(history_cell::new_session_info(
@@ -416,7 +462,9 @@ impl ChatWidget {
             event,
             self.show_welcome_banner,
         ));
-        if let Some(messages) = initial_messages {
+        if let Some(messages) = initial_messages
+            && !self.try_replay_rollout_transcript(&rollout_path)
+        {
             self.replay_initial_messages(messages);
         }
         // Ask codex-core to enumerate custom prompts for this session.
@@ -427,6 +475,10 @@ impl ChatWidget {
         });
         if let Some(user_message) = self.initial_user_message.take() {
             self.submit_user_message(user_message);
+        }
+        self.ensure_live_status_writer();
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::WaitingUserInput, None);
         }
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
@@ -533,6 +585,9 @@ impl ChatWidget {
         self.retry_status_header = None;
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(String::from("Working"));
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::Running, None);
+        }
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.request_redraw();
@@ -556,6 +611,9 @@ impl ChatWidget {
         });
 
         self.maybe_show_pending_rate_limit_prompt();
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::WaitingUserInput, None);
+        }
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -680,6 +738,9 @@ impl ChatWidget {
         self.last_unified_wait = None;
         self.stream_controller = None;
         self.maybe_show_pending_rate_limit_prompt();
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::WaitingUserInput, None);
+        }
     }
 
     fn on_error(&mut self, message: String) {
@@ -704,6 +765,9 @@ impl ChatWidget {
         status.insert(ev.server, ev.status);
         self.mcp_startup_status = Some(status);
         self.bottom_pane.set_task_running(true);
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::Running, None);
+        }
         if let Some(current) = &self.mcp_startup_status {
             let total = current.len();
             let mut starting: Vec<_> = current
@@ -762,6 +826,9 @@ impl ChatWidget {
         self.bottom_pane.set_task_running(false);
         self.maybe_send_next_queued_input();
         self.request_redraw();
+        if let Some(writer) = self.live_status.as_ref() {
+            writer.set_status(LiveSessionStatus::WaitingUserInput, None);
+        }
     }
 
     /// Handle a turn aborted due to user interrupt (Esc).
@@ -929,6 +996,45 @@ impl ChatWidget {
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(message);
+    }
+
+    fn on_pending_tool_state(&mut self, event: PendingToolStateEvent) {
+        if let Some(writer) = self.live_status.as_ref() {
+            match event.status {
+                PendingToolStatus::Waiting => {
+                    writer.set_status(
+                        LiveSessionStatus::WaitingPendingTool,
+                        Some(LiveStatusDetail {
+                            call_id: Some(event.call_id.clone()),
+                            tool_name: Some(event.tool_name.clone()),
+                            turn_id: Some(event.turn_id.clone()),
+                            note: event.note.clone(),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                PendingToolStatus::Resolved | PendingToolStatus::Cancelled => {
+                    writer.set_status(LiveSessionStatus::Running, None);
+                }
+            }
+        }
+
+        let status_text = match event.status {
+            PendingToolStatus::Waiting => "waiting on external completion",
+            PendingToolStatus::Resolved => "resumed",
+            PendingToolStatus::Cancelled => "cancelled",
+        };
+        let mut message = format!(
+            "Pending tool {} ({}) {status_text}.",
+            event.tool_name, event.call_id
+        );
+        if let Some(note) = event.note.as_ref()
+            && !note.trim().is_empty()
+        {
+            message.push(' ');
+            message.push_str(note.trim());
+        }
+        self.on_background_event(message);
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -1330,6 +1436,7 @@ impl ChatWidget {
             current_status_header: String::from("Working"),
             retry_status_header: None,
             conversation_id: None,
+            live_status: None,
             queued_user_messages: VecDeque::new(),
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
@@ -1414,6 +1521,7 @@ impl ChatWidget {
             current_status_header: String::from("Working"),
             retry_status_header: None,
             conversation_id: None,
+            live_status: None,
             queued_user_messages: VecDeque::new(),
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
@@ -1868,6 +1976,214 @@ impl ChatWidget {
         }
     }
 
+    fn try_replay_rollout_transcript(&mut self, rollout_path: &Path) -> bool {
+        let Ok(meta) = std::fs::metadata(rollout_path) else {
+            return false;
+        };
+        if meta.len() == 0 {
+            return false;
+        }
+
+        let file = match File::open(rollout_path) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to open rollout file {}: {err}",
+                    rollout_path.display()
+                );
+                return false;
+            }
+        };
+        let reader = BufReader::new(file);
+
+        let mut tool_names_by_call_id: HashMap<String, String> = HashMap::new();
+        let mut custom_tool_names_by_call_id: HashMap<String, String> = HashMap::new();
+        let mut replayed_any = false;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed reading rollout file {}: {err}",
+                        rollout_path.display()
+                    );
+                    break;
+                }
+            };
+            let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(&line) else {
+                continue;
+            };
+            match rollout_line.item {
+                RolloutItem::ResponseItem(item) => {
+                    if self.replay_rollout_response_item(
+                        item,
+                        &mut tool_names_by_call_id,
+                        &mut custom_tool_names_by_call_id,
+                    ) {
+                        replayed_any = true;
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => {
+                    self.set_token_info(ev.info);
+                    self.on_rate_limit_snapshot(ev.rate_limits);
+                }
+                _ => {}
+            }
+        }
+
+        replayed_any
+    }
+
+    fn replay_rollout_response_item(
+        &mut self,
+        item: ResponseItem,
+        tool_names_by_call_id: &mut HashMap<String, String>,
+        custom_tool_names_by_call_id: &mut HashMap<String, String>,
+    ) -> bool {
+        match item {
+            ResponseItem::Message { role, content, .. } => match role.as_str() {
+                "user" => {
+                    let text = extract_text(&content, TextFlavor::Input).trim().to_string();
+                    if text.is_empty() || should_skip_replayed_user_message(&text) {
+                        return false;
+                    }
+                    self.add_to_history(history_cell::new_user_prompt(text));
+                    true
+                }
+                "assistant" => {
+                    let text = extract_text(&content, TextFlavor::Output)
+                        .trim()
+                        .to_string();
+                    if text.is_empty() {
+                        return false;
+                    }
+                    let mut rendered: Vec<Line<'static>> = vec!["".into()];
+                    append_markdown(&text, None, &mut rendered);
+                    self.add_boxed_history(Box::new(history_cell::AgentMessageCell::new(
+                        rendered, true,
+                    )));
+                    true
+                }
+                _ => false,
+            },
+            ResponseItem::Reasoning { summary, .. } => {
+                let mut buf = String::new();
+                for entry in summary {
+                    let codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } =
+                        entry;
+                    if !buf.is_empty() {
+                        buf.push_str("\n\n");
+                    }
+                    buf.push_str(&text);
+                }
+                let buf = buf.trim().to_string();
+                if buf.is_empty() {
+                    return false;
+                }
+                self.add_boxed_history(history_cell::new_reasoning_summary_block(buf));
+                true
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                tool_names_by_call_id.insert(call_id, name.clone());
+                if name == "update_plan"
+                    && let Ok(args) = serde_json::from_str::<UpdatePlanArgs>(&arguments)
+                {
+                    self.add_to_history(history_cell::new_plan_update(args));
+                    return true;
+                }
+                if name == "view_image"
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&arguments)
+                    && let Some(path) = val.get("path").and_then(serde_json::Value::as_str)
+                {
+                    self.add_to_history(history_cell::new_view_image_tool_call(
+                        PathBuf::from(path),
+                        &self.config.cwd,
+                    ));
+                    return true;
+                }
+
+                let hint = truncate_multiline(&arguments, 24, 2_000);
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Tool call: {name}"),
+                    (!hint.trim().is_empty()).then_some(hint),
+                ));
+                true
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let tool_name = tool_names_by_call_id.get(&call_id).cloned();
+                if tool_name.as_deref() == Some("update_plan") {
+                    return false;
+                }
+                let content = truncate_multiline(&output.content, 48, 4_000);
+                let label = tool_name.unwrap_or_else(|| call_id.clone());
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Tool output: {label}"),
+                    (!content.trim().is_empty()).then_some(content),
+                ));
+                true
+            }
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                custom_tool_names_by_call_id.insert(call_id, name.clone());
+                let hint = truncate_multiline(&input, 24, 2_000);
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Custom tool: {name}"),
+                    (!hint.trim().is_empty()).then_some(hint),
+                ));
+                true
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                let tool_name = custom_tool_names_by_call_id.get(&call_id).cloned();
+                let content = truncate_multiline(&output, 48, 4_000);
+                let label = tool_name.unwrap_or(call_id);
+                self.add_to_history(history_cell::new_info_event(
+                    format!("Custom tool output: {label}"),
+                    (!content.trim().is_empty()).then_some(content),
+                ));
+                true
+            }
+            ResponseItem::LocalShellCall { action, .. } => {
+                let cmd = match action {
+                    codex_protocol::models::LocalShellAction::Exec(exec) => exec.command.join(" "),
+                };
+                let cmd = truncate_multiline(&cmd, 3, 400);
+                self.add_to_history(history_cell::new_info_event(
+                    "Shell".to_string(),
+                    (!cmd.trim().is_empty()).then_some(cmd),
+                ));
+                true
+            }
+            ResponseItem::WebSearchCall { action, .. } => {
+                if let WebSearchAction::Search { query } = action
+                    && let Some(query) = query
+                    && !query.trim().is_empty()
+                {
+                    self.add_to_history(history_cell::new_web_search_call(query));
+                    return true;
+                }
+                false
+            }
+            ResponseItem::Compaction { .. } => {
+                self.add_to_history(history_cell::new_info_event(
+                    "Context compacted".to_string(),
+                    None,
+                ));
+                true
+            }
+            ResponseItem::GhostSnapshot { .. } | ResponseItem::Other => false,
+        }
+    }
+
     pub(crate) fn handle_codex_event(&mut self, event: Event) {
         let Event { id, msg } = event;
         self.dispatch_event_msg(Some(id), msg, false);
@@ -1988,12 +2304,12 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::PendingToolState(ev) => self.on_pending_tool_state(ev),
             EventMsg::RawResponseItem(_)
             | EventMsg::ThreadRolledBack(_)
             | EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
-            | EventMsg::PendingToolState(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_) => {}
         }
@@ -3432,6 +3748,20 @@ impl ChatWidget {
         );
     }
 
+    pub(crate) fn set_cwd(&mut self, cwd: PathBuf) {
+        if self.config.cwd == cwd {
+            return;
+        }
+
+        self.config.cwd = cwd.clone();
+        self.set_skills(None);
+        self.submit_op(Op::ListSkills {
+            cwds: vec![cwd],
+            force_reload: false,
+        });
+        self.request_redraw();
+    }
+
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&self, op: Op) {
         // Record outbound operation for session replay fidelity.
@@ -3632,6 +3962,10 @@ impl ChatWidget {
         self.conversation_id
     }
 
+    pub(crate) fn take_live_status_writer(&mut self) -> Option<LiveStatusWriter> {
+        self.live_status.take()
+    }
+
     pub(crate) fn rollout_path(&self) -> Option<PathBuf> {
         self.current_rollout_path.clone()
     }
@@ -3759,6 +4093,72 @@ const EXAMPLE_PROMPTS: [&str; 6] = [
     "Write tests for @filename",
     "Improve documentation in @filename",
 ];
+
+#[derive(Debug, Clone, Copy)]
+enum TextFlavor {
+    Input,
+    Output,
+}
+
+fn extract_text(content: &[ContentItem], flavor: TextFlavor) -> String {
+    let mut out = String::new();
+    for item in content {
+        match (flavor, item) {
+            (TextFlavor::Input, ContentItem::InputText { text }) => out.push_str(text),
+            (TextFlavor::Input, ContentItem::InputImage { image_url }) => {
+                out.push_str(&format!("[image: {image_url}]"));
+            }
+            (TextFlavor::Output, ContentItem::OutputText { text }) => out.push_str(text),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn should_skip_replayed_user_message(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("<environment_context>") {
+        return true;
+    }
+
+    // Don't spam resumes with harness/agent instructions blocks.
+    if trimmed.starts_with("# AGENTS.md instructions") {
+        return true;
+    }
+
+    false
+}
+
+fn truncate_multiline(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut out = String::new();
+
+    for (idx, line) in text.lines().enumerate() {
+        if idx >= max_lines {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push('…');
+            break;
+        }
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+
+    if out.chars().count() > max_chars {
+        let mut truncated: String = out.chars().take(max_chars.saturating_sub(1)).collect();
+        truncated.push('…');
+        return truncated;
+    }
+
+    out
+}
 
 // Extract the first bold (Markdown) element in the form **...** from `s`.
 // Returns the inner text if found; otherwise `None`.

@@ -1045,6 +1045,94 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn save_auth_writes_per_account_backup() -> Result<(), std::io::Error> {
+        let dir = tempdir()?;
+
+        let fake_jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_account_id: None,
+            },
+            dir.path(),
+        )?;
+        let id_token = parse_id_token(&fake_jwt).map_err(std::io::Error::other)?;
+
+        let auth_dot_json = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token,
+                access_token: "access-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                account_id: None,
+            }),
+            last_refresh: Some(Utc::now()),
+        };
+        super::save_auth(dir.path(), &auth_dot_json, AuthCredentialsStoreMode::File)?;
+
+        let primary = std::fs::read_to_string(get_auth_file(dir.path()))?;
+        let primary_json: serde_json::Value = serde_json::from_str(&primary)?;
+
+        let backup = std::fs::read_to_string(dir.path().join("user_auth.json"))?;
+        let backup_json: serde_json::Value = serde_json::from_str(&backup)?;
+
+        assert_eq!(backup_json, primary_json);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_tokens_updates_per_account_backup() -> Result<(), std::io::Error> {
+        let codex_home = tempdir()?;
+
+        let fake_jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: "pro".to_string(),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )?;
+        let id_token = parse_id_token(&fake_jwt).map_err(std::io::Error::other)?;
+
+        let auth_dot_json = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token,
+                access_token: "access-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                account_id: None,
+            }),
+            last_refresh: Some(Utc::now()),
+        };
+        super::save_auth(
+            codex_home.path(),
+            &auth_dot_json,
+            AuthCredentialsStoreMode::File,
+        )?;
+
+        let storage = create_auth_storage(
+            codex_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+        );
+        super::update_tokens(
+            &storage,
+            None,
+            Some("new-access-token".to_string()),
+            Some("new-refresh-token".to_string()),
+        )
+        .await?;
+
+        let primary = std::fs::read_to_string(get_auth_file(codex_home.path()))?;
+        let primary_json: serde_json::Value = serde_json::from_str(&primary)?;
+
+        let backup = std::fs::read_to_string(codex_home.path().join("user_auth.json"))?;
+        let backup_json: serde_json::Value = serde_json::from_str(&backup)?;
+
+        assert_eq!(backup_json, primary_json);
+        Ok(())
+    }
+
     struct AuthFileParams {
         openai_api_key: Option<String>,
         chatgpt_plan_type: String,

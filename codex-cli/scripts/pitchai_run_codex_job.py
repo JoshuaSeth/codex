@@ -571,123 +571,132 @@ def main() -> int:
                 if selected_prompt == cfg.prompt_path:
                     break
 
-            if work_item is not None:
-                state_dir = Path(os.getenv("PITCHAI_STATE_DIR", str(cfg.volume_root)))
-                state_key = work_item.state_key or _state_key_for_config(work_item.config_path)
-                state_path = Path(os.getenv("PITCHAI_STATE_PATH", str(state_dir / f"state_{state_key}.json")))
-
-                # Default per-item workdir: isolate runs by queue bundle name.
-                if work_item.workdir == cfg.workdir:
+            try:
+                if work_item is not None:
+                    state_dir = Path(os.getenv("PITCHAI_STATE_DIR", str(cfg.volume_root)))
+                    state_key = work_item.state_key or _state_key_for_config(work_item.config_path)
+                    state_path = Path(os.getenv("PITCHAI_STATE_PATH", str(state_dir / f"state_{state_key}.json")))
                     bundle_name = work_item.queue_processing_path.name
-                    run_root = cfg.volume_root / "workdir" / _sanitize_key(state_key) / _sanitize_key(bundle_name)
-                    run_root.mkdir(parents=True, exist_ok=True)
-                    workdir = run_root
-                else:
-                    workdir = work_item.workdir
+                    os.environ["PITCHAI_DISPATCH_BUNDLE"] = bundle_name
 
-                run_cfg = CodexRunConfig(
-                    volume_root=cfg.volume_root,
-                    codex_home=cfg.codex_home,
-                    workdir=workdir,
-                    state_path=state_path,
-                    prompt_path=work_item.prompt_path,
-                    config_path=work_item.config_path,
-                    prompt_queue_dir=cfg.prompt_queue_dir,
-                )
-                if work_item.model:
-                    os.environ["PITCHAI_CODEX_MODEL_OVERRIDE"] = work_item.model
+                    # Default per-item workdir: isolate runs by queue bundle name.
+                    if work_item.workdir == cfg.workdir:
+                        run_root = cfg.volume_root / "workdir" / _sanitize_key(state_key) / _sanitize_key(bundle_name)
+                        run_root.mkdir(parents=True, exist_ok=True)
+                        workdir = run_root
+                    else:
+                        workdir = work_item.workdir
+
+                    run_cfg = CodexRunConfig(
+                        volume_root=cfg.volume_root,
+                        codex_home=cfg.codex_home,
+                        workdir=workdir,
+                        state_path=state_path,
+                        prompt_path=work_item.prompt_path,
+                        config_path=work_item.config_path,
+                        prompt_queue_dir=cfg.prompt_queue_dir,
+                    )
+                    if work_item.model:
+                        os.environ["PITCHAI_CODEX_MODEL_OVERRIDE"] = work_item.model
+                    else:
+                        os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
                 else:
+                    os.environ.pop("PITCHAI_DISPATCH_BUNDLE", None)
+                    run_cfg = CodexRunConfig(
+                        volume_root=cfg.volume_root,
+                        codex_home=cfg.codex_home,
+                        workdir=cfg.workdir,
+                        state_path=cfg.state_path,
+                        prompt_path=selected_prompt,
+                        config_path=cfg.config_path,
+                        prompt_queue_dir=cfg.prompt_queue_dir,
+                    )
                     os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
-            else:
-                run_cfg = CodexRunConfig(
-                    volume_root=cfg.volume_root,
-                    codex_home=cfg.codex_home,
-                    workdir=cfg.workdir,
-                    state_path=cfg.state_path,
-                    prompt_path=selected_prompt,
-                    config_path=cfg.config_path,
-                    prompt_queue_dir=cfg.prompt_queue_dir,
-                )
-                os.environ.pop("PITCHAI_CODEX_MODEL_OVERRIDE", None)
 
-            state = _read_state(run_cfg.state_path)
-            resume_id = state.get("thread_id") if isinstance(state, dict) else None
-            if not isinstance(resume_id, str) or not resume_id.strip():
-                resume_id = None
+                state = _read_state(run_cfg.state_path)
+                resume_id = state.get("thread_id") if isinstance(state, dict) else None
+                if not isinstance(resume_id, str) or not resume_id.strip():
+                    resume_id = None
 
-            fork = False
-            persist_thread_id = True
-            pre_commands: list[str] = []
-            post_commands: list[str] = []
-            git_repo: Optional[str] = None
-            git_branch: Optional[str] = None
-            git_base: Optional[str] = None
-            git_clone_dir_rel: Optional[str] = None
-            git_prepared = False
-            if work_item is not None and work_item.conversation_id:
-                resume_id = work_item.conversation_id
-            if work_item is not None and work_item.fork:
-                fork = True
-                # Preserve the original `conversation_id` for future "fork again"
-                # runs by not persisting the newly created fork session id.
-                persist_thread_id = False
-            if work_item is not None:
-                pre_commands = list(work_item.pre_commands or [])
-                post_commands = list(work_item.post_commands or [])
-                git_repo = work_item.git_repo
-                git_branch = work_item.git_branch
-                git_base = work_item.git_base
-                git_clone_dir_rel = work_item.git_clone_dir_rel
-                git_prepared = bool(work_item.git_prepared)
+                fork = False
+                persist_thread_id = True
+                pre_commands: list[str] = []
+                post_commands: list[str] = []
+                git_repo: Optional[str] = None
+                git_branch: Optional[str] = None
+                git_base: Optional[str] = None
+                git_clone_dir_rel: Optional[str] = None
+                git_prepared = False
+                if work_item is not None and work_item.conversation_id:
+                    resume_id = work_item.conversation_id
+                if work_item is not None and work_item.fork:
+                    fork = True
+                    # Preserve the original `conversation_id` for future "fork again"
+                    # runs by not persisting the newly created fork session id.
+                    persist_thread_id = False
+                if work_item is not None:
+                    pre_commands = list(work_item.pre_commands or [])
+                    post_commands = list(work_item.post_commands or [])
+                    git_repo = work_item.git_repo
+                    git_branch = work_item.git_branch
+                    git_base = work_item.git_base
+                    git_clone_dir_rel = work_item.git_clone_dir_rel
+                    git_prepared = bool(work_item.git_prepared)
 
-            hook_env = dict(os.environ)
-            hook_env["PITCHAI_CODEX_PHASE"] = "pre"
-            hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
-
-            # Optional: clone repo + create branch before running Codex/prompt.
-            if git_repo and git_branch and not git_prepared:
-                base = git_base or "main"
-                repo_dir = _prepare_git_repo(
-                    run_cfg.workdir,
-                    repo_url=git_repo,
-                    branch=git_branch,
-                    base=base,
-                    clone_dir_rel=git_clone_dir_rel,
-                )
-                run_cfg = CodexRunConfig(
-                    volume_root=run_cfg.volume_root,
-                    codex_home=run_cfg.codex_home,
-                    workdir=repo_dir,
-                    state_path=run_cfg.state_path,
-                    prompt_path=run_cfg.prompt_path,
-                    config_path=run_cfg.config_path,
-                    prompt_queue_dir=run_cfg.prompt_queue_dir,
-                )
+                hook_env = dict(os.environ)
+                hook_env["PITCHAI_CODEX_PHASE"] = "pre"
                 hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
-            elif git_prepared and not (run_cfg.workdir / ".git").exists():
-                print("[git] git_prepared=true but no .git found in workdir", file=sys.stderr, flush=True)
+
+                # Optional: clone repo + create branch before running Codex/prompt.
+                if git_repo and git_branch and not git_prepared:
+                    base = git_base or "main"
+                    repo_dir = _prepare_git_repo(
+                        run_cfg.workdir,
+                        repo_url=git_repo,
+                        branch=git_branch,
+                        base=base,
+                        clone_dir_rel=git_clone_dir_rel,
+                    )
+                    run_cfg = CodexRunConfig(
+                        volume_root=run_cfg.volume_root,
+                        codex_home=run_cfg.codex_home,
+                        workdir=repo_dir,
+                        state_path=run_cfg.state_path,
+                        prompt_path=run_cfg.prompt_path,
+                        config_path=run_cfg.config_path,
+                        prompt_queue_dir=run_cfg.prompt_queue_dir,
+                    )
+                    hook_env["PITCHAI_CODEX_WORKDIR"] = str(run_cfg.workdir)
+                elif git_prepared and not (run_cfg.workdir / ".git").exists():
+                    print("[git] git_prepared=true but no .git found in workdir", file=sys.stderr, flush=True)
+                    last_rc = 1
+                    _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
+                    break
+
+                pre_rc = _run_hook_commands(pre_commands, cwd=run_cfg.workdir, env=hook_env, label="pre")
+                if pre_rc != 0:
+                    last_rc = int(pre_rc)
+                    _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
+                    # Best effort: run post even if pre failed.
+                    hook_env["PITCHAI_CODEX_PHASE"] = "post"
+                    hook_env["PITCHAI_CODEX_LAST_RC"] = str(last_rc)
+                    _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
+                    break
+
+                rc = _spawn_codex(run_cfg, resume_id=resume_id, fork=fork, persist_thread_id=persist_thread_id)
+                last_rc = rc
+                _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
+
+                hook_env["PITCHAI_CODEX_PHASE"] = "post"
+                hook_env["PITCHAI_CODEX_LAST_RC"] = str(rc)
+                _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
+                if rc != 0:
+                    break
+            except Exception as exc:
+                # Ensure the queue does not get stuck in _processing on unexpected failures.
+                print(f"[error] runner failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
                 last_rc = 1
                 _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
-                break
-
-            pre_rc = _run_hook_commands(pre_commands, cwd=run_cfg.workdir, env=hook_env, label="pre")
-            if pre_rc != 0:
-                last_rc = int(pre_rc)
-                _finalize_work_item(work_item, rc=last_rc, prompt_queue_dir=cfg.prompt_queue_dir)
-                # Best effort: run post even if pre failed.
-                hook_env["PITCHAI_CODEX_PHASE"] = "post"
-                hook_env["PITCHAI_CODEX_LAST_RC"] = str(last_rc)
-                _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
-                break
-
-            rc = _spawn_codex(run_cfg, resume_id=resume_id, fork=fork, persist_thread_id=persist_thread_id)
-            last_rc = rc
-            _finalize_work_item(work_item, rc=rc, prompt_queue_dir=cfg.prompt_queue_dir)
-
-            hook_env["PITCHAI_CODEX_PHASE"] = "post"
-            hook_env["PITCHAI_CODEX_LAST_RC"] = str(rc)
-            _run_hook_commands(post_commands, cwd=run_cfg.workdir, env=hook_env, label="post")
-            if rc != 0:
                 break
 
         return int(last_rc)

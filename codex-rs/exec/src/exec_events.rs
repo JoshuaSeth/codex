@@ -161,6 +161,12 @@ pub struct CommandExecutionItem {
 pub struct FileUpdateChange {
     pub path: String,
     pub kind: PatchChangeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_lines: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_lines: Option<u32>,
 }
 
 /// The status of a file change.

@@ -32,11 +32,22 @@ use owo_colors::OwoColorize;
 use std::path::PathBuf;
 use supports_color::Stream;
 
+mod await_any_cmd;
+mod exec_async_cmd;
+mod exec_view_cmd;
+mod exec_view_meta;
+mod get_result_cmd;
 mod mcp_cmd;
+mod view_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
+use crate::await_any_cmd::AwaitAnyCli;
+use crate::exec_async_cmd::ExecAsyncCli;
+use crate::exec_view_cmd::ExecViewCli;
+use crate::get_result_cmd::GetResultCli;
 use crate::mcp_cmd::McpCli;
+use crate::view_cmd::ViewCli;
 
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -82,6 +93,21 @@ enum Subcommand {
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
+
+    /// Run `codex exec --json` detached and print the thread id immediately.
+    ExecAsync(ExecAsyncCli),
+
+    /// Block until any of the given conversations finishes.
+    AwaitAny(AwaitAnyCli),
+
+    /// Print a non-interactive summary of a thread (status + last turn result).
+    GetResult(GetResultCli),
+
+    /// Run `codex exec --json` detached, write events to a file, then attach a read-only viewer.
+    ExecView(ExecViewCli),
+
+    /// View a `codex exec --json` JSONL event stream file (read-only).
+    View(ViewCli),
 
     /// Run a code review non-interactively.
     Review(ReviewArgs),
@@ -160,6 +186,10 @@ struct ResumeCommand {
     /// Show all sessions (disables cwd filtering and shows CWD column).
     #[arg(long = "all", default_value_t = false)]
     all: bool,
+
+    /// Fork the selected session into a new session id before resuming.
+    #[arg(long = "fork", default_value_t = false)]
+    fork: bool,
 
     #[clap(flatten)]
     config_overrides: TuiCli,
@@ -453,6 +483,21 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             prepend_config_flags(&mut exec_cli.config_overrides, &root_config_overrides);
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
+        Some(Subcommand::ExecAsync(exec_async_cli)) => {
+            crate::exec_async_cmd::run_exec_async(exec_async_cli, &root_config_overrides)?;
+        }
+        Some(Subcommand::AwaitAny(await_cli)) => {
+            crate::await_any_cmd::run_await_any(await_cli, &root_config_overrides)?;
+        }
+        Some(Subcommand::GetResult(get_result_cli)) => {
+            crate::get_result_cmd::run_get_result(get_result_cli, &root_config_overrides)?;
+        }
+        Some(Subcommand::ExecView(exec_view_cli)) => {
+            crate::exec_view_cmd::run_exec_view(exec_view_cli, &root_config_overrides)?;
+        }
+        Some(Subcommand::View(view_cli)) => {
+            crate::view_cmd::run_view(view_cli, &root_config_overrides)?;
+        }
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
@@ -490,6 +535,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             session_id,
             last,
             all,
+            fork,
             config_overrides,
         })) => {
             interactive = finalize_resume_interactive(
@@ -498,6 +544,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 session_id,
                 last,
                 all,
+                fork,
                 config_overrides,
             );
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
@@ -712,6 +759,7 @@ fn finalize_resume_interactive(
     session_id: Option<String>,
     last: bool,
     show_all: bool,
+    fork: bool,
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
@@ -721,6 +769,7 @@ fn finalize_resume_interactive(
     interactive.resume_last = last;
     interactive.resume_session_id = resume_session_id;
     interactive.resume_show_all = show_all;
+    interactive.resume_fork = fork;
 
     // Merge resume-scoped flags and overrides with highest precedence.
     merge_resume_cli_flags(&mut interactive, resume_cli);
@@ -771,9 +820,6 @@ fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
     if !resume_cli.add_dir.is_empty() {
         interactive.add_dir.extend(resume_cli.add_dir);
     }
-    if let Some(value) = resume_cli.replace_last_tool_result {
-        interactive.replace_last_tool_result = Some(value);
-    }
     if let Some(prompt) = resume_cli.prompt {
         interactive.prompt = Some(prompt);
     }
@@ -811,6 +857,7 @@ mod tests {
             session_id,
             last,
             all,
+            fork,
             config_overrides: resume_cli,
         }) = subcommand.expect("resume present")
         else {
@@ -823,6 +870,7 @@ mod tests {
             session_id,
             last,
             all,
+            fork,
             resume_cli,
         )
     }

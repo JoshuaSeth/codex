@@ -425,12 +425,17 @@ def _format_stop_hook_message(payload: dict[str, Any]) -> str:
     utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     execution_name = os.getenv("CONTAINER_APP_JOB_EXECUTION_NAME") or os.getenv("PITCHAI_JOB_EXECUTION_NAME")
     conversation_id = payload.get("conversation_id")
+    dispatch_bundle = os.getenv("PITCHAI_DISPATCH_BUNDLE") or os.getenv("PITCHAI_CODEX_BUNDLE")
 
     meta_parts = [utc]
     if isinstance(execution_name, str) and execution_name.strip():
         meta_parts.append(execution_name.strip())
     if isinstance(conversation_id, str) and conversation_id.strip():
-        meta_parts.append(f"convo={conversation_id.strip()[:10]}")
+        convo = conversation_id.strip()
+        meta_parts.append(f"convo={convo[:10]}")
+        meta_parts.append(f"cid={convo}")
+    if isinstance(dispatch_bundle, str) and dispatch_bundle.strip():
+        meta_parts.append(f"bundle={dispatch_bundle.strip()}")
     meta = " | ".join(meta_parts)
 
     project_name = _escape_markdown(project_name)

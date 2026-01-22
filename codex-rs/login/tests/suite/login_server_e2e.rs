@@ -151,6 +151,13 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     assert_eq!(json["tokens"]["refresh_token"], "refresh-123");
     assert_eq!(json["tokens"]["account_id"], chatgpt_account_id);
 
+    // Per-account backup should be written alongside auth.json.
+    let backup_path = codex_home.join("user_auth.json");
+    assert!(backup_path.exists(), "per-account auth backup should exist");
+    let backup_data = std::fs::read_to_string(&backup_path)?;
+    let backup_json: serde_json::Value = serde_json::from_str(&backup_data)?;
+    assert_eq!(backup_json, json);
+
     // Stop mock issuer
     drop(issuer_handle);
     Ok(())
@@ -194,6 +201,12 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
     assert!(
         auth_path.exists(),
         "auth.json should be created even if parent dir was missing"
+    );
+
+    let backup_path = codex_home.join("user_auth.json");
+    assert!(
+        backup_path.exists(),
+        "per-account auth backup should be created even if parent dir was missing"
     );
     Ok(())
 }
@@ -250,6 +263,12 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
     assert!(
         !auth_path.exists(),
         "auth.json should not be written when the workspace mismatches"
+    );
+
+    let backup_path = codex_home.join("user_auth.json");
+    assert!(
+        !backup_path.exists(),
+        "per-account auth backup should not be written when the workspace mismatches"
     );
 
     Ok(())

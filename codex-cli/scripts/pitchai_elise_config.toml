@@ -33,9 +33,8 @@ Seth mailbox access (separate state):
 
 Boss approval policy (MANDATORY):
 - You may always email Seth (`seth.vanderbijl@pitchai.net`) for advice / approval.
-- Do NOT send email to anyone else unless you have explicit approval from Seth.
-- Approval arrives by email from Seth with the literal text `APPROVED: <draft_filename>` in the body or subject.
-- When approved, send the corresponding draft (from `/mnt/elise/elise/drafts/`) using `send_email` and log it in `ledger.md`.
+- Do NOT send email automatically. This agent only creates drafts for humans to review/edit/send.
+- Use `send_email` to create an Outlook draft in `elise@pitchai.net` and log the returned `draft_id` + `web_link` in `ledger.md`.
 
 When you have no more actions for now:
 - Write a short status update into `ledger.md`.
@@ -55,9 +54,9 @@ parameters = { type = "object", additionalProperties = false, required = ["messa
 timeout_ms = 120000
 
 [custom_tools.send_email]
-command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "send_email"]
-description = "Send an email (Graph app-only). Use only after boss approval for external recipients."
-parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } }, save_to_sent = { type = "boolean" }, approved_draft_filename = { type = "string" } } }
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/elise_graph_tool.py", "draft_email"]
+description = "Create an Outlook draft email in Elise's mailbox (Graph app-only). Does NOT send."
+parameters = { type = "object", additionalProperties = false, required = ["to", "subject", "body"], properties = { to = { type = "array", items = { type = "string" } }, cc = { type = "array", items = { type = "string" } }, bcc = { type = "array", items = { type = "string" } }, subject = { type = "string" }, body = { type = "string" }, body_type = { type = "string" }, reply_to = { type = "array", items = { type = "string" } } } }
 timeout_ms = 120000
 
 [custom_tools.seth_mail_search]

@@ -37,6 +37,8 @@ use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::RateLimitWindow;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
+use codex_core::protocol::RolloutItem;
+use codex_core::protocol::RolloutLine;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TokenCountEvent;
 use codex_core::protocol::TokenUsage;
@@ -49,6 +51,8 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WarningEvent;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::parse_command::ParsedCommand;
@@ -65,6 +69,7 @@ use pretty_assertions::assert_eq;
 #[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
@@ -156,6 +161,119 @@ async fn resumed_initial_messages_render_history() {
     assert!(
         text_blob.contains("assistant reply"),
         "expected replayed agent message",
+    );
+}
+
+#[tokio::test]
+async fn resumed_session_prefers_rollout_transcript_over_initial_messages() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let conversation_id = ThreadId::new();
+    let mut rollout_file = NamedTempFile::new().unwrap();
+
+    let plan_args = UpdatePlanArgs {
+        explanation: Some("resume".into()),
+        plan: vec![PlanItemArg {
+            step: "step from rollout".into(),
+            status: StepStatus::InProgress,
+        }],
+    };
+    let plan_args_json = serde_json::to_string(&plan_args).expect("plan args json");
+
+    let rollout_lines = vec![
+        RolloutLine {
+            timestamp: "t1".into(),
+            item: RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: "user from rollout".into(),
+                }],
+            }),
+        },
+        RolloutLine {
+            timestamp: "t2".into(),
+            item: RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "update_plan".into(),
+                arguments: plan_args_json,
+                call_id: "call_1".into(),
+            }),
+        },
+        RolloutLine {
+            timestamp: "t3".into(),
+            item: RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText {
+                    text: "assistant from rollout".into(),
+                }],
+            }),
+        },
+    ];
+
+    for rollout_line in rollout_lines {
+        let line = serde_json::to_string(&rollout_line).expect("rollout line json");
+        writeln!(rollout_file, "{line}").expect("write rollout line");
+    }
+    rollout_file.flush().expect("flush rollout");
+
+    let configured = codex_core::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::ReadOnly,
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: Some(vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "fallback initial user".to_string(),
+                images: None,
+            }),
+            EventMsg::AgentMessage(AgentMessageEvent {
+                message: "fallback initial assistant".to_string(),
+            }),
+        ]),
+        rollout_path: rollout_file.path().to_path_buf(),
+    };
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let text_blob = cells
+        .iter()
+        .flat_map(|lines| lines.iter())
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text_blob.contains("user from rollout"),
+        "expected rollout transcript to include user message",
+    );
+    assert!(
+        text_blob.contains("assistant from rollout"),
+        "expected rollout transcript to include assistant message",
+    );
+    assert!(
+        text_blob.contains("step from rollout"),
+        "expected rollout transcript to include plan steps",
+    );
+
+    assert!(
+        !text_blob.contains("fallback initial user"),
+        "expected to prefer rollout transcript over initial_messages",
+    );
+    assert!(
+        !text_blob.contains("fallback initial assistant"),
+        "expected to prefer rollout transcript over initial_messages",
     );
 }
 
@@ -402,6 +520,7 @@ async fn make_chatwidget_manual(
         current_status_header: String::from("Working"),
         retry_status_header: None,
         conversation_id: None,
+        live_status: None,
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),

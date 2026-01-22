@@ -30,6 +30,13 @@ use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::git_info::get_git_repo_root;
+use codex_core::live_status::LiveFrontend;
+use codex_core::live_status::LiveIpc;
+use codex_core::live_status::LiveSessionStatus;
+use codex_core::live_status::LiveStatusDetail;
+use codex_core::live_status::LiveStatusRecordV1;
+use codex_core::live_status::LiveStatusWriter;
+use codex_core::live_status::LiveStatusWriterConfig;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
@@ -49,6 +56,7 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use supports_color::Stream;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -73,7 +81,8 @@ use crate::pending_tool_ipc::send_pending_result;
 use crate::prompt_sequence::PromptSequenceRunner;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_selector_str;
-use codex_core::replace_last_tool_result as patch_last_tool_result;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 
 enum InitialOperation {
     UserTurn {
@@ -351,17 +360,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
         let mut resume_path = resolve_resume_path(&config, args).await?;
 
-        if let Some(replacement) = args.replace_last_tool_result.as_deref() {
-            let path = resume_path.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--replace-last-toolresult requires specifying a session id or --last"
-                )
-            })?;
-            patch_last_tool_result(path, replacement)
-                .await
-                .with_context(|| {
-                    format!("failed to replace last tool result in {}", path.display())
-                })?;
+        if let Some(path) = resume_path.as_ref() {
+            let thread_id = resolve_thread_id_for_resume(args, path).await?;
+            wait_for_thread_to_finish_if_running(&config.codex_home, &thread_id).await?;
         }
 
         if let Some(path) = resume_path.take() {
@@ -374,16 +375,40 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     } else {
         thread_manager.start_thread(config.clone()).await?
     };
-    let _pending_tool_server =
-        match PendingToolServer::start(&config.codex_home, &conversation_id, conversation.clone())
-            .await
-        {
-            Ok(server) => Some(server),
-            Err(err) => {
-                warn!(?err, "failed to start pending tool IPC server");
-                None
-            }
-        };
+
+    let pending_tool_server = match PendingToolServer::start(conversation.clone()).await {
+        Ok(server) => Some(server),
+        Err(err) => {
+            warn!(?err, "failed to start pending tool IPC server");
+            None
+        }
+    };
+
+    let cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let mut live_status = match LiveStatusWriter::spawn(LiveStatusWriterConfig {
+        codex_home: config.codex_home.clone(),
+        thread_id: conversation_id,
+        frontend: LiveFrontend::Exec,
+        status: LiveSessionStatus::Running,
+        detail: None,
+        cwd: Some(config.cwd.clone()),
+        cli_version,
+        heartbeat_interval: None,
+    }) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            warn!(?err, "failed to start live status writer");
+            None
+        }
+    };
+
+    if let (Some(writer), Some(server)) = (live_status.as_ref(), pending_tool_server.as_ref()) {
+        let addr = server.addr();
+        writer.set_ipc(LiveIpc {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        });
+    }
 
     let mut prompt_sequence_runner = match prompt_sequence {
         Some(path) => Some(PromptSequenceRunner::load(&path)?),
@@ -592,6 +617,26 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 })
                 .await?;
         }
+        if let (Some(writer), EventMsg::PendingToolState(ev)) = (live_status.as_ref(), &event.msg) {
+            match ev.status {
+                codex_core::protocol::PendingToolStatus::Waiting => {
+                    writer.set_status(
+                        LiveSessionStatus::WaitingPendingTool,
+                        Some(LiveStatusDetail {
+                            call_id: Some(ev.call_id.clone()),
+                            tool_name: Some(ev.tool_name.clone()),
+                            turn_id: Some(ev.turn_id.clone()),
+                            note: ev.note.clone(),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                codex_core::protocol::PendingToolStatus::Resolved
+                | codex_core::protocol::PendingToolStatus::Cancelled => {
+                    writer.set_status(LiveSessionStatus::Running, None);
+                }
+            }
+        }
         if matches!(&event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
@@ -630,8 +675,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
+    if let Some(writer) = live_status.take() {
+        let status = if error_seen {
+            LiveSessionStatus::Errored
+        } else {
+            LiveSessionStatus::Completed
+        };
+        writer
+            .shutdown(
+                status,
+                Some(if error_seen {
+                    "fatal error seen".to_string()
+                } else {
+                    "finished".to_string()
+                }),
+            )
+            .await;
+    }
+    drop(pending_tool_server);
+
     if error_seen {
-        std::process::exit(1);
+        anyhow::bail!("fatal error reported by server");
     }
 
     Ok(())
@@ -639,14 +703,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
 async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
     let codex_home = find_codex_home().context("failed to locate codex home")?;
-    let metadata_path = codex_home
-        .join("live")
-        .join(format!("{}.json", args.session_id));
+    let thread_id = codex_protocol::ThreadId::from_string(&args.session_id)?;
+    let metadata_path = LiveStatusRecordV1::path_for(&codex_home, &thread_id);
     let bytes = fs::read(&metadata_path)
         .await
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
     let value: Value = serde_json::from_slice(&bytes)?;
-    let meta = load_metadata(value)?;
+    let meta = load_metadata(value.clone())?;
+    if let Ok(record) = serde_json::from_value::<LiveStatusRecordV1>(value) {
+        if !record.alive {
+            anyhow::bail!("session {} is not alive", record.thread_id);
+        }
+        if let Some(age_s) = heartbeat_age_seconds(&record.last_heartbeat_at)
+            && age_s > 30.0
+        {
+            anyhow::bail!(
+                "session {} live record is stale (last heartbeat {:.1}s ago)",
+                record.thread_id,
+                age_s
+            );
+        }
+    }
     let addr = addr_from_metadata(meta)?;
     let payload = FunctionCallOutputPayload {
         content: args.output,
@@ -659,6 +736,125 @@ async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
         args.session_id
     );
     Ok(())
+}
+
+fn heartbeat_age_seconds(last_heartbeat_at: &str) -> Option<f64> {
+    let parsed = time::OffsetDateTime::parse(
+        last_heartbeat_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    let now = time::OffsetDateTime::now_utc();
+    let diff = now - parsed;
+    Some(diff.whole_milliseconds() as f64 / 1000.0)
+}
+
+async fn resolve_thread_id_for_resume(
+    args: &crate::cli::ResumeArgs,
+    rollout_path: &Path,
+) -> anyhow::Result<codex_protocol::ThreadId> {
+    if let Some(selector) = args.session_id.as_deref()
+        && let Ok(id) = codex_protocol::ThreadId::from_string(selector)
+    {
+        return Ok(id);
+    }
+    read_thread_id_from_rollout_head(rollout_path).await
+}
+
+async fn read_thread_id_from_rollout_head(path: &Path) -> anyhow::Result<codex_protocol::ThreadId> {
+    use tokio::io::AsyncBufReadExt;
+
+    const HEAD_RECORD_LIMIT: usize = 25;
+
+    let file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open rollout {}", path.display()))?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut non_empty = 0usize;
+    while non_empty < HEAD_RECORD_LIMIT {
+        let line_opt = lines.next_line().await?;
+        let Some(line) = line_opt else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            continue;
+        };
+        if let RolloutItem::SessionMeta(meta) = rollout_line.item {
+            return Ok(meta.meta.id);
+        }
+    }
+
+    anyhow::bail!(
+        "failed to resolve thread id from rollout {}",
+        path.display()
+    )
+}
+
+async fn wait_for_thread_to_finish_if_running(
+    codex_home: &Path,
+    thread_id: &codex_protocol::ThreadId,
+) -> anyhow::Result<()> {
+    let status_path = LiveStatusRecordV1::path_for(codex_home, thread_id);
+
+    let mut printed_wait_message = false;
+    loop {
+        let bytes = match fs::read(&status_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed reading live status {}", status_path.display())
+                });
+            }
+        };
+        let value: Value = serde_json::from_slice(&bytes).with_context(|| {
+            format!("failed parsing live status json {}", status_path.display())
+        })?;
+
+        let alive = value
+            .get("alive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !alive {
+            return Ok(());
+        }
+
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(status, "completed" | "errored") {
+            return Ok(());
+        }
+
+        let last_heartbeat_at = value
+            .get("last_heartbeat_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let age_s = heartbeat_age_seconds(last_heartbeat_at).unwrap_or(f64::INFINITY);
+        if age_s > 30.0 {
+            // Best-effort: treat stale records as not-running so users can recover after a crash.
+            return Ok(());
+        }
+
+        if !printed_wait_message {
+            printed_wait_message = true;
+            eprintln!(
+                "Session {thread_id} appears to be running; waiting for it to finish before resuming (Ctrl+C to cancel)."
+            );
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                anyhow::bail!("interrupted while waiting for session {thread_id} to finish");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
 }
 
 async fn resolve_resume_path(
@@ -841,6 +1037,8 @@ fn build_review_request(args: ReviewArgs) -> anyhow::Result<ReviewRequest> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+    use time::format_description::well_known::Rfc3339;
 
     #[test]
     fn builds_uncommitted_review_request() {
@@ -902,5 +1100,121 @@ mod tests {
         };
 
         assert_eq!(request, expected);
+    }
+
+    #[tokio::test]
+    async fn resolves_thread_id_for_resume_from_rollout_head() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let rollout_path = tmp.path().join("rollout.jsonl");
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let meta = codex_protocol::protocol::SessionMeta {
+            id: thread_id,
+            timestamp: "2026-01-01T00:00:00".to_string(),
+            ..Default::default()
+        };
+        let line = RolloutLine {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            item: RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta,
+                git: None,
+            }),
+        };
+        let json = serde_json::to_string(&line).expect("serialize rollout line");
+        tokio::fs::write(&rollout_path, format!("{json}\n"))
+            .await
+            .expect("write rollout file");
+
+        let args = crate::cli::ResumeArgs {
+            session_id: None,
+            last: false,
+            fork: false,
+            images: Vec::new(),
+            prompt: None,
+            no_prompt: false,
+        };
+
+        let resolved = resolve_thread_id_for_resume(&args, &rollout_path)
+            .await
+            .expect("resolve thread id");
+        assert_eq!(resolved, thread_id);
+    }
+
+    #[tokio::test]
+    async fn waits_for_running_session_to_finish_before_resuming() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let codex_home = tmp.path();
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
+        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
+            .await
+            .expect("create live dir");
+
+        let now = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("format rfc3339");
+        let initial = serde_json::json!({
+            "alive": true,
+            "status": "running",
+            "last_heartbeat_at": now,
+        });
+        tokio::fs::write(&status_path, serde_json::to_vec(&initial).expect("json"))
+            .await
+            .expect("write live status");
+
+        let status_path_for_task = status_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let done = serde_json::json!({
+                "alive": false,
+                "status": "completed",
+                "last_heartbeat_at": time::OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .expect("format rfc3339"),
+            });
+            let _ = tokio::fs::write(
+                &status_path_for_task,
+                serde_json::to_vec(&done).expect("json"),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
+        )
+        .await
+        .expect("wait returns")
+        .expect("ok");
+    }
+
+    #[tokio::test]
+    async fn does_not_block_on_stale_live_status() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let codex_home = tmp.path();
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
+        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
+            .await
+            .expect("create live dir");
+
+        let stale = serde_json::json!({
+            "alive": true,
+            "status": "running",
+            "last_heartbeat_at": "1970-01-01T00:00:00Z",
+        });
+        tokio::fs::write(&status_path, serde_json::to_vec(&stale).expect("json"))
+            .await
+            .expect("write live status");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
+        )
+        .await
+        .expect("returns without blocking")
+        .expect("ok");
     }
 }

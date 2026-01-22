@@ -19,6 +19,8 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
 codex-app-server = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-arg0 = { workspace = true }
@@ -39,9 +41,13 @@ codex-tui2 = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
+ratatui = { workspace = true }
 regex-lite = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 supports-color = { workspace = true }
+textwrap = { workspace = true }
+time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",

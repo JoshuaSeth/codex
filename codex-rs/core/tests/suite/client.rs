@@ -1868,3 +1868,127 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
         "request 3 tail mismatch",
     );
 }
+
+/// Scenario:
+/// - Turn 1: user sends U1; model streams deltas but never emits output_item.done for the assistant message.
+/// - Turn 2: user sends U2; same streamed deltas.
+/// - Turn 3: user sends U3; same streamed deltas.
+///
+/// We assert that Codex still records a durable assistant message in history, so subsequent turns
+/// include it in the prompt input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_recovers_assistant_message_when_output_item_done_missing() {
+    // Skip under Codex sandbox network restrictions (mirrors other tests).
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+
+    // SSE: deltas + completed, but no `response.output_item.done` message.
+    let sse_raw = r##"[
+        {"type":"response.output_item.added", "item":{
+            "type":"message", "role":"assistant",
+            "content":[{"type":"output_text","text":""}]
+        }},
+        {"type":"response.output_text.delta", "delta":"Hey "},
+        {"type":"response.output_text.delta", "delta":"there"},
+        {"type":"response.output_text.delta", "delta":"!\\n"},
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"##;
+    let sse1 = core_test_support::load_sse_fixture_with_id_from_str(sse_raw, "resp1");
+
+    let request_log = mount_sse_sequence(&server, vec![sse1.clone(), sse1.clone(), sse1]).await;
+
+    // Configure provider to point to mock server (Responses API) and use API key auth.
+    let model_provider = ModelProviderInfo {
+        base_url: Some(format!("{}/v1", server.uri())),
+        ..built_in_model_providers()["openai"].clone()
+    };
+
+    // Init session with isolated codex home.
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home).await;
+    config.model_provider = model_provider;
+
+    let thread_manager = ThreadManager::with_models_provider_and_home(
+        CodexAuth::from_api_key("Test API Key"),
+        config.model_provider.clone(),
+        config.codex_home.clone(),
+    );
+    let NewThread { thread: codex, .. } = thread_manager
+        .start_thread(config)
+        .await
+        .expect("create new conversation");
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text { text: "U1".into() }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text { text: "U2".into() }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text { text: "U3".into() }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3, "expected 3 requests (one per turn)");
+
+    let r3_tail_expected = json!([
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type":"input_text","text":"U1"}]
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"Hey there!\\n"}]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type":"input_text","text":"U2"}]
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"Hey there!\\n"}]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type":"input_text","text":"U3"}]
+        }
+    ]);
+
+    let r3_input_array = requests[2]
+        .body_json()
+        .get("input")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("r3 missing input array");
+
+    let tail_len = r3_tail_expected.as_array().unwrap().len();
+    let actual_tail = &r3_input_array[r3_input_array.len() - tail_len..];
+    assert_eq!(
+        serde_json::Value::Array(actual_tail.to_vec()),
+        r3_tail_expected,
+        "request 3 tail mismatch",
+    );
+}

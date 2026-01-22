@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Error as IoError;
@@ -15,6 +16,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
+use tokio::time::Duration;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
@@ -33,6 +36,8 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Records all [`ResponseItem`]s for a session and flushes them to disk after
 /// every update.
@@ -65,10 +70,10 @@ enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
     /// Ensure all prior writes are processed; respond when flushed.
     Flush {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
 }
 
@@ -204,7 +209,7 @@ impl RolloutRecorder {
             .await
             .map_err(|e| IoError::other(format!("failed to queue rollout flush: {e}")))?;
         rx.await
-            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))
+            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))?
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -283,7 +288,8 @@ impl RolloutRecorder {
         match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
             Ok(_) => rx_done
                 .await
-                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}"))),
+                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}")))?
+                .map(|_| ()),
             Err(e) => {
                 warn!("failed to send rollout shutdown command: {e}");
                 Err(IoError::other(format!(
@@ -350,6 +356,11 @@ async fn rollout_writer(
     cwd: std::path::PathBuf,
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter { file };
+    let mut pending: VecDeque<RolloutItem> = VecDeque::new();
+    let mut next_retry_at: Option<Instant> = None;
+    let mut retry_delay = Duration::from_millis(200);
+    let mut last_retry_warning_at: Option<Instant> = None;
+    const MAX_PENDING_ITEMS: usize = 10_000;
 
     // If we have a meta, collect git info asynchronously and write meta first
     if let Some(session_meta) = meta.take() {
@@ -365,31 +376,144 @@ async fn rollout_writer(
             .await?;
     }
 
-    // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        if next_retry_at.is_none()
+            && let Some(item) = pending.pop_front()
+        {
+            if let Err(err) = writer.write_rollout_item(item.clone()).await {
+                pending.push_front(item);
+                if is_retryable_rollout_error(&err) {
+                    schedule_retry(
+                        &mut next_retry_at,
+                        &mut retry_delay,
+                        &mut last_retry_warning_at,
+                        &err,
+                    );
+                } else {
+                    return Err(err);
+                }
+            } else {
+                retry_delay = Duration::from_millis(200);
+            }
+            continue;
+        }
+
+        let cmd = match next_retry_at {
+            Some(deadline) => tokio::select! {
+                cmd = rx.recv() => cmd,
+                _ = tokio::time::sleep_until(deadline) => {
+                    next_retry_at = None;
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+
+        let Some(cmd) = cmd else {
+            // Best-effort drain before exiting when the sender side is dropped.
+            let _ = drain_pending(&mut writer, &mut pending).await;
+            let _ = writer.file.flush().await;
+            break;
+        };
+
         match cmd {
             RolloutCmd::AddItems(items) => {
                 for item in items {
-                    if is_persisted_response_item(&item) {
-                        writer.write_rollout_item(item).await?;
+                    if !is_persisted_response_item(&item) {
+                        continue;
+                    }
+
+                    if pending.len() >= MAX_PENDING_ITEMS {
+                        warn!(
+                            "rollout persistence backlog exceeded {MAX_PENDING_ITEMS} items; dropping new items until persistence recovers"
+                        );
+                        break;
+                    }
+                    pending.push_back(item);
+                }
+            }
+            RolloutCmd::Flush { ack } => match flush_all(&mut writer, &mut pending).await {
+                Ok(()) => {
+                    let _ = ack.send(Ok(()));
+                }
+                Err(err) => {
+                    if is_retryable_rollout_error(&err) {
+                        schedule_retry(
+                            &mut next_retry_at,
+                            &mut retry_delay,
+                            &mut last_retry_warning_at,
+                            &err,
+                        );
+                        let _ = ack.send(Err(err));
+                    } else {
+                        let err_for_return = IoError::new(err.kind(), err.to_string());
+                        let _ = ack.send(Err(err));
+                        return Err(err_for_return);
                     }
                 }
-            }
-            RolloutCmd::Flush { ack } => {
-                // Ensure underlying file is flushed and then ack.
-                if let Err(e) = writer.file.flush().await {
-                    let _ = ack.send(());
-                    return Err(e);
-                }
-                let _ = ack.send(());
-            }
+            },
             RolloutCmd::Shutdown { ack } => {
-                let _ = ack.send(());
+                let res = flush_all(&mut writer, &mut pending).await;
+                let _ = ack.send(res);
+                break;
             }
         }
     }
 
     Ok(())
+}
+
+fn is_retryable_rollout_error(err: &IoError) -> bool {
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+
+    // ENOSPC (28) / EDQUOT (122) on Unix; ERROR_DISK_FULL (112) on Windows.
+    matches!(err.raw_os_error(), Some(28 | 112 | 122))
+}
+
+fn schedule_retry(
+    next_retry_at: &mut Option<Instant>,
+    retry_delay: &mut Duration,
+    last_warning_at: &mut Option<Instant>,
+    err: &IoError,
+) {
+    let now = Instant::now();
+
+    let should_warn = last_warning_at
+        .map(|last| now.saturating_duration_since(last) > Duration::from_secs(30))
+        .unwrap_or(true);
+    if should_warn {
+        warn!(
+            "rollout persistence temporarily failed ({}); will retry in {:?}",
+            err, *retry_delay
+        );
+        *last_warning_at = Some(now);
+    }
+
+    *next_retry_at = Some(now + *retry_delay);
+    *retry_delay = (*retry_delay * 2).min(MAX_RETRY_DELAY);
+}
+
+async fn drain_pending(
+    writer: &mut JsonlWriter,
+    pending: &mut VecDeque<RolloutItem>,
+) -> std::io::Result<()> {
+    while let Some(item) = pending.pop_front() {
+        if let Err(err) = writer.write_rollout_item(item.clone()).await {
+            pending.push_front(item);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+async fn flush_all(
+    writer: &mut JsonlWriter,
+    pending: &mut VecDeque<RolloutItem>,
+) -> std::io::Result<()> {
+    drain_pending(writer, pending).await?;
+    writer.file.flush().await
 }
 
 struct JsonlWriter {

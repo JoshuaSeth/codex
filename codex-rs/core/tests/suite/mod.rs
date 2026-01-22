@@ -51,7 +51,6 @@ mod resume;
 mod resume_warning;
 mod review;
 mod rmcp_client;
-mod rollout_edit;
 mod rollout_list_find;
 mod seatbelt;
 mod shell_command;

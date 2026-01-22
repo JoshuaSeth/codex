@@ -38,6 +38,7 @@ use codex_core::protocol;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use serde_json::Value as JsonValue;
+use std::io::Write;
 use tracing::error;
 use tracing::warn;
 
@@ -359,6 +360,44 @@ impl EventProcessorWithJsonOutput {
         }
     }
 
+    fn change_line_stats(&self, change: &protocol::FileChange) -> (u32, u32) {
+        match change {
+            protocol::FileChange::Add { content } => {
+                (content.lines().count().try_into().unwrap_or(u32::MAX), 0)
+            }
+            protocol::FileChange::Delete { content } => {
+                (0, content.lines().count().try_into().unwrap_or(u32::MAX))
+            }
+            protocol::FileChange::Update { unified_diff, .. } => {
+                let mut added = 0u32;
+                let mut deleted = 0u32;
+                for line in unified_diff.lines() {
+                    if line.starts_with("+++") || line.starts_with("---") {
+                        continue;
+                    }
+                    if line.starts_with('+') {
+                        added = added.saturating_add(1);
+                        continue;
+                    }
+                    if line.starts_with('-') {
+                        deleted = deleted.saturating_add(1);
+                    }
+                }
+                (added, deleted)
+            }
+        }
+    }
+
+    fn change_move_to(&self, change: &protocol::FileChange) -> Option<String> {
+        match change {
+            protocol::FileChange::Update { move_path, .. } => move_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
     fn handle_patch_apply_end(&mut self, ev: &protocol::PatchApplyEndEvent) -> Vec<ThreadEvent> {
         if let Some(running_patch_apply) = self.running_patch_applies.remove(&ev.call_id) {
             let status = if ev.success {
@@ -373,9 +412,15 @@ impl EventProcessorWithJsonOutput {
                     changes: running_patch_apply
                         .changes
                         .iter()
-                        .map(|(path, change)| FileUpdateChange {
-                            path: path.to_str().unwrap_or("").to_string(),
-                            kind: self.map_change_kind(change),
+                        .map(|(path, change)| {
+                            let (added_lines, deleted_lines) = self.change_line_stats(change);
+                            FileUpdateChange {
+                                path: path.to_str().unwrap_or("").to_string(),
+                                kind: self.map_change_kind(change),
+                                move_to: self.change_move_to(change),
+                                added_lines: Some(added_lines),
+                                deleted_lines: Some(deleted_lines),
+                            }
                         })
                         .collect(),
                     status,
@@ -533,6 +578,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
                 }
             }
         }
+        let _ = std::io::stdout().flush();
 
         let protocol::Event { msg, .. } = event;
 

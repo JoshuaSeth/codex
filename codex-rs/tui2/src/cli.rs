@@ -23,6 +23,9 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_last: bool,
 
+    #[clap(skip)]
+    pub resume_fork: bool,
+
     /// Internal: resume a specific recorded session by id (UUID). Set by the
     /// top-level `codex resume <SESSION_ID>` wrapper; not exposed as a public flag.
     #[clap(skip)]
@@ -107,6 +110,7 @@ impl From<codex_tui::Cli> for Cli {
             images: cli.images,
             resume_picker: cli.resume_picker,
             resume_last: cli.resume_last,
+            resume_fork: cli.resume_fork,
             resume_session_id: cli.resume_session_id,
             resume_show_all: cli.resume_show_all,
             model: cli.model,

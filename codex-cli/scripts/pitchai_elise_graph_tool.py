@@ -165,9 +165,6 @@ class GraphMailClient:
         if from_address:
             addr = _odata_quote(from_address.strip())
             filters.append(f"from/emailAddress/address eq '{addr}'")
-        if subject_contains:
-            sub = _odata_quote(subject_contains.strip())
-            filters.append(f"contains(subject,'{sub}')")
         if received_since_utc:
             filters.append(f"receivedDateTime ge {received_since_utc.strip()}")
 
@@ -184,6 +181,13 @@ class GraphMailClient:
         value = data.get("value", [])
         if not isinstance(value, list):
             value = []
+        if subject_contains and subject_contains.strip():
+            needle = subject_contains.strip().lower()
+            value = [
+                msg
+                for msg in value
+                if isinstance(msg, dict) and isinstance(msg.get("subject"), str) and needle in msg["subject"].lower()
+            ]
         return {"ok": True, "folder": folder, "count": len(value), "messages": value, "ts": _now_utc_iso()}
 
     def read_message(self, message_id: str, *, max_chars: int = 15000, mark_as_read: bool = False) -> Dict[str, Any]:
@@ -268,9 +272,6 @@ class GraphMailClient:
         if not isinstance(draft_id, str) or not draft_id:
             raise RuntimeError("Graph did not return a draft id")
 
-        send_url = f"{GRAPH_ROOT}/users/{self.sender_id}/messages/{_quote_path(draft_id)}/send"
-        _request_with_retries("POST", send_url, headers=self._headers(), timeout_s=60, max_attempts=3)
-
         return {
             "ok": True,
             "draft_id": draft_id,
@@ -279,6 +280,7 @@ class GraphMailClient:
             "web_link": draft.get("webLink"),
             "sender_upn": self.sender_upn,
             "save_to_sent_requested": save_to_sent,
+            "sent": False,
             "ts": _now_utc_iso(),
         }
 
@@ -287,9 +289,25 @@ def _normalize_email(addr: str) -> str:
     return addr.strip().lower()
 
 
+def _normalize_upn(upn: str) -> str:
+    return upn.strip().lower()
+
+
 def _boss_email() -> str:
     # Default to Seth unless overridden in the container job env.
     return _normalize_email(os.getenv("PITCHAI_BOSS_EMAIL", "seth.vanderbijl@pitchai.net"))
+
+
+def _enforce_elise_drafts_only(client: GraphMailClient) -> None:
+    if os.getenv("PITCHAI_ALLOW_NON_ELISE_DRAFTS") == "1":
+        return
+    sender = _normalize_upn(client.sender_upn)
+    if sender != "elise@pitchai.net":
+        raise RuntimeError(
+            "Refusing to create a draft from a non-Elise mailbox. "
+            "Set PITCHAI_GRAPH_MAILBOX_UPN=elise@pitchai.net (and optionally PITCHAI_GRAPH_SENDER_UPN). "
+            "To override for debugging, set PITCHAI_ALLOW_NON_ELISE_DRAFTS=1."
+        )
 
 
 def _recipient_set(
@@ -404,7 +422,6 @@ def _op_send_email() -> Dict[str, Any]:
     bcc = args.get("bcc")
     reply_to = args.get("reply_to")
     body_type = str(args.get("body_type") or "HTML")
-    approved_draft_filename = args.get("approved_draft_filename")
 
     if "save_to_sent" in args:
         save_to_sent = bool(args.get("save_to_sent"))
@@ -412,6 +429,7 @@ def _op_send_email() -> Dict[str, Any]:
         save_to_sent = True
 
     client = GraphMailClient()
+    _enforce_elise_drafts_only(client)
     cc_addrs = (
         [str(x).strip() for x in cc if isinstance(cc, list) and isinstance(x, str) and x.strip()]
         if isinstance(cc, list)
@@ -421,11 +439,6 @@ def _op_send_email() -> Dict[str, Any]:
         [str(x).strip() for x in bcc if isinstance(bcc, list) and isinstance(x, str) and x.strip()]
         if isinstance(bcc, list)
         else None
-    )
-    _enforce_boss_approval(
-        client,
-        recipients=_recipient_set(to_addrs, cc_addrs, bcc_addrs),
-        approved_draft_filename=approved_draft_filename if isinstance(approved_draft_filename, str) else None,
     )
     return client.send_email(
         to=to_addrs,
@@ -444,13 +457,14 @@ def _op_send_email() -> Dict[str, Any]:
 def main(argv: List[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if len(argv) < 1:
-        print("Usage: elise_graph_tool.py <mail_search|mail_read|send_email>", file=sys.stderr)
+        print("Usage: elise_graph_tool.py <mail_search|mail_read|draft_email|send_email>", file=sys.stderr)
         return 2
 
     op = argv[0].strip()
     ops = {
         "mail_search": _op_mail_search,
         "mail_read": _op_mail_read,
+        "draft_email": _op_send_email,
         "send_email": _op_send_email,
     }
     fn = ops.get(op)

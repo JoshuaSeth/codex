@@ -38,6 +38,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
@@ -384,6 +385,7 @@ pub(crate) struct TurnContext {
     /// the model as well as sandbox policies are resolved against this path
     /// instead of `std::env::current_dir()`.
     pub(crate) cwd: PathBuf,
+    pub(crate) git_info: Option<GitInfo>,
     pub(crate) developer_instructions: Option<String>,
     pub(crate) base_instructions: Option<String>,
     pub(crate) compact_prompt: Option<String>,
@@ -622,6 +624,7 @@ impl Session {
             sub_id,
             client,
             cwd: session_configuration.cwd.clone(),
+            git_info: None,
             developer_instructions: session_configuration.developer_instructions.clone(),
             base_instructions: session_configuration.base_instructions.clone(),
             compact_prompt: session_configuration.compact_prompt.clone(),
@@ -982,6 +985,13 @@ impl Session {
                     let shell = self.user_shell();
                     let env_update = EnvironmentContext::new(
                         cwd_changed.then(|| turn_context.cwd.clone()),
+                        cwd_changed.then(|| {
+                            turn_context.git_info.clone().unwrap_or(GitInfo {
+                                commit_hash: None,
+                                branch: None,
+                                repository_url: None,
+                            })
+                        }),
                         approval_policy_changed.then(|| turn_context.approval_policy),
                         sandbox_policy_changed.then(|| turn_context.sandbox_policy.clone()),
                         shell.as_ref().clone(),
@@ -1117,6 +1127,7 @@ impl Session {
         if let Some(final_schema) = final_output_json_schema {
             turn_context.final_output_json_schema = final_schema;
         }
+        turn_context.git_info = crate::git_info::collect_git_info(&turn_context.cwd).await;
         Arc::new(turn_context)
     }
 
@@ -1501,6 +1512,7 @@ impl Session {
         }
         items.push(ResponseItem::from(EnvironmentContext::new(
             Some(turn_context.cwd.clone()),
+            turn_context.git_info.clone(),
             Some(turn_context.approval_policy),
             Some(turn_context.sandbox_policy.clone()),
             shell.as_ref().clone(),
@@ -2478,6 +2490,7 @@ async fn spawn_review_thread(
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
         cwd: parent_turn_context.cwd.clone(),
+        git_info: parent_turn_context.git_info.clone(),
         final_output_json_schema: None,
         codex_linux_sandbox_exe: parent_turn_context.codex_linux_sandbox_exe.clone(),
         tool_call_gate: Arc::new(ReadinessFlag::new()),
@@ -2920,6 +2933,9 @@ async fn try_run_turn(
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
+    let mut pending_output_text = String::new();
+    let mut pending_output_text_active = false;
+    let mut saw_assistant_message_done = false;
     let mut should_emit_turn_diff = false;
     let receiving_span = trace_span!("receiving_stream");
     let outcome: CodexResult<TurnRunResult> = loop {
@@ -2958,6 +2974,11 @@ async fn try_run_turn(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
+                if matches!(&item, ResponseItem::Message { role, .. } if role == "assistant") {
+                    pending_output_text.clear();
+                    pending_output_text_active = false;
+                    saw_assistant_message_done = true;
+                }
                 let previously_active_item = active_item.take();
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
@@ -2978,6 +2999,13 @@ async fn try_run_turn(
                 needs_follow_up |= output_result.needs_follow_up;
             }
             ResponseEvent::OutputItemAdded(item) => {
+                if matches!(&item, ResponseItem::Message { role, .. } if role == "assistant") {
+                    pending_output_text.clear();
+                    pending_output_text_active = true;
+                    saw_assistant_message_done = false;
+                } else {
+                    pending_output_text_active = false;
+                }
                 if let Some(turn_item) = handle_non_tool_response_item(&item).await {
                     let tracked_item = turn_item.clone();
                     sess.emit_turn_item_started(&turn_context, &turn_item).await;
@@ -3005,6 +3033,37 @@ async fn try_run_turn(
                     .await;
                 should_emit_turn_diff = true;
 
+                if pending_output_text_active
+                    && !pending_output_text.is_empty()
+                    && !saw_assistant_message_done
+                {
+                    let previously_active_item = active_item.take();
+                    let item = ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![ContentItem::OutputText {
+                            text: std::mem::take(&mut pending_output_text),
+                        }],
+                    };
+
+                    let mut ctx = HandleOutputCtx {
+                        sess: sess.clone(),
+                        turn_context: turn_context.clone(),
+                        tool_runtime: tool_runtime.clone(),
+                        cancellation_token: cancellation_token.child_token(),
+                    };
+
+                    let output_result =
+                        handle_output_item_done(&mut ctx, item, previously_active_item)
+                            .instrument(handle_responses)
+                            .await?;
+
+                    if let Some(agent_message) = output_result.last_agent_message {
+                        last_agent_message = Some(agent_message);
+                    }
+                    needs_follow_up |= output_result.needs_follow_up;
+                }
+
                 break Ok(TurnRunResult {
                     needs_follow_up,
                     last_agent_message,
@@ -3013,6 +3072,9 @@ async fn try_run_turn(
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
+                if pending_output_text_active {
+                    pending_output_text.push_str(&delta);
+                }
                 if let Some(active) = active_item.as_ref() {
                     let event = AgentMessageContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
@@ -3177,6 +3239,59 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
+    fn strip_git_block_from_environment_context(text: &str) -> String {
+        let mut lines = Vec::new();
+        let mut in_git = false;
+        for line in text.lines() {
+            match line.trim() {
+                "<git>" => {
+                    in_git = true;
+                    continue;
+                }
+                "</git>" if in_git => {
+                    in_git = false;
+                    continue;
+                }
+                _ => {}
+            }
+
+            if !in_git {
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn normalize_environment_context_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+        items
+            .iter()
+            .cloned()
+            .map(|item| match item {
+                ResponseItem::Message { id, role, content } if role == "user" => {
+                    let next_content = content
+                        .into_iter()
+                        .map(|content_item| match content_item {
+                            ContentItem::InputText { text }
+                                if text.starts_with(ENVIRONMENT_CONTEXT_OPEN_TAG) =>
+                            {
+                                ContentItem::InputText {
+                                    text: strip_git_block_from_environment_context(&text),
+                                }
+                            }
+                            other => other,
+                        })
+                        .collect();
+                    ResponseItem::Message {
+                        id,
+                        role,
+                        content: next_content,
+                    }
+                }
+                other => other,
+            })
+            .collect()
+    }
+
     #[test]
     fn append_extension_updates_first_text_item() {
         let mut items = vec![UserInput::Text {
@@ -3231,7 +3346,9 @@ mod tests {
             .await;
 
         let history = session.state.lock().await.clone_history();
-        assert_eq!(expected, history.raw_items());
+        let expected = normalize_environment_context_items(&expected);
+        let actual = normalize_environment_context_items(history.raw_items());
+        assert_eq!(expected, actual);
     }
 
     #[tokio::test]
@@ -3383,7 +3500,9 @@ mod tests {
             .await;
 
         let history = session.state.lock().await.clone_history();
-        assert_eq!(expected, history.raw_items());
+        let expected = normalize_environment_context_items(&expected);
+        let actual = normalize_environment_context_items(history.raw_items());
+        assert_eq!(expected, actual);
     }
 
     #[tokio::test]

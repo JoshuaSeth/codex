@@ -563,14 +563,14 @@ pub async fn find_thread_path_by_id_str(
     )
     .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
-    let best_match = results
+    if let Some(best_match) = results
         .matches
         .into_iter()
         .next()
-        .map(|m| root.join(m.path));
-
-    if best_match.is_some() {
-        return Ok(best_match);
+        .map(|m| root.join(m.path))
+        && file_path_matches_thread_id(&best_match, target_id).await?
+    {
+        return Ok(Some(best_match));
     }
 
     let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u16>().ok()).await?;
@@ -618,6 +618,18 @@ pub async fn find_thread_path_by_id_str(
     }
 
     Ok(None)
+}
+
+async fn file_path_matches_thread_id(path: &Path, target_id: Uuid) -> io::Result<bool> {
+    if let Some(name_str) = path.file_name().and_then(|name| name.to_str())
+        && let Some((_ts, candidate_id)) = parse_timestamp_uuid_from_filename(name_str)
+    {
+        return Ok(candidate_id == target_id);
+    }
+
+    Ok(read_timestamp_uuid_from_session_meta(path)
+        .await?
+        .is_some_and(|(_ts, candidate_id)| candidate_id == target_id))
 }
 
 /// Locate a recorded conversation rollout file by a user-provided selector.

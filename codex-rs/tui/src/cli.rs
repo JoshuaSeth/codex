@@ -23,6 +23,9 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_last: bool,
 
+    #[clap(skip)]
+    pub resume_fork: bool,
+
     /// Internal: resume a specific recorded session by id (UUID). Set by the
     /// top-level `codex resume <SESSION_ID>` wrapper; not exposed as a public flag.
     #[clap(skip)]
@@ -91,9 +94,6 @@ pub struct Cli {
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 
-    /// Replace the last tool call output in the rollout before resuming a session.
-    #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
-    pub replace_last_tool_result: Option<String>,
     /// Disable alternate screen mode
     ///
     /// Runs the TUI in inline mode, preserving terminal scrollback history. This is useful

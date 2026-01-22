@@ -20,14 +20,13 @@ use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_selector_str;
+use codex_core::fork_rollout_file;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
-use codex_core::replace_last_tool_result as patch_last_tool_result;
 use codex_core::terminal::Multiplexer;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use color_eyre::eyre::eyre;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::error;
@@ -107,6 +106,15 @@ pub async fn run_main(
     mut cli: Cli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<AppExitInfo> {
+    // `codex resume ...` is a new process; default to the caller's current
+    // directory as the working root so resuming from another worktree/branch
+    // follows the shell cwd (even when config.toml sets `default_cwd`).
+    let is_resume_invocation =
+        cli.resume_picker || cli.resume_last || cli.resume_session_id.is_some();
+    if is_resume_invocation && cli.cwd.is_none() {
+        cli.cwd = Some(std::env::current_dir()?);
+    }
+
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
@@ -433,9 +441,8 @@ async fn run_ratatui_app(
     };
 
     // Determine resume behavior: explicit id, then resume last, then picker.
-    let replace_last_tool_result_text = cli.replace_last_tool_result.clone();
 
-    let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
+    let mut resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
         match find_conversation_path_by_selector_str(&config.codex_home, id_str).await? {
             Some(path) => resume_picker::ResumeSelection::Resume(path),
             None => {
@@ -499,24 +506,27 @@ async fn run_ratatui_app(
         resume_picker::ResumeSelection::StartFresh
     };
 
-    if let Some(replacement) = replace_last_tool_result_text {
+    if cli.resume_fork {
         match &resume_selection {
             resume_picker::ResumeSelection::Resume(path) => {
-                if let Err(err) = patch_last_tool_result(path, &replacement).await {
-                    restore();
-                    session_log::log_session_end();
-                    return Err(eyre!(
-                        "Failed to replace last tool result in {}: {err}",
-                        path.display()
-                    ));
-                }
+                let forked = fork_rollout_file(&config.codex_home, path).await?;
+                resume_selection = resume_picker::ResumeSelection::Resume(forked);
             }
             _ => {
                 restore();
                 session_log::log_session_end();
-                return Err(eyre!(
-                    "--replace-last-toolresult requires resuming a saved session (provide an id or --last)"
-                ));
+                let _ = tui.terminal.clear();
+                if let Err(err) = writeln!(
+                    std::io::stdout(),
+                    "--fork requires selecting an existing saved session (provide an id, --last, or pick one)."
+                ) {
+                    error!("Failed to write fork error message: {err}");
+                }
+                return Ok(AppExitInfo {
+                    token_usage: codex_core::protocol::TokenUsage::default(),
+                    thread_id: None,
+                    update_action: None,
+                });
             }
         }
     }

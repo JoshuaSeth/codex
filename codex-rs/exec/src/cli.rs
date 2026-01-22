@@ -135,10 +135,6 @@ pub struct ResumeArgs {
     #[arg(long = "fork", default_value_t = false)]
     pub fork: bool,
 
-    /// Replace the last tool call output before resuming (useful after pending flows).
-    #[arg(long = "replace-last-toolresult", value_name = "TEXT")]
-    pub replace_last_tool_result: Option<String>,
-
     /// Optional image(s) to attach to the prompt sent after resuming.
     #[arg(
         long = "image",

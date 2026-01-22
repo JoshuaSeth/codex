@@ -32,6 +32,7 @@ use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 #[cfg(target_os = "windows")]
 use codex_core::features::Feature;
+use codex_core::live_status::LiveSessionStatus;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
@@ -329,7 +330,50 @@ impl App {
             self.suppress_shutdown_complete = true;
             self.chat_widget.submit_op(Op::Shutdown);
             self.server.remove_thread(&thread_id).await;
+            if let Some(writer) = self.chat_widget.take_live_status_writer() {
+                writer
+                    .shutdown(
+                        LiveSessionStatus::Completed,
+                        Some("interactive session ended".to_string()),
+                    )
+                    .await;
+            }
         }
+    }
+
+    fn maybe_sync_cwd_from_parent_process(&mut self) {
+        let Some(parent_cwd) = codex_core::parent_process::parent_cwd() else {
+            return;
+        };
+        if parent_cwd == self.config.cwd {
+            return;
+        }
+        if !parent_cwd.is_dir() {
+            return;
+        }
+
+        if let Err(err) = std::env::set_current_dir(&parent_cwd) {
+            tracing::debug!(
+                "failed to set current dir while syncing cwd from parent process: {err:?}"
+            );
+        }
+
+        tracing::info!(
+            "syncing cwd from parent process: {} -> {}",
+            self.config.cwd.display(),
+            parent_cwd.display()
+        );
+        self.config.cwd = parent_cwd.clone();
+        self.chat_widget.set_cwd(parent_cwd.clone());
+        self.file_search = FileSearchManager::new(parent_cwd.clone(), self.app_event_tx.clone());
+        self.chat_widget.submit_op(Op::OverrideTurnContext {
+            cwd: Some(parent_cwd),
+            approval_policy: None,
+            sandbox_policy: None,
+            model: None,
+            effort: None,
+            summary: None,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -491,6 +535,14 @@ impl App {
                 app.handle_tui_event(tui, event).await?
             }
         } {}
+        if let Some(writer) = app.chat_widget.take_live_status_writer() {
+            writer
+                .shutdown(
+                    LiveSessionStatus::Completed,
+                    Some("interactive session exited".to_string()),
+                )
+                .await;
+        }
         tui.terminal.clear()?;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
@@ -504,6 +556,10 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if matches!(&event, TuiEvent::Draw) {
+            self.maybe_sync_cwd_from_parent_process();
+        }
+
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {

@@ -8,6 +8,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::GitInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 #[serde(rename = "environment_context", rename_all = "snake_case")]
 pub(crate) struct EnvironmentContext {
     pub cwd: Option<PathBuf>,
+    pub git: Option<GitInfo>,
     pub approval_policy: Option<AskForApproval>,
     pub sandbox_mode: Option<SandboxMode>,
     pub network_access: Option<NetworkAccess>,
@@ -27,12 +29,14 @@ pub(crate) struct EnvironmentContext {
 impl EnvironmentContext {
     pub fn new(
         cwd: Option<PathBuf>,
+        git: Option<GitInfo>,
         approval_policy: Option<AskForApproval>,
         sandbox_policy: Option<SandboxPolicy>,
         shell: Shell,
     ) -> Self {
         Self {
             cwd,
+            git,
             approval_policy,
             sandbox_mode: match sandbox_policy {
                 Some(SandboxPolicy::DangerFullAccess) => Some(SandboxMode::DangerFullAccess),
@@ -74,6 +78,7 @@ impl EnvironmentContext {
     pub fn equals_except_shell(&self, other: &EnvironmentContext) -> bool {
         let EnvironmentContext {
             cwd,
+            git,
             approval_policy,
             sandbox_mode,
             network_access,
@@ -83,6 +88,7 @@ impl EnvironmentContext {
         } = other;
 
         self.cwd == *cwd
+            && self.git == *git
             && self.approval_policy == *approval_policy
             && self.sandbox_mode == *sandbox_mode
             && self.network_access == *network_access
@@ -92,6 +98,15 @@ impl EnvironmentContext {
     pub fn diff(before: &TurnContext, after: &TurnContext, shell: &Shell) -> Self {
         let cwd = if before.cwd != after.cwd {
             Some(after.cwd.clone())
+        } else {
+            None
+        };
+        let git = if before.git_info != after.git_info {
+            Some(after.git_info.clone().unwrap_or(GitInfo {
+                commit_hash: None,
+                branch: None,
+                repository_url: None,
+            }))
         } else {
             None
         };
@@ -105,12 +120,13 @@ impl EnvironmentContext {
         } else {
             None
         };
-        EnvironmentContext::new(cwd, approval_policy, sandbox_policy, shell.clone())
+        EnvironmentContext::new(cwd, git, approval_policy, sandbox_policy, shell.clone())
     }
 
     pub fn from_turn_context(turn_context: &TurnContext, shell: &Shell) -> Self {
         Self::new(
             Some(turn_context.cwd.clone()),
+            turn_context.git_info.clone(),
             Some(turn_context.approval_policy),
             Some(turn_context.sandbox_policy.clone()),
             shell.clone(),
@@ -160,6 +176,22 @@ impl EnvironmentContext {
                 ));
             }
             lines.push("  </writable_roots>".to_string());
+        }
+
+        if let Some(git) = self.git {
+            lines.push("  <git>".to_string());
+            if let Some(commit_hash) = git.commit_hash {
+                lines.push(format!("    <commit_hash>{commit_hash}</commit_hash>"));
+            }
+            if let Some(branch) = git.branch {
+                lines.push(format!("    <branch>{branch}</branch>"));
+            }
+            if let Some(repository_url) = git.repository_url {
+                lines.push(format!(
+                    "    <repository_url>{repository_url}</repository_url>"
+                ));
+            }
+            lines.push("  </git>".to_string());
         }
 
         let shell_name = self.shell.name();
@@ -220,6 +252,7 @@ mod tests {
             .expect("writable root is valid utf-8");
         let context = EnvironmentContext::new(
             Some(cwd.clone()),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(
                 vec![cwd_str, writable_root_str],
@@ -251,6 +284,7 @@ mod tests {
     fn serialize_read_only_environment_context() {
         let context = EnvironmentContext::new(
             None,
+            None,
             Some(AskForApproval::Never),
             Some(SandboxPolicy::ReadOnly),
             fake_shell(),
@@ -269,6 +303,7 @@ mod tests {
     #[test]
     fn serialize_external_sandbox_environment_context() {
         let context = EnvironmentContext::new(
+            None,
             None,
             Some(AskForApproval::OnRequest),
             Some(SandboxPolicy::ExternalSandbox {
@@ -291,6 +326,7 @@ mod tests {
     fn serialize_external_sandbox_with_restricted_network_environment_context() {
         let context = EnvironmentContext::new(
             None,
+            None,
             Some(AskForApproval::OnRequest),
             Some(SandboxPolicy::ExternalSandbox {
                 network_access: NetworkAccess::Restricted,
@@ -312,6 +348,7 @@ mod tests {
     fn serialize_full_access_environment_context() {
         let context = EnvironmentContext::new(
             None,
+            None,
             Some(AskForApproval::OnFailure),
             Some(SandboxPolicy::DangerFullAccess),
             fake_shell(),
@@ -328,16 +365,48 @@ mod tests {
     }
 
     #[test]
+    fn serialize_git_environment_context() {
+        let context = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(GitInfo {
+                commit_hash: Some("a1b2c3d".to_string()),
+                branch: Some("main".to_string()),
+                repository_url: Some("https://example.com/repo.git".to_string()),
+            }),
+            Some(AskForApproval::Never),
+            Some(SandboxPolicy::ReadOnly),
+            fake_shell(),
+        );
+
+        let expected = r#"<environment_context>
+  <cwd>/repo</cwd>
+  <approval_policy>never</approval_policy>
+  <sandbox_mode>read-only</sandbox_mode>
+  <network_access>restricted</network_access>
+  <git>
+    <commit_hash>a1b2c3d</commit_hash>
+    <branch>main</branch>
+    <repository_url>https://example.com/repo.git</repository_url>
+  </git>
+  <shell>bash</shell>
+</environment_context>"#;
+
+        assert_eq!(context.serialize_to_xml(), expected);
+    }
+
+    #[test]
     fn equals_except_shell_compares_approval_policy() {
         // Approval policy
         let context1 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo"], false)),
             fake_shell(),
         );
         let context2 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::Never),
             Some(workspace_write_policy(vec!["/repo"], true)),
             fake_shell(),
@@ -349,12 +418,14 @@ mod tests {
     fn equals_except_shell_compares_sandbox_policy() {
         let context1 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(SandboxPolicy::new_read_only_policy()),
             fake_shell(),
         );
         let context2 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(SandboxPolicy::new_workspace_write_policy()),
             fake_shell(),
@@ -367,12 +438,14 @@ mod tests {
     fn equals_except_shell_compares_workspace_write_policy() {
         let context1 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo", "/tmp", "/var"], false)),
             fake_shell(),
         );
         let context2 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo", "/tmp"], true)),
             fake_shell(),
@@ -385,6 +458,7 @@ mod tests {
     fn equals_except_shell_ignores_shell() {
         let context1 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo"], false)),
             Shell {
@@ -395,6 +469,7 @@ mod tests {
         );
         let context2 = EnvironmentContext::new(
             Some(PathBuf::from("/repo")),
+            None,
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo"], false)),
             Shell {

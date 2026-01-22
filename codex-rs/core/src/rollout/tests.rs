@@ -17,6 +17,7 @@ use crate::rollout::list::Cursor;
 use crate::rollout::list::ThreadItem;
 use crate::rollout::list::ThreadsPage;
 use crate::rollout::list::find_conversation_path_by_selector_str;
+use crate::rollout::list::find_thread_path_by_id_str;
 use crate::rollout::list::get_threads;
 use anyhow::Result;
 use codex_protocol::ThreadId;
@@ -1296,6 +1297,27 @@ async fn find_conversation_path_by_selector_accepts_uuid_path_and_filename() -> 
 
     let missing = find_conversation_path_by_selector_str(home, "nope").await?;
     assert!(missing.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn find_thread_path_by_id_str_requires_exact_uuid_match() -> Result<()> {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+
+    let existing = Uuid::from_u128(1);
+    write_session_file(
+        home,
+        "2025-01-01T12-00-00",
+        existing,
+        1,
+        Some(SessionSource::VSCode),
+    )?;
+
+    let missing = Uuid::from_u128(2);
+    let found = find_thread_path_by_id_str(home, &missing.to_string()).await?;
+    assert!(found.is_none());
 
     Ok(())
 }
