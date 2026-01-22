@@ -8,9 +8,12 @@ import os
 import ssl
 import sys
 import time
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
+
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL*", category=Warning)
 
 import msal
 import requests

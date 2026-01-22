@@ -484,6 +484,9 @@ impl CodexErr {
             CodexErr::UsageLimitReached(_)
             | CodexErr::QuotaExceeded
             | CodexErr::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
+            CodexErr::Stream(..) => CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: self.http_status_code_value(),
+            },
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
@@ -673,6 +676,17 @@ mod tests {
             output: Box::new(output),
         });
         assert_eq!(get_error_message_ui(&err), "stdout only");
+    }
+
+    #[test]
+    fn to_error_event_handles_stream_disconnect() {
+        let err = CodexErr::Stream("socket closed".into(), None);
+        assert_eq!(
+            err.to_error_event(None).codex_error_info,
+            Some(CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: None
+            })
+        );
     }
 
     #[test]

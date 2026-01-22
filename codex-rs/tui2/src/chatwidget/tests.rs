@@ -1078,6 +1078,33 @@ async fn empty_enter_during_task_does_not_queue() {
 }
 
 #[tokio::test]
+async fn stream_disconnect_error_does_not_auto_send_queued_input() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("queued submission".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+
+    chat.handle_codex_event(Event {
+        id: "err".into(),
+        msg: EventMsg::Error(codex_core::protocol::ErrorEvent {
+            message: "stream disconnected before completion: socket hangup".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: None,
+            }),
+        }),
+    });
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
 async fn alt_up_edits_most_recent_queued_message() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 

@@ -32,6 +32,7 @@ use codex_core::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_core::protocol::AgentReasoningRawContentEvent;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
 use codex_core::protocol::BackgroundEventEvent;
+use codex_core::protocol::CodexErrorInfo;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::DeprecationNoticeEvent;
 use codex_core::protocol::ErrorEvent;
@@ -743,13 +744,35 @@ impl ChatWidget {
         }
     }
 
-    fn on_error(&mut self, message: String) {
+    fn should_auto_send_next_after_error(error: &ErrorEvent) -> bool {
+        if matches!(
+            error.codex_error_info.as_ref(),
+            Some(
+                CodexErrorInfo::ResponseStreamDisconnected { .. }
+                    | CodexErrorInfo::ResponseStreamConnectionFailed { .. }
+                    | CodexErrorInfo::HttpConnectionFailed { .. }
+                    | CodexErrorInfo::ResponseTooManyFailedAttempts { .. }
+            )
+        ) {
+            return false;
+        }
+
+        !error
+            .message
+            .starts_with("stream disconnected before completion:")
+    }
+
+    fn on_error(&mut self, error: ErrorEvent) {
+        let should_auto_send_next = Self::should_auto_send_next_after_error(&error);
+
         self.finalize_turn();
-        self.add_to_history(history_cell::new_error_event(message));
+        self.add_to_history(history_cell::new_error_event(error.message));
         self.request_redraw();
 
         // After an error ends the turn, try sending the next queued input.
-        self.maybe_send_next_queued_input();
+        if should_auto_send_next {
+            self.maybe_send_next_queued_input();
+        }
     }
 
     fn on_warning(&mut self, message: impl Into<String>) {
@@ -2235,16 +2258,17 @@ impl ChatWidget {
                 self.on_rate_limit_snapshot(ev.rate_limits);
             }
             EventMsg::Warning(WarningEvent { message }) => self.on_warning(message),
-            EventMsg::Error(ErrorEvent { message, .. }) => self.on_error(message),
+            EventMsg::Error(ev) => self.on_error(ev),
             EventMsg::McpStartupUpdate(ev) => self.on_mcp_startup_update(ev),
             EventMsg::McpStartupComplete(ev) => self.on_mcp_startup_complete(ev),
             EventMsg::TurnAborted(ev) => match ev.reason {
                 TurnAbortReason::Interrupted => {
                     self.on_interrupted_turn(ev.reason);
                 }
-                TurnAbortReason::Replaced => {
-                    self.on_error("Turn aborted: replaced by a new task".to_owned())
-                }
+                TurnAbortReason::Replaced => self.on_error(ErrorEvent {
+                    message: "Turn aborted: replaced by a new task".to_owned(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
                 TurnAbortReason::ReviewEnded => {
                     self.on_interrupted_turn(ev.reason);
                 }
