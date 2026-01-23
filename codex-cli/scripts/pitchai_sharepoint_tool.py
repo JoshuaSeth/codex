@@ -765,21 +765,23 @@ def _normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _parse_routing_mapping(config: Any) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], List[str]]:
+def _parse_routing_mapping(config: Any) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str], List[str]]:
     emails: Dict[str, str] = {}
     domains: Dict[str, str] = {}
     names: Dict[str, str] = {}
+    subjects: Dict[str, str] = {}
     errors: List[str] = []
 
     if config is None:
-        return emails, domains, names, errors
+        return emails, domains, names, subjects, errors
     if not isinstance(config, dict):
         errors.append("routing YAML must be a mapping/object at the top level")
-        return emails, domains, names, errors
+        return emails, domains, names, subjects, errors
 
     raw_emails = config.get("emails") or {}
     raw_domains = config.get("domains") or {}
     raw_names = config.get("names") or {}
+    raw_subjects = config.get("subject_contains") or config.get("subjects") or {}
 
     def add_email(email_raw: Any, project_raw: Any) -> None:
         email = str(email_raw).strip().lower()
@@ -814,6 +816,17 @@ def _parse_routing_mapping(config: Any) -> tuple[Dict[str, str], Dict[str, str],
             errors.append(f"invalid project code for name '{name}': {project_raw!r}")
             return
         names[name] = project
+
+    def add_subject(subject_raw: Any, project_raw: Any) -> None:
+        subject = str(subject_raw).strip().lower()
+        project = _normalize_project_code(str(project_raw))
+        if not subject:
+            errors.append(f"invalid subject_contains key: {subject_raw!r}")
+            return
+        if not project:
+            errors.append(f"invalid project code for subject_contains '{subject}': {project_raw!r}")
+            return
+        subjects[subject] = project
 
     if isinstance(raw_emails, dict):
         for k, v in raw_emails.items():
@@ -851,7 +864,41 @@ def _parse_routing_mapping(config: Any) -> tuple[Dict[str, str], Dict[str, str],
     else:
         errors.append("names must be a mapping or list")
 
-    return emails, domains, names, errors
+    if isinstance(raw_subjects, dict):
+        for k, v in raw_subjects.items():
+            add_subject(k, v)
+    elif isinstance(raw_subjects, list):
+        for entry in raw_subjects:
+            if not isinstance(entry, dict):
+                continue
+            if "contains" in entry and "project" in entry:
+                add_subject(entry.get("contains"), entry.get("project"))
+    else:
+        errors.append("subject_contains must be a mapping or list")
+
+    return emails, domains, names, subjects, errors
+
+
+def _match_subject_to_project(subject: str, subjects: Dict[str, str]) -> Optional[Dict[str, str]]:
+    if not subject:
+        return None
+    if not subjects:
+        return None
+    subject_norm = subject.strip().lower()
+    if not subject_norm:
+        return None
+    best_key: Optional[str] = None
+    best_project: Optional[str] = None
+    for key, project in subjects.items():
+        if not key:
+            continue
+        if key in subject_norm:
+            if best_key is None or len(key) > len(best_key):
+                best_key = key
+                best_project = project
+    if best_key and best_project:
+        return {"project": best_project, "match_type": "subject", "match_key": best_key}
+    return None
 
 
 def _match_sender_to_project(
@@ -1001,12 +1048,13 @@ def _op_route_eml_by_sender() -> Dict[str, Any]:
         out["skipped_reason"] = f"invalid YAML: {exc}"
         return out
 
-    emails, domains, names, mapping_errors = _parse_routing_mapping(config)
+    emails, domains, names, subjects, mapping_errors = _parse_routing_mapping(config)
     out["mapping_errors"] = mapping_errors
     out["mapping_email_count"] = len(emails)
     out["mapping_domain_count"] = len(domains)
     out["mapping_name_count"] = len(names)
-    if not emails and not domains and not names:
+    out["mapping_subject_count"] = len(subjects)
+    if not emails and not domains and not names and not subjects:
         out["ok"] = True
         out["skipped_reason"] = "mapping empty"
         return out
@@ -1040,6 +1088,10 @@ def _op_route_eml_by_sender() -> Dict[str, Any]:
             out["errors"].append({"file_ref": ref, "name": name, "error": f"parse_eml_failed: {exc}"})
             continue
 
+        subject = msg.get("Subject")
+        subject_str = subject.strip() if isinstance(subject, str) else ""
+        subject_match = _match_subject_to_project(subject_str, subjects)
+
         from_header = msg.get("from")
         if not isinstance(from_header, str) or not from_header.strip():
             out["skipped"].append({"file_ref": ref, "name": name, "reason": "missing_from_header"})
@@ -1050,13 +1102,14 @@ def _op_route_eml_by_sender() -> Dict[str, Any]:
             out["errors"].append({"file_ref": ref, "name": name, "error": f"parse_from_header_failed: {exc}"})
             continue
 
-        match = _match_sender_to_project(sender_addresses, emails, names, domains)
+        match = subject_match or _match_sender_to_project(sender_addresses, emails, names, domains)
         if not match:
             out["skipped"].append(
                 {
                     "file_ref": ref,
                     "name": name,
                     "sender_from": from_header.strip(),
+                    "subject": subject_str,
                     "reason": "no_match",
                 }
             )

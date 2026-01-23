@@ -1,12 +1,14 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -15,17 +17,25 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
+use tokio::time::Duration;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
+use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
-use super::list::ConversationsPage;
 use super::list::Cursor;
-use super::list::get_conversations;
+use super::list::ThreadListConfig;
+use super::list::ThreadListLayout;
+use super::list::ThreadSortKey;
+use super::list::ThreadsPage;
+use super::list::get_threads;
+use super::list::get_threads_in_root;
 use super::policy::is_persisted_response_item;
 use crate::config::Config;
 use crate::default_client::originator;
 use crate::git_info::collect_git_info;
+use crate::path_utils;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -33,6 +43,8 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Records all [`ResponseItem`]s for a session and flushes them to disk after
 /// every update.
@@ -52,9 +64,10 @@ pub struct RolloutRecorder {
 #[derive(Clone)]
 pub enum RolloutRecorderParams {
     Create {
-        conversation_id: ConversationId,
-        instructions: Option<String>,
+        conversation_id: ThreadId,
+        forked_from_id: Option<ThreadId>,
         source: SessionSource,
+        base_instructions: BaseInstructions,
     },
     Resume {
         path: PathBuf,
@@ -65,23 +78,25 @@ enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
     /// Ensure all prior writes are processed; respond when flushed.
     Flush {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<std::io::Result<()>>,
     },
 }
 
 impl RolloutRecorderParams {
     pub fn new(
-        conversation_id: ConversationId,
-        instructions: Option<String>,
+        conversation_id: ThreadId,
+        forked_from_id: Option<ThreadId>,
         source: SessionSource,
+        base_instructions: BaseInstructions,
     ) -> Self {
         Self::Create {
             conversation_id,
-            instructions,
+            forked_from_id,
             source,
+            base_instructions,
         }
     }
 
@@ -91,24 +106,86 @@ impl RolloutRecorderParams {
 }
 
 impl RolloutRecorder {
-    /// List conversations (rollout files) under the provided Codex home directory.
-    pub async fn list_conversations(
+    /// List threads (rollout files) under the provided Codex home directory.
+    pub async fn list_threads(
         codex_home: &Path,
         page_size: usize,
         cursor: Option<&Cursor>,
+        sort_key: ThreadSortKey,
         allowed_sources: &[SessionSource],
         model_providers: Option<&[String]>,
         default_provider: &str,
-    ) -> std::io::Result<ConversationsPage> {
-        get_conversations(
+    ) -> std::io::Result<ThreadsPage> {
+        get_threads(
             codex_home,
             page_size,
             cursor,
+            sort_key,
             allowed_sources,
             model_providers,
             default_provider,
         )
         .await
+    }
+
+    /// List archived threads (rollout files) under the archived sessions directory.
+    pub async fn list_archived_threads(
+        codex_home: &Path,
+        page_size: usize,
+        cursor: Option<&Cursor>,
+        sort_key: ThreadSortKey,
+        allowed_sources: &[SessionSource],
+        model_providers: Option<&[String]>,
+        default_provider: &str,
+    ) -> std::io::Result<ThreadsPage> {
+        let root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
+        get_threads_in_root(
+            root,
+            page_size,
+            cursor,
+            sort_key,
+            ThreadListConfig {
+                allowed_sources,
+                model_providers,
+                default_provider,
+                layout: ThreadListLayout::Flat,
+            },
+        )
+        .await
+    }
+
+    /// Find the newest recorded thread path, optionally filtering to a matching cwd.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_latest_thread_path(
+        codex_home: &Path,
+        page_size: usize,
+        cursor: Option<&Cursor>,
+        sort_key: ThreadSortKey,
+        allowed_sources: &[SessionSource],
+        model_providers: Option<&[String]>,
+        default_provider: &str,
+        filter_cwd: Option<&Path>,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let mut cursor = cursor.cloned();
+        loop {
+            let page = Self::list_threads(
+                codex_home,
+                page_size,
+                cursor.as_ref(),
+                sort_key,
+                allowed_sources,
+                model_providers,
+                default_provider,
+            )
+            .await?;
+            if let Some(path) = select_resume_path(&page, filter_cwd) {
+                return Ok(Some(path));
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(None);
+            }
+        }
     }
 
     /// Attempt to create a new [`RolloutRecorder`]. If the sessions directory
@@ -118,8 +195,9 @@ impl RolloutRecorder {
         let (file, rollout_path, meta) = match params {
             RolloutRecorderParams::Create {
                 conversation_id,
-                instructions,
+                forked_from_id,
                 source,
+                base_instructions,
             } => {
                 let LogFileInfo {
                     file,
@@ -141,13 +219,14 @@ impl RolloutRecorder {
                     path,
                     Some(SessionMeta {
                         id: session_id,
+                        forked_from_id,
                         timestamp,
                         cwd: config.cwd.clone(),
-                        originator: originator().value.clone(),
+                        originator: originator().value,
                         cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                        instructions,
                         source,
                         model_provider: Some(config.model_provider_id.clone()),
+                        base_instructions: Some(base_instructions),
                     }),
                 )
             }
@@ -204,7 +283,7 @@ impl RolloutRecorder {
             .await
             .map_err(|e| IoError::other(format!("failed to queue rollout flush: {e}")))?;
         rx.await
-            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))
+            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))?
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -215,7 +294,7 @@ impl RolloutRecorder {
         }
 
         let mut items: Vec<RolloutItem> = Vec::new();
-        let mut conversation_id: Option<ConversationId> = None;
+        let mut thread_id: Option<ThreadId> = None;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -233,9 +312,9 @@ impl RolloutRecorder {
                 Ok(rollout_line) => match rollout_line.item {
                     RolloutItem::SessionMeta(session_meta_line) => {
                         // Use the FIRST SessionMeta encountered in the file as the canonical
-                        // conversation id and main session information. Keep all items intact.
-                        if conversation_id.is_none() {
-                            conversation_id = Some(session_meta_line.meta.id);
+                        // thread id and main session information. Keep all items intact.
+                        if thread_id.is_none() {
+                            thread_id = Some(session_meta_line.meta.id);
                         }
                         items.push(RolloutItem::SessionMeta(session_meta_line));
                     }
@@ -259,12 +338,12 @@ impl RolloutRecorder {
         }
 
         info!(
-            "Resumed rollout with {} items, conversation ID: {:?}",
+            "Resumed rollout with {} items, thread ID: {:?}",
             items.len(),
-            conversation_id
+            thread_id
         );
-        let conversation_id = conversation_id
-            .ok_or_else(|| IoError::other("failed to parse conversation ID from rollout file"))?;
+        let conversation_id = thread_id
+            .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
 
         if items.is_empty() {
             return Ok(InitialHistory::New);
@@ -283,7 +362,8 @@ impl RolloutRecorder {
         match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
             Ok(_) => rx_done
                 .await
-                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}"))),
+                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}")))?
+                .map(|_| ()),
             Err(e) => {
                 warn!("failed to send rollout shutdown command: {e}");
                 Err(IoError::other(format!(
@@ -302,16 +382,13 @@ struct LogFileInfo {
     path: PathBuf,
 
     /// Session ID (also embedded in filename).
-    conversation_id: ConversationId,
+    conversation_id: ThreadId,
 
     /// Timestamp for the start of the session.
     timestamp: OffsetDateTime,
 }
 
-fn create_log_file(
-    config: &Config,
-    conversation_id: ConversationId,
-) -> std::io::Result<LogFileInfo> {
+fn create_log_file(config: &Config, conversation_id: ThreadId) -> std::io::Result<LogFileInfo> {
     // Resolve ~/.codex/sessions/YYYY/MM/DD and create it if missing.
     let timestamp = OffsetDateTime::now_local()
         .map_err(|e| IoError::other(format!("failed to get local time: {e}")))?;
@@ -353,6 +430,11 @@ async fn rollout_writer(
     cwd: std::path::PathBuf,
 ) -> std::io::Result<()> {
     let mut writer = JsonlWriter { file };
+    let mut pending: VecDeque<RolloutItem> = VecDeque::new();
+    let mut next_retry_at: Option<Instant> = None;
+    let mut retry_delay = Duration::from_millis(200);
+    let mut last_retry_warning_at: Option<Instant> = None;
+    const MAX_PENDING_ITEMS: usize = 10_000;
 
     // If we have a meta, collect git info asynchronously and write meta first
     if let Some(session_meta) = meta.take() {
@@ -368,31 +450,144 @@ async fn rollout_writer(
             .await?;
     }
 
-    // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        if next_retry_at.is_none()
+            && let Some(item) = pending.pop_front()
+        {
+            if let Err(err) = writer.write_rollout_item(item.clone()).await {
+                pending.push_front(item);
+                if is_retryable_rollout_error(&err) {
+                    schedule_retry(
+                        &mut next_retry_at,
+                        &mut retry_delay,
+                        &mut last_retry_warning_at,
+                        &err,
+                    );
+                } else {
+                    return Err(err);
+                }
+            } else {
+                retry_delay = Duration::from_millis(200);
+            }
+            continue;
+        }
+
+        let cmd = match next_retry_at {
+            Some(deadline) => tokio::select! {
+                cmd = rx.recv() => cmd,
+                _ = tokio::time::sleep_until(deadline) => {
+                    next_retry_at = None;
+                    continue;
+                }
+            },
+            None => rx.recv().await,
+        };
+
+        let Some(cmd) = cmd else {
+            // Best-effort drain before exiting when the sender side is dropped.
+            let _ = drain_pending(&mut writer, &mut pending).await;
+            let _ = writer.file.flush().await;
+            break;
+        };
+
         match cmd {
             RolloutCmd::AddItems(items) => {
                 for item in items {
-                    if is_persisted_response_item(&item) {
-                        writer.write_rollout_item(item).await?;
+                    if !is_persisted_response_item(&item) {
+                        continue;
+                    }
+
+                    if pending.len() >= MAX_PENDING_ITEMS {
+                        warn!(
+                            "rollout persistence backlog exceeded {MAX_PENDING_ITEMS} items; dropping new items until persistence recovers"
+                        );
+                        break;
+                    }
+                    pending.push_back(item);
+                }
+            }
+            RolloutCmd::Flush { ack } => match flush_all(&mut writer, &mut pending).await {
+                Ok(()) => {
+                    let _ = ack.send(Ok(()));
+                }
+                Err(err) => {
+                    if is_retryable_rollout_error(&err) {
+                        schedule_retry(
+                            &mut next_retry_at,
+                            &mut retry_delay,
+                            &mut last_retry_warning_at,
+                            &err,
+                        );
+                        let _ = ack.send(Err(err));
+                    } else {
+                        let err_for_return = IoError::new(err.kind(), err.to_string());
+                        let _ = ack.send(Err(err));
+                        return Err(err_for_return);
                     }
                 }
-            }
-            RolloutCmd::Flush { ack } => {
-                // Ensure underlying file is flushed and then ack.
-                if let Err(e) = writer.file.flush().await {
-                    let _ = ack.send(());
-                    return Err(e);
-                }
-                let _ = ack.send(());
-            }
+            },
             RolloutCmd::Shutdown { ack } => {
-                let _ = ack.send(());
+                let res = flush_all(&mut writer, &mut pending).await;
+                let _ = ack.send(res);
+                break;
             }
         }
     }
 
     Ok(())
+}
+
+fn is_retryable_rollout_error(err: &IoError) -> bool {
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+
+    // ENOSPC (28) / EDQUOT (122) on Unix; ERROR_DISK_FULL (112) on Windows.
+    matches!(err.raw_os_error(), Some(28 | 112 | 122))
+}
+
+fn schedule_retry(
+    next_retry_at: &mut Option<Instant>,
+    retry_delay: &mut Duration,
+    last_warning_at: &mut Option<Instant>,
+    err: &IoError,
+) {
+    let now = Instant::now();
+
+    let should_warn = last_warning_at
+        .map(|last| now.saturating_duration_since(last) > Duration::from_secs(30))
+        .unwrap_or(true);
+    if should_warn {
+        warn!(
+            "rollout persistence temporarily failed ({}); will retry in {:?}",
+            err, *retry_delay
+        );
+        *last_warning_at = Some(now);
+    }
+
+    *next_retry_at = Some(now + *retry_delay);
+    *retry_delay = (*retry_delay * 2).min(MAX_RETRY_DELAY);
+}
+
+async fn drain_pending(
+    writer: &mut JsonlWriter,
+    pending: &mut VecDeque<RolloutItem>,
+) -> std::io::Result<()> {
+    while let Some(item) = pending.pop_front() {
+        if let Err(err) = writer.write_rollout_item(item.clone()).await {
+            pending.push_front(item);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+async fn flush_all(
+    writer: &mut JsonlWriter,
+    pending: &mut VecDeque<RolloutItem>,
+) -> std::io::Result<()> {
+    drain_pending(writer, pending).await?;
+    writer.file.flush().await
 }
 
 struct JsonlWriter {
@@ -421,4 +616,37 @@ impl JsonlWriter {
         self.file.flush().await?;
         Ok(())
     }
+}
+
+fn select_resume_path(page: &ThreadsPage, filter_cwd: Option<&Path>) -> Option<PathBuf> {
+    match filter_cwd {
+        Some(cwd) => page.items.iter().find_map(|item| {
+            if session_cwd_matches(&item.head, cwd) {
+                Some(item.path.clone())
+            } else {
+                None
+            }
+        }),
+        None => page.items.first().map(|item| item.path.clone()),
+    }
+}
+
+fn session_cwd_matches(head: &[serde_json::Value], cwd: &Path) -> bool {
+    let Some(session_cwd) = extract_session_cwd(head) else {
+        return false;
+    };
+    if let (Ok(ca), Ok(cb)) = (
+        path_utils::normalize_for_path_comparison(&session_cwd),
+        path_utils::normalize_for_path_comparison(cwd),
+    ) {
+        return ca == cb;
+    }
+    session_cwd == cwd
+}
+
+fn extract_session_cwd(head: &[serde_json::Value]) -> Option<PathBuf> {
+    head.iter().find_map(|value| {
+        let meta_line = serde_json::from_value::<SessionMetaLine>(value.clone()).ok()?;
+        Some(meta_line.meta.cwd)
+    })
 }

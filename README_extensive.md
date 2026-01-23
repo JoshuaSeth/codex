@@ -64,6 +64,7 @@ This document grows over multiple **iterations**. Each pass adds more depth, con
 
 ### 3.3 Non-interactive & Programmatic Interfaces
 - `codex exec` (documented in `docs/exec.md`) is the headless automation surface. It defaults to read-only sandboxing, streams structured JSON events, supports JSON Schema constrained output, and can resume previous sessions. Exporting `CODEX_API_KEY` lets you run exec jobs without touching stored ChatGPT credentials. docs/exec.md:1-114
+- `codex view` is a read-only viewer for the `codex exec --json` event stream, and `codex exec-view` is a convenience wrapper that runs `exec` detached, writes events to a file, then attaches the viewer (so “process” and “view” stay decoupled even if you disconnect).
 - The app server (`codex-rs/app-server/README.md`) exposes a JSON-RPC protocol over stdio with thread/turn/item primitives—the same infrastructure used by the official IDE extension, so you can embed Codex in other clients without the CLI front-end. codex-rs/app-server/README.md:1-140
 - The TypeScript SDK (`sdk/typescript/README.md`) wraps the CLI binary, spawning it and exchanging JSONL events. It keeps the CLI’s required env vars (e.g., `OPENAI_BASE_URL`, `CODEX_API_KEY`) so Node/Electron apps inherit the same agent behavior. sdk/typescript/README.md:1-132
 

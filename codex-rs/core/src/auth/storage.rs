@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use chrono::Utc;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -21,7 +22,7 @@ use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 
 /// Determine where Codex should store CLI auth credentials.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthCredentialsStoreMode {
     #[default]
@@ -48,6 +49,32 @@ pub struct AuthDotJson {
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
+}
+
+fn get_auth_account_backup_file(codex_home: &Path, auth_dot_json: &AuthDotJson) -> Option<PathBuf> {
+    let email = auth_dot_json
+        .tokens
+        .as_ref()
+        .and_then(|t| t.id_token.email.as_deref())?;
+    let account_name = email.split('@').next().unwrap_or(email);
+    let account_name = sanitize_account_name(account_name);
+    if account_name.is_empty() {
+        return None;
+    }
+    Some(codex_home.join(format!("{account_name}_auth.json")))
+}
+
+fn sanitize_account_name(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    out.chars().take(64).collect()
 }
 
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
@@ -111,9 +138,22 @@ impl AuthStorageBackend for FileAuthStorage {
         {
             options.mode(0o600);
         }
-        let mut file = options.open(auth_file)?;
+        let mut file = options.open(&auth_file)?;
         file.write_all(json_data.as_bytes())?;
         file.flush()?;
+
+        // Also persist a per-account backup alongside auth.json so users can
+        // easily switch between multiple logins by copying the desired file
+        // into place.
+        if let Some(backup_file) = get_auth_account_backup_file(&self.codex_home, auth_dot_json) {
+            if let Some(parent) = backup_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut backup = options.open(backup_file)?;
+            backup.write_all(json_data.as_bytes())?;
+            backup.flush()?;
+        }
+
         Ok(())
     }
 

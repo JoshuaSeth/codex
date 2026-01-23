@@ -72,6 +72,7 @@ impl PromptSequenceRunner {
             .collect();
         items.push(UserInput::Text {
             text: step.prompt.clone(),
+            text_elements: Vec::new(),
         });
 
         Some(PromptSequenceEntry {

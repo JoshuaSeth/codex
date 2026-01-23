@@ -1,18 +1,22 @@
 use std::path::PathBuf;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::config::types::Personality;
 use crate::protocol::AskForApproval;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Verbosity;
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::openai_models::ReasoningEffort;
 
 /// Collection of common configuration options that a user can define as a unit
 /// in `config.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ConfigProfile {
     pub model: Option<String>,
     /// The key in the `model_providers` map identifying the
@@ -23,7 +27,12 @@ pub struct ConfigProfile {
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     pub model_verbosity: Option<Verbosity>,
+    pub model_personality: Option<Personality>,
     pub chatgpt_base_url: Option<String>,
+    /// Optional path to a file containing model instructions.
+    pub model_instructions_file: Option<AbsolutePathBuf>,
+    /// Deprecated: ignored. Use `model_instructions_file`.
+    #[schemars(skip)]
     pub experimental_instructions_file: Option<AbsolutePathBuf>,
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub include_apply_patch_tool: Option<bool>,
@@ -38,8 +47,12 @@ pub struct ConfigProfile {
     pub experimental_supported_tools: Option<Vec<String>>,
     /// Optional default cwd used when this profile is active.
     pub default_cwd: Option<PathBuf>,
+    pub web_search: Option<WebSearchMode>,
+    pub analytics: Option<crate::config::types::AnalyticsConfigToml>,
     /// Optional feature toggles scoped to this profile.
     #[serde(default)]
+    // Injects known feature keys into the schema and forbids unknown keys.
+    #[schemars(schema_with = "crate::config::schema::features_schema")]
     pub features: Option<crate::features::FeaturesToml>,
     pub oss_provider: Option<String>,
 }

@@ -12,7 +12,7 @@ Important rules:
 - Your final message must be a concise summary only (no questions, no “tell me which one”, no follow-ups).
 
 ## How to work
-0) Call `sp_route_eml_by_sender` (limit 50) once to auto-route `.eml` files by sender email/domain mapping.
+0) Call `sp_route_eml_by_sender` (limit 50) once to auto-route `.eml` files by routing rules in `_CONFIG/mail_routing.yaml` (sender email/name/domain + optional `subject_contains` keywords).
    - This may move some `.eml` files out of `Documenten/INBOX` before you start processing.
    - Track `auto_routed_count` and the filenames you auto-routed for the final summary.
 
@@ -50,6 +50,7 @@ Important rules:
 
 Note: Orthocenter is merged into `AUTOPAR`. Always use `AUTOPAR` (never `ORTHOCENTER`).
 Note: ZLTO is merged into `potAIto`. Always use `potAIto` (never `ZLTO`).
+Note: `DRIESTAR` has multiple separate SharePoint project folders (AI Pilot Regie / AIGenda / Studiedag+Cursus). Keep `PitchAIProject=DRIESTAR`, but file into the correct `PRJ-DRIESTAR-*` folder based on content.
 
 ### `PitchAIRecordSeries` (choose the best match)
 `Ops.Email`, `Ops.Project`,
@@ -75,7 +76,11 @@ Note: ZLTO is merged into `potAIto`. Always use `potAIto` (never `ZLTO`).
 Use `library_root` from `sp_list_inbox` and append:
 
 - `Ops.Email`:
-  - `/05_OPERATIONS_PROJECTS/Projects/PRJ-<PitchAIProject>/comms_inbox/<YYYY-MM-DD>/`
+  - Default: `/05_OPERATIONS_PROJECTS/Projects/PRJ-<PitchAIProject>/comms_inbox/<YYYY-MM-DD>/`
+  - Driestar exceptions (choose the right one by content):
+    - `/05_OPERATIONS_PROJECTS/Projects/PRJ-DRIESTAR-AI-PILOT-REGIE/comms_inbox/<YYYY-MM-DD>/`
+    - `/05_OPERATIONS_PROJECTS/Projects/PRJ-DRIESTAR-AIGENDA/comms_inbox/<YYYY-MM-DD>/`
+    - `/05_OPERATIONS_PROJECTS/Projects/PRJ-DRIESTAR-STUDIEDAG-CURSUS/comms_inbox/<YYYY-MM-DD>/`
 - `Ops.Project`:
   - If it’s a meeting/minutes: `/05_OPERATIONS_PROJECTS/Projects/PRJ-<PitchAIProject>/03_Meetings_Minutes/inbox/<YYYY-MM-DD>/`
   - If it’s a deliverable/output: `/05_OPERATIONS_PROJECTS/Projects/PRJ-<PitchAIProject>/02_Deliverables/inbox/<YYYY-MM-DD>/`

@@ -8,7 +8,7 @@ Elise runs as a Codex agent driven by a natural-language prompt. The prompt + co
 
 - `mail_search` — list newest messages (defaults to **unread** in Inbox).
 - `mail_read` — read a specific message body + headers.
-- `send_email` — send an email (Graph app-only).
+- `send_email` — create an Outlook draft email (Graph app-only; does **not** send).
 
 When operating:
 
@@ -17,10 +17,10 @@ When operating:
 3. Maintain persistent state:
    - Write decisions + next actions to `/mnt/elise/elise/ledger.md`.
    - Store drafts under `/mnt/elise/elise/drafts/`.
-4. Respect the boss-approval policy:
-   - You may always email Seth (`seth.vanderbijl@pitchai.net`) for advice/approval.
-   - Do **not** email anyone else unless Seth explicitly approves.
-   - Approval arrives by email containing `APPROVED: <draft_filename>`.
+4. Email policy:
+   - Do **not** send email automatically.
+   - Use `send_email` to create drafts in Outlook and log the returned `draft_id` + `web_link` in `ledger.md`.
+   - A human reviews/edits/sends drafts in Outlook.
 5. When finished for now, write a short status update in `ledger.md` and end your final response with a concise summary + what you’re waiting on.
 
 Tool parameters (as implemented today):
@@ -42,7 +42,6 @@ Tool parameters (as implemented today):
   - `body` (string, required)
   - `cc`, `bcc`, `reply_to` (string[], optional)
   - `body_type` (string, default `HTML`)
-  - `save_to_sent` (bool, default `true`)
 
 Implementation references:
 
@@ -87,7 +86,7 @@ Related: for running **any** Codex config/prompt in the same image (not just Eli
 This deployment uses **two independent auth systems**:
 
 1. **Codex auth** (OpenAI / ChatGPT plan / OpenAI API key), stored as `auth.json`.
-2. **Microsoft Graph app-only** (client credentials with certificate), used to read/send mail.
+2. **Microsoft Graph app-only** (client credentials with certificate), used to read mail and create Outlook drafts.
 
 Secrets must be injected at runtime (ACA Job secrets / Key Vault references). Do **not** bake credentials into git or into the image.
 
@@ -126,7 +125,7 @@ Create the app registration **in the tenant that contains the mailbox** (your Az
 2. Add a certificate credential (upload the public cert)
 3. Add Microsoft Graph **Application** permissions:
    - `Mail.ReadWrite`
-   - `Mail.Send`
+   - `Mail.Send` (optional; only needed if you later enable sending)
 4. Grant **admin consent**
 
 Generate a certificate (example: 10 years):

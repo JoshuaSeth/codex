@@ -1,18 +1,15 @@
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use codex_core::CodexConversation;
+use codex_core::CodexThread;
 use codex_core::protocol::Op;
-use codex_protocol::ConversationId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -28,7 +25,7 @@ struct DeliverPendingRequest {
 
 pub struct PendingToolServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
-    metadata_path: PathBuf,
+    addr: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,18 +34,8 @@ pub struct PendingToolSocketMetadata {
     pub port: u16,
 }
 
-pub fn metadata_path_for(codex_home: &Path, conversation_id: &ConversationId) -> PathBuf {
-    codex_home
-        .join("live")
-        .join(format!("{conversation_id}.json"))
-}
-
 impl PendingToolServer {
-    pub async fn start(
-        codex_home: &Path,
-        conversation_id: &ConversationId,
-        conversation: Arc<CodexConversation>,
-    ) -> anyhow::Result<Self> {
+    pub async fn start(conversation: Arc<CodexThread>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .context("failed to bind pending tool listener")?;
@@ -56,16 +43,6 @@ impl PendingToolServer {
             .local_addr()
             .context("listener missing local addr")?;
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-
-        let metadata_path = metadata_path_for(codex_home, conversation_id);
-        if let Some(parent) = metadata_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let metadata = json!({
-            "host": addr.ip().to_string(),
-            "port": addr.port(),
-        });
-        tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata)?).await?;
 
         tokio::spawn(async move {
             loop {
@@ -94,8 +71,12 @@ impl PendingToolServer {
 
         Ok(Self {
             shutdown_tx: Some(shutdown_tx),
-            metadata_path,
+            addr,
         })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 }
 
@@ -104,15 +85,12 @@ impl Drop for PendingToolServer {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        let path = self.metadata_path.clone();
-        // Best-effort cleanup.
-        let _ = std::fs::remove_file(path);
     }
 }
 
 async fn handle_connection(
     mut stream: TcpStream,
-    conversation: Arc<CodexConversation>,
+    conversation: Arc<CodexThread>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -135,14 +113,18 @@ pub async fn send_pending_result(
     call_id: String,
     output: FunctionCallOutputPayload,
 ) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect(addr)
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
+        .context("pending tool IPC connect timeout")?
         .context("failed to connect to pending tool listener")?;
     let request = DeliverPendingRequest { call_id, output };
     let body = serde_json::to_vec(&request)?;
     stream.write_all(&body).await?;
+    stream.shutdown().await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf))
+        .await
+        .context("pending tool IPC response timeout")??;
     Ok(())
 }
 

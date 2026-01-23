@@ -18,11 +18,13 @@ pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
+use codex_common::oss::ollama_chat_deprecation_notice;
 use codex_core::AuthManager;
-use codex_core::ConversationManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
-use codex_core::NewConversation;
+use codex_core::NewThread;
+use codex_core::OLLAMA_CHAT_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
+use codex_core::ThreadManager;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -30,6 +32,14 @@ use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::git_info::get_git_repo_root;
+use codex_core::live_status::LiveFrontend;
+use codex_core::live_status::LiveIpc;
+use codex_core::live_status::LiveSessionStatus;
+use codex_core::live_status::LiveStatusDetail;
+use codex_core::live_status::LiveStatusRecordV1;
+use codex_core::live_status::LiveStatusWriter;
+use codex_core::live_status::LiveStatusWriterConfig;
+use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
@@ -49,6 +59,7 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use supports_color::Stream;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -73,7 +84,8 @@ use crate::pending_tool_ipc::send_pending_result;
 use crate::prompt_sequence::PromptSequenceRunner;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_selector_str;
-use codex_core::replace_last_tool_result as patch_last_tool_result;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 
 enum InitialOperation {
     UserTurn {
@@ -222,7 +234,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             Some(provider)
         } else {
             return Err(anyhow::anyhow!(
-                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to either {LMSTUDIO_OSS_PROVIDER_ID} or {OLLAMA_OSS_PROVIDER_ID} in config.toml"
+                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}, {OLLAMA_CHAT_PROVIDER_ID} in config.toml"
             ));
         }
     } else {
@@ -264,19 +276,30 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
 
-    if let Err(err) = enforce_login_restrictions(&config).await {
+    if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
 
-    let otel = codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"));
+    let ollama_chat_support_notice = match ollama_chat_deprecation_notice(&config).await {
+        Ok(notice) => notice,
+        Err(err) => {
+            tracing::warn!(?err, "Failed to detect Ollama wire API");
+            None
+        }
+    };
 
-    #[allow(clippy::print_stderr)]
-    let otel = match otel {
-        Ok(otel) => otel,
-        Err(e) => {
+    let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, false)
+    })) {
+        Ok(Ok(otel)) => otel,
+        Ok(Err(e)) => {
             eprintln!("Could not create otel exporter: {e}");
-            std::process::exit(1);
+            None
+        }
+        Err(_) => {
+            eprintln!("Could not create otel exporter: panicked during initialization");
+            None
         }
     };
 
@@ -298,6 +321,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             last_message_file.clone(),
         )),
     };
+
+    if let Some(notice) = ollama_chat_support_notice {
+        event_processor.process_event(Event {
+            id: String::new(),
+            msg: EventMsg::DeprecationNotice(notice),
+        });
+    }
 
     if oss {
         // We're in the oss section, so provider_id should be Some
@@ -332,57 +362,73 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         true,
         config.cli_auth_credentials_store_mode,
     );
-    let conversation_manager = ConversationManager::new(auth_manager.clone(), SessionSource::Exec);
-    let default_model = conversation_manager
+    let thread_manager = ThreadManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        SessionSource::Exec,
+    );
+    let default_model = thread_manager
         .get_models_manager()
-        .get_model(&config.model, &config)
+        .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)
         .await;
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
-    let NewConversation {
-        conversation_id,
-        conversation,
+    let NewThread {
+        thread_id: conversation_id,
+        thread: conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
         let mut resume_path = resolve_resume_path(&config, args).await?;
 
-        if let Some(replacement) = args.replace_last_tool_result.as_deref() {
-            let path = resume_path.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--replace-last-toolresult requires specifying a session id or --last"
-                )
-            })?;
-            patch_last_tool_result(path, replacement)
-                .await
-                .with_context(|| {
-                    format!("failed to replace last tool result in {}", path.display())
-                })?;
+        if let Some(path) = resume_path.as_ref() {
+            let thread_id = resolve_thread_id_for_resume(args, path).await?;
+            wait_for_thread_to_finish_if_running(&config.codex_home, &thread_id).await?;
         }
 
         if let Some(path) = resume_path.take() {
-            conversation_manager
-                .resume_conversation_from_rollout(config.clone(), path, auth_manager.clone())
+            thread_manager
+                .resume_thread_from_rollout(config.clone(), path, auth_manager.clone())
                 .await?
         } else {
-            conversation_manager
-                .new_conversation(config.clone())
-                .await?
+            thread_manager.start_thread(config.clone()).await?
         }
     } else {
-        conversation_manager
-            .new_conversation(config.clone())
-            .await?
+        thread_manager.start_thread(config.clone()).await?
     };
-    let _pending_tool_server =
-        match PendingToolServer::start(&config.codex_home, &conversation_id, conversation.clone())
-            .await
-        {
-            Ok(server) => Some(server),
-            Err(err) => {
-                warn!(?err, "failed to start pending tool IPC server");
-                None
-            }
-        };
+
+    let pending_tool_server = match PendingToolServer::start(conversation.clone()).await {
+        Ok(server) => Some(server),
+        Err(err) => {
+            warn!(?err, "failed to start pending tool IPC server");
+            None
+        }
+    };
+
+    let cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let mut live_status = match LiveStatusWriter::spawn(LiveStatusWriterConfig {
+        codex_home: config.codex_home.clone(),
+        thread_id: conversation_id,
+        frontend: LiveFrontend::Exec,
+        status: LiveSessionStatus::Running,
+        detail: None,
+        cwd: Some(config.cwd.clone()),
+        cli_version,
+        heartbeat_interval: None,
+    }) {
+        Ok(writer) => Some(writer),
+        Err(err) => {
+            warn!(?err, "failed to start live status writer");
+            None
+        }
+    };
+
+    if let (Some(writer), Some(server)) = (live_status.as_ref(), pending_tool_server.as_ref()) {
+        let addr = server.addr();
+        writer.set_ipc(LiveIpc {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        });
+    }
 
     let mut prompt_sequence_runner = match prompt_sequence {
         Some(path) => Some(PromptSequenceRunner::load(&path)?),
@@ -433,6 +479,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 if args.no_prompt {
                     let items: Vec<UserInput> = imgs
                         .into_iter()
+                        .chain(args.images.into_iter())
                         .map(|path| UserInput::LocalImage { path })
                         .collect();
                     (
@@ -457,10 +504,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     let prompt_text = resolve_prompt(prompt_arg);
                     let mut items: Vec<UserInput> = imgs
                         .into_iter()
+                        .chain(args.images.into_iter())
                         .map(|path| UserInput::LocalImage { path })
                         .collect();
                     items.push(UserInput::Text {
                         text: prompt_text.clone(),
+                        // CLI input doesn't track UI element ranges, so none are available here.
+                        text_elements: Vec::new(),
                     });
                     (
                         InitialOperation::UserTurn {
@@ -479,6 +529,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     .collect();
                 items.push(UserInput::Text {
                     text: prompt_text.clone(),
+                    // CLI input doesn't track UI element ranges, so none are available here.
+                    text_elements: Vec::new(),
                 });
                 (
                     InitialOperation::UserTurn {
@@ -554,6 +606,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     effort: default_effort,
                     summary: default_summary,
                     final_output_json_schema: output_schema,
+                    collaboration_mode: None,
+                    personality: None,
                 })
                 .await?;
             info!("Sent prompt with event ID: {task_id}");
@@ -573,7 +627,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     while let Some(event) = rx.recv().await {
         let mut queued_sequence_step = None;
         if let Some(runner) = prompt_sequence_runner.as_mut()
-            && matches!(&event.msg, EventMsg::TaskComplete(_))
+            && matches!(&event.msg, EventMsg::TurnComplete(_))
             && runner.has_remaining()
         {
             queued_sequence_step = runner.next_entry();
@@ -588,6 +642,26 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     decision: ElicitationAction::Cancel,
                 })
                 .await?;
+        }
+        if let (Some(writer), EventMsg::PendingToolState(ev)) = (live_status.as_ref(), &event.msg) {
+            match ev.status {
+                codex_core::protocol::PendingToolStatus::Waiting => {
+                    writer.set_status(
+                        LiveSessionStatus::WaitingPendingTool,
+                        Some(LiveStatusDetail {
+                            call_id: Some(ev.call_id.clone()),
+                            tool_name: Some(ev.tool_name.clone()),
+                            turn_id: Some(ev.turn_id.clone()),
+                            note: ev.note.clone(),
+                            ..Default::default()
+                        }),
+                    );
+                }
+                codex_core::protocol::PendingToolStatus::Resolved
+                | codex_core::protocol::PendingToolStatus::Cancelled => {
+                    writer.set_status(LiveSessionStatus::Running, None);
+                }
+            }
         }
         if matches!(&event.msg, EventMsg::Error(_)) {
             error_seen = true;
@@ -611,6 +685,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     effort: default_effort,
                     summary: default_summary,
                     final_output_json_schema: output_schema.clone(),
+                    collaboration_mode: None,
+                    personality: None,
                 })
                 .await?;
             shutdown = CodexStatus::Running;
@@ -627,8 +703,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
+    if let Some(writer) = live_status.take() {
+        let status = if error_seen {
+            LiveSessionStatus::Errored
+        } else {
+            LiveSessionStatus::Completed
+        };
+        writer
+            .shutdown(
+                status,
+                Some(if error_seen {
+                    "fatal error seen".to_string()
+                } else {
+                    "finished".to_string()
+                }),
+            )
+            .await;
+    }
+    drop(pending_tool_server);
+
     if error_seen {
-        std::process::exit(1);
+        anyhow::bail!("fatal error reported by server");
     }
 
     Ok(())
@@ -636,14 +731,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
 async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
     let codex_home = find_codex_home().context("failed to locate codex home")?;
-    let metadata_path = codex_home
-        .join("live")
-        .join(format!("{}.json", args.session_id));
+    let thread_id = codex_protocol::ThreadId::from_string(&args.session_id)?;
+    let metadata_path = LiveStatusRecordV1::path_for(&codex_home, &thread_id);
     let bytes = fs::read(&metadata_path)
         .await
         .with_context(|| format!("failed to read {}", metadata_path.display()))?;
     let value: Value = serde_json::from_slice(&bytes)?;
-    let meta = load_metadata(value)?;
+    let meta = load_metadata(value.clone())?;
+    if let Ok(record) = serde_json::from_value::<LiveStatusRecordV1>(value) {
+        if !record.alive {
+            anyhow::bail!("session {} is not alive", record.thread_id);
+        }
+        if let Some(age_s) = heartbeat_age_seconds(&record.last_heartbeat_at)
+            && age_s > 30.0
+        {
+            anyhow::bail!(
+                "session {} live record is stale (last heartbeat {:.1}s ago)",
+                record.thread_id,
+                age_s
+            );
+        }
+    }
     let addr = addr_from_metadata(meta)?;
     let payload = FunctionCallOutputPayload {
         content: args.output,
@@ -658,25 +766,151 @@ async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn heartbeat_age_seconds(last_heartbeat_at: &str) -> Option<f64> {
+    let parsed = time::OffsetDateTime::parse(
+        last_heartbeat_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    let now = time::OffsetDateTime::now_utc();
+    let diff = now - parsed;
+    Some(diff.whole_milliseconds() as f64 / 1000.0)
+}
+
+async fn resolve_thread_id_for_resume(
+    args: &crate::cli::ResumeArgs,
+    rollout_path: &Path,
+) -> anyhow::Result<codex_protocol::ThreadId> {
+    if let Some(selector) = args.session_id.as_deref()
+        && let Ok(id) = codex_protocol::ThreadId::from_string(selector)
+    {
+        return Ok(id);
+    }
+    read_thread_id_from_rollout_head(rollout_path).await
+}
+
+async fn read_thread_id_from_rollout_head(path: &Path) -> anyhow::Result<codex_protocol::ThreadId> {
+    use tokio::io::AsyncBufReadExt;
+
+    const HEAD_RECORD_LIMIT: usize = 25;
+
+    let file = fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open rollout {}", path.display()))?;
+    let reader = tokio::io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut non_empty = 0usize;
+    while non_empty < HEAD_RECORD_LIMIT {
+        let line_opt = lines.next_line().await?;
+        let Some(line) = line_opt else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty += 1;
+
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            continue;
+        };
+        if let RolloutItem::SessionMeta(meta) = rollout_line.item {
+            return Ok(meta.meta.id);
+        }
+    }
+
+    anyhow::bail!(
+        "failed to resolve thread id from rollout {}",
+        path.display()
+    )
+}
+
+async fn wait_for_thread_to_finish_if_running(
+    codex_home: &Path,
+    thread_id: &codex_protocol::ThreadId,
+) -> anyhow::Result<()> {
+    let status_path = LiveStatusRecordV1::path_for(codex_home, thread_id);
+
+    let mut printed_wait_message = false;
+    loop {
+        let bytes = match fs::read(&status_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed reading live status {}", status_path.display())
+                });
+            }
+        };
+        let value: Value = serde_json::from_slice(&bytes).with_context(|| {
+            format!("failed parsing live status json {}", status_path.display())
+        })?;
+
+        let alive = value
+            .get("alive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !alive {
+            return Ok(());
+        }
+
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(status, "completed" | "errored") {
+            return Ok(());
+        }
+
+        let last_heartbeat_at = value
+            .get("last_heartbeat_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let age_s = heartbeat_age_seconds(last_heartbeat_at).unwrap_or(f64::INFINITY);
+        if age_s > 30.0 {
+            // Best-effort: treat stale records as not-running so users can recover after a crash.
+            return Ok(());
+        }
+
+        if !printed_wait_message {
+            printed_wait_message = true;
+            eprintln!(
+                "Session {thread_id} appears to be running; waiting for it to finish before resuming (Ctrl+C to cancel)."
+            );
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                anyhow::bail!("interrupted while waiting for session {thread_id} to finish");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+    }
+}
+
 async fn resolve_resume_path(
     config: &Config,
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<PathBuf>> {
     let resolved = if args.last {
         let default_provider_filter = vec![config.model_provider_id.clone()];
-        match codex_core::RolloutRecorder::list_conversations(
+        let filter_cwd = if args.all {
+            None
+        } else {
+            Some(config.cwd.as_path())
+        };
+        match codex_core::RolloutRecorder::find_latest_thread_path(
             &config.codex_home,
             1,
             None,
+            codex_core::ThreadSortKey::UpdatedAt,
             &[],
             Some(default_provider_filter.as_slice()),
             &config.model_provider_id,
+            filter_cwd,
         )
         .await
         {
-            Ok(page) => page.items.first().map(|it| it.path.clone()),
+            Ok(path) => path,
             Err(e) => {
-                error!("Error listing conversations: {e}");
+                error!("Error listing threads: {e}");
                 None
             }
         }
@@ -707,7 +941,7 @@ async fn fork_rollout_file(codex_home: &Path, source_path: &Path) -> anyhow::Res
     let mut first_json: Value = serde_json::from_str(first)
         .with_context(|| format!("invalid session meta json in {}", source_path.display()))?;
 
-    let new_id = codex_protocol::ConversationId::default();
+    let new_id = codex_protocol::ThreadId::default();
 
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     let format: &[FormatItem] =
@@ -775,6 +1009,79 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptDecodeError {
+    InvalidUtf8 { valid_up_to: usize },
+    InvalidUtf16 { encoding: &'static str },
+    UnsupportedBom { encoding: &'static str },
+}
+
+impl std::fmt::Display for PromptDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromptDecodeError::InvalidUtf8 { valid_up_to } => write!(
+                f,
+                "input is not valid UTF-8 (invalid byte at offset {valid_up_to}). Convert it to UTF-8 and retry (e.g., `iconv -f <ENC> -t UTF-8 prompt.txt`)."
+            ),
+            PromptDecodeError::InvalidUtf16 { encoding } => write!(
+                f,
+                "input looked like {encoding} but could not be decoded. Convert it to UTF-8 and retry."
+            ),
+            PromptDecodeError::UnsupportedBom { encoding } => write!(
+                f,
+                "input appears to be {encoding}. Convert it to UTF-8 and retry."
+            ),
+        }
+    }
+}
+
+fn decode_prompt_bytes(input: &[u8]) -> Result<String, PromptDecodeError> {
+    let input = input.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(input);
+
+    if input.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        return Err(PromptDecodeError::UnsupportedBom {
+            encoding: "UTF-32LE",
+        });
+    }
+
+    if input.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        return Err(PromptDecodeError::UnsupportedBom {
+            encoding: "UTF-32BE",
+        });
+    }
+
+    if let Some(rest) = input.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, "UTF-16LE", u16::from_le_bytes);
+    }
+
+    if let Some(rest) = input.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, "UTF-16BE", u16::from_be_bytes);
+    }
+
+    std::str::from_utf8(input)
+        .map(str::to_string)
+        .map_err(|e| PromptDecodeError::InvalidUtf8 {
+            valid_up_to: e.valid_up_to(),
+        })
+}
+
+fn decode_utf16(
+    input: &[u8],
+    encoding: &'static str,
+    decode_unit: fn([u8; 2]) -> u16,
+) -> Result<String, PromptDecodeError> {
+    if !input.len().is_multiple_of(2) {
+        return Err(PromptDecodeError::InvalidUtf16 { encoding });
+    }
+
+    let units: Vec<u16> = input
+        .chunks_exact(2)
+        .map(|chunk| decode_unit([chunk[0], chunk[1]]))
+        .collect();
+
+    String::from_utf16(&units).map_err(|_| PromptDecodeError::InvalidUtf16 { encoding })
+}
+
 fn resolve_prompt(prompt_arg: Option<String>) -> String {
     match prompt_arg {
         Some(p) if p != "-" => p,
@@ -791,11 +1098,22 @@ fn resolve_prompt(prompt_arg: Option<String>) -> String {
             if !force_stdin {
                 eprintln!("Reading prompt from stdin...");
             }
-            let mut buffer = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
+
+            let mut bytes = Vec::new();
+            if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
                 eprintln!("Failed to read prompt from stdin: {e}");
                 std::process::exit(1);
-            } else if buffer.trim().is_empty() {
+            }
+
+            let buffer = match decode_prompt_bytes(&bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to read prompt from stdin: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            if buffer.trim().is_empty() {
                 eprintln!("No prompt provided via stdin.");
                 std::process::exit(1);
             }
@@ -838,6 +1156,8 @@ fn build_review_request(args: ReviewArgs) -> anyhow::Result<ReviewRequest> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+    use time::format_description::well_known::Rfc3339;
 
     #[test]
     fn builds_uncommitted_review_request() {
@@ -899,5 +1219,197 @@ mod tests {
         };
 
         assert_eq!(request, expected);
+    }
+
+    #[tokio::test]
+    async fn resolves_thread_id_for_resume_from_rollout_head() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let rollout_path = tmp.path().join("rollout.jsonl");
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let meta = codex_protocol::protocol::SessionMeta {
+            id: thread_id,
+            timestamp: "2026-01-01T00:00:00".to_string(),
+            ..Default::default()
+        };
+        let line = RolloutLine {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            item: RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta,
+                git: None,
+            }),
+        };
+        let json = serde_json::to_string(&line).expect("serialize rollout line");
+        tokio::fs::write(&rollout_path, format!("{json}\n"))
+            .await
+            .expect("write rollout file");
+
+        let args = crate::cli::ResumeArgs {
+            session_id: None,
+            last: false,
+            all: false,
+            fork: false,
+            images: Vec::new(),
+            prompt: None,
+            no_prompt: false,
+        };
+
+        let resolved = resolve_thread_id_for_resume(&args, &rollout_path)
+            .await
+            .expect("resolve thread id");
+        assert_eq!(resolved, thread_id);
+    }
+
+    #[tokio::test]
+    async fn waits_for_running_session_to_finish_before_resuming() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let codex_home = tmp.path();
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
+        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
+            .await
+            .expect("create live dir");
+
+        let now = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("format rfc3339");
+        let initial = serde_json::json!({
+            "alive": true,
+            "status": "running",
+            "last_heartbeat_at": now,
+        });
+        tokio::fs::write(&status_path, serde_json::to_vec(&initial).expect("json"))
+            .await
+            .expect("write live status");
+
+        let status_path_for_task = status_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let done = serde_json::json!({
+                "alive": false,
+                "status": "completed",
+                "last_heartbeat_at": time::OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .expect("format rfc3339"),
+            });
+            let _ = tokio::fs::write(
+                &status_path_for_task,
+                serde_json::to_vec(&done).expect("json"),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
+        )
+        .await
+        .expect("wait returns")
+        .expect("ok");
+    }
+
+    #[tokio::test]
+    async fn does_not_block_on_stale_live_status() {
+        let tmp = TempDir::new().expect("creates tempdir");
+        let codex_home = tmp.path();
+
+        let thread_id = codex_protocol::ThreadId::default();
+        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
+        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
+            .await
+            .expect("create live dir");
+
+        let stale = serde_json::json!({
+            "alive": true,
+            "status": "running",
+            "last_heartbeat_at": "1970-01-01T00:00:00Z",
+        });
+        tokio::fs::write(&status_path, serde_json::to_vec(&stale).expect("json"))
+            .await
+            .expect("write live status");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
+        )
+        .await
+        .expect("returns without blocking")
+        .expect("ok");
+    }
+
+    #[test]
+    fn decode_prompt_bytes_strips_utf8_bom() {
+        let input = [0xEF, 0xBB, 0xBF, b'h', b'i', b'\n'];
+
+        let out = decode_prompt_bytes(&input).expect("decode utf-8 with BOM");
+
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn decode_prompt_bytes_decodes_utf16le_bom() {
+        // UTF-16LE BOM + "hi\n"
+        let input = [0xFF, 0xFE, b'h', 0x00, b'i', 0x00, b'\n', 0x00];
+
+        let out = decode_prompt_bytes(&input).expect("decode utf-16le with BOM");
+
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn decode_prompt_bytes_decodes_utf16be_bom() {
+        // UTF-16BE BOM + "hi\n"
+        let input = [0xFE, 0xFF, 0x00, b'h', 0x00, b'i', 0x00, b'\n'];
+
+        let out = decode_prompt_bytes(&input).expect("decode utf-16be with BOM");
+
+        assert_eq!(out, "hi\n");
+    }
+
+    #[test]
+    fn decode_prompt_bytes_rejects_utf32le_bom() {
+        // UTF-32LE BOM + "hi\n"
+        let input = [
+            0xFF, 0xFE, 0x00, 0x00, b'h', 0x00, 0x00, 0x00, b'i', 0x00, 0x00, 0x00, b'\n', 0x00,
+            0x00, 0x00,
+        ];
+
+        let err = decode_prompt_bytes(&input).expect_err("utf-32le should be rejected");
+
+        assert_eq!(
+            err,
+            PromptDecodeError::UnsupportedBom {
+                encoding: "UTF-32LE"
+            }
+        );
+    }
+
+    #[test]
+    fn decode_prompt_bytes_rejects_utf32be_bom() {
+        // UTF-32BE BOM + "hi\n"
+        let input = [
+            0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x00, b'h', 0x00, 0x00, 0x00, b'i', 0x00, 0x00,
+            0x00, b'\n',
+        ];
+
+        let err = decode_prompt_bytes(&input).expect_err("utf-32be should be rejected");
+
+        assert_eq!(
+            err,
+            PromptDecodeError::UnsupportedBom {
+                encoding: "UTF-32BE"
+            }
+        );
+    }
+
+    #[test]
+    fn decode_prompt_bytes_rejects_invalid_utf8() {
+        // Invalid UTF-8 sequence: 0xC3 0x28
+        let input = [0xC3, 0x28];
+
+        let err = decode_prompt_bytes(&input).expect_err("invalid utf-8 should fail");
+
+        assert_eq!(err, PromptDecodeError::InvalidUtf8 { valid_up_to: 0 });
     }
 }

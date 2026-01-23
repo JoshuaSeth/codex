@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.92
 
       - name: Validate tag matches Cargo.toml version
         shell: bash
@@ -45,11 +46,20 @@ jobs:
           echo "✅  Tag and Cargo.toml agree (${tag_ver})"
           echo "::endgroup::"
 
+      - name: Verify config schema fixture
+        shell: bash
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          echo "If this fails, run: just write-config-schema to overwrite fixture with intentional changes."
+          cargo run -p codex-core --bin codex-write-config-schema
+          git diff --exit-code core/config.schema.json
+
   build:
     needs: tag-check
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
@@ -80,7 +90,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@1.92
         with:
           targets: ${{ matrix.target }}
 
@@ -323,6 +333,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Generate release notes from tag commit message
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # On tag pushes, GITHUB_SHA may be a tag object for annotated tags;
+          # peel it to the underlying commit.
+          commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+
+          # Use the commit message for the commit the tag points at (not the
+          # annotated tag message).
+          git log -1 --format=%B "${commit}" > "${notes_path}"
+          # Ensure trailing newline so GitHub's markdown renderer doesn't
+          # occasionally run the last line into subsequent content.
+          echo >> "${notes_path}"
+
+          echo "path=${notes_path}" >> "${GITHUB_OUTPUT}"
+
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -337,6 +367,10 @@ jobs:
           rm -rf dist/shell-tool-mcp*
 
           ls -R dist/
+
+      - name: Add config schema release asset
+        run: |
+          cp codex-rs/core/config.schema.json dist/config-schema.json
 
       - name: Define release name
         id: release_name
@@ -395,6 +429,7 @@ jobs:
         with:
           name: ${{ steps.release_name.outputs.name }}
           tag_name: ${{ github.ref_name }}
+          body_path: ${{ steps.release_notes.outputs.path }}
           files: dist/**
           # Mark as prerelease only when the version has a suffix after x.y.z
           # (e.g. -alpha, -beta). Otherwise publish a normal release.
@@ -406,6 +441,19 @@ jobs:
         with:
           tag: ${{ github.ref_name }}
           config: .github/dotslash-config.json
+
+      - name: Trigger developers.openai.com deploy
+        # Only trigger the deploy if the release is not a pre-release.
+        # The deploy is used to update the developers.openai.com website with the new config schema json file.
+        if: ${{ !contains(steps.release_name.outputs.name, '-') }}
+        continue-on-error: true
+        env:
+          DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL: ${{ secrets.DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          if ! curl -sS -f -o /dev/null -X POST "$DEV_WEBSITE_VERCEL_DEPLOY_HOOK_URL"; then
+            echo "::warning title=developers.openai.com deploy hook failed::Vercel deploy hook POST failed for ${GITHUB_REF_NAME}"
+            exit 1
+          fi
 
   # Publish to npm using OIDC authentication.
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/

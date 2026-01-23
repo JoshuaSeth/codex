@@ -12,10 +12,13 @@ mod tests;
 
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigToml;
-use crate::config_loader::config_requirements::ConfigRequirementsToml;
+use crate::config::deserialize_config_toml_with_base;
+use crate::config_loader::config_requirements::ConfigRequirementsWithSources;
 use crate::config_loader::layer_io::LoadedConfigLayers;
+use crate::git_info::resolve_root_git_project_for_trust;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
@@ -25,7 +28,14 @@ use std::path::Path;
 use toml::Value as TomlValue;
 
 pub use config_requirements::ConfigRequirements;
+pub use config_requirements::ConfigRequirementsToml;
+pub use config_requirements::McpServerIdentity;
+pub use config_requirements::McpServerRequirement;
+pub use config_requirements::RequirementSource;
+pub use config_requirements::SandboxModeRequirement;
+pub use config_requirements::Sourced;
 pub use merge::merge_toml_values;
+pub(crate) use overrides::build_cli_overrides_layer;
 pub use state::ConfigLayerEntry;
 pub use state::ConfigLayerStack;
 pub use state::ConfigLayerStackOrdering;
@@ -57,9 +67,9 @@ const DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 /// - admin:    managed preferences (*)
 /// - system    `/etc/codex/config.toml`
 /// - user      `${CODEX_HOME}/config.toml`
-/// - cwd       `${PWD}/config.toml`
-/// - tree      parent directories up to root looking for `./.codex/config.toml`
-/// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml`
+/// - cwd       `${PWD}/config.toml` (only when the directory is trusted)
+/// - tree      parent directories up to root looking for `./.codex/config.toml` (trusted only)
+/// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml` (trusted only)
 /// - runtime   e.g., --config flags, model selector in UI
 ///
 /// (*) Only available on macOS via managed device profiles.
@@ -76,10 +86,16 @@ pub async fn load_config_layers_state(
     cli_overrides: &[(String, TomlValue)],
     overrides: LoaderOverrides,
 ) -> io::Result<ConfigLayerStack> {
-    let mut config_requirements_toml = ConfigRequirementsToml::default();
+    let mut config_requirements_toml = ConfigRequirementsWithSources::default();
 
-    // TODO(gt): Support an entry in MDM for config requirements and use it
-    // with `config_requirements_toml.merge_unset_fields(...)`, if present.
+    #[cfg(target_os = "macos")]
+    macos::load_managed_admin_requirements_toml(
+        &mut config_requirements_toml,
+        overrides
+            .macos_managed_config_requirements_base64
+            .as_deref(),
+    )
+    .await?;
 
     // Honor /etc/codex/requirements.toml.
     if cfg!(unix) {
@@ -101,7 +117,11 @@ pub async fn load_config_layers_state(
 
     let mut layers = Vec::<ConfigLayerEntry>::new();
 
-    // TODO(gt): Honor managed preferences (macOS only).
+    let cli_overrides_layer = if cli_overrides.is_empty() {
+        None
+    } else {
+        Some(overrides::build_cli_overrides_layer(cli_overrides))
+    };
 
     // Include an entry for the "system" config folder, loading its config.toml,
     // if it exists.
@@ -147,17 +167,22 @@ pub async fn load_config_layers_state(
         for layer in &layers {
             merge_toml_values(&mut merged_so_far, &layer.config);
         }
+        if let Some(cli_overrides_layer) = cli_overrides_layer.as_ref() {
+            merge_toml_values(&mut merged_so_far, cli_overrides_layer);
+        }
+
         let project_root_markers = project_root_markers_from_config(&merged_so_far)?
             .unwrap_or_else(default_project_root_markers);
-
-        let project_root = find_project_root(&cwd, &project_root_markers).await?;
-        let project_layers = load_project_layers(&cwd, &project_root).await?;
-        layers.extend(project_layers);
+        if let Some(project_root) =
+            trusted_project_root(&merged_so_far, &cwd, &project_root_markers, codex_home).await?
+        {
+            let project_layers = load_project_layers(&cwd, &project_root).await?;
+            layers.extend(project_layers);
+        }
     }
 
     // Add a layer for runtime overrides from the CLI or UI, if any exist.
-    if !cli_overrides.is_empty() {
-        let cli_overrides_layer = overrides::build_cli_overrides_layer(cli_overrides);
+    if let Some(cli_overrides_layer) = cli_overrides_layer {
         layers.push(ConfigLayerEntry::new(
             ConfigLayerSource::SessionFlags,
             cli_overrides_layer,
@@ -197,7 +222,11 @@ pub async fn load_config_layers_state(
         ));
     }
 
-    ConfigLayerStack::new(layers, config_requirements_toml.try_into()?)
+    ConfigLayerStack::new(
+        layers,
+        config_requirements_toml.clone().try_into()?,
+        config_requirements_toml.into_toml(),
+    )
 }
 
 /// Attempts to load a config.toml file from `config_toml`.
@@ -249,9 +278,11 @@ async fn load_config_toml_for_required_layer(
 /// If available, apply requirements from `/etc/codex/requirements.toml` to
 /// `config_requirements_toml` by filling in any unset fields.
 async fn load_requirements_toml(
-    config_requirements_toml: &mut ConfigRequirementsToml,
+    config_requirements_toml: &mut ConfigRequirementsWithSources,
     requirements_toml_file: impl AsRef<Path>,
 ) -> io::Result<()> {
+    let requirements_toml_file =
+        AbsolutePathBuf::from_absolute_path(requirements_toml_file.as_ref())?;
     match tokio::fs::read_to_string(&requirements_toml_file).await {
         Ok(contents) => {
             let requirements_config: ConfigRequirementsToml =
@@ -264,7 +295,12 @@ async fn load_requirements_toml(
                         ),
                     )
                 })?;
-            config_requirements_toml.merge_unset_fields(requirements_config);
+            config_requirements_toml.merge_unset_fields(
+                RequirementSource::SystemRequirementsToml {
+                    file: requirements_toml_file.clone(),
+                },
+                requirements_config,
+            );
         }
         Err(e) => {
             if e.kind() != io::ErrorKind::NotFound {
@@ -283,7 +319,7 @@ async fn load_requirements_toml(
 }
 
 async fn load_requirements_from_legacy_scheme(
-    config_requirements_toml: &mut ConfigRequirementsToml,
+    config_requirements_toml: &mut ConfigRequirementsWithSources,
     loaded_config_layers: LoadedConfigLayers,
 ) -> io::Result<()> {
     // In this implementation, earlier layers cannot be overwritten by later
@@ -293,12 +329,16 @@ async fn load_requirements_from_legacy_scheme(
         managed_config,
         managed_config_from_mdm,
     } = loaded_config_layers;
-    for config in [
-        managed_config_from_mdm,
-        managed_config.map(|c| c.managed_config),
-    ]
-    .into_iter()
-    .flatten()
+
+    for (source, config) in managed_config_from_mdm
+        .map(|config| (RequirementSource::LegacyManagedConfigTomlFromMdm, config))
+        .into_iter()
+        .chain(managed_config.map(|c| {
+            (
+                RequirementSource::LegacyManagedConfigTomlFromFile { file: c.file },
+                c.managed_config,
+            )
+        }))
     {
         let legacy_config: LegacyManagedConfigToml =
             config.try_into().map_err(|err: toml::de::Error| {
@@ -309,7 +349,7 @@ async fn load_requirements_from_legacy_scheme(
             })?;
 
         let new_requirements_toml = ConfigRequirementsToml::from(legacy_config);
-        config_requirements_toml.merge_unset_fields(new_requirements_toml);
+        config_requirements_toml.merge_unset_fields(source, new_requirements_toml);
     }
 
     Ok(())
@@ -360,6 +400,44 @@ fn default_project_root_markers() -> Vec<String> {
         .iter()
         .map(ToString::to_string)
         .collect()
+}
+
+async fn trusted_project_root(
+    merged_config: &TomlValue,
+    cwd: &AbsolutePathBuf,
+    project_root_markers: &[String],
+    config_base_dir: &Path,
+) -> io::Result<Option<AbsolutePathBuf>> {
+    let config_toml = deserialize_config_toml_with_base(merged_config.clone(), config_base_dir)?;
+
+    let project_root = find_project_root(cwd, project_root_markers).await?;
+    let projects = config_toml.projects.unwrap_or_default();
+
+    let cwd_key = cwd.as_path().to_string_lossy().to_string();
+    let project_root_key = project_root.as_path().to_string_lossy().to_string();
+    let repo_root_key = resolve_root_git_project_for_trust(cwd.as_path())
+        .map(|root| root.to_string_lossy().to_string());
+
+    let trust_level = projects
+        .get(&cwd_key)
+        .and_then(|project| project.trust_level)
+        .or_else(|| {
+            projects
+                .get(&project_root_key)
+                .and_then(|project| project.trust_level)
+        })
+        .or_else(|| {
+            repo_root_key
+                .as_ref()
+                .and_then(|root| projects.get(root))
+                .and_then(|project| project.trust_level)
+        });
+
+    if matches!(trust_level, Some(TrustLevel::Trusted)) {
+        Ok(Some(project_root))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Takes a `toml::Value` parsed from a config.toml file and walks through it,
@@ -552,7 +630,14 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
             config_requirements_toml.allowed_approval_policies = Some(vec![approval_policy]);
         }
         if let Some(sandbox_mode) = sandbox_mode {
-            config_requirements_toml.allowed_sandbox_modes = Some(vec![sandbox_mode.into()]);
+            let required_mode: SandboxModeRequirement = sandbox_mode.into();
+            // Allowing read-only is a requirement for Codex to function correctly.
+            // So in this backfill path, we append read-only if it's not already specified.
+            let mut allowed_modes = vec![SandboxModeRequirement::ReadOnly];
+            if required_mode != SandboxModeRequirement::ReadOnly {
+                allowed_modes.push(required_mode);
+            }
+            config_requirements_toml.allowed_sandbox_modes = Some(allowed_modes);
         }
         config_requirements_toml
     }
@@ -571,7 +656,7 @@ mod unit_tests {
         let contents = r#"
 # This is a field recognized by config.toml that is an AbsolutePathBuf in
 # the ConfigToml struct.
-experimental_instructions_file = "./some_file.md"
+model_instructions_file = "./some_file.md"
 
 # This is a field recognized by config.toml.
 model = "gpt-1000"
@@ -584,7 +669,7 @@ foo = "xyzzy"
         let normalized_toml_value = resolve_relative_paths_in_config_toml(user_config, base_dir)?;
         let mut expected_toml_value = toml::map::Map::new();
         expected_toml_value.insert(
-            "experimental_instructions_file".to_string(),
+            "model_instructions_file".to_string(),
             TomlValue::String(
                 AbsolutePathBuf::resolve_path_against_base("./some_file.md", base_dir)?
                     .as_path()
@@ -599,5 +684,23 @@ foo = "xyzzy"
         expected_toml_value.insert("foo".to_string(), TomlValue::String("xyzzy".to_string()));
         assert_eq!(normalized_toml_value, TomlValue::Table(expected_toml_value));
         Ok(())
+    }
+
+    #[test]
+    fn legacy_managed_config_backfill_includes_read_only_sandbox_mode() {
+        let legacy = LegacyManagedConfigToml {
+            approval_policy: None,
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+        };
+
+        let requirements = ConfigRequirementsToml::from(legacy);
+
+        assert_eq!(
+            requirements.allowed_sandbox_modes,
+            Some(vec![
+                SandboxModeRequirement::ReadOnly,
+                SandboxModeRequirement::WorkspaceWrite
+            ])
+        );
     }
 }
