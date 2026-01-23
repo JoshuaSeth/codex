@@ -266,6 +266,7 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
         .submit(Op::UserTurn {
             items: vec![UserInput::Text {
                 text: "run the pending tool".to_string(),
+                text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
@@ -274,6 +275,8 @@ print(json.dumps({"status": "pending", "ticket": ticket}))
             model: test.session_configured.model.clone(),
             effort: None,
             summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
         })
         .await?;
 

@@ -14,11 +14,9 @@ use codex_cli::login::run_login_status;
 use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
-use codex_cli::login::run_login_with_device_code_fallback_to_browser;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
-use codex_core::env::is_headless_environment;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
@@ -26,9 +24,10 @@ use codex_execpolicy::ExecPolicyCheckCommand;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
+use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
-use codex_tui2 as tui2;
 use owo_colors::OwoColorize;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use supports_color::Stream;
 
@@ -51,13 +50,8 @@ use crate::view_cmd::ViewCli;
 
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
-use codex_core::config::find_codex_home;
-use codex_core::config::load_config_as_toml_with_cli_overrides;
-use codex_core::features::Feature;
-use codex_core::features::FeatureOverrides;
-use codex_core::features::Features;
 use codex_core::features::is_known_feature_key;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_core::terminal::TerminalName;
 
 /// Codex CLI
 ///
@@ -145,6 +139,9 @@ enum Subcommand {
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
 
+    /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
+    Fork(ForkCommand),
+
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
     #[clap(name = "cloud", alias = "cloud-tasks")]
     Cloud(CloudTasksCli),
@@ -190,6 +187,25 @@ struct ResumeCommand {
     /// Fork the selected session into a new session id before resuming.
     #[arg(long = "fork", default_value_t = false)]
     fork: bool,
+
+    #[clap(flatten)]
+    config_overrides: TuiCli,
+}
+
+#[derive(Debug, Parser)]
+struct ForkCommand {
+    /// Conversation/session id (UUID). When provided, forks this session.
+    /// If omitted, use --last to pick the most recent recorded session.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: Option<String>,
+
+    /// Fork the most recent session without showing the picker.
+    #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
+    last: bool,
+
+    /// Show all sessions (disables cwd filtering and shows CWD column).
+    #[arg(long = "all", default_value_t = false)]
+    all: bool,
 
     #[clap(flatten)]
     config_overrides: TuiCli,
@@ -280,6 +296,24 @@ struct AppServerCommand {
     /// Omit to run the app server; specify a subcommand for tooling.
     #[command(subcommand)]
     subcommand: Option<AppServerSubcommand>,
+
+    /// Controls whether analytics are enabled by default.
+    ///
+    /// Analytics are disabled by default for app-server. Users have to explicitly opt in
+    /// via the `analytics` section in the config.toml file.
+    ///
+    /// However, for first-party use cases like the VSCode IDE extension, we default analytics
+    /// to be enabled by default by setting this flag. Users can still opt out by setting this
+    /// in their config.toml:
+    ///
+    /// ```toml
+    /// [analytics]
+    /// enabled = false
+    /// ```
+    ///
+    /// See https://developers.openai.com/codex/config-advanced/#metrics for more details.
+    #[arg(long = "analytics-default-enabled")]
+    analytics_default_enabled: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -347,6 +381,14 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
 
 /// Handle the app exit and print the results. Optionally run the update action.
 fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+    match exit_info.exit_reason {
+        ExitReason::Fatal(message) => {
+            eprintln!("ERROR: {message}");
+            std::process::exit(1);
+        }
+        ExitReason::UserRequested => { /* normal exit */ }
+    }
+
     let update_action = exit_info.update_action;
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
     for line in format_exit_messages(exit_info, color_enabled) {
@@ -446,8 +488,8 @@ enum FeaturesSubcommand {
 fn stage_str(stage: codex_core::features::Stage) -> &'static str {
     use codex_core::features::Stage;
     match stage {
-        Stage::Experimental => "experimental",
-        Stage::Beta { .. } => "beta",
+        Stage::Beta => "experimental",
+        Stage::Experimental { .. } => "beta",
         Stage::Stable => "stable",
         Stage::Deprecated => "deprecated",
         Stage::Removed => "removed",
@@ -518,6 +560,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     codex_linux_sandbox_exe,
                     root_config_overrides,
                     codex_core::config_loader::LoaderOverrides::default(),
+                    app_server_cli.analytics_default_enabled,
                 )
                 .await?;
             }
@@ -538,13 +581,40 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             fork,
             config_overrides,
         })) => {
-            interactive = finalize_resume_interactive(
+            interactive = if fork {
+                finalize_fork_interactive(
+                    interactive,
+                    root_config_overrides.clone(),
+                    session_id,
+                    last,
+                    all,
+                    config_overrides,
+                )
+            } else {
+                finalize_resume_interactive(
+                    interactive,
+                    root_config_overrides.clone(),
+                    session_id,
+                    last,
+                    all,
+                    config_overrides,
+                )
+            };
+            let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
+            handle_app_exit(exit_info)?;
+        }
+        Some(Subcommand::Fork(ForkCommand {
+            session_id,
+            last,
+            all,
+            config_overrides,
+        })) => {
+            interactive = finalize_fork_interactive(
                 interactive,
                 root_config_overrides.clone(),
                 session_id,
                 last,
                 all,
-                fork,
                 config_overrides,
             );
             let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
@@ -572,13 +642,6 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     } else if login_cli.with_api_key {
                         let api_key = read_api_key_from_stdin();
                         run_login_with_api_key(login_cli.config_overrides, api_key).await;
-                    } else if is_headless_environment() {
-                        run_login_with_device_code_fallback_to_browser(
-                            login_cli.config_overrides,
-                            login_cli.issuer_base_url,
-                            login_cli.client_id,
-                        )
-                        .await;
                     } else {
                         run_login_with_chatgpt(login_cli.config_overrides).await;
                     }
@@ -645,11 +708,11 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     .parse_overrides()
                     .map_err(anyhow::Error::msg)?;
 
-                // Honor `--search` via the new feature toggle.
+                // Honor `--search` via the canonical web_search mode.
                 if interactive.web_search {
                     cli_kv_overrides.push((
-                        "features.web_search_request".to_string(),
-                        toml::Value::Boolean(true),
+                        "web_search".to_string(),
+                        toml::Value::String("live".to_string()),
                     ));
                 }
 
@@ -664,11 +727,20 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     overrides,
                 )
                 .await?;
+                let mut rows = Vec::with_capacity(codex_core::features::FEATURES.len());
+                let mut name_width = 0;
+                let mut stage_width = 0;
                 for def in codex_core::features::FEATURES.iter() {
                     let name = def.key;
                     let stage = stage_str(def.stage);
                     let enabled = config.features.enabled(def.id);
-                    println!("{name}\t{stage}\t{enabled}");
+                    name_width = name_width.max(name.len());
+                    stage_width = stage_width.max(stage.len());
+                    rows.push((name, stage, enabled));
+                }
+
+                for (name, stage, enabled) in rows {
+                    println!("{name:<name_width$}  {stage:<stage_width$}  {enabled}");
                 }
             }
         },
@@ -686,19 +758,35 @@ fn prepend_config_flags(
     subcommand_config_overrides.prepend_from(cli_config_overrides);
 }
 
-/// Run the interactive Codex TUI, dispatching to either the legacy implementation or the
-/// experimental TUI v2 shim based on feature flags resolved from config.
 async fn run_interactive_tui(
     mut interactive: TuiCli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<AppExitInfo> {
     resolve_git_branch_override(&mut interactive).await?;
-    if is_tui2_enabled(&interactive).await? {
-        let result = tui2::run_main(interactive.into(), codex_linux_sandbox_exe).await?;
-        Ok(result.into())
-    } else {
-        codex_tui::run_main(interactive, codex_linux_sandbox_exe).await
+    if let Some(prompt) = interactive.prompt.take() {
+        // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
+        interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
     }
+
+    let terminal_info = codex_core::terminal::terminal_info();
+    if terminal_info.name == TerminalName::Dumb {
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            return Ok(AppExitInfo::fatal(
+                "TERM is set to \"dumb\". Refusing to start the interactive TUI because no terminal is available for a confirmation prompt (stdin/stderr is not a TTY). Run in a supported terminal or unset TERM.",
+            ));
+        }
+
+        eprintln!(
+            "WARNING: TERM is set to \"dumb\". Codex's interactive TUI may not work in this terminal."
+        );
+        if !confirm("Continue anyway? [y/N]: ")? {
+            return Ok(AppExitInfo::fatal(
+                "Refusing to start the interactive TUI because TERM is set to \"dumb\". Run in a supported terminal or unset TERM.",
+            ));
+        }
+    }
+
+    codex_tui::run_main(interactive, codex_linux_sandbox_exe).await
 }
 
 async fn resolve_git_branch_override(cli: &mut TuiCli) -> std::io::Result<()> {
@@ -727,29 +815,13 @@ async fn resolve_git_branch_override(cli: &mut TuiCli) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Returns `Ok(true)` when the resolved configuration enables the `tui2` feature flag.
-///
-/// This performs a lightweight config load (honoring the same precedence as the lower-level TUI
-/// bootstrap: `$CODEX_HOME`, config.toml, profile, and CLI `-c` overrides) solely to decide which
-/// TUI frontend to launch. The full configuration is still loaded later by the interactive TUI.
-async fn is_tui2_enabled(cli: &TuiCli) -> std::io::Result<bool> {
-    let overrides_cli = cli.config_overrides.clone();
-    let cli_kv_overrides = overrides_cli
-        .parse_overrides()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+fn confirm(prompt: &str) -> std::io::Result<bool> {
+    eprintln!("{prompt}");
 
-    let codex_home = find_codex_home()?;
-    let cwd = cli.cwd.clone();
-    let config_cwd = match cwd.as_deref() {
-        Some(path) => AbsolutePathBuf::from_absolute_path(path)?,
-        None => AbsolutePathBuf::current_dir()?,
-    };
-    let config_toml =
-        load_config_as_toml_with_cli_overrides(&codex_home, &config_cwd, cli_kv_overrides).await?;
-    let config_profile = config_toml.get_config_profile(cli.config_profile.clone())?;
-    let overrides = FeatureOverrides::default();
-    let features = Features::from_config(&config_toml, &config_profile, overrides);
-    Ok(features.enabled(Feature::Tui2))
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 /// Build the final `TuiCli` for a `codex resume` invocation.
@@ -759,7 +831,6 @@ fn finalize_resume_interactive(
     session_id: Option<String>,
     last: bool,
     show_all: bool,
-    fork: bool,
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
@@ -769,10 +840,9 @@ fn finalize_resume_interactive(
     interactive.resume_last = last;
     interactive.resume_session_id = resume_session_id;
     interactive.resume_show_all = show_all;
-    interactive.resume_fork = fork;
 
     // Merge resume-scoped flags and overrides with highest precedence.
-    merge_resume_cli_flags(&mut interactive, resume_cli);
+    merge_interactive_cli_flags(&mut interactive, resume_cli);
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
     prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
@@ -780,54 +850,81 @@ fn finalize_resume_interactive(
     interactive
 }
 
-/// Merge flags provided to `codex resume` so they take precedence over any
-/// root-level flags. Only overrides fields explicitly set on the resume-scoped
+/// Build the final `TuiCli` for a `codex fork` invocation.
+fn finalize_fork_interactive(
+    mut interactive: TuiCli,
+    root_config_overrides: CliConfigOverrides,
+    session_id: Option<String>,
+    last: bool,
+    show_all: bool,
+    fork_cli: TuiCli,
+) -> TuiCli {
+    // Start with the parsed interactive CLI so fork shares the same
+    // configuration surface area as `codex` without additional flags.
+    let fork_session_id = session_id;
+    interactive.fork_picker = fork_session_id.is_none() && !last;
+    interactive.fork_last = last;
+    interactive.fork_session_id = fork_session_id;
+    interactive.fork_show_all = show_all;
+
+    // Merge fork-scoped flags and overrides with highest precedence.
+    merge_interactive_cli_flags(&mut interactive, fork_cli);
+
+    // Propagate any root-level config overrides (e.g. `-c key=value`).
+    prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
+
+    interactive
+}
+
+/// Merge flags provided to `codex resume`/`codex fork` so they take precedence over any
+/// root-level flags. Only overrides fields explicitly set on the subcommand-scoped
 /// CLI. Also appends `-c key=value` overrides with highest precedence.
-fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
-    if let Some(model) = resume_cli.model {
+fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli) {
+    if let Some(model) = subcommand_cli.model {
         interactive.model = Some(model);
     }
-    if resume_cli.oss {
+    if subcommand_cli.oss {
         interactive.oss = true;
     }
-    if let Some(profile) = resume_cli.config_profile {
+    if let Some(profile) = subcommand_cli.config_profile {
         interactive.config_profile = Some(profile);
     }
-    if let Some(sandbox) = resume_cli.sandbox_mode {
+    if let Some(sandbox) = subcommand_cli.sandbox_mode {
         interactive.sandbox_mode = Some(sandbox);
     }
-    if let Some(approval) = resume_cli.approval_policy {
+    if let Some(approval) = subcommand_cli.approval_policy {
         interactive.approval_policy = Some(approval);
     }
-    if resume_cli.full_auto {
+    if subcommand_cli.full_auto {
         interactive.full_auto = true;
     }
-    if resume_cli.dangerously_bypass_approvals_and_sandbox {
+    if subcommand_cli.dangerously_bypass_approvals_and_sandbox {
         interactive.dangerously_bypass_approvals_and_sandbox = true;
     }
-    if let Some(cwd) = resume_cli.cwd {
+    if let Some(cwd) = subcommand_cli.cwd {
         interactive.cwd = Some(cwd);
     }
-    if let Some(branch) = resume_cli.git_branch {
+    if let Some(branch) = subcommand_cli.git_branch {
         interactive.git_branch = Some(branch);
     }
-    if resume_cli.web_search {
+    if subcommand_cli.web_search {
         interactive.web_search = true;
     }
-    if !resume_cli.images.is_empty() {
-        interactive.images = resume_cli.images;
+    if !subcommand_cli.images.is_empty() {
+        interactive.images = subcommand_cli.images;
     }
-    if !resume_cli.add_dir.is_empty() {
-        interactive.add_dir.extend(resume_cli.add_dir);
+    if !subcommand_cli.add_dir.is_empty() {
+        interactive.add_dir.extend(subcommand_cli.add_dir);
     }
-    if let Some(prompt) = resume_cli.prompt {
-        interactive.prompt = Some(prompt);
+    if let Some(prompt) = subcommand_cli.prompt {
+        // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
+        interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     interactive
         .config_overrides
         .raw_overrides
-        .extend(resume_cli.config_overrides.raw_overrides);
+        .extend(subcommand_cli.config_overrides.raw_overrides);
 }
 
 fn print_completion(cmd: CompletionCommand) {
@@ -844,7 +941,7 @@ mod tests {
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
 
-    fn finalize_from_args(args: &[&str]) -> TuiCli {
+    fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
@@ -864,15 +961,55 @@ mod tests {
             unreachable!()
         };
 
-        finalize_resume_interactive(
+        if fork {
+            finalize_fork_interactive(
+                interactive,
+                root_overrides,
+                session_id,
+                last,
+                all,
+                resume_cli,
+            )
+        } else {
+            finalize_resume_interactive(
+                interactive,
+                root_overrides,
+                session_id,
+                last,
+                all,
+                resume_cli,
+            )
+        }
+    }
+
+    fn finalize_fork_from_args(args: &[&str]) -> TuiCli {
+        let cli = MultitoolCli::try_parse_from(args).expect("parse");
+        let MultitoolCli {
             interactive,
-            root_overrides,
+            config_overrides: root_overrides,
+            subcommand,
+            feature_toggles: _,
+        } = cli;
+
+        let Subcommand::Fork(ForkCommand {
             session_id,
             last,
             all,
-            fork,
-            resume_cli,
-        )
+            config_overrides: fork_cli,
+        }) = subcommand.expect("fork present")
+        else {
+            unreachable!()
+        };
+
+        finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+    }
+
+    fn app_server_from_args(args: &[&str]) -> AppServerCommand {
+        let cli = MultitoolCli::try_parse_from(args).expect("parse");
+        let Subcommand::AppServer(app_server) = cli.subcommand.expect("app-server present") else {
+            unreachable!()
+        };
+        app_server
     }
 
     fn sample_exit_info(conversation: Option<&str>) -> AppExitInfo {
@@ -885,6 +1022,7 @@ mod tests {
             token_usage,
             thread_id: conversation.map(ThreadId::from_string).map(Result::unwrap),
             update_action: None,
+            exit_reason: ExitReason::UserRequested,
         }
     }
 
@@ -894,6 +1032,7 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: None,
             update_action: None,
+            exit_reason: ExitReason::UserRequested,
         };
         let lines = format_exit_messages(exit_info, false);
         assert!(lines.is_empty());
@@ -923,7 +1062,8 @@ mod tests {
 
     #[test]
     fn resume_model_flag_applies_when_no_root_flags() {
-        let interactive = finalize_from_args(["codex", "resume", "-m", "gpt-5.1-test"].as_ref());
+        let interactive =
+            finalize_resume_from_args(["codex", "resume", "-m", "gpt-5.1-test"].as_ref());
 
         assert_eq!(interactive.model.as_deref(), Some("gpt-5.1-test"));
         assert!(interactive.resume_picker);
@@ -933,7 +1073,7 @@ mod tests {
 
     #[test]
     fn resume_picker_logic_none_and_not_last() {
-        let interactive = finalize_from_args(["codex", "resume"].as_ref());
+        let interactive = finalize_resume_from_args(["codex", "resume"].as_ref());
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
@@ -942,7 +1082,7 @@ mod tests {
 
     #[test]
     fn resume_picker_logic_last() {
-        let interactive = finalize_from_args(["codex", "resume", "--last"].as_ref());
+        let interactive = finalize_resume_from_args(["codex", "resume", "--last"].as_ref());
         assert!(!interactive.resume_picker);
         assert!(interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
@@ -951,7 +1091,7 @@ mod tests {
 
     #[test]
     fn resume_picker_logic_with_session_id() {
-        let interactive = finalize_from_args(["codex", "resume", "1234"].as_ref());
+        let interactive = finalize_resume_from_args(["codex", "resume", "1234"].as_ref());
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id.as_deref(), Some("1234"));
@@ -960,14 +1100,14 @@ mod tests {
 
     #[test]
     fn resume_all_flag_sets_show_all() {
-        let interactive = finalize_from_args(["codex", "resume", "--all"].as_ref());
+        let interactive = finalize_resume_from_args(["codex", "resume", "--all"].as_ref());
         assert!(interactive.resume_picker);
         assert!(interactive.resume_show_all);
     }
 
     #[test]
     fn resume_merges_option_flags_and_full_auto() {
-        let interactive = finalize_from_args(
+        let interactive = finalize_resume_from_args(
             [
                 "codex",
                 "resume",
@@ -1024,7 +1164,7 @@ mod tests {
 
     #[test]
     fn resume_merges_dangerously_bypass_flag() {
-        let interactive = finalize_from_args(
+        let interactive = finalize_resume_from_args(
             [
                 "codex",
                 "resume",
@@ -1036,6 +1176,53 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn fork_picker_logic_none_and_not_last() {
+        let interactive = finalize_fork_from_args(["codex", "fork"].as_ref());
+        assert!(interactive.fork_picker);
+        assert!(!interactive.fork_last);
+        assert_eq!(interactive.fork_session_id, None);
+        assert!(!interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_picker_logic_last() {
+        let interactive = finalize_fork_from_args(["codex", "fork", "--last"].as_ref());
+        assert!(!interactive.fork_picker);
+        assert!(interactive.fork_last);
+        assert_eq!(interactive.fork_session_id, None);
+        assert!(!interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_picker_logic_with_session_id() {
+        let interactive = finalize_fork_from_args(["codex", "fork", "1234"].as_ref());
+        assert!(!interactive.fork_picker);
+        assert!(!interactive.fork_last);
+        assert_eq!(interactive.fork_session_id.as_deref(), Some("1234"));
+        assert!(!interactive.fork_show_all);
+    }
+
+    #[test]
+    fn fork_all_flag_sets_show_all() {
+        let interactive = finalize_fork_from_args(["codex", "fork", "--all"].as_ref());
+        assert!(interactive.fork_picker);
+        assert!(interactive.fork_show_all);
+    }
+
+    #[test]
+    fn app_server_analytics_default_disabled_without_flag() {
+        let app_server = app_server_from_args(["codex", "app-server"].as_ref());
+        assert!(!app_server.analytics_default_enabled);
+    }
+
+    #[test]
+    fn app_server_analytics_default_enabled_with_flag() {
+        let app_server =
+            app_server_from_args(["codex", "app-server", "--analytics-default-enabled"].as_ref());
+        assert!(app_server.analytics_default_enabled);
     }
 
     #[test]
