@@ -26,7 +26,6 @@ use codex_core::config::resolve_oss_provider;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
-use codex_core::read_session_meta_line;
 use codex_core::terminal::Multiplexer;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
@@ -568,30 +567,6 @@ async fn run_ratatui_app(
         resume_picker::SessionSelection::StartFresh
     };
 
-    let config = match &session_selection {
-        resume_picker::SessionSelection::Resume(path)
-        | resume_picker::SessionSelection::Fork(path) => {
-            let history_cwd = match read_session_meta_line(path).await {
-                Ok(meta_line) => Some(meta_line.meta.cwd),
-                Err(err) => {
-                    let rollout_path = path.display().to_string();
-                    tracing::warn!(
-                        %rollout_path,
-                        %err,
-                        "Failed to read session metadata from rollout"
-                    );
-                    None
-                }
-            };
-            load_config_or_exit_with_fallback_cwd(
-                cli_kv_overrides.clone(),
-                overrides.clone(),
-                history_cwd,
-            )
-            .await
-        }
-        _ => config,
-    };
     let active_profile = config.active_profile.clone();
     let should_show_trust_screen = should_show_trust_screen(&config);
 
