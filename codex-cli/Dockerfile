@@ -47,26 +47,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   zsh \
   && rm -rf /var/lib/apt/lists/*
 
-# Ensure default node user has access to /usr/local/share
-RUN mkdir -p /usr/local/share/npm-global && \
-  chown -R node:node /usr/local/share
-
-ARG USERNAME=node
-
-# Set up non-root user
-USER node
+# Prepare a dedicated global install prefix (avoid polluting /usr/local).
+RUN mkdir -p /usr/local/share/npm-global
 
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
 
-# Install codex
-COPY codex-cli/dist/codex.tgz codex.tgz
-RUN npm install -g codex.tgz \
-  && npm cache clean --force \
-  && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/node_modules/.cache \
-  && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/tests \
-  && rm -rf /usr/local/share/npm-global/lib/node_modules/codex-cli/docs
+# Install codex (Node wrapper) from this checkout.
+COPY codex-cli/package.json codex-cli/package-lock.json /tmp/codex-cli/
+COPY codex-cli/bin /tmp/codex-cli/bin
+RUN set -eu; \
+  cd /tmp/codex-cli; \
+  tgz="$(npm pack --silent)"; \
+  npm install -g "./$tgz"; \
+  cd /; \
+  rm -rf /tmp/codex-cli; \
+  npm cache clean --force; \
+  rm -rf /usr/local/share/npm-global/lib/node_modules/@openai/codex/node_modules/.cache; \
+  rm -rf /usr/local/share/npm-global/lib/node_modules/@openai/codex/tests; \
+  rm -rf /usr/local/share/npm-global/lib/node_modules/@openai/codex/docs
 
 # Replace the bundled native Codex binary with the one built from this checkout.
 #
@@ -74,7 +74,7 @@ RUN npm install -g codex.tgz \
 # target triple at runtime (e.g. `x86_64-unknown-linux-musl` or
 # `aarch64-unknown-linux-musl`). Populate the appropriate vendor folder for the
 # image architecture so `codex` works both locally (Apple Silicon) and in Azure.
-COPY --from=codex-builder --chown=node:node /src/codex-rs/target/release/codex /tmp/codex
+COPY --from=codex-builder /src/codex-rs/target/release/codex /tmp/codex
 RUN set -eu; \
   pkg="/usr/local/share/npm-global/lib/node_modules/@openai/codex"; \
   arch="$(uname -m)"; \
@@ -104,6 +104,12 @@ COPY codex-cli/scripts/pitchai_elise_prompt.md /opt/pitchai/elise_prompt.md
 COPY codex-cli/scripts/pitchai_elise_graph_tool.py /opt/pitchai/elise_graph_tool.py
 COPY codex-cli/scripts/pitchai_run_elise_job.py /opt/pitchai/run_elise_job.py
 COPY codex-cli/scripts/pitchai_run_codex_job.py /opt/pitchai/run_codex_job.py
+COPY codex-cli/scripts/pitchai_mail_tagger_config.toml /opt/pitchai/mail_tagger_config.toml
+COPY codex-cli/scripts/pitchai_mail_tagger_prompt.md /opt/pitchai/mail_tagger_prompt.md
+COPY codex-cli/scripts/pitchai_mail_tagger_skill.md /opt/pitchai/mail_tagger_skill.md
+COPY codex-cli/scripts/pitchai_mail_tagger_graph_tool.py /opt/pitchai/mail_tagger_graph_tool.py
+COPY codex-cli/scripts/pitchai_pm_db_tool.py /opt/pitchai/pm_db_tool.py
+COPY codex-cli/scripts/pitchai_run_mail_tagger_job.sh /opt/pitchai/run_mail_tagger_job.sh
 COPY docs/pitchai_elise_agent.md /opt/pitchai/elise_agent.md
 RUN chmod 755 \
   /opt/pitchai/sharepoint_tool.py \
@@ -111,6 +117,9 @@ RUN chmod 755 \
   /opt/pitchai/run_sharepoint_inbox_job.sh \
   /opt/pitchai/run_elise_job.py \
   /opt/pitchai/run_codex_job.py \
+  /opt/pitchai/mail_tagger_graph_tool.py \
+  /opt/pitchai/pm_db_tool.py \
+  /opt/pitchai/run_mail_tagger_job.sh \
   /opt/pitchai/telegram_bot.py
 USER node
 

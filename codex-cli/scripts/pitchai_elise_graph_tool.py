@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 import ssl
 import sys
@@ -117,6 +118,66 @@ def _odata_quote(value: str) -> str:
 
 def _quote_path(value: str) -> str:
     return quote(value, safe="")
+
+
+def _guess_attachment_content_type(filename: str) -> str:
+    lowered = filename.strip().lower()
+    if lowered.endswith(".eml"):
+        return "message/rfc822"
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+def _normalize_attachments(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    if not raw:
+        return None
+    if not isinstance(raw, list):
+        raise RuntimeError("attachments must be an array")
+
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name") or "").strip()
+        path = str(item.get("path") or "").strip()
+        content_b64 = str(item.get("content_b64") or "").strip()
+
+        if not name:
+            name = os.path.basename(path) if path else ""
+        if not name:
+            raise RuntimeError("attachment is missing name (or path basename)")
+
+        if content_b64:
+            content_bytes_b64 = content_b64
+        elif path:
+            try:
+                with open(path, "rb") as fh:
+                    content_bytes_b64 = base64.b64encode(fh.read()).decode("ascii")
+            except Exception as exc:
+                raise RuntimeError(f"Failed to read attachment path={path}: {exc}") from exc
+        else:
+            raise RuntimeError("attachment must include either path or content_b64")
+
+        content_type = str(item.get("content_type") or "").strip() or _guess_attachment_content_type(name)
+
+        att: Dict[str, Any] = {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": name,
+            "contentType": content_type,
+            "contentBytes": content_bytes_b64,
+        }
+
+        is_inline = bool(item.get("inline") or item.get("is_inline") or False)
+        if is_inline:
+            att["isInline"] = True
+            content_id = str(item.get("content_id") or item.get("cid") or name).strip()
+            if content_id:
+                att["contentId"] = content_id
+
+        out.append(att)
+
+    return out or None
 
 
 class GraphMailClient:
@@ -244,6 +305,7 @@ class GraphMailClient:
         cc: Optional[List[str]] = None,
         bcc: Optional[List[str]] = None,
         reply_to: Optional[List[str]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         body_type: str = "HTML",
         save_to_sent: bool = True,
     ) -> Dict[str, Any]:
@@ -274,6 +336,11 @@ class GraphMailClient:
         draft_id = draft.get("id")
         if not isinstance(draft_id, str) or not draft_id:
             raise RuntimeError("Graph did not return a draft id")
+
+        if attachments:
+            attach_url = f"{GRAPH_ROOT}/users/{self.sender_id}/messages/{_quote_path(draft_id)}/attachments"
+            for attachment in attachments:
+                _request_with_retries("POST", attach_url, headers=self._headers(), json_body=attachment, timeout_s=120)
 
         return {
             "ok": True,
@@ -431,6 +498,8 @@ def _op_send_email() -> Dict[str, Any]:
     else:
         save_to_sent = True
 
+    attachments = _normalize_attachments(args.get("attachments"))
+
     client = GraphMailClient()
     _enforce_elise_drafts_only(client)
     cc_addrs = (
@@ -450,6 +519,7 @@ def _op_send_email() -> Dict[str, Any]:
         reply_to=[str(x).strip() for x in reply_to if isinstance(reply_to, list) and isinstance(x, str) and x.strip()]
         if isinstance(reply_to, list)
         else None,
+        attachments=attachments,
         subject=subject.strip(),
         body=body,
         body_type=body_type,

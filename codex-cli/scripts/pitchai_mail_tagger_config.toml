@@ -1,0 +1,76 @@
+# PitchAI Mailbox Tagger runtime config (container).
+#
+# This agent tags incoming email messages with Outlook categories and creates
+# PM DB tasks when actionable. Tools are restricted to Graph + PM DB + Telegram.
+
+# This job runs in an externally sandboxed container (Docker / Azure Container Apps Job),
+# so disable Codex sandbox + approvals to avoid Landlock/seccomp issues in some runtimes.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+hide_agent_reasoning = true
+stop_hook_command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/telegram_bot.py", "--stop-hook"]
+
+base_prompt_extend = """
+You are the PitchAI Mailbox Tagger agent.
+
+Goal: For the latest unread + untagged emails, classify them, apply Outlook categories (tags),
+optionally unsubscribe from newsletters, and create PM DB tasks/features when a client email implies actionable work.
+
+Hard rules:
+- Do NOT ask for human input. Do the work end-to-end.
+- Do NOT print or reveal secrets (certs, keys, tokens, auth.json, env vars).
+- Do NOT quote email bodies in your final answer. Summaries + tags only.
+- Use ONLY the provided tools (`mail_*`, `pm_*`). Do not use shell/exec.
+
+Reference docs (optional):
+- Mail tagging policy + credentials: `/opt/pitchai/mail_tagger_skill.md`
+"""
+
+[custom_tools.mail_search]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/mail_tagger_graph_tool.py", "mail_search"]
+description = "Search mailbox messages (Graph app-only). Returns message metadata including categories."
+parameters = { type = "object", additionalProperties = false, properties = { folder = { type = "string" }, top = { type = "integer" }, unread_only = { type = "boolean" }, untagged_only = { type = "boolean" }, from_address = { type = "string" }, subject_contains = { type = "string" }, received_since_utc = { type = "string" } } }
+timeout_ms = 120000
+
+[custom_tools.mail_read]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/mail_tagger_graph_tool.py", "mail_read"]
+description = "Read a specific email message (Graph app-only). Returns headers + body (text)."
+parameters = { type = "object", additionalProperties = false, required = ["message_id"], properties = { message_id = { type = "string" }, max_chars = { type = "integer" } } }
+timeout_ms = 120000
+
+[custom_tools.mail_update_categories]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/mail_tagger_graph_tool.py", "mail_update_categories"]
+description = "Set/add Outlook categories on a message (Graph app-only)."
+parameters = { type = "object", additionalProperties = false, required = ["message_id", "categories"], properties = { message_id = { type = "string" }, categories = { type = "array", items = { type = "string" } }, mode = { type = "string" } } }
+timeout_ms = 120000
+
+[custom_tools.mail_set_read_state]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/mail_tagger_graph_tool.py", "mail_set_read_state"]
+description = "Set isRead true/false for a message (Graph app-only)."
+parameters = { type = "object", additionalProperties = false, required = ["message_id", "is_read"], properties = { message_id = { type = "string" }, is_read = { type = "boolean" } } }
+timeout_ms = 120000
+
+[custom_tools.mail_unsubscribe]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/mail_tagger_graph_tool.py", "mail_unsubscribe"]
+description = "Attempt to unsubscribe using List-Unsubscribe headers (safe HTTP)."
+parameters = { type = "object", additionalProperties = false, required = ["message_id"], properties = { message_id = { type = "string" }, dry_run = { type = "boolean" } } }
+timeout_ms = 120000
+
+[custom_tools.pm_search_projects]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/pm_db_tool.py", "search_projects"]
+description = "Search PitchAI PM DB projects by keyword."
+parameters = { type = "object", additionalProperties = false, required = ["query"], properties = { query = { type = "string" }, limit = { type = "integer" } } }
+timeout_ms = 60000
+
+[custom_tools.pm_create_feature]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/pm_db_tool.py", "create_feature"]
+description = "Create (or return existing) a PM DB feature linked to a project."
+parameters = { type = "object", additionalProperties = false, required = ["project_id", "name"], properties = { project_id = { type = "string" }, name = { type = "string" }, description_text = { type = "string" }, source_message_id = { type = "string" }, source_internet_message_id = { type = "string" }, source_subject = { type = "string" }, source_from = { type = "string" }, received_utc = { type = "string" }, mailbox_upn = { type = "string" } } }
+timeout_ms = 60000
+
+[custom_tools.pm_create_task]
+command = ["/opt/pitchai/venv/bin/python", "/opt/pitchai/pm_db_tool.py", "create_task"]
+description = "Create (or return existing) a PM DB task linked to a project (and optional feature)."
+parameters = { type = "object", additionalProperties = false, required = ["project_id", "name"], properties = { project_id = { type = "string" }, feature_id = { type = "string" }, name = { type = "string" }, description_text = { type = "string" }, value_name = { type = "string" }, state_name = { type = "string" }, is_bug = { type = "boolean" }, source_message_id = { type = "string" }, source_internet_message_id = { type = "string" }, source_subject = { type = "string" }, source_from = { type = "string" }, received_utc = { type = "string" }, mailbox_upn = { type = "string" } } }
+timeout_ms = 60000
+
