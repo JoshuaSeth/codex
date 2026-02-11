@@ -3162,7 +3162,11 @@ impl ChatWidget {
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
                     };
-                    if self.is_session_configured() && !self.is_plan_streaming_in_tui() {
+                    if self.is_session_configured()
+                        && !self.is_plan_streaming_in_tui()
+                        && !self.bottom_pane.is_task_running()
+                        && !self.is_review_mode
+                    {
                         // Submitted is only emitted when steer is enabled.
                         // Reset any reasoning header only when we are actually submitting a turn.
                         self.reasoning_buffer.clear();
@@ -6712,7 +6716,9 @@ impl ChatWidget {
             return;
         }
         self.set_collaboration_mask(collaboration_mode);
-        let should_queue = self.is_plan_streaming_in_tui();
+        let should_queue = self.is_plan_streaming_in_tui()
+            || self.bottom_pane.is_task_running()
+            || self.is_review_mode;
         let user_message = UserMessage {
             text,
             local_images: Vec::new(),

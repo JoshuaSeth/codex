@@ -449,9 +449,10 @@ impl ChatComposer {
 
     /// Enables or disables "Steer" behavior for submission keys.
     ///
-    /// When steer is enabled, `Enter` produces [`InputResult::Submitted`] (send immediately) and
-    /// `Tab` produces [`InputResult::Queued`] when a task is running; otherwise it submits
-    /// immediately. `Tab` does not submit when the input is a `!` shell command.
+    /// When steer is enabled, `Enter` produces [`InputResult::Submitted`] when the agent is idle.
+    /// When a task is running, `Enter` queues instead so new drafts do not replace the active
+    /// turn. `Tab` always queues while a task is running. `Tab` does not submit when the input is
+    /// a `!` shell command.
     /// When steer is disabled, `Enter` produces [`InputResult::Queued`], preserving the default
     /// "queue while a task is running" behavior.
     pub fn set_steer_enabled(&mut self, enabled: bool) {
@@ -2421,7 +2422,7 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                let should_queue = !self.steer_enabled;
+                let should_queue = self.is_task_running || !self.steer_enabled;
                 self.handle_submission(should_queue)
             }
             input => self.handle_input_basic(input),
