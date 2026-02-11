@@ -12,6 +12,12 @@ use crate::protocol::TokenUsageInfo;
 use crate::tasks::RegularTask;
 use crate::truncate::TruncationPolicy;
 
+#[derive(Debug, Clone)]
+pub(crate) struct SilentRerouteState {
+    pub(crate) requested_model: String,
+    pub(crate) served_model: String,
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
@@ -30,6 +36,7 @@ pub(crate) struct SessionState {
     /// Startup regular task pre-created during session initialization.
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
+    pub(crate) silent_reroute: Option<SilentRerouteState>,
 }
 
 impl SessionState {
@@ -47,6 +54,7 @@ impl SessionState {
             pending_resume_previous_model: None,
             startup_regular_task: None,
             active_mcp_tool_selection: None,
+            silent_reroute: None,
         }
     }
 

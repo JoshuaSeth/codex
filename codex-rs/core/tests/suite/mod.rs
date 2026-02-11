@@ -109,6 +109,7 @@ mod seatbelt;
 mod shell_command;
 mod shell_serialization;
 mod shell_snapshot;
+mod silent_reroute;
 mod skills;
 mod sqlite_state;
 mod stream_error_allows_next_turn;

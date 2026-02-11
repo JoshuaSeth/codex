@@ -441,6 +441,16 @@ pub fn ev_response_created(id: &str) -> Value {
     })
 }
 
+pub fn ev_response_created_with_model(id: &str, model: &str) -> Value {
+    serde_json::json!({
+        "type": "response.created",
+        "response": {
+            "id": id,
+            "model": model,
+        }
+    })
+}
+
 pub fn ev_completed_with_tokens(id: &str, total_tokens: i64) -> Value {
     serde_json::json!({
         "type": "response.completed",

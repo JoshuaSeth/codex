@@ -212,6 +212,7 @@ use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
+use crate::state::SilentRerouteState;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::RegularTask;
@@ -518,6 +519,38 @@ pub(crate) struct Session {
 
 const SEARCH_TOOL_DEVELOPER_INSTRUCTIONS: &str =
     include_str!("../templates/search_tool/developer_instructions.md");
+
+const SILENT_REROUTE_FALLBACK_MODEL: &str = "gpt-5.2";
+const SILENT_REROUTE_FALLBACK_EFFORT: ReasoningEffortConfig = ReasoningEffortConfig::XHigh;
+
+fn trim_openai_model_date_suffix(model: &str) -> &str {
+    // Most OpenAI models may be returned with a trailing version date suffix like:
+    // "gpt-5.2-2025-12-11". For reroute detection we treat those as equivalent.
+    const DATE_SUFFIX_LEN: usize = 11; // "-YYYY-MM-DD"
+    if model.len() <= DATE_SUFFIX_LEN {
+        return model;
+    }
+    let suffix = &model[model.len().saturating_sub(DATE_SUFFIX_LEN)..];
+    let bytes = suffix.as_bytes();
+    let is_date_suffix = bytes.len() == DATE_SUFFIX_LEN
+        && bytes[0] == b'-'
+        && bytes[5] == b'-'
+        && bytes[8] == b'-'
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[6..8].iter().all(u8::is_ascii_digit)
+        && bytes[9..11].iter().all(u8::is_ascii_digit);
+    if is_date_suffix {
+        &model[..model.len() - DATE_SUFFIX_LEN]
+    } else {
+        model
+    }
+}
+
+fn silent_reroute_error_message(requested_model: &str, served_model: &str) -> String {
+    format!(
+        "Backend silently rerouted the model (requested {requested_model}, served {served_model}). Forcing fallback to {SILENT_REROUTE_FALLBACK_MODEL} with reasoning effort {SILENT_REROUTE_FALLBACK_EFFORT}."
+    )
+}
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -1502,6 +1535,14 @@ impl Session {
                 let next_cwd = updated.cwd.clone();
                 let codex_home = updated.codex_home.clone();
                 state.session_configuration = updated;
+                if state.silent_reroute.is_some() {
+                    state.session_configuration.collaboration_mode =
+                        state.session_configuration.collaboration_mode.with_updates(
+                            Some(SILENT_REROUTE_FALLBACK_MODEL.to_string()),
+                            Some(Some(SILENT_REROUTE_FALLBACK_EFFORT)),
+                            None,
+                        );
+                }
                 drop(state);
 
                 self.maybe_refresh_shell_snapshot_for_cwd(&previous_cwd, &next_cwd, &codex_home);
@@ -1524,6 +1565,14 @@ impl Session {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(&updates) {
                 Ok(next) => {
+                    let mut next = next;
+                    if state.silent_reroute.is_some() {
+                        next.collaboration_mode = next.collaboration_mode.with_updates(
+                            Some(SILENT_REROUTE_FALLBACK_MODEL.to_string()),
+                            Some(Some(SILENT_REROUTE_FALLBACK_EFFORT)),
+                            None,
+                        );
+                    }
                     let previous_cwd = state.session_configuration.cwd.clone();
                     let sandbox_policy_changed =
                         state.session_configuration.sandbox_policy != next.sandbox_policy;
@@ -1652,6 +1701,74 @@ impl Session {
     pub(crate) async fn current_collaboration_mode(&self) -> CollaborationMode {
         let state = self.state.lock().await;
         state.session_configuration.collaboration_mode.clone()
+    }
+
+    async fn maybe_handle_silent_model_reroute(
+        &self,
+        turn_context: &TurnContext,
+        served_model: &str,
+    ) {
+        let served_model = served_model.trim();
+        if served_model.is_empty() {
+            return;
+        }
+
+        let requested_model = turn_context.model_info.slug.as_str();
+        if trim_openai_model_date_suffix(requested_model)
+            == trim_openai_model_date_suffix(served_model)
+        {
+            return;
+        }
+
+        let mut should_emit = false;
+        {
+            let mut state = self.state.lock().await;
+            if state.silent_reroute.is_none() {
+                state.silent_reroute = Some(SilentRerouteState {
+                    requested_model: requested_model.to_string(),
+                    served_model: served_model.to_string(),
+                });
+                should_emit = true;
+            }
+
+            // Once detected, always force subsequent turns onto the stable fallback model/effort.
+            state.session_configuration.collaboration_mode =
+                state.session_configuration.collaboration_mode.with_updates(
+                    Some(SILENT_REROUTE_FALLBACK_MODEL.to_string()),
+                    Some(Some(SILENT_REROUTE_FALLBACK_EFFORT)),
+                    None,
+                );
+        }
+
+        if should_emit {
+            self.send_event(
+                turn_context,
+                EventMsg::Error(ErrorEvent {
+                    message: silent_reroute_error_message(requested_model, served_model),
+                    codex_error_info: None,
+                }),
+            )
+            .await;
+        }
+    }
+
+    async fn emit_silent_reroute_error_if_needed(&self, turn_context: &TurnContext) {
+        let silent_reroute = {
+            let state = self.state.lock().await;
+            state.silent_reroute.clone()
+        };
+        let Some(info) = silent_reroute else {
+            return;
+        };
+
+        self.send_event(
+            turn_context,
+            EventMsg::Error(ErrorEvent {
+                message: silent_reroute_error_message(&info.requested_model, &info.served_model),
+                codex_error_info: None,
+            }),
+        )
+        .await;
     }
 
     fn build_environment_update_item(
@@ -3887,6 +4004,8 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
+    sess.emit_silent_reroute_error_if_needed(&turn_context)
+        .await;
     if total_usage_tokens >= auto_compact_limit
         && run_auto_compact(&sess, &turn_context).await.is_err()
     {
@@ -4940,7 +5059,12 @@ async fn try_run_sampling_request(
             .record_responses(&handle_responses, &event);
 
         match event {
-            ResponseEvent::Created => {}
+            ResponseEvent::Created { model, .. } => {
+                if let Some(served_model) = model.as_deref() {
+                    sess.maybe_handle_silent_model_reroute(&turn_context, served_model)
+                        .await;
+                }
+            }
             ResponseEvent::OutputItemDone(item) => {
                 let previously_active_item = active_item.take();
                 if let Some(state) = plan_mode_state.as_mut() {

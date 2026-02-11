@@ -53,7 +53,10 @@ pub struct MemorySummarizeOutput {
 
 #[derive(Debug)]
 pub enum ResponseEvent {
-    Created,
+    Created {
+        response_id: Option<String>,
+        model: Option<String>,
+    },
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),
     /// Emitted when `X-Reasoning-Included: true` is present on the response,
