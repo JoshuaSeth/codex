@@ -1660,7 +1660,13 @@ impl ChatWidget {
     }
 
     fn on_warning(&mut self, message: impl Into<String>) {
-        self.add_to_history(history_cell::new_warning_event(message.into()));
+        let message = message.into();
+        if message.starts_with("Backend silently rerouted the model") {
+            // Show in red but do not abort the active turn; this is a notification, not a failure.
+            self.add_to_history(history_cell::new_error_event(message));
+        } else {
+            self.add_to_history(history_cell::new_warning_event(message));
+        }
         self.request_redraw();
     }
 

@@ -63,7 +63,7 @@ async fn silent_reroute_forces_fallback_model_and_effort() -> Result<()> {
 
     wait_for_event(
         &test.codex,
-        |ev| matches!(ev, EventMsg::Error(err) if err.message.contains("silently rerouted")),
+        |ev| matches!(ev, EventMsg::Warning(warn) if warn.message.contains("silently rerouted")),
     )
     .await;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -90,7 +90,7 @@ async fn silent_reroute_forces_fallback_model_and_effort() -> Result<()> {
 
     wait_for_event(
         &test.codex,
-        |ev| matches!(ev, EventMsg::Error(err) if err.message.contains("silently rerouted")),
+        |ev| matches!(ev, EventMsg::Warning(warn) if warn.message.contains("silently rerouted")),
     )
     .await;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;

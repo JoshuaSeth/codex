@@ -548,7 +548,7 @@ fn trim_openai_model_date_suffix(model: &str) -> &str {
 
 fn silent_reroute_error_message(requested_model: &str, served_model: &str) -> String {
     format!(
-        "Backend silently rerouted the model (requested {requested_model}, served {served_model}). Forcing fallback to {SILENT_REROUTE_FALLBACK_MODEL} with reasoning effort {SILENT_REROUTE_FALLBACK_EFFORT}."
+        "Backend silently rerouted the model (requested {requested_model}, served {served_model}). This may be due to Trusted Access for Cyber checks: https://chatgpt.com/cyber. Forcing fallback to {SILENT_REROUTE_FALLBACK_MODEL} with reasoning effort {SILENT_REROUTE_FALLBACK_EFFORT}."
     )
 }
 
@@ -1743,9 +1743,8 @@ impl Session {
         if should_emit {
             self.send_event(
                 turn_context,
-                EventMsg::Error(ErrorEvent {
+                EventMsg::Warning(WarningEvent {
                     message: silent_reroute_error_message(requested_model, served_model),
-                    codex_error_info: None,
                 }),
             )
             .await;
@@ -1763,9 +1762,8 @@ impl Session {
 
         self.send_event(
             turn_context,
-            EventMsg::Error(ErrorEvent {
+            EventMsg::Warning(WarningEvent {
                 message: silent_reroute_error_message(&info.requested_model, &info.served_model),
-                codex_error_info: None,
             }),
         )
         .await;
