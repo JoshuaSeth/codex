@@ -1,3 +1,4 @@
+use codex_exec::exec_events::CollabToolCallStatus;
 use codex_exec::exec_events::CommandExecutionStatus;
 use codex_exec::exec_events::McpToolCallStatus;
 use codex_exec::exec_events::PatchApplyStatus;
@@ -386,6 +387,11 @@ fn item_status(record: &ItemRecord) -> (&'static str, Style) {
             McpToolCallStatus::Failed => ("ERR", Style::new().red().bold()),
             McpToolCallStatus::InProgress => ("RUN", Style::new().cyan().bold()),
         },
+        ThreadItemDetails::CollabToolCall(call) => match call.status {
+            CollabToolCallStatus::Completed => ("", Style::new()),
+            CollabToolCallStatus::Failed => ("ERR", Style::new().red().bold()),
+            CollabToolCallStatus::InProgress => ("RUN", Style::new().cyan().bold()),
+        },
         ThreadItemDetails::Error(_) => ("ERR", Style::new().red().bold()),
         _ => ("", Style::new()),
     }
@@ -404,6 +410,15 @@ fn item_kind_and_summary(details: &ThreadItemDetails) -> (String, String) {
         }
         ThreadItemDetails::McpToolCall(tc) => {
             ("MCP".to_string(), format!("{}::{}", tc.server, tc.tool))
+        }
+        ThreadItemDetails::CollabToolCall(call) => {
+            let tool = format!("{:?}", call.tool);
+            let summary = match call.receiver_thread_ids.as_slice() {
+                [receiver] => format!("{tool} -> {receiver}"),
+                receivers if receivers.is_empty() => tool,
+                receivers => format!("{tool} -> {} threads", receivers.len()),
+            };
+            ("Collab".to_string(), summary)
         }
         ThreadItemDetails::WebSearch(ws) => ("Search".to_string(), trim_one_line(&ws.query)),
         ThreadItemDetails::TodoList(todos) => {
@@ -547,6 +562,54 @@ fn selected_item_details(app: &ViewApp) -> Vec<Line<'static>> {
                 out.push("Error:".red().bold().into());
                 out.push(Line::default());
                 push_wrapped(&mut out, &err.message);
+            }
+        }
+        ThreadItemDetails::CollabToolCall(call) => {
+            out.push(vec!["Tool: ".dim(), format!("{:?}", call.tool).into()].into());
+            out.push(vec!["Sender: ".dim(), call.sender_thread_id.clone().into()].into());
+            out.push(vec!["Status: ".dim(), format!("{:?}", call.status).into()].into());
+
+            if !call.receiver_thread_ids.is_empty() {
+                out.push(Line::default());
+                out.push("Receivers:".bold().into());
+                out.push(Line::default());
+                for receiver in &call.receiver_thread_ids {
+                    out.push(vec!["  ".into(), receiver.clone().into()].into());
+                }
+            }
+
+            if let Some(prompt) = call
+                .prompt
+                .as_deref()
+                .filter(|prompt| !prompt.trim().is_empty())
+            {
+                out.push(Line::default());
+                out.push("Prompt:".bold().into());
+                out.push(Line::default());
+                push_markdown(&mut out, prompt);
+            }
+
+            if !call.agents_states.is_empty() {
+                out.push(Line::default());
+                out.push("Agents:".bold().into());
+                out.push(Line::default());
+                let mut agents = call
+                    .agents_states
+                    .iter()
+                    .map(|(thread_id, state)| (thread_id.clone(), state.clone()))
+                    .collect::<Vec<_>>();
+                agents.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (thread_id, state) in agents {
+                    let status = format!("{:?}", state.status);
+                    let mut spans: Vec<Span<'static>> =
+                        vec!["  ".into(), thread_id.dim(), "  ".into(), status.into()];
+                    if let Some(message) = state.message.as_deref().filter(|m| !m.trim().is_empty())
+                    {
+                        spans.push("  ".into());
+                        spans.push(trim_one_line(message).dim());
+                    }
+                    out.push(spans.into());
+                }
             }
         }
         ThreadItemDetails::WebSearch(ws) => {
