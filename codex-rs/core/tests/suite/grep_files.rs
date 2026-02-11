@@ -126,7 +126,11 @@ async fn grep_files_tool_reports_empty_results() -> Result<()> {
 
 #[allow(clippy::expect_used)]
 async fn build_test_codex(server: &wiremock::MockServer) -> Result<TestCodex> {
-    let mut builder = test_codex().with_model(MODEL_WITH_TOOL);
+    let mut builder = test_codex()
+        .with_model(MODEL_WITH_TOOL)
+        .with_config(|config| {
+            config.experimental_supported_tools = vec!["grep_files".to_string()];
+        });
     builder.build(server).await
 }
 

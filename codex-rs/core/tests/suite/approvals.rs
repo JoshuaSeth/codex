@@ -1528,7 +1528,8 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
             }
             test.codex
                 .submit(Op::ExecApproval {
-                    id: "0".into(),
+                    id: approval.call_id,
+                    turn_id: None,
                     decision: decision.clone(),
                 })
                 .await?;
@@ -1549,7 +1550,7 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
             }
             test.codex
                 .submit(Op::PatchApproval {
-                    id: "0".into(),
+                    id: approval.call_id,
                     decision: decision.clone(),
                 })
                 .await?;
@@ -1624,10 +1625,10 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
         sandbox_policy.clone(),
     )
     .await?;
-    let _ = expect_patch_approval(&test, call_id_1).await;
+    let approval = expect_patch_approval(&test, call_id_1).await;
     test.codex
         .submit(Op::PatchApproval {
-            id: "0".into(),
+            id: approval.call_id,
             decision: ReviewDecision::ApprovedForSession,
         })
         .await?;
@@ -1746,13 +1747,24 @@ async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts
 
     test.codex
         .submit(Op::ExecApproval {
-            id: "0".into(),
+            id: approval.call_id,
+            turn_id: None,
             decision: ReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment: expected_execpolicy_amendment.clone(),
             },
         })
         .await?;
     wait_for_completion(&test).await;
+
+    let developer_messages = first_results
+        .single_request()
+        .message_input_texts("developer");
+    assert!(
+        developer_messages
+            .iter()
+            .any(|message| message.contains(r#"["touch", "allow-prefix.txt"]"#)),
+        "expected developer message documenting saved rule, got: {developer_messages:?}"
+    );
 
     let policy_path = test.home.path().join("rules").join("default.rules");
     let policy_contents = fs::read_to_string(&policy_path)?;

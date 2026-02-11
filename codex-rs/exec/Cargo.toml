@@ -19,6 +19,7 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }
+codex-cloud-requirements = { workspace = true }
 codex-common = { workspace = true, features = [
     "cli",
     "elapsed",
@@ -27,7 +28,6 @@ codex-common = { workspace = true, features = [
 codex-core = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-mcp-types = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -36,6 +36,8 @@ supports-color = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset", "macros"] }
 toml = { workspace = true }
 tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
     "io-std",
     "macros",
     "process",
@@ -49,6 +51,7 @@ ts-rs = { workspace = true, features = [
     "serde-json-impl",
     "no-serde-warnings",
 ] }
+uuid = { workspace = true }
 
 
 [dev-dependencies]
@@ -56,9 +59,9 @@ assert_cmd = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 libc = { workspace = true }
-mcp-types = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
+rmcp = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }

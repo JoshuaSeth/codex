@@ -1,11 +1,12 @@
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
-use crate::rate_limits::parse_rate_limit;
+use crate::rate_limits::parse_all_rate_limits;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_client::TransportError;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
@@ -54,7 +55,7 @@ pub fn spawn_response_stream(
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> ResponseStream {
-    let rate_limits = parse_rate_limit(&stream_response.headers);
+    let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
         .headers
         .get("X-Models-Etag")
@@ -74,7 +75,7 @@ pub fn spawn_response_stream(
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
-        if let Some(snapshot) = rate_limits {
+        for snapshot in rate_limit_snapshots {
             let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
         }
         if let Some(etag) = models_etag {
@@ -157,12 +158,18 @@ struct ResponseCompletedOutputTokensDetails {
 #[derive(Deserialize, Debug)]
 pub struct ResponsesStreamEvent {
     #[serde(rename = "type")]
-    kind: String,
+    pub(crate) kind: String,
     response: Option<Value>,
     item: Option<Value>,
     delta: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+}
+
+impl ResponsesStreamEvent {
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
 }
 
 #[derive(Debug)]
@@ -291,7 +298,7 @@ pub fn process_responses_event(
                 if let Ok(item) = serde_json::from_value::<ResponseItem>(item_val) {
                     return Ok(Some(ResponseEvent::OutputItemAdded(item)));
                 }
-                debug!("failed to parse ResponseItem from output_item.done");
+                debug!("failed to parse ResponseItem from output_item.added");
             }
         }
         "response.reasoning_summary_part.added" => {
@@ -309,6 +316,24 @@ pub fn process_responses_event(
     Ok(None)
 }
 
+fn append_output_text_delta(item: &mut ResponseItem, delta: &str) {
+    let ResponseItem::Message { content, .. } = item else {
+        return;
+    };
+
+    if let Some(ContentItem::OutputText { text }) = content
+        .iter_mut()
+        .rev()
+        .find(|entry| matches!(entry, ContentItem::OutputText { .. }))
+    {
+        text.push_str(delta);
+    } else {
+        content.push(ContentItem::OutputText {
+            text: delta.to_string(),
+        });
+    }
+}
+
 pub async fn process_sse(
     stream: ByteStream,
     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
@@ -317,6 +342,7 @@ pub async fn process_sse(
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
+    let mut active_output_item: Option<ResponseItem> = None;
 
     loop {
         let start = Instant::now();
@@ -358,12 +384,41 @@ pub async fn process_sse(
 
         match process_responses_event(event) {
             Ok(Some(event)) => {
-                let is_completed = matches!(event, ResponseEvent::Completed { .. });
-                if tx_event.send(Ok(event)).await.is_err() {
-                    return;
+                let mut queue: Vec<ResponseEvent> = Vec::new();
+
+                match &event {
+                    ResponseEvent::OutputItemAdded(item) => {
+                        if let Some(pending) = active_output_item.take() {
+                            queue.push(ResponseEvent::OutputItemDone(pending));
+                        }
+                        active_output_item = Some(item.clone());
+                    }
+                    ResponseEvent::OutputItemDone(_) => {
+                        active_output_item = None;
+                    }
+                    ResponseEvent::OutputTextDelta(delta) => {
+                        if let Some(item) = active_output_item.as_mut() {
+                            append_output_text_delta(item, delta);
+                        }
+                    }
+                    ResponseEvent::Completed { .. } => {
+                        if let Some(pending) = active_output_item.take() {
+                            queue.push(ResponseEvent::OutputItemDone(pending));
+                        }
+                    }
+                    _ => {}
                 }
-                if is_completed {
-                    return;
+
+                queue.push(event);
+
+                for event in queue {
+                    let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                    if tx_event.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                    if is_completed {
+                        return;
+                    }
                 }
             }
             Ok(None) => {}
@@ -429,6 +484,8 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use bytes::Bytes;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
     use futures::stream;
     use pretty_assertions::assert_eq;
@@ -492,7 +549,8 @@ mod tests {
             "item": {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "Hello"}]
+                "content": [{"type": "output_text", "text": "Hello"}],
+                "phase": "commentary"
             }
         })
         .to_string();
@@ -523,8 +581,11 @@ mod tests {
 
         assert_matches!(
             &events[0],
-            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message { role, .. }))
-                if role == "assistant"
+            Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+                role,
+                phase: Some(MessagePhase::Commentary),
+                ..
+            })) if role == "assistant"
         );
 
         assert_matches!(
@@ -543,6 +604,45 @@ mod tests {
             }
             other => panic!("unexpected third event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn synthesizes_output_item_done_when_missing() {
+        let added = json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": ""}]
+            }
+        });
+        let delta1 = json!({"type": "response.output_text.delta", "delta": "Hey "});
+        let delta2 = json!({"type": "response.output_text.delta", "delta": "there"});
+        let delta3 = json!({"type": "response.output_text.delta", "delta": "!\\n"});
+        let completed = json!({
+            "type": "response.completed",
+            "response": { "id": "resp1" }
+        });
+
+        let events = run_sse(vec![added, delta1, delta2, delta3, completed]).await;
+
+        let done = events.iter().find_map(|ev| match ev {
+            ResponseEvent::OutputItemDone(item) => Some(item),
+            _ => None,
+        });
+        let Some(ResponseItem::Message { role, content, .. }) = done else {
+            panic!("expected synthesized output_item.done message event");
+        };
+        assert_eq!(role, "assistant");
+
+        let combined = content
+            .iter()
+            .filter_map(|ci| match ci {
+                ContentItem::OutputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(combined, "Hey there!\\n");
     }
 
     #[tokio::test]

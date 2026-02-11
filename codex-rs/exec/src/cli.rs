@@ -1,3 +1,5 @@
+use clap::Args;
+use clap::FromArgMatches;
 use clap::Parser;
 use clap::ValueEnum;
 use codex_common::CliConfigOverrides;
@@ -28,7 +30,7 @@ pub struct Cli {
     #[arg(long = "oss", default_value_t = false)]
     pub oss: bool,
 
-    /// Specify which local provider to use (lmstudio, ollama, or ollama-chat).
+    /// Specify which local provider to use (lmstudio or ollama).
     /// If not specified with --oss, will use config default or show selection.
     #[arg(long = "local-provider")]
     pub oss_provider: Option<String>,
@@ -73,6 +75,10 @@ pub struct Cli {
     #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 
+    /// Run without persisting session files to disk.
+    #[arg(long = "ephemeral", global = true, default_value_t = false)]
+    pub ephemeral: bool,
+
     /// Path to a JSON Schema file describing the model's final response shape.
     #[arg(long = "output-schema", value_name = "FILE")]
     pub output_schema: Option<PathBuf>,
@@ -110,34 +116,33 @@ pub enum Command {
 
     /// Run a code review against the current repository.
     Review(ReviewArgs),
-
-    /// Deliver the final output for a pending tool call to a running session.
-    DeliverPending(DeliverPendingArgs),
 }
 
-#[derive(Parser, Debug)]
-pub struct ResumeArgs {
-    /// Conversation/session selector. When provided, resumes this session.
+#[derive(Args, Debug)]
+struct ResumeArgsRaw {
+    // Note: This is the direct clap shape. We reinterpret the positional when --last is set
+    // so "codex resume --last <prompt>" treats the positional as a prompt, not a session id.
+    /// Conversation/session selector.
     ///
-    /// Accepts a session UUID, a path to a `.jsonl` file, or a plain filename (with or without
-    /// `.jsonl`) under `~/.codex/sessions/**`.
+    /// Accepts a session UUID, a thread name (UUIDs take precedence if it parses), a path to a
+    /// `.jsonl` file, or a plain filename (with or without `.jsonl`) under `~/.codex/sessions/**`.
     ///
     /// If omitted, use --last to pick the most recent recorded session.
     #[arg(value_name = "SESSION")]
-    pub session_id: Option<String>,
+    session_id: Option<String>,
 
     /// Resume the most recent recorded session (newest) without specifying an id.
     #[arg(long = "last", default_value_t = false)]
-    pub last: bool,
+    last: bool,
 
     /// Show all sessions (disables cwd filtering).
     #[arg(long = "all", default_value_t = false)]
-    pub all: bool,
+    all: bool,
 
     /// Fork the selected session into a new session id before resuming.
     /// This preserves the original rollout file so it can be reused later.
     #[arg(long = "fork", default_value_t = false)]
-    pub fork: bool,
+    fork: bool,
 
     /// Optional image(s) to attach to the prompt sent after resuming.
     #[arg(
@@ -147,15 +152,85 @@ pub struct ResumeArgs {
         value_delimiter = ',',
         num_args = 1
     )]
-    pub images: Vec<PathBuf>,
+    images: Vec<PathBuf>,
 
     /// Prompt to send after resuming the session. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
-    pub prompt: Option<String>,
+    prompt: Option<String>,
 
     /// Resume the session without sending any new user prompt.
     #[arg(long = "no-prompt", default_value_t = false, conflicts_with = "prompt")]
+    no_prompt: bool,
+}
+
+#[derive(Debug)]
+pub struct ResumeArgs {
+    /// Conversation/session selector.
+    /// If omitted, use --last to pick the most recent recorded session.
+    pub session_id: Option<String>,
+
+    /// Resume the most recent recorded session (newest) without specifying an id.
+    pub last: bool,
+
+    /// Show all sessions (disables cwd filtering).
+    pub all: bool,
+
+    /// Fork the selected session into a new session id before resuming.
+    /// This preserves the original rollout file so it can be reused later.
+    pub fork: bool,
+
+    /// Optional image(s) to attach to the prompt sent after resuming.
+    pub images: Vec<PathBuf>,
+
+    /// Prompt to send after resuming the session. If `-` is used, read from stdin.
+    pub prompt: Option<String>,
+
+    /// Resume the session without sending any new user prompt.
     pub no_prompt: bool,
+}
+
+impl From<ResumeArgsRaw> for ResumeArgs {
+    fn from(raw: ResumeArgsRaw) -> Self {
+        // When --last is used without an explicit prompt, treat the positional as the prompt
+        // (clap can’t express this conditional positional meaning cleanly).
+        let (session_id, prompt) = if raw.no_prompt {
+            (raw.session_id, None)
+        } else if raw.last && raw.prompt.is_none() {
+            (None, raw.session_id)
+        } else {
+            (raw.session_id, raw.prompt)
+        };
+        Self {
+            session_id,
+            last: raw.last,
+            all: raw.all,
+            fork: raw.fork,
+            images: raw.images,
+            prompt,
+            no_prompt: raw.no_prompt,
+        }
+    }
+}
+
+impl Args for ResumeArgs {
+    fn augment_args(cmd: clap::Command) -> clap::Command {
+        ResumeArgsRaw::augment_args(cmd)
+    }
+
+    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
+        ResumeArgsRaw::augment_args_for_update(cmd)
+    }
+}
+
+impl FromArgMatches for ResumeArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        ResumeArgsRaw::from_arg_matches(matches).map(Self::from)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = ResumeArgsRaw::from_arg_matches(matches).map(Self::from)?;
+        Ok(())
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -193,25 +268,6 @@ pub struct ReviewArgs {
     pub prompt: Option<String>,
 }
 
-#[derive(Parser, Debug)]
-pub struct DeliverPendingArgs {
-    /// Conversation/session id whose pending tool should be fulfilled.
-    #[arg(value_name = "SESSION_ID")]
-    pub session_id: String,
-
-    /// Call id that was marked as pending.
-    #[arg(long = "call-id", value_name = "CALL_ID")]
-    pub call_id: String,
-
-    /// Plaintext output to deliver to the agent.
-    #[arg(long = "output", value_name = "TEXT")]
-    pub output: String,
-
-    /// Whether the tool succeeded (sets the `success` flag in the payload).
-    #[arg(long = "success", default_value_t = true)]
-    pub success: bool,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum Color {
@@ -219,4 +275,40 @@ pub enum Color {
     Never,
     #[default]
     Auto,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn resume_parses_prompt_after_global_flags() {
+        const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
+        let cli = Cli::parse_from([
+            "codex-exec",
+            "resume",
+            "--last",
+            "--json",
+            "--model",
+            "gpt-5.2-codex",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            PROMPT,
+        ]);
+
+        assert!(cli.ephemeral);
+        let Some(Command::Resume(args)) = cli.command else {
+            panic!("expected resume command");
+        };
+        let effective_prompt = args.prompt.clone().or_else(|| {
+            if args.last {
+                args.session_id.clone()
+            } else {
+                None
+            }
+        });
+        assert_eq!(effective_prompt.as_deref(), Some(PROMPT));
+    }
 }

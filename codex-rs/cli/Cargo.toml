@@ -23,6 +23,7 @@ crossterm = { workspace = true }
 dirs = { workspace = true }
 codex-app-server = { workspace = true }
 codex-app-server-protocol = { workspace = true }
+codex-app-server-test-client = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
@@ -44,6 +45,7 @@ regex-lite = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 supports-color = { workspace = true }
+tempfile = { workspace = true }
 textwrap = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
 tokio = { workspace = true, features = [
@@ -65,4 +67,3 @@ assert_matches = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }

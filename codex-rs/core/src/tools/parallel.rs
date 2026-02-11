@@ -17,6 +17,7 @@ use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 
@@ -70,7 +71,11 @@ impl ToolCallRuntime {
 
         let handle: AbortOnDropHandle<Result<ResponseInputItem, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
+                // Prefer cancellation if both the tool future and cancellation become ready
+                // concurrently. This keeps abort handling deterministic in tests and avoids
+                // flakiness where the tool's own early-return races with the cancellation path.
                 tokio::select! {
+                    biased;
                     _ = cancellation_token.cancelled() => {
                         let secs = started.elapsed().as_secs_f32().max(0.1);
                         dispatch_span.record("aborted", true);
@@ -119,7 +124,7 @@ impl ToolCallRuntime {
             _ => ResponseInputItem::FunctionCallOutput {
                 call_id: call.call_id.clone(),
                 output: FunctionCallOutputPayload {
-                    content: Self::abort_message(call, secs),
+                    body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
                     ..Default::default()
                 },
             },

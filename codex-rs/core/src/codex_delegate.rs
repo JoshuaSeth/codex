@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use async_channel::Receiver;
 use async_channel::Sender;
@@ -54,9 +53,11 @@ pub(crate) async fn run_codex_thread_interactive(
         auth_manager,
         models_manager,
         Arc::clone(&parent_session.services.skills_manager),
+        Arc::clone(&parent_session.services.file_watcher),
         initial_history.unwrap_or(InitialHistory::New),
         SessionSource::SubAgent(SubAgentSource::Review),
         parent_session.services.agent_control.clone(),
+        Vec::new(),
     )
     .await?;
     let codex = Arc::new(codex);
@@ -88,10 +89,10 @@ pub(crate) async fn run_codex_thread_interactive(
     });
 
     Ok(Codex {
-        next_id: AtomicU64::new(0),
         tx_sub: tx_ops,
         rx_event: rx_sub,
         agent_status: codex.agent_status.clone(),
+        session: Arc::clone(&codex.session),
     })
 }
 
@@ -134,6 +135,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let ops_tx = io.tx_sub.clone();
     let agent_status = io.agent_status.clone();
+    let session = Arc::clone(&io.session);
     let io_for_bridge = io;
     tokio::spawn(async move {
         while let Ok(event) = io_for_bridge.next_event().await {
@@ -162,10 +164,10 @@ pub(crate) async fn run_codex_thread_one_shot(
     drop(rx_closed);
 
     Ok(Codex {
-        next_id: AtomicU64::new(0),
         rx_event: rx_bridge,
         tx_sub: tx_closed,
         agent_status,
+        session,
     })
 }
 
@@ -203,6 +205,10 @@ async fn forward_events(
                     Event {
                         id: _,
                         msg: EventMsg::SessionConfigured(_),
+                    } => {}
+                    Event {
+                        id: _,
+                        msg: EventMsg::ThreadNameUpdated(_),
                     } => {}
                     Event {
                         id,
@@ -298,58 +304,75 @@ async fn forward_ops(
 /// Handle an ExecApprovalRequest by consulting the parent session and replying.
 async fn handle_exec_approval(
     codex: &Codex,
-    id: String,
+    turn_id: String,
     parent_session: &Session,
     parent_ctx: &TurnContext,
     event: ExecApprovalRequestEvent,
     cancel_token: &CancellationToken,
 ) {
+    let ExecApprovalRequestEvent {
+        call_id,
+        command,
+        cwd,
+        reason,
+        proposed_execpolicy_amendment,
+        ..
+    } = event;
+    let approval_id = call_id.clone();
     // Race approval with cancellation and timeout to avoid hangs.
     let approval_fut = parent_session.request_command_approval(
         parent_ctx,
-        parent_ctx.sub_id.clone(),
-        event.command,
-        event.cwd,
-        event.reason,
-        event.proposed_execpolicy_amendment,
+        call_id,
+        command,
+        cwd,
+        reason,
+        proposed_execpolicy_amendment,
     );
-    let decision = await_approval_with_cancel(
-        approval_fut,
-        parent_session,
-        &parent_ctx.sub_id,
-        cancel_token,
-    )
-    .await;
+    let decision =
+        await_approval_with_cancel(approval_fut, parent_session, &approval_id, cancel_token).await;
 
-    let _ = codex.submit(Op::ExecApproval { id, decision }).await;
+    let _ = codex
+        .submit(Op::ExecApproval {
+            id: approval_id,
+            turn_id: Some(turn_id),
+            decision,
+        })
+        .await;
 }
 
 /// Handle an ApplyPatchApprovalRequest by consulting the parent session and replying.
 async fn handle_patch_approval(
     codex: &Codex,
-    id: String,
+    _id: String,
     parent_session: &Session,
     parent_ctx: &TurnContext,
     event: ApplyPatchApprovalRequestEvent,
     cancel_token: &CancellationToken,
 ) {
+    let ApplyPatchApprovalRequestEvent {
+        call_id,
+        changes,
+        reason,
+        grant_root,
+        ..
+    } = event;
+    let approval_id = call_id.clone();
     let decision_rx = parent_session
-        .request_patch_approval(
-            parent_ctx,
-            parent_ctx.sub_id.clone(),
-            event.changes,
-            event.reason,
-            event.grant_root,
-        )
+        .request_patch_approval(parent_ctx, call_id, changes, reason, grant_root)
         .await;
     let decision = await_approval_with_cancel(
         async move { decision_rx.await.unwrap_or_default() },
         parent_session,
-        &parent_ctx.sub_id,
+        &approval_id,
         cancel_token,
     )
     .await;
-    let _ = codex.submit(Op::PatchApproval { id, decision }).await;
+    let _ = codex
+        .submit(Op::PatchApproval {
+            id: approval_id,
+            decision,
+        })
+        .await;
 }
 
 async fn handle_request_user_input(
@@ -405,7 +428,7 @@ where
 async fn await_approval_with_cancel<F>(
     fut: F,
     parent_session: &Session,
-    sub_id: &str,
+    approval_id: &str,
     cancel_token: &CancellationToken,
 ) -> codex_protocol::protocol::ReviewDecision
 where
@@ -415,7 +438,7 @@ where
         biased;
         _ = cancel_token.cancelled() => {
             parent_session
-                .notify_approval(sub_id, codex_protocol::protocol::ReviewDecision::Abort)
+                .notify_approval(approval_id, codex_protocol::protocol::ReviewDecision::Abort)
                 .await;
             codex_protocol::protocol::ReviewDecision::Abort
         }
@@ -442,20 +465,20 @@ mod tests {
         let (tx_events, rx_events) = bounded(1);
         let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (session, ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
         let codex = Arc::new(Codex {
-            next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
             agent_status,
+            session: Arc::clone(&session),
         });
-
-        let (session, ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
 
         let (tx_out, rx_out) = bounded(1);
         tx_out
             .send(Event {
                 id: "full".to_string(),
                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some("turn-1".to_string()),
                     reason: TurnAbortReason::Interrupted,
                 }),
             })

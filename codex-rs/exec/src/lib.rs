@@ -9,33 +9,32 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
-mod pending_tool_ipc;
 mod prompt_sequence;
 
 use anyhow::Context;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
+use codex_cloud_requirements::cloud_requirements_loader;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
-use codex_common::oss::ollama_chat_deprecation_notice;
 use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::NewThread;
-use codex_core::OLLAMA_CHAT_PROVIDER_ID;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
+use codex_core::config_loader::ConfigLoadError;
+use codex_core::config_loader::format_config_error_with_source;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::live_status::LiveFrontend;
-use codex_core::live_status::LiveIpc;
 use codex_core::live_status::LiveSessionStatus;
-use codex_core::live_status::LiveStatusDetail;
 use codex_core::live_status::LiveStatusRecordV1;
 use codex_core::live_status::LiveStatusWriter;
 use codex_core::live_status::LiveStatusWriterConfig;
@@ -49,16 +48,17 @@ use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SessionSource;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use supports_color::Stream;
 use time::OffsetDateTime;
@@ -66,6 +66,7 @@ use time::format_description::FormatItem;
 use time::macros::format_description;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -74,14 +75,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::cli::Command as ExecCommand;
-use crate::cli::DeliverPendingArgs;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::pending_tool_ipc::PendingToolServer;
-use crate::pending_tool_ipc::addr_from_metadata;
-use crate::pending_tool_ipc::load_metadata;
-use crate::pending_tool_ipc::send_pending_result;
 use crate::prompt_sequence::PromptSequenceRunner;
+use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_selector_str;
 use codex_protocol::protocol::RolloutItem;
@@ -95,6 +92,13 @@ enum InitialOperation {
     Review {
         review_request: ReviewRequest,
     },
+}
+
+#[derive(Clone)]
+struct ThreadEventEnvelope {
+    thread_id: codex_protocol::ThreadId,
+    thread: Arc<codex_core::CodexThread>,
+    event: Event,
 }
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
@@ -115,6 +119,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         skip_git_repo_check,
         prompt_sequence,
         add_dir,
+        ephemeral,
         color,
         last_message_file,
         json: json_mode,
@@ -123,14 +128,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         output_schema: output_schema_path,
         config_overrides,
     } = cli;
-
-    let command = match command {
-        Some(Command::DeliverPending(args)) => {
-            run_deliver_pending(args).await?;
-            return Ok(());
-        }
-        other => other,
-    };
 
     if prompt_sequence.is_some() {
         if command.is_some() {
@@ -199,29 +196,51 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
-    let config_toml = {
-        let codex_home = match find_codex_home() {
-            Ok(codex_home) => codex_home,
-            Err(err) => {
-                eprintln!("Error finding codex home: {err}");
-                std::process::exit(1);
-            }
-        };
-
-        match load_config_as_toml_with_cli_overrides(
-            &codex_home,
-            &config_cwd,
-            cli_kv_overrides.clone(),
-        )
-        .await
-        {
-            Ok(config_toml) => config_toml,
-            Err(err) => {
-                eprintln!("Error loading config.toml: {err}");
-                std::process::exit(1);
-            }
+    let codex_home = match find_codex_home() {
+        Ok(codex_home) => codex_home,
+        Err(err) => {
+            eprintln!("Error finding codex home: {err}");
+            std::process::exit(1);
         }
     };
+
+    #[allow(clippy::print_stderr)]
+    let config_toml = match load_config_as_toml_with_cli_overrides(
+        &codex_home,
+        &config_cwd,
+        cli_kv_overrides.clone(),
+    )
+    .await
+    {
+        Ok(config_toml) => config_toml,
+        Err(err) => {
+            let config_error = err
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<ConfigLoadError>())
+                .map(ConfigLoadError::config_error);
+            if let Some(config_error) = config_error {
+                eprintln!(
+                    "Error loading config.toml:\n{}",
+                    format_config_error_with_source(config_error)
+                );
+            } else {
+                eprintln!("Error loading config.toml: {err}");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let cloud_auth_manager = AuthManager::shared(
+        codex_home.clone(),
+        false,
+        config_toml.cli_auth_credentials_store.unwrap_or_default(),
+    );
+    let chatgpt_base_url = config_toml
+        .chatgpt_base_url
+        .clone()
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
+    let cloud_requirements = cloud_requirements_loader(cloud_auth_manager, chatgpt_base_url);
 
     let model_provider = if oss {
         let resolved = resolve_oss_provider(
@@ -234,7 +253,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             Some(provider)
         } else {
             return Err(anyhow::anyhow!(
-                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}, {OLLAMA_CHAT_PROVIDER_ID} in config.toml"
+                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID} in config.toml"
             ));
         }
     } else {
@@ -266,28 +285,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         codex_linux_sandbox_exe,
         base_instructions: None,
         developer_instructions: None,
+        personality: None,
         compact_prompt: None,
         include_apply_patch_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
+        ephemeral: ephemeral.then_some(true),
         additional_writable_roots: add_dir,
     };
 
-    let config =
-        Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await?;
+    let config = ConfigBuilder::default()
+        .cli_overrides(cli_kv_overrides)
+        .harness_overrides(overrides)
+        .cloud_requirements(cloud_requirements)
+        .build()
+        .await?;
+    set_default_client_residency_requirement(config.enforce_residency.value());
 
     if let Err(err) = enforce_login_restrictions(&config) {
         eprintln!("{err}");
         std::process::exit(1);
     }
-
-    let ollama_chat_support_notice = match ollama_chat_deprecation_notice(&config).await {
-        Ok(notice) => notice,
-        Err(err) => {
-            tracing::warn!(?err, "Failed to detect Ollama wire API");
-            None
-        }
-    };
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, false)
@@ -321,13 +339,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             last_message_file.clone(),
         )),
     };
-
-    if let Some(notice) = ollama_chat_support_notice {
-        event_processor.process_event(Event {
-            id: String::new(),
-            msg: EventMsg::DeprecationNotice(notice),
-        });
-    }
+    let required_mcp_servers: HashSet<String> = config
+        .mcp_servers
+        .get()
+        .iter()
+        .filter(|(_, server)| server.enabled && server.required)
+        .map(|(name, _)| name.clone())
+        .collect();
 
     if oss {
         // We're in the oss section, so provider_id should be Some
@@ -352,7 +370,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;
 
-    if !skip_git_repo_check && get_git_repo_root(&default_cwd).is_none() {
+    // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
+    // since the user is explicitly running in an externally sandboxed environment.
+    if !skip_git_repo_check
+        && !dangerously_bypass_approvals_and_sandbox
+        && get_git_repo_root(&default_cwd).is_none()
+    {
         eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
         std::process::exit(1);
     }
@@ -362,11 +385,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         true,
         config.cli_auth_credentials_store_mode,
     );
-    let thread_manager = ThreadManager::new(
+    let thread_manager = Arc::new(ThreadManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),
         SessionSource::Exec,
-    );
+    ));
     let default_model = thread_manager
         .get_models_manager()
         .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)
@@ -374,8 +397,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewThread {
-        thread_id: conversation_id,
-        thread: conversation,
+        thread_id: primary_thread_id,
+        thread,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
         let mut resume_path = resolve_resume_path(&config, args).await?;
@@ -396,18 +419,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         thread_manager.start_thread(config.clone()).await?
     };
 
-    let pending_tool_server = match PendingToolServer::start(conversation.clone()).await {
-        Ok(server) => Some(server),
-        Err(err) => {
-            warn!(?err, "failed to start pending tool IPC server");
-            None
-        }
-    };
-
     let cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
     let mut live_status = match LiveStatusWriter::spawn(LiveStatusWriterConfig {
         codex_home: config.codex_home.clone(),
-        thread_id: conversation_id,
+        thread_id: primary_thread_id,
         frontend: LiveFrontend::Exec,
         status: LiveSessionStatus::Running,
         detail: None,
@@ -421,14 +436,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             None
         }
     };
-
-    if let (Some(writer), Some(server)) = (live_status.as_ref(), pending_tool_server.as_ref()) {
-        let addr = server.addr();
-        writer.set_ipc(LiveIpc {
-            host: addr.ip().to_string(),
-            port: addr.port(),
-        });
-    }
 
     let mut prompt_sequence_runner = match prompt_sequence {
         Some(path) => Some(PromptSequenceRunner::load(&path)?),
@@ -540,9 +547,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     prompt_text,
                 )
             }
-            (Some(ExecCommand::DeliverPending(_)), _, _) => {
-                unreachable!("deliver command handled earlier")
-            }
         }
     };
 
@@ -552,40 +556,47 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     info!("Codex initialized with event: {session_configured:?}");
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEventEnvelope>();
+    let attached_threads = Arc::new(Mutex::new(HashSet::from([primary_thread_id])));
+    spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone());
+
     {
-        let conversation = conversation.clone();
+        let thread = thread.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::debug!("Keyboard interrupt");
+                // Immediately notify Codex to abort any in-flight task.
+                thread.submit(Op::Interrupt).await.ok();
+            }
+        });
+    }
+
+    {
+        let thread_manager = Arc::clone(&thread_manager);
+        let attached_threads = Arc::clone(&attached_threads);
+        let tx = tx.clone();
+        let mut thread_created_rx = thread_manager.subscribe_thread_created();
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::debug!("Keyboard interrupt");
-                        // Immediately notify Codex to abort any in‑flight task.
-                        conversation.submit(Op::Interrupt).await.ok();
-
-                        // Exit the inner loop and return to the main input prompt. The codex
-                        // will emit a `TurnInterrupted` (Error) event which is drained later.
-                        break;
-                    }
-                    res = conversation.next_event() => match res {
-                        Ok(event) => {
-                            debug!("Received event: {event:?}");
-
-                            let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
-                            if let Err(e) = tx.send(event) {
-                                error!("Error sending event: {e:?}");
-                                break;
+                match thread_created_rx.recv().await {
+                    Ok(thread_id) => {
+                        if attached_threads.lock().await.contains(&thread_id) {
+                            continue;
+                        }
+                        match thread_manager.get_thread(thread_id).await {
+                            Ok(thread) => {
+                                attached_threads.lock().await.insert(thread_id);
+                                spawn_thread_listener(thread_id, thread, tx.clone());
                             }
-                            if is_shutdown_complete {
-                                info!("Received shutdown event, exiting event loop.");
-                                break;
+                            Err(err) => {
+                                warn!("failed to attach listener for thread {thread_id}: {err}")
                             }
-                        },
-                        Err(e) => {
-                            error!("Error receiving event: {e:?}");
-                            break;
                         }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        warn!("thread_created receiver lagged; skipping resync");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -596,7 +607,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             items,
             output_schema,
         } => {
-            let task_id = conversation
+            let task_id = thread
                 .submit(Op::UserTurn {
                     items,
                     cwd: default_cwd.clone(),
@@ -614,7 +625,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             task_id
         }
         InitialOperation::Review { review_request } => {
-            let task_id = conversation.submit(Op::Review { review_request }).await?;
+            let task_id = thread.submit(Op::Review { review_request }).await?;
             info!("Sent review request with event ID: {task_id}");
             task_id
         }
@@ -624,18 +635,37 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // Track whether a fatal error was reported by the server so we can
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
-    while let Some(event) = rx.recv().await {
-        let mut queued_sequence_step = None;
-        if let Some(runner) = prompt_sequence_runner.as_mut()
-            && matches!(&event.msg, EventMsg::TurnComplete(_))
-            && runner.has_remaining()
-        {
-            queued_sequence_step = runner.next_entry();
-        }
+    let mut shutdown_requested = false;
+    while let Some(envelope) = rx.recv().await {
+        let ThreadEventEnvelope {
+            thread_id,
+            thread,
+            event,
+        } = envelope;
+        let is_primary_turn_complete =
+            thread_id == primary_thread_id && matches!(event.msg, EventMsg::TurnComplete(_));
+        let queued_sequence_step = if is_primary_turn_complete {
+            prompt_sequence_runner.as_mut().and_then(|runner| {
+                runner
+                    .has_remaining()
+                    .then(|| runner.next_entry())
+                    .flatten()
+            })
+        } else {
+            None
+        };
 
+        if matches!(event.msg, EventMsg::Error(_)) {
+            error_seen = true;
+        }
+        if shutdown_requested
+            && !matches!(&event.msg, EventMsg::ShutdownComplete | EventMsg::Error(_))
+        {
+            continue;
+        }
         if let EventMsg::ElicitationRequest(ev) = &event.msg {
             // Automatically cancel elicitation requests in exec mode.
-            conversation
+            thread
                 .submit(Op::ResolveElicitation {
                     server_name: ev.server_name.clone(),
                     request_id: ev.id.clone(),
@@ -643,39 +673,35 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                 })
                 .await?;
         }
-        if let (Some(writer), EventMsg::PendingToolState(ev)) = (live_status.as_ref(), &event.msg) {
-            match ev.status {
-                codex_core::protocol::PendingToolStatus::Waiting => {
-                    writer.set_status(
-                        LiveSessionStatus::WaitingPendingTool,
-                        Some(LiveStatusDetail {
-                            call_id: Some(ev.call_id.clone()),
-                            tool_name: Some(ev.tool_name.clone()),
-                            turn_id: Some(ev.turn_id.clone()),
-                            note: ev.note.clone(),
-                            ..Default::default()
-                        }),
-                    );
-                }
-                codex_core::protocol::PendingToolStatus::Resolved
-                | codex_core::protocol::PendingToolStatus::Cancelled => {
-                    writer.set_status(LiveSessionStatus::Running, None);
-                }
+        if let EventMsg::McpStartupUpdate(update) = &event.msg
+            && required_mcp_servers.contains(&update.server)
+            && let codex_core::protocol::McpStartupStatus::Failed { error } = &update.status
+        {
+            error_seen = true;
+            eprintln!(
+                "Required MCP server '{}' failed to initialize: {error}",
+                update.server
+            );
+            if !shutdown_requested {
+                thread.submit(Op::Shutdown).await?;
+                shutdown_requested = true;
             }
         }
-        if matches!(&event.msg, EventMsg::Error(_)) {
-            error_seen = true;
+        if thread_id != primary_thread_id && matches!(&event.msg, EventMsg::TurnComplete(_)) {
+            continue;
         }
-        let mut shutdown: CodexStatus = event_processor.process_event(event);
+        let mut shutdown = event_processor.process_event(event);
 
-        if let Some(entry) = queued_sequence_step {
+        if let Some(entry) = queued_sequence_step
+            && !shutdown_requested
+        {
             info!(
                 "Prompt sequence: launching step {}/{} ({})",
                 entry.index + 1,
                 entry.total,
                 entry.description
             );
-            conversation
+            thread
                 .submit(Op::UserTurn {
                     items: entry.items,
                     cwd: default_cwd.clone(),
@@ -692,14 +718,20 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             shutdown = CodexStatus::Running;
         }
 
+        if thread_id != primary_thread_id && matches!(shutdown, CodexStatus::InitiateShutdown) {
+            continue;
+        }
+
         match shutdown {
             CodexStatus::Running => continue,
             CodexStatus::InitiateShutdown => {
-                conversation.submit(Op::Shutdown).await?;
+                if !shutdown_requested {
+                    thread.submit(Op::Shutdown).await?;
+                    shutdown_requested = true;
+                }
             }
-            CodexStatus::Shutdown => {
-                break;
-            }
+            CodexStatus::Shutdown if thread_id == primary_thread_id => break,
+            CodexStatus::Shutdown => continue,
         }
     }
     event_processor.print_final_output();
@@ -720,49 +752,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             )
             .await;
     }
-    drop(pending_tool_server);
 
     if error_seen {
         anyhow::bail!("fatal error reported by server");
     }
 
-    Ok(())
-}
-
-async fn run_deliver_pending(args: DeliverPendingArgs) -> anyhow::Result<()> {
-    let codex_home = find_codex_home().context("failed to locate codex home")?;
-    let thread_id = codex_protocol::ThreadId::from_string(&args.session_id)?;
-    let metadata_path = LiveStatusRecordV1::path_for(&codex_home, &thread_id);
-    let bytes = fs::read(&metadata_path)
-        .await
-        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
-    let value: Value = serde_json::from_slice(&bytes)?;
-    let meta = load_metadata(value.clone())?;
-    if let Ok(record) = serde_json::from_value::<LiveStatusRecordV1>(value) {
-        if !record.alive {
-            anyhow::bail!("session {} is not alive", record.thread_id);
-        }
-        if let Some(age_s) = heartbeat_age_seconds(&record.last_heartbeat_at)
-            && age_s > 30.0
-        {
-            anyhow::bail!(
-                "session {} live record is stale (last heartbeat {:.1}s ago)",
-                record.thread_id,
-                age_s
-            );
-        }
-    }
-    let addr = addr_from_metadata(meta)?;
-    let payload = FunctionCallOutputPayload {
-        content: args.output,
-        success: Some(args.success),
-        ..Default::default()
-    };
-    send_pending_result(addr, args.call_id, payload).await?;
-    eprintln!(
-        "Delivered pending tool result for session {}.",
-        args.session_id
-    );
     Ok(())
 }
 
@@ -885,6 +879,42 @@ async fn wait_for_thread_to_finish_if_running(
     }
 }
 
+fn spawn_thread_listener(
+    thread_id: codex_protocol::ThreadId,
+    thread: Arc<codex_core::CodexThread>,
+    tx: tokio::sync::mpsc::UnboundedSender<ThreadEventEnvelope>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match thread.next_event().await {
+                Ok(event) => {
+                    debug!("Received event: {event:?}");
+
+                    let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
+                    if let Err(err) = tx.send(ThreadEventEnvelope {
+                        thread_id,
+                        thread: Arc::clone(&thread),
+                        event,
+                    }) {
+                        error!("Error sending event: {err:?}");
+                        break;
+                    }
+                    if is_shutdown_complete {
+                        info!(
+                            "Received shutdown event for thread {thread_id}, exiting event loop."
+                        );
+                        break;
+                    }
+                }
+                Err(err) => {
+                    error!("Error receiving event: {err:?}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 async fn resolve_resume_path(
     config: &Config,
     args: &crate::cli::ResumeArgs,
@@ -897,7 +927,7 @@ async fn resolve_resume_path(
             Some(config.cwd.as_path())
         };
         match codex_core::RolloutRecorder::find_latest_thread_path(
-            &config.codex_home,
+            config,
             1,
             None,
             codex_core::ThreadSortKey::UpdatedAt,

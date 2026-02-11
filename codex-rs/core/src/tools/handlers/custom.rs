@@ -5,14 +5,22 @@ use serde_json::Value;
 
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
+use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
+use crate::protocol::ExecCommandSource;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::shell::ShellHandler;
+use crate::tools::events::ToolEmitter;
+use crate::tools::events::ToolEventCtx;
+use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::runtimes::shell::ShellRequest;
+use crate::tools::runtimes::shell::ShellRuntime;
+use crate::tools::sandboxing::ToolCtx;
 use crate::tools::spec::ConfigCustomTool;
 
 pub struct CustomToolHandler {
@@ -71,14 +79,17 @@ impl ToolHandler for CustomToolHandler {
             ))
         })?;
 
-        let mut env = create_env(&turn.shell_environment_policy);
+        let mut env = create_env(
+            &turn.shell_environment_policy,
+            Some(session.conversation_id),
+        );
         env.extend(tool.env.clone());
         env.insert("CODEX_TOOL_ARGS_JSON".to_string(), serialized_args.clone());
         env.insert("CODEX_TOOL_NAME".to_string(), tool.name.clone());
         env.insert("CODEX_TOOL_CALL_ID".to_string(), call_id.clone());
         env.insert(
             "CODEX_CONVERSATION_ID".to_string(),
-            session.conversation_id().to_string(),
+            session.conversation_id.to_string(),
         );
         env.insert("CODEX_TURN_ID".to_string(), turn.sub_id.clone());
         env.insert(
@@ -91,42 +102,109 @@ impl ToolHandler for CustomToolHandler {
             _ => SandboxPermissions::UseDefault,
         };
 
-        let exec_params = ExecParams {
+        let mut exec_params = ExecParams {
             command: tool.command.clone(),
             cwd: turn.resolve_path(tool.cwd.clone()),
             expiration: tool.timeout_ms.into(),
             env,
+            network: turn.network.clone(),
             sandbox_permissions,
+            windows_sandbox_level: turn.windows_sandbox_level,
             justification: None,
             arg0: None,
         };
 
-        let output = ShellHandler::run_exec_like(
-            tool_name.as_str(),
-            exec_params,
-            session,
-            turn,
-            tracker,
-            call_id,
-            false,
-        )
-        .await?;
-
-        if tool.hibernate_after_call
-            && let ToolOutput::Function {
-                content,
-                content_items,
-                success,
-            } = output
-        {
-            return Ok(ToolOutput::Pending {
-                content,
-                content_items,
-                success,
-                shutdown: true,
-            });
+        let dependency_env = session.dependency_env().await;
+        if !dependency_env.is_empty() {
+            exec_params.env.extend(dependency_env);
         }
 
-        Ok(output)
+        // Approval policy guard for explicit escalation in non-OnRequest modes.
+        if exec_params
+            .sandbox_permissions
+            .requires_escalated_permissions()
+            && !matches!(
+                turn.approval_policy,
+                codex_protocol::protocol::AskForApproval::OnRequest
+            )
+        {
+            let approval_policy = turn.approval_policy;
+            return Err(FunctionCallError::RespondToModel(format!(
+                "approval policy is {approval_policy:?}; reject command - you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
+            )));
+        }
+
+        // Intercept apply_patch if present.
+        if let Some(output) = intercept_apply_patch(
+            &exec_params.command,
+            &exec_params.cwd,
+            exec_params.expiration.timeout_ms(),
+            session.as_ref(),
+            turn.as_ref(),
+            Some(&tracker),
+            &call_id,
+            tool_name.as_str(),
+        )
+        .await?
+        {
+            return Ok(output);
+        }
+
+        let source = ExecCommandSource::Agent;
+        let emitter = ToolEmitter::shell(
+            exec_params.command.clone(),
+            exec_params.cwd.clone(),
+            source,
+            false,
+        );
+        let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
+        emitter.begin(event_ctx).await;
+
+        let exec_approval_requirement = session
+            .services
+            .exec_policy
+            .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                command: &exec_params.command,
+                approval_policy: turn.approval_policy,
+                sandbox_policy: &turn.sandbox_policy,
+                sandbox_permissions: exec_params.sandbox_permissions,
+                prefix_rule: None,
+            })
+            .await;
+
+        let req = ShellRequest {
+            command: exec_params.command.clone(),
+            cwd: exec_params.cwd.clone(),
+            timeout_ms: exec_params.expiration.timeout_ms(),
+            env: exec_params.env.clone(),
+            network: exec_params.network.clone(),
+            sandbox_permissions: exec_params.sandbox_permissions,
+            justification: exec_params.justification.clone(),
+            exec_approval_requirement,
+        };
+        let mut orchestrator = ToolOrchestrator::new();
+        let mut runtime = ShellRuntime::new();
+        let tool_ctx = ToolCtx {
+            session: session.as_ref(),
+            turn: turn.as_ref(),
+            call_id: call_id.clone(),
+            tool_name: tool_name.clone(),
+        };
+        let out = orchestrator
+            .run(
+                &mut runtime,
+                &req,
+                &tool_ctx,
+                turn.as_ref(),
+                turn.approval_policy,
+            )
+            .await;
+        let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
+        let content = emitter.finish(event_ctx, out).await?;
+
+        Ok(ToolOutput::Function {
+            body: codex_protocol::models::FunctionCallOutputBody::Text(content),
+            success: Some(true),
+        })
     }
 }

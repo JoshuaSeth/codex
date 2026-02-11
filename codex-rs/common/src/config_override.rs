@@ -95,7 +95,7 @@ impl CliConfigOverrides {
                     }
                 };
 
-                Ok((key.to_string(), value))
+                Ok((canonicalize_override_key(key), value))
             })
             .collect()
     }
@@ -240,6 +240,14 @@ fn inherit_if_absent<T: Clone>(target: &mut Option<T>, candidate: Option<T>) {
     }
 }
 
+fn canonicalize_override_key(key: &str) -> String {
+    if key == "use_linux_sandbox_bwrap" {
+        "features.use_linux_sandbox_bwrap".to_string()
+    } else {
+        key.to_string()
+    }
+}
+
 /// Apply a single override onto `root`, creating intermediate objects as
 /// necessary.
 fn apply_single_override(root: &mut Value, path: &str, value: Value) {
@@ -322,6 +330,16 @@ mod tests {
         let v = parse_toml_value("[1, 2, 3]").expect("parse");
         let arr = v.as_array().expect("array");
         assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn canonicalizes_use_linux_sandbox_bwrap_alias() {
+        let overrides = CliConfigOverrides {
+            raw_overrides: vec!["use_linux_sandbox_bwrap=true".to_string()],
+        };
+        let parsed = overrides.parse_overrides().expect("parse_overrides");
+        assert_eq!(parsed[0].0.as_str(), "features.use_linux_sandbox_bwrap");
+        assert_eq!(parsed[0].1.as_bool(), Some(true));
     }
 
     #[test]
