@@ -1022,7 +1022,10 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
 
     // Consume all events for this turn so we can assert on each stage.
     loop {
-        let msg = wait_for_event(&codex, |_| true).await;
+        // This test runs real `sleep` commands and can go quiet for >10s under load when the full
+        // suite is running (tool execution + scheduler contention). Use a longer timeout to avoid
+        // flaky failures.
+        let msg = wait_for_event_with_timeout(&codex, |_| true, Duration::from_secs(30)).await;
         match msg {
             EventMsg::ExecCommandBegin(ev) if ev.call_id == open_call_id => {
                 begin_event = Some(ev);
