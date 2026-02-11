@@ -88,8 +88,8 @@ pub struct LiveStatusRecordV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipc: Option<LiveIpc>,
 
-    // Backward compat: exec used to write `{host,port}` only. Keeping these fields means older
-    // `codex exec deliver-pending` binaries can still deserialize successfully.
+    // Backward compat: exec used to write `{host,port}` only. Keeping these fields preserves
+    // deserialization for legacy tooling that reads the live-status record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

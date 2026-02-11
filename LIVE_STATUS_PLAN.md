@@ -1,5 +1,7 @@
 # Codex live session status (Route 4)
 
+NOTE: This plan references the removed pending-tool lifecycle (`hibernate_after_call`, `deliver-pending`, `PendingToolState`). It is retained for historical context only and needs a refresh if we reintroduce live-status semantics.
+
 ## Verbatim goal + architecture (from request)
 
 ### 4) Codex-level live status + unify exec and TUI (requires Codex change): “one truth for all frontends”
@@ -254,4 +256,3 @@ All tests below are required before stopping.
 - Dispatcher: Python import/syntax smoke must pass; server must boot in the E2E configuration.
 - Playwright: test run must complete with exit code 0; failures must be visible via console output and HTML report.
 - Stopping is allowed only when all definition-of-done items are met and all tests above have been run successfully.
-

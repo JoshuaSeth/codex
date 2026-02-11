@@ -1,5 +1,7 @@
 # Pending Tool Wait Improvements
 
+NOTE: The pending-tool lifecycle (`hibernate_after_call`, `deliver-pending`, `PendingToolState`) has been removed from this fork. This document is retained for historical context only. Prefer resume-based flows (`codex exec resume --replace-last-toolresult ... --no-prompt`) or explicit polling tools.
+
 ## Background
 
 Custom tools can request `hibernate_after_call = true`, which currently makes Codex exit immediately after logging a placeholder tool result. The operator (or a webhook) later edits the rollout via `codex-dev exec resume --replace-last-toolresult …` and sends a follow-up turn. This halts the CLI, forces humans to reopen the conversation, and prevents any live visual feedback while the automation waits for an email/webhook.
@@ -50,4 +52,3 @@ Given the requirements (single-machine CLI UX, deterministic local logs), **Appr
    - Unit-test the new `PendingToolManager` (register/resolve/cancel).
    - Integration test: run a fake tool with `hibernate_after_call`, simulate webhook by calling the new op after a short delay, assert that the CLI stays connected and the model receives the final output.
    - Smoke-test existing resume helper to ensure fallback path works when no live session is found.
-

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[smoke] deprecated: pending-tool flow was removed; this script is kept for reference only." >&2
+echo "[smoke] use resume-based flows (e.g. --replace-last-toolresult + --no-prompt) instead." >&2
+exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CODEX_BIN="$ROOT/codex-rs/target/debug/codex"
 
