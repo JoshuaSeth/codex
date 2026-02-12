@@ -11,6 +11,7 @@ use crate::parse_command::shlex_join;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
+const MAX_BACKOFF_DELAY_MS: u64 = 30_000;
 
 /// Emit structured feedback metadata as key/value pairs.
 ///
@@ -38,10 +39,12 @@ macro_rules! feedback_tags {
 }
 
 pub fn backoff(attempt: u64) -> Duration {
-    let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
-    let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
+    let exponent = attempt.saturating_sub(1).min(32) as i32;
+    let exp = BACKOFF_FACTOR.powi(exponent);
+    let base = ((INITIAL_DELAY_MS as f64 * exp) as u64).min(MAX_BACKOFF_DELAY_MS);
     let jitter = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((base as f64 * jitter) as u64)
+    let delay_ms = ((base as f64 * jitter) as u64).min(MAX_BACKOFF_DELAY_MS);
+    Duration::from_millis(delay_ms)
 }
 
 pub(crate) fn error_or_panic(message: impl std::string::ToString) {
@@ -182,5 +185,10 @@ mod tests {
 
         let command = resume_command(Some("quote'case"), None);
         assert_eq!(command, Some("codex resume \"quote'case\"".to_string()));
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        assert!(backoff(1_000).as_millis() <= MAX_BACKOFF_DELAY_MS as u128);
     }
 }
