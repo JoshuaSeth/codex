@@ -567,6 +567,14 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    /// When true, the composer currently contains a queued user message that was restored for
+    /// editing via Alt+Up.
+    queued_user_message_edit_active: bool,
+    /// Messages that were queued *after* the message currently being edited in the composer.
+    ///
+    /// When the user presses Alt+Up repeatedly, we move the in-composer message into this deque
+    /// so newer drafts are not dropped while editing older queued messages.
+    queued_user_messages_newer: VecDeque<UserMessage>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -1362,7 +1370,7 @@ impl ChatWidget {
         self.unified_exec_wait_streak = None;
         self.request_redraw();
 
-        if !from_replay && self.queued_user_messages.is_empty() {
+        if !from_replay && self.queued_user_messages_is_empty() {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -1384,7 +1392,7 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
-        if !self.queued_user_messages.is_empty() {
+        if !self.queued_user_messages_is_empty() {
             return;
         }
         if self.active_mode_kind() != ModeKind::Plan {
@@ -1770,7 +1778,7 @@ impl ChatWidget {
     /// fixes text element byte ranges as content is appended. Returns `None` when there is nothing
     /// to restore.
     fn drain_queued_messages_for_restore(&mut self) -> Option<UserMessage> {
-        if self.queued_user_messages.is_empty() {
+        if self.queued_user_messages_is_empty() {
             return None;
         }
 
@@ -1782,9 +1790,18 @@ impl ChatWidget {
         };
 
         let mut to_merge: Vec<UserMessage> = self.queued_user_messages.drain(..).collect();
-        if !existing_message.text.is_empty() || !existing_message.local_images.is_empty() {
-            to_merge.push(existing_message);
+        if self.queued_user_message_edit_active {
+            if !existing_message.text.is_empty() || !existing_message.local_images.is_empty() {
+                to_merge.push(existing_message);
+            }
+            to_merge.extend(self.queued_user_messages_newer.drain(..));
+        } else {
+            to_merge.extend(self.queued_user_messages_newer.drain(..));
+            if !existing_message.text.is_empty() || !existing_message.local_images.is_empty() {
+                to_merge.push(existing_message);
+            }
         }
+        self.queued_user_message_edit_active = false;
 
         let mut combined = UserMessage {
             text: String::new(),
@@ -2688,6 +2705,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2857,6 +2876,8 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -3007,6 +3028,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -3141,11 +3164,26 @@ impl ChatWidget {
                 ..
             } if !self.queued_user_messages.is_empty() => {
                 // Prefer the most recently queued item.
+                if self.queued_user_message_edit_active {
+                    let existing_message = UserMessage {
+                        text: self.bottom_pane.composer_text(),
+                        text_elements: self.bottom_pane.composer_text_elements(),
+                        local_images: self.bottom_pane.composer_local_images(),
+                        mention_bindings: self.bottom_pane.composer_mention_bindings(),
+                    };
+                    if !existing_message.text.is_empty()
+                        || !existing_message.local_images.is_empty()
+                    {
+                        self.queued_user_messages_newer.push_front(existing_message);
+                    }
+                }
+
                 if let Some(user_message) = self.queued_user_messages.pop_back() {
                     self.restore_user_message_to_composer(user_message);
-                    self.refresh_queued_user_messages();
-                    self.request_redraw();
+                    self.queued_user_message_edit_active = true;
                 }
+                self.refresh_queued_user_messages();
+                self.request_redraw();
             }
             _ => match self.bottom_pane.handle_key_event(key_event) {
                 InputResult::Submitted {
@@ -3176,6 +3214,7 @@ impl ChatWidget {
                     } else {
                         self.queue_user_message(user_message);
                     }
+                    self.finish_queued_user_message_edit();
                 }
                 InputResult::Queued {
                     text,
@@ -3192,6 +3231,7 @@ impl ChatWidget {
                             .take_recent_submission_mention_bindings(),
                     };
                     self.queue_user_message(user_message);
+                    self.finish_queued_user_message_edit();
                 }
                 InputResult::Command(cmd) => {
                     self.dispatch_command(cmd);
@@ -4250,11 +4290,26 @@ impl ChatWidget {
         self.refresh_queued_user_messages();
     }
 
+    fn queued_user_messages_is_empty(&self) -> bool {
+        self.queued_user_messages.is_empty() && self.queued_user_messages_newer.is_empty()
+    }
+
+    fn finish_queued_user_message_edit(&mut self) {
+        if !self.queued_user_message_edit_active && self.queued_user_messages_newer.is_empty() {
+            return;
+        }
+        self.queued_user_message_edit_active = false;
+        self.queued_user_messages
+            .extend(self.queued_user_messages_newer.drain(..));
+        self.refresh_queued_user_messages();
+    }
+
     /// Rebuild and update the queued user messages from the current queue.
     fn refresh_queued_user_messages(&mut self) {
         let messages: Vec<String> = self
             .queued_user_messages
             .iter()
+            .chain(self.queued_user_messages_newer.iter())
             .map(|m| m.text.clone())
             .collect();
         self.bottom_pane.set_queued_user_messages(messages);

@@ -1102,6 +1102,8 @@ async fn make_chatwidget_manual(
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
+        queued_user_message_edit_active: false,
+        queued_user_messages_newer: VecDeque::new(),
         suppress_session_configured_redraw: false,
         pending_notification: None,
         quit_shortcut_expires_at: None,
@@ -2266,6 +2268,56 @@ async fn alt_up_edits_most_recent_queued_message() {
         chat.queued_user_messages.front().unwrap().text,
         "first queued"
     );
+}
+
+#[tokio::test]
+async fn alt_up_edits_older_queued_message_without_dropping_newer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    // Simulate a running task so messages would normally be queued.
+    chat.bottom_pane.set_task_running(true);
+
+    // Seed three queued messages.
+    chat.queued_user_messages
+        .push_back(UserMessage::from("first queued".to_string()));
+    chat.queued_user_messages
+        .push_back(UserMessage::from("second queued".to_string()));
+    chat.queued_user_messages
+        .push_back(UserMessage::from("third queued".to_string()));
+    chat.refresh_queued_user_messages();
+
+    // Edit the most recent queued message.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "third queued");
+    assert_eq!(chat.queued_user_messages.len(), 2);
+    assert!(chat.queued_user_messages_newer.is_empty());
+
+    // Edit an older queued message. The newer message should be preserved in the queue.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "second queued");
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.queued_user_messages_newer.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages_newer.front().unwrap().text,
+        "third queued"
+    );
+
+    // Queue the edited message again and ensure the newer draft is still queued after it.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(chat.queued_user_messages.len(), 3);
+    assert_eq!(
+        chat.queued_user_messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "first queued".to_string(),
+            "second queued".to_string(),
+            "third queued".to_string(),
+        ]
+    );
+    assert!(chat.queued_user_messages_newer.is_empty());
+    assert!(!chat.queued_user_message_edit_active);
 }
 
 /// Pressing Up to recall the most recent history entry and immediately queuing
