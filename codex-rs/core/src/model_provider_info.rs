@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
+const DEFAULT_STREAM_MAX_RETRIES: u64 = 30;
 const DEFAULT_STREAM_DISCONNECT_MAX_RETRIES: u64 = 30;
 const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
 /// Hard cap for user-configured `stream_max_retries`.
