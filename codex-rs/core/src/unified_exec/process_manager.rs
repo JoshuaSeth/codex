@@ -28,8 +28,6 @@ use crate::truncate::approx_token_count;
 use crate::truncate::formatted_truncate_text;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
-use crate::unified_exec::MAX_YIELD_TIME_MS;
-use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
@@ -41,6 +39,7 @@ use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
+use crate::unified_exec::clamp_empty_yield_time;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
@@ -294,13 +293,10 @@ impl UnifiedExecProcessManager {
         }
 
         let max_tokens = resolve_max_tokens(request.max_output_tokens);
-        let yield_time_ms = {
-            let time_ms = clamp_yield_time(request.yield_time_ms);
-            if request.input.is_empty() {
-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
-            } else {
-                time_ms
-            }
+        let yield_time_ms = if request.input.is_empty() {
+            clamp_empty_yield_time(request.yield_time_ms)
+        } else {
+            clamp_yield_time(request.yield_time_ms)
         };
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
