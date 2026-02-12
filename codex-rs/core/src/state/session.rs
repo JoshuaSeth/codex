@@ -14,8 +14,7 @@ use crate::truncate::TruncationPolicy;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SilentRerouteState {
-    pub(crate) requested_model: String,
-    pub(crate) served_model: String,
+    pub(crate) last_warned_turn_id: String,
 }
 
 /// Persistent, session-scoped state previously stored directly on `Session`.

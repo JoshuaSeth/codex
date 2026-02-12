@@ -1720,16 +1720,21 @@ impl Session {
             return;
         }
 
+        let turn_id = turn_context.sub_id.as_str();
         let mut should_emit = false;
         {
             let mut state = self.state.lock().await;
-            if state.silent_reroute.is_none() {
-                state.silent_reroute = Some(SilentRerouteState {
-                    requested_model: requested_model.to_string(),
-                    served_model: served_model.to_string(),
-                });
+            if state
+                .silent_reroute
+                .as_ref()
+                .is_none_or(|info| info.last_warned_turn_id != turn_id)
+            {
                 should_emit = true;
             }
+
+            state.silent_reroute = Some(SilentRerouteState {
+                last_warned_turn_id: turn_context.sub_id.clone(),
+            });
 
             // Once detected, always force subsequent turns onto the stable fallback model/effort.
             state.session_configuration.collaboration_mode =
@@ -1749,24 +1754,6 @@ impl Session {
             )
             .await;
         }
-    }
-
-    async fn emit_silent_reroute_error_if_needed(&self, turn_context: &TurnContext) {
-        let silent_reroute = {
-            let state = self.state.lock().await;
-            state.silent_reroute.clone()
-        };
-        let Some(info) = silent_reroute else {
-            return;
-        };
-
-        self.send_event(
-            turn_context,
-            EventMsg::Warning(WarningEvent {
-                message: silent_reroute_error_message(&info.requested_model, &info.served_model),
-            }),
-        )
-        .await;
     }
 
     fn build_environment_update_item(
@@ -4002,8 +3989,6 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    sess.emit_silent_reroute_error_if_needed(&turn_context)
-        .await;
     if total_usage_tokens >= auto_compact_limit
         && run_auto_compact(&sess, &turn_context).await.is_err()
     {

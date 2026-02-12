@@ -36,7 +36,7 @@ async fn silent_reroute_forces_fallback_model_and_effort() -> Result<()> {
     .await;
 
     let mut builder = test_codex()
-        .with_model("gpt-5.2-codex")
+        .with_model("gpt-5.3-codex")
         .with_config(|config| {
             // Ensure `reasoning.effort` is sent so we can assert against it.
             config.model_supports_reasoning_summaries = Some(true);
@@ -69,7 +69,9 @@ async fn silent_reroute_forces_fallback_model_and_effort() -> Result<()> {
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // Simulate a client that keeps trying to use the original model: core should still force
-    // the fallback model once reroute has been detected.
+    // the fallback model once reroute has been detected. Since the fallback model is stable,
+    // the reroute warning should not be re-emitted on subsequent turns unless a mismatch
+    // happens again.
     test.codex
         .submit(Op::UserTurn {
             items: vec![UserInput::Text {
@@ -88,18 +90,13 @@ async fn silent_reroute_forces_fallback_model_and_effort() -> Result<()> {
         })
         .await?;
 
-    wait_for_event(
-        &test.codex,
-        |ev| matches!(ev, EventMsg::Warning(warn) if warn.message.contains("silently rerouted")),
-    )
-    .await;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2);
 
     let first = requests[0].body_json();
-    assert_eq!(first["model"], "gpt-5.2-codex");
+    assert_eq!(first["model"], "gpt-5.3-codex");
 
     let second = requests[1].body_json();
     assert_eq!(second["model"], "gpt-5.2");
