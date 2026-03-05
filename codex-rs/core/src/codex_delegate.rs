@@ -53,11 +53,16 @@ pub(crate) async fn run_codex_thread_interactive(
         auth_manager,
         models_manager,
         Arc::clone(&parent_session.services.skills_manager),
+        Arc::clone(&parent_session.services.plugins_manager),
+        Arc::clone(&parent_session.services.mcp_manager),
         Arc::clone(&parent_session.services.file_watcher),
         initial_history.unwrap_or(InitialHistory::New),
         SessionSource::SubAgent(SubAgentSource::Review),
         parent_session.services.agent_control.clone(),
         Vec::new(),
+        false,
+        None,
+        None,
     )
     .await?;
     let codex = Arc::new(codex);
@@ -149,6 +154,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                     .send(Submission {
                         id: "shutdown".to_string(),
                         op: Op::Shutdown {},
+                        trace: None,
                     })
                     .await;
                 child_cancel.cancel();
@@ -293,11 +299,11 @@ async fn forward_ops(
     cancel_token_ops: CancellationToken,
 ) {
     loop {
-        let op: Op = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
-            Ok(Ok(Submission { id: _, op })) => op,
+        let submission = match rx_ops.recv().or_cancel(&cancel_token_ops).await {
+            Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        let _ = codex.submit(op).await;
+        let _ = codex.submit_with_id(submission).await;
     }
 }
 
@@ -310,30 +316,43 @@ async fn handle_exec_approval(
     event: ExecApprovalRequestEvent,
     cancel_token: &CancellationToken,
 ) {
+    let approval_id_for_op = event.effective_approval_id();
     let ExecApprovalRequestEvent {
         call_id,
+        approval_id,
         command,
         cwd,
         reason,
+        network_approval_context,
         proposed_execpolicy_amendment,
+        additional_permissions,
+        available_decisions,
         ..
     } = event;
-    let approval_id = call_id.clone();
     // Race approval with cancellation and timeout to avoid hangs.
     let approval_fut = parent_session.request_command_approval(
         parent_ctx,
         call_id,
+        approval_id,
         command,
         cwd,
         reason,
+        network_approval_context,
         proposed_execpolicy_amendment,
+        additional_permissions,
+        available_decisions,
     );
-    let decision =
-        await_approval_with_cancel(approval_fut, parent_session, &approval_id, cancel_token).await;
+    let decision = await_approval_with_cancel(
+        approval_fut,
+        parent_session,
+        &approval_id_for_op,
+        cancel_token,
+    )
+    .await;
 
     let _ = codex
         .submit(Op::ExecApproval {
-            id: approval_id,
+            id: approval_id_for_op,
             turn_id: Some(turn_id),
             decision,
         })
@@ -531,5 +550,48 @@ mod tests {
             ops.iter().any(|op| matches!(op, Op::Shutdown)),
             "expected Shutdown op after cancellation"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_ops_preserves_submission_trace_context() {
+        let (tx_sub, rx_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_tx_events, rx_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (session, _ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
+        let codex = Arc::new(Codex {
+            tx_sub,
+            rx_event: rx_events,
+            agent_status,
+            session,
+        });
+        let (tx_ops, rx_ops) = bounded(1);
+        let cancel = CancellationToken::new();
+        let forward = tokio::spawn(forward_ops(Arc::clone(&codex), rx_ops, cancel));
+
+        let submission = Submission {
+            id: "sub-1".to_string(),
+            op: Op::Interrupt,
+            trace: Some(codex_protocol::protocol::W3cTraceContext {
+                traceparent: Some(
+                    "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01".to_string(),
+                ),
+                tracestate: Some("vendor=state".to_string()),
+            }),
+        };
+        tx_ops.send(submission.clone()).await.unwrap();
+        drop(tx_ops);
+
+        let forwarded = timeout(Duration::from_secs(1), rx_sub.recv())
+            .await
+            .expect("forward_ops hung")
+            .expect("forwarded submission missing");
+        assert_eq!(submission.id, forwarded.id);
+        assert_eq!(submission.op, forwarded.op);
+        assert_eq!(submission.trace, forwarded.trace);
+
+        timeout(Duration::from_secs(1), forward)
+            .await
+            .expect("forward_ops did not exit")
+            .expect("forward_ops join error");
     }
 }

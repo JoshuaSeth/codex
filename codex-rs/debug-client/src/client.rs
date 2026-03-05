@@ -180,6 +180,8 @@ impl AppServerClient {
                 model_providers: None,
                 source_kinds: None,
                 archived: None,
+                cwd: None,
+                search_term: None,
             },
         };
         self.send(&request)?;

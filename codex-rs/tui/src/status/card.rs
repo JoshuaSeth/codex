@@ -5,16 +5,17 @@ use crate::history_cell::with_border_with_inner_width;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
-use codex_common::summarize_sandbox_policy;
 use codex_core::WireApi;
 use codex_core::config::Config;
-use codex_core::protocol::NetworkAccess;
-use codex_core::protocol::SandboxPolicy;
-use codex_core::protocol::TokenUsage;
-use codex_core::protocol::TokenUsageInfo;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::NetworkAccess;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
+use codex_utils_sandbox_summary::summarize_sandbox_policy;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
@@ -40,7 +41,7 @@ use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use crate::wrapping::RtOptions;
-use crate::wrapping::word_wrap_lines;
+use crate::wrapping::adaptive_wrap_lines;
 use codex_core::AuthManager;
 
 #[derive(Debug, Clone)]
@@ -63,8 +64,7 @@ struct StatusHistoryCell {
     model_name: String,
     model_details: Vec<String>,
     directory: PathBuf,
-    approval: String,
-    sandbox: String,
+    permissions: String,
     agents_summary: String,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
@@ -168,10 +168,13 @@ impl StatusHistoryCell {
             ("workdir", config.cwd.display().to_string()),
             ("model", model_name.to_string()),
             ("provider", config.model_provider_id.clone()),
-            ("approval", config.approval_policy.value().to_string()),
+            (
+                "approval",
+                config.permissions.approval_policy.value().to_string(),
+            ),
             (
                 "sandbox",
-                summarize_sandbox_policy(config.sandbox_policy.get()),
+                summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
             ),
         ];
         if config.model_provider.wire_api == WireApi::Responses {
@@ -182,7 +185,10 @@ impl StatusHistoryCell {
             config_entries.push(("reasoning effort", effort_value));
             config_entries.push((
                 "reasoning summaries",
-                config.model_reasoning_summary.to_string(),
+                config
+                    .model_reasoning_summary
+                    .map(|summary| summary.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
             ));
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
@@ -191,9 +197,13 @@ impl StatusHistoryCell {
             .find(|(k, _)| *k == "approval")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let sandbox = match config.sandbox_policy.get() {
+        let sandbox = match config.permissions.sandbox_policy.get() {
             SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly => "read-only".to_string(),
+            SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
+            SandboxPolicy::WorkspaceWrite {
+                network_access: true,
+                ..
+            } => "workspace-write with network access".to_string(),
             SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
             SandboxPolicy::ExternalSandbox { network_access } => {
                 if matches!(network_access, NetworkAccess::Enabled) {
@@ -202,6 +212,18 @@ impl StatusHistoryCell {
                     "external-sandbox".to_string()
                 }
             }
+        };
+        let permissions = if config.permissions.approval_policy.value() == AskForApproval::OnRequest
+            && *config.permissions.sandbox_policy.get()
+                == SandboxPolicy::new_workspace_write_policy()
+        {
+            "Default".to_string()
+        } else if config.permissions.approval_policy.value() == AskForApproval::Never
+            && *config.permissions.sandbox_policy.get() == SandboxPolicy::DangerFullAccess
+        {
+            "Full Access".to_string()
+        } else {
+            format!("Custom ({sandbox}, {approval})")
         };
         let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
@@ -235,8 +257,7 @@ impl StatusHistoryCell {
             model_name,
             model_details,
             directory: config.cwd.clone(),
-            approval,
-            sandbox,
+            permissions,
             agents_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
             model_provider,
@@ -416,11 +437,10 @@ impl HistoryCell for StatusHistoryCell {
             }
         });
 
-        let mut labels: Vec<String> =
-            vec!["Model", "Directory", "Approval", "Sandbox", "Agents.md"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let mut seen: BTreeSet<String> = labels.iter().cloned().collect();
         let thread_name = self.thread_name.as_deref().filter(|name| !name.is_empty());
 
@@ -462,7 +482,7 @@ impl HistoryCell for StatusHistoryCell {
         let note_second_line = Line::from(vec![
             Span::from("information on rate limits and credits").cyan(),
         ]);
-        let note_lines = word_wrap_lines(
+        let note_lines = adaptive_wrap_lines(
             [note_first_line, note_second_line],
             RtOptions::new(available_inner_width),
         );
@@ -483,8 +503,7 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(formatter.line("Model provider", vec![Span::from(model_provider.clone())]));
         }
         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
-        lines.push(formatter.line("Approval", vec![Span::from(self.approval.clone())]));
-        lines.push(formatter.line("Sandbox", vec![Span::from(self.sandbox.clone())]));
+        lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
         lines.push(formatter.line("Agents.md", vec![Span::from(self.agents_summary.clone())]));
 
         if let Some(account_value) = account_value {

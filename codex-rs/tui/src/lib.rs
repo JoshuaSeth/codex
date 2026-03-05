@@ -8,8 +8,6 @@ use app::App;
 pub use app::AppExitInfo;
 pub use app::ExitReason;
 use codex_cloud_requirements::cloud_requirements_loader;
-use codex_common::oss::ensure_oss_provider_ready;
-use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
@@ -17,6 +15,7 @@ use codex_core::RolloutRecorder;
 use codex_core::ThreadSortKey;
 use codex_core::auth::AuthMode;
 use codex_core::auth::enforce_login_restrictions;
+use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -29,19 +28,25 @@ use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
+use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
-use codex_core::protocol::AskForApproval;
 use codex_core::read_session_meta_line;
+use codex_core::state_db::get_state_db;
 use codex_core::terminal::Multiplexer;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_state::log_db;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_oss::ensure_oss_provider_ready;
+use codex_utils_oss::get_default_model_for_oss_provider;
 use cwd_prompt::CwdPromptAction;
+use cwd_prompt::CwdPromptOutcome;
 use cwd_prompt::CwdSelection;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -58,11 +63,13 @@ mod app_backtrack;
 mod app_event;
 mod app_event_sender;
 mod ascii_animation;
+#[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+mod audio_device;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
 mod clipboard_paste;
-mod collab;
+mod clipboard_text;
 mod collaboration_modes;
 mod color;
 pub mod custom_terminal;
@@ -78,12 +85,14 @@ mod get_git_diff;
 mod history_cell;
 pub mod insert_history;
 mod key_hint;
+mod line_truncation;
 pub mod live_wrap;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
 mod mention_codec;
 mod model_migration;
+mod multi_agents;
 mod notifications;
 pub mod onboarding;
 mod oss_selection;
@@ -102,6 +111,7 @@ mod streaming;
 mod style;
 mod terminal_palette;
 mod text_formatting;
+mod theme_picker;
 mod tooltips;
 mod tui;
 mod ui_consts;
@@ -109,7 +119,99 @@ pub mod update_action;
 mod update_prompt;
 mod updates;
 mod version;
+#[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+mod voice;
+#[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
+mod voice {
+    use crate::app_event::AppEvent;
+    use crate::app_event_sender::AppEventSender;
+    use codex_core::config::Config;
+    use codex_protocol::protocol::RealtimeAudioFrame;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU16;
 
+    pub struct RecordedAudio {
+        pub data: Vec<i16>,
+        pub sample_rate: u32,
+        pub channels: u16,
+    }
+
+    pub struct VoiceCapture;
+
+    pub(crate) struct RecordingMeterState;
+
+    pub(crate) struct RealtimeAudioPlayer;
+
+    impl VoiceCapture {
+        pub fn start() -> Result<Self, String> {
+            Err("voice input is unavailable in this build".to_string())
+        }
+
+        pub fn start_realtime(_config: &Config, _tx: AppEventSender) -> Result<Self, String> {
+            Err("voice input is unavailable in this build".to_string())
+        }
+
+        pub fn stop(self) -> Result<RecordedAudio, String> {
+            Err("voice input is unavailable in this build".to_string())
+        }
+
+        pub fn data_arc(&self) -> Arc<Mutex<Vec<i16>>> {
+            Arc::new(Mutex::new(Vec::new()))
+        }
+
+        pub fn stopped_flag(&self) -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(true))
+        }
+
+        pub fn sample_rate(&self) -> u32 {
+            0
+        }
+
+        pub fn channels(&self) -> u16 {
+            0
+        }
+
+        pub fn last_peak_arc(&self) -> Arc<AtomicU16> {
+            Arc::new(AtomicU16::new(0))
+        }
+    }
+
+    impl RecordingMeterState {
+        pub(crate) fn new() -> Self {
+            Self
+        }
+
+        pub(crate) fn next_text(&mut self, _peak: u16) -> String {
+            "⠤⠤⠤⠤".to_string()
+        }
+    }
+
+    impl RealtimeAudioPlayer {
+        pub(crate) fn start(_config: &Config) -> Result<Self, String> {
+            Err("voice output is unavailable in this build".to_string())
+        }
+
+        pub(crate) fn enqueue_frame(&self, _frame: &RealtimeAudioFrame) -> Result<(), String> {
+            Err("voice output is unavailable in this build".to_string())
+        }
+
+        pub(crate) fn clear(&self) {}
+    }
+
+    pub fn transcribe_async(
+        id: String,
+        _audio: RecordedAudio,
+        _context: Option<String>,
+        tx: AppEventSender,
+    ) {
+        tx.send(AppEvent::TranscriptionFailed {
+            id,
+            error: "voice input is unavailable in this build".to_string(),
+        });
+    }
+}
 mod wrapping;
 
 #[cfg(test)]
@@ -119,15 +221,13 @@ use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
 pub use cli::Cli;
+use codex_arg0::Arg0DispatchPaths;
 pub use markdown_render::render_markdown_text;
 pub use public_widgets::composer_input::ComposerAction;
 pub use public_widgets::composer_input::ComposerInput;
 // (tests access modules directly within the crate)
 
-pub async fn run_main(
-    mut cli: Cli,
-    codex_linux_sandbox_exe: Option<PathBuf>,
-) -> std::io::Result<AppExitInfo> {
+pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::Result<AppExitInfo> {
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
@@ -156,11 +256,7 @@ pub async fn run_main(
     // gpt-oss:20b) and ensure it is present locally. Also, force the built‑in
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     // `oss` model provider.
-    let overrides_cli = codex_common::CliConfigOverrides {
-        raw_overrides,
-        config_home: cli.config_overrides.config_home.clone(),
-        config_file: cli.config_overrides.config_file.clone(),
-    };
+    let overrides_cli = codex_utils_cli::CliConfigOverrides { raw_overrides };
     let cli_kv_overrides = match overrides_cli.parse_overrides() {
         // Parse `-c` overrides from the CLI.
         Ok(v) => v,
@@ -229,7 +325,11 @@ pub async fn run_main(
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    let cloud_requirements = cloud_requirements_loader(cloud_auth_manager, chatgpt_base_url);
+    let cloud_requirements = cloud_requirements_loader(
+        cloud_auth_manager,
+        chatgpt_base_url,
+        codex_home.to_path_buf(),
+    );
 
     let model_provider_override = if cli.oss {
         let resolved = resolve_oss_provider(
@@ -276,7 +376,8 @@ pub async fn run_main(
         cwd,
         model_provider: model_provider_override.clone(),
         config_profile: cli.config_profile.clone(),
-        codex_linux_sandbox_exe,
+        codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
+        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
         ..Default::default()
@@ -288,9 +389,24 @@ pub async fn run_main(
         cloud_requirements.clone(),
     )
     .await;
+
+    #[allow(clippy::print_stderr)]
+    match check_execpolicy_for_warnings(&config.config_layer_stack).await {
+        Ok(None) => {}
+        Ok(Some(err)) | Err(err) => {
+            eprintln!(
+                "Error loading rules:\n{}",
+                format_exec_policy_error_with_source(&err)
+            );
+            std::process::exit(1);
+        }
+    }
+
     set_default_client_residency_requirement(config.enforce_residency.value());
 
-    if let Some(warning) = add_dir_warning_message(&cli.add_dir, config.sandbox_policy.get()) {
+    if let Some(warning) =
+        add_dir_warning_message(&cli.add_dir, config.permissions.sandbox_policy.get())
+    {
         #[allow(clippy::print_stderr)]
         {
             eprintln!("Error adding directories: {warning}");
@@ -450,7 +566,7 @@ async fn run_ratatui_app(
                 UpdatePromptOutcome::RunUpdate(action) => {
                     crate::tui::restore()?;
                     return Ok(AppExitInfo {
-                        token_usage: codex_core::protocol::TokenUsage::default(),
+                        token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
                         thread_name: None,
                         update_action: Some(action),
@@ -473,6 +589,7 @@ async fn run_ratatui_app(
     let should_show_trust_screen_flag = should_show_trust_screen(&initial_config);
     let should_show_onboarding =
         should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
+    let mut trust_decision_was_made = false;
 
     let config = if should_show_onboarding {
         let show_login_screen = should_show_login_screen(login_status, &initial_config);
@@ -492,13 +609,14 @@ async fn run_ratatui_app(
             session_log::log_session_end();
             let _ = tui.terminal.clear();
             return Ok(AppExitInfo {
-                token_usage: codex_core::protocol::TokenUsage::default(),
+                token_usage: codex_protocol::protocol::TokenUsage::default(),
                 thread_id: None,
                 thread_name: None,
                 update_action: None,
                 exit_reason: ExitReason::UserRequested,
             });
         }
+        trust_decision_was_made = onboarding_result.directory_trust_decision.is_some();
         // If this onboarding run included the login step, always refresh cloud requirements and
         // rebuild config. This avoids missing newly available cloud requirements due to login
         // status detection edge cases.
@@ -506,6 +624,7 @@ async fn run_ratatui_app(
             cloud_requirements = cloud_requirements_loader(
                 auth_manager.clone(),
                 initial_config.chatgpt_base_url.clone(),
+                initial_config.codex_home.clone(),
             );
         }
 
@@ -524,13 +643,14 @@ async fn run_ratatui_app(
     } else {
         initial_config
     };
+
     let mut missing_session_exit = |id_str: &str, action: &str| {
         error!("Error finding conversation path: {id_str}");
         restore();
         session_log::log_session_end();
         let _ = tui.terminal.clear();
         Ok(AppExitInfo {
-            token_usage: codex_core::protocol::TokenUsage::default(),
+            token_usage: codex_protocol::protocol::TokenUsage::default(),
             thread_id: None,
             thread_name: None,
             update_action: None,
@@ -550,7 +670,19 @@ async fn run_ratatui_app(
                 find_thread_path_by_name_str(&config.codex_home, id_str).await?
             };
             match path {
-                Some(path) => resume_picker::SessionSelection::Fork(path),
+                Some(path) => {
+                    let thread_id =
+                        match resolve_session_thread_id(path.as_path(), is_uuid.then_some(id_str))
+                            .await
+                        {
+                            Some(thread_id) => thread_id,
+                            None => return missing_session_exit(id_str, "fork"),
+                        };
+                    resume_picker::SessionSelection::Fork(resume_picker::SessionTarget {
+                        path,
+                        thread_id,
+                    })
+                }
                 None => return missing_session_exit(id_str, "fork"),
             }
         } else if cli.fork_last {
@@ -563,14 +695,41 @@ async fn run_ratatui_app(
                 INTERACTIVE_SESSION_SOURCES,
                 Some(provider_filter.as_slice()),
                 &config.model_provider_id,
+                None,
             )
             .await
             {
-                Ok(page) => page
-                    .items
-                    .first()
-                    .map(|it| resume_picker::SessionSelection::Fork(it.path.clone()))
-                    .unwrap_or(resume_picker::SessionSelection::StartFresh),
+                Ok(page) => match page.items.first() {
+                    Some(item) => {
+                        match resolve_session_thread_id(item.path.as_path(), None).await {
+                            Some(thread_id) => resume_picker::SessionSelection::Fork(
+                                resume_picker::SessionTarget {
+                                    path: item.path.clone(),
+                                    thread_id,
+                                },
+                            ),
+                            None => {
+                                let rollout_path = item.path.display();
+                                error!(
+                                    "Error reading session metadata from latest rollout: {rollout_path}"
+                                );
+                                restore();
+                                session_log::log_session_end();
+                                let _ = tui.terminal.clear();
+                                return Ok(AppExitInfo {
+                                    token_usage: codex_protocol::protocol::TokenUsage::default(),
+                                    thread_id: None,
+                                    thread_name: None,
+                                    update_action: None,
+                                    exit_reason: ExitReason::Fatal(format!(
+                                        "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex fork` to choose from existing sessions."
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                    None => resume_picker::SessionSelection::StartFresh,
+                },
                 Err(_) => resume_picker::SessionSelection::StartFresh,
             }
         } else if cli.fork_picker {
@@ -579,7 +738,7 @@ async fn run_ratatui_app(
                     restore();
                     session_log::log_session_end();
                     return Ok(AppExitInfo {
-                        token_usage: codex_core::protocol::TokenUsage::default(),
+                        token_usage: codex_protocol::protocol::TokenUsage::default(),
                         thread_id: None,
                         thread_name: None,
                         update_action: None,
@@ -599,7 +758,21 @@ async fn run_ratatui_app(
             find_thread_path_by_name_str(&config.codex_home, id_str).await?
         };
         match path {
-            Some(path) => resume_picker::SessionSelection::Resume(path),
+            Some(path) => {
+                let thread_id = match resolve_session_thread_id(
+                    path.as_path(),
+                    is_uuid.then_some(id_str),
+                )
+                .await
+                {
+                    Some(thread_id) => thread_id,
+                    None => return missing_session_exit(id_str, "resume"),
+                };
+                resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
+                    path,
+                    thread_id,
+                })
+            }
             None => return missing_session_exit(id_str, "resume"),
         }
     } else if cli.resume_last {
@@ -621,7 +794,30 @@ async fn run_ratatui_app(
         )
         .await
         {
-            Ok(Some(path)) => resume_picker::SessionSelection::Resume(path),
+            Ok(Some(path)) => match resolve_session_thread_id(path.as_path(), None).await {
+                Some(thread_id) => {
+                    resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
+                        path,
+                        thread_id,
+                    })
+                }
+                None => {
+                    let rollout_path = path.display();
+                    error!("Error reading session metadata from latest rollout: {rollout_path}");
+                    restore();
+                    session_log::log_session_end();
+                    let _ = tui.terminal.clear();
+                    return Ok(AppExitInfo {
+                        token_usage: codex_protocol::protocol::TokenUsage::default(),
+                        thread_id: None,
+                        thread_name: None,
+                        update_action: None,
+                        exit_reason: ExitReason::Fatal(format!(
+                            "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex resume` to choose from existing sessions."
+                        )),
+                    });
+                }
+            },
             _ => resume_picker::SessionSelection::StartFresh,
         }
     } else if cli.resume_picker {
@@ -630,7 +826,7 @@ async fn run_ratatui_app(
                 restore();
                 session_log::log_session_end();
                 return Ok(AppExitInfo {
-                    token_usage: codex_core::protocol::TokenUsage::default(),
+                    token_usage: codex_protocol::protocol::TokenUsage::default(),
                     thread_id: None,
                     thread_name: None,
                     update_action: None,
@@ -645,20 +841,46 @@ async fn run_ratatui_app(
 
     let current_cwd = config.cwd.clone();
     let allow_prompt = cli.cwd.is_none();
-    let action_and_path_if_resume_or_fork = match &session_selection {
-        resume_picker::SessionSelection::Resume(path) => Some((CwdPromptAction::Resume, path)),
-        resume_picker::SessionSelection::Fork(path) => Some((CwdPromptAction::Fork, path)),
+    let action_and_target_session_if_resume_or_fork = match &session_selection {
+        resume_picker::SessionSelection::Resume(target_session) => {
+            Some((CwdPromptAction::Resume, target_session))
+        }
+        resume_picker::SessionSelection::Fork(target_session) => {
+            Some((CwdPromptAction::Fork, target_session))
+        }
         _ => None,
     };
-    let fallback_cwd = match action_and_path_if_resume_or_fork {
-        Some((action, path)) => {
-            resolve_cwd_for_resume_or_fork(&mut tui, &current_cwd, path, action, allow_prompt)
-                .await?
+    let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+        Some((action, target_session)) => {
+            match resolve_cwd_for_resume_or_fork(
+                &mut tui,
+                &config,
+                &current_cwd,
+                target_session.thread_id,
+                &target_session.path,
+                action,
+                allow_prompt,
+            )
+            .await?
+            {
+                ResolveCwdOutcome::Continue(cwd) => cwd,
+                ResolveCwdOutcome::Exit => {
+                    restore();
+                    session_log::log_session_end();
+                    return Ok(AppExitInfo {
+                        token_usage: codex_protocol::protocol::TokenUsage::default(),
+                        thread_id: None,
+                        thread_name: None,
+                        update_action: None,
+                        exit_reason: ExitReason::UserRequested,
+                    });
+                }
+            }
         }
         None => None,
     };
 
-    let config = match &session_selection {
+    let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
             load_config_or_exit_with_fallback_cwd(
                 cli_kv_overrides.clone(),
@@ -670,9 +892,23 @@ async fn run_ratatui_app(
         }
         _ => config,
     };
+
+    // Configure syntax highlighting theme from the final config — onboarding
+    // and resume/fork can both reload config with a different tui_theme, so
+    // this must happen after the last possible reload.
+    if let Some(w) = crate::render::highlight::set_theme_override(
+        config.tui_theme.clone(),
+        find_codex_home().ok(),
+    ) {
+        config.startup_warnings.push(w);
+    }
+
     set_default_client_residency_requirement(config.enforce_residency.value());
     let active_profile = config.active_profile.clone();
     let should_show_trust_screen = should_show_trust_screen(&config);
+    let should_prompt_windows_sandbox_nux_at_startup = cfg!(target_os = "windows")
+        && trust_decision_was_made
+        && WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
 
     let Cli {
         prompt,
@@ -696,6 +932,7 @@ async fn run_ratatui_app(
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
+        should_prompt_windows_sandbox_nux_at_startup,
     )
     .await;
 
@@ -706,12 +943,35 @@ async fn run_ratatui_app(
     app_result
 }
 
-pub(crate) async fn read_session_cwd(path: &Path) -> Option<PathBuf> {
+pub(crate) async fn resolve_session_thread_id(
+    path: &Path,
+    id_str_if_uuid: Option<&str>,
+) -> Option<ThreadId> {
+    match id_str_if_uuid {
+        Some(id_str) => ThreadId::from_string(id_str).ok(),
+        None => read_session_meta_line(path)
+            .await
+            .ok()
+            .map(|meta_line| meta_line.meta.id),
+    }
+}
+
+pub(crate) async fn read_session_cwd(
+    config: &Config,
+    thread_id: ThreadId,
+    path: &Path,
+) -> Option<PathBuf> {
+    if let Some(state_db_ctx) = get_state_db(config, None).await
+        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
+    {
+        return Some(metadata.cwd);
+    }
+
     // Prefer the latest TurnContext cwd so resume/fork reflects the most recent
-    // session directory (for the changed-cwd prompt). The alternative would be
-    // mutating the SessionMeta line when the session cwd changes, but the rollout
-    // is an append-only JSONL log and rewriting the head would be error-prone.
-    // When rollouts move to SQLite, we can drop this scan.
+    // session directory (for the changed-cwd prompt) when DB data is unavailable.
+    // The alternative would be mutating the SessionMeta line when the session cwd
+    // changes, but the rollout is an append-only JSONL log and rewriting the head
+    // would be error-prone.
     if let Some(cwd) = parse_latest_turn_context_cwd(path).await {
         return Some(cwd);
     }
@@ -756,25 +1016,37 @@ pub(crate) fn cwds_differ(current_cwd: &Path, session_cwd: &Path) -> bool {
     }
 }
 
+pub(crate) enum ResolveCwdOutcome {
+    Continue(Option<PathBuf>),
+    Exit,
+}
+
 pub(crate) async fn resolve_cwd_for_resume_or_fork(
     tui: &mut Tui,
+    config: &Config,
     current_cwd: &Path,
+    thread_id: ThreadId,
     path: &Path,
     action: CwdPromptAction,
     allow_prompt: bool,
-) -> color_eyre::Result<Option<PathBuf>> {
-    let Some(history_cwd) = read_session_cwd(path).await else {
-        return Ok(None);
+) -> color_eyre::Result<ResolveCwdOutcome> {
+    let Some(history_cwd) = read_session_cwd(config, thread_id, path).await else {
+        return Ok(ResolveCwdOutcome::Continue(None));
     };
     if allow_prompt && cwds_differ(current_cwd, &history_cwd) {
-        let selection =
+        let selection_outcome =
             cwd_prompt::run_cwd_selection_prompt(tui, action, current_cwd, &history_cwd).await?;
-        return Ok(Some(match selection {
-            CwdSelection::Current => current_cwd.to_path_buf(),
-            CwdSelection::Session => history_cwd,
-        }));
+        return Ok(match selection_outcome {
+            CwdPromptOutcome::Selection(CwdSelection::Current) => {
+                ResolveCwdOutcome::Continue(Some(current_cwd.to_path_buf()))
+            }
+            CwdPromptOutcome::Selection(CwdSelection::Session) => {
+                ResolveCwdOutcome::Continue(Some(history_cwd))
+            }
+            CwdPromptOutcome::Exit => ResolveCwdOutcome::Exit,
+        });
     }
-    Ok(Some(history_cwd))
+    Ok(ResolveCwdOutcome::Continue(Some(history_cwd)))
 }
 
 #[expect(
@@ -880,12 +1152,6 @@ async fn load_config_or_exit_with_fallback_cwd(
 /// or if the current cwd project is already trusted. If not, we need to
 /// show the trust screen.
 fn should_show_trust_screen(config: &Config) -> bool {
-    if cfg!(target_os = "windows")
-        && WindowsSandboxLevel::from_config(config) == WindowsSandboxLevel::Disabled
-    {
-        // If the experimental sandbox is not enabled, Native Windows cannot enforce sandboxed write access; skip the trust prompt entirely.
-        return false;
-    }
     if config.did_user_set_custom_approval_policy_or_sandbox_mode {
         // Respect explicit approval/sandbox overrides made by the user.
         return false;
@@ -922,11 +1188,14 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
-    use codex_core::protocol::AskForApproval;
+    use codex_core::features::Feature;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
+    use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnContextItem;
     use serial_test::serial;
     use tempfile::TempDir;
@@ -940,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn windows_skips_trust_prompt_without_sandbox() -> std::io::Result<()> {
+    async fn windows_shows_trust_prompt_without_sandbox() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut config = build_config(&temp_dir).await?;
         config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
@@ -948,17 +1217,10 @@ mod tests {
         config.set_windows_sandbox_enabled(false);
 
         let should_show = should_show_trust_screen(&config);
-        if cfg!(target_os = "windows") {
-            assert!(
-                !should_show,
-                "Windows trust prompt should always be skipped on native Windows"
-            );
-        } else {
-            assert!(
-                should_show,
-                "Non-Windows should still show trust prompt when project is untrusted"
-            );
-        }
+        assert!(
+            should_show,
+            "Trust prompt should be shown when project trust is undecided"
+        );
         Ok(())
     }
     #[tokio::test]
@@ -1009,14 +1271,21 @@ mod tests {
             .unwrap_or_else(|| "gpt-5.1".to_string());
         TurnContextItem {
             turn_id: None,
+            trace_id: None,
             cwd,
-            approval_policy: config.approval_policy.value(),
-            sandbox_policy: config.sandbox_policy.get().clone(),
+            current_date: None,
+            timezone: None,
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            network: None,
             model,
             personality: None,
             collaboration_mode: None,
+            realtime_active: Some(false),
             effort: config.model_reasoning_effort,
-            summary: config.model_reasoning_summary,
+            summary: config
+                .model_reasoning_summary
+                .unwrap_or(codex_protocol::config_types::ReasoningSummary::Auto),
             user_instructions: None,
             developer_instructions: None,
             final_output_json_schema: None,
@@ -1051,7 +1320,9 @@ mod tests {
         }
         std::fs::write(&rollout_path, text)?;
 
-        let cwd = read_session_cwd(&rollout_path).await.expect("expected cwd");
+        let cwd = read_session_cwd(&config, ThreadId::new(), &rollout_path)
+            .await
+            .expect("expected cwd");
         assert_eq!(cwd, second);
         Ok(())
     }
@@ -1091,7 +1362,9 @@ mod tests {
         }
         std::fs::write(&rollout_path, text)?;
 
-        let session_cwd = read_session_cwd(&rollout_path).await.expect("expected cwd");
+        let session_cwd = read_session_cwd(&config, ThreadId::new(), &rollout_path)
+            .await
+            .expect("expected cwd");
         assert_eq!(session_cwd, latest);
         assert!(cwds_differ(&current, &session_cwd));
         Ok(())
@@ -1129,7 +1402,7 @@ trust_level = "untrusted"
             .build()
             .await?;
         assert_eq!(
-            trusted_config.approval_policy.value(),
+            trusted_config.permissions.approval_policy.value(),
             AskForApproval::OnRequest
         );
 
@@ -1143,8 +1416,52 @@ trust_level = "untrusted"
             .build()
             .await?;
         assert_eq!(
-            untrusted_config.approval_policy.value(),
+            untrusted_config.permissions.approval_policy.value(),
             AskForApproval::UnlessTrusted
+        );
+        Ok(())
+    }
+
+    /// Regression: theme must be configured from the *final* config.
+    ///
+    /// `run_ratatui_app` can reload config during onboarding and again
+    /// during session resume/fork.  The syntax theme override (stored in
+    /// a `OnceLock`) must use the final config's `tui_theme`, not the
+    /// initial one — otherwise users resuming a thread in a project with
+    /// a different theme get the wrong highlighting.
+    ///
+    /// We verify the invariant indirectly: `validate_theme_name` (the
+    /// pure validation core of `set_theme_override`) must be called with
+    /// the *final* config's theme, and its warning must land in the
+    /// final config's `startup_warnings`.
+    #[tokio::test]
+    async fn theme_warning_uses_final_config() -> std::io::Result<()> {
+        use crate::render::highlight::validate_theme_name;
+
+        let temp_dir = TempDir::new()?;
+
+        // initial_config has a valid theme — no warning.
+        let initial_config = build_config(&temp_dir).await?;
+        assert!(initial_config.tui_theme.is_none());
+
+        // Simulate resume/fork reload: the final config has an invalid theme.
+        let mut config = build_config(&temp_dir).await?;
+        config.tui_theme = Some("bogus-theme".into());
+
+        // Theme override must use the final config (not initial_config).
+        // This mirrors the real call site in run_ratatui_app.
+        if let Some(w) = validate_theme_name(config.tui_theme.as_deref(), Some(temp_dir.path())) {
+            config.startup_warnings.push(w);
+        }
+
+        assert_eq!(
+            config.startup_warnings.len(),
+            1,
+            "warning from final config's invalid theme should be present"
+        );
+        assert!(
+            config.startup_warnings[0].contains("bogus-theme"),
+            "warning should reference the final config's theme name"
         );
         Ok(())
     }
@@ -1152,7 +1469,7 @@ trust_level = "untrusted"
     #[tokio::test]
     async fn read_session_cwd_falls_back_to_session_meta() -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
-        let _config = build_config(&temp_dir).await?;
+        let config = build_config(&temp_dir).await?;
         let session_cwd = temp_dir.path().join("session");
         std::fs::create_dir_all(&session_cwd)?;
 
@@ -1174,8 +1491,70 @@ trust_level = "untrusted"
         );
         std::fs::write(&rollout_path, text)?;
 
-        let cwd = read_session_cwd(&rollout_path).await.expect("expected cwd");
+        let cwd = read_session_cwd(&config, ThreadId::new(), &rollout_path)
+            .await
+            .expect("expected cwd");
         assert_eq!(cwd, session_cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_session_cwd_prefers_sqlite_when_thread_id_present() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = build_config(&temp_dir).await?;
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow sqlite");
+
+        let thread_id = ThreadId::new();
+        let rollout_cwd = temp_dir.path().join("rollout-cwd");
+        let sqlite_cwd = temp_dir.path().join("sqlite-cwd");
+        std::fs::create_dir_all(&rollout_cwd)?;
+        std::fs::create_dir_all(&sqlite_cwd)?;
+
+        let rollout_path = temp_dir.path().join("rollout.jsonl");
+        let rollout_line = RolloutLine {
+            timestamp: "t0".to_string(),
+            item: RolloutItem::TurnContext(build_turn_context(&config, rollout_cwd)),
+        };
+        std::fs::write(
+            &rollout_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&rollout_line).expect("serialize rollout")
+            ),
+        )?;
+
+        let runtime = codex_state::StateRuntime::init(
+            config.codex_home.clone(),
+            config.model_provider_id.clone(),
+            None,
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        runtime
+            .mark_backfill_complete(None)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            chrono::Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.cwd = sqlite_cwd.clone();
+        let metadata = builder.build(config.model_provider_id.as_str());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let cwd = read_session_cwd(&config, thread_id, &rollout_path)
+            .await
+            .expect("expected cwd");
+        assert_eq!(cwd, sqlite_cwd);
         Ok(())
     }
 }

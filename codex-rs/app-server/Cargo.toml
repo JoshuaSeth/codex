@@ -20,8 +20,10 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-cloud-requirements = { workspace = true }
-codex-common = { workspace = true, features = ["cli"] }
 codex-core = { workspace = true }
+codex-otel = { workspace = true }
+codex-shell-command = { workspace = true }
+codex-utils-cli = { workspace = true }
 codex-backend-client = { workspace = true }
 codex-file-search = { workspace = true }
 codex-chatgpt = { workspace = true }
@@ -30,8 +32,13 @@ codex-protocol = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-feedback = { workspace = true }
 codex-rmcp-client = { workspace = true }
+codex-state = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 codex-utils-json-to-toml = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+owo-colors = { workspace = true, features = ["supports-colors"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -44,8 +51,10 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "signal",
 ] }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
 uuid = { workspace = true, features = ["serde", "v7"] }
 
 [dev-dependencies]
@@ -56,15 +65,15 @@ axum = { workspace = true, default-features = false, features = [
     "tokio",
 ] }
 base64 = { workspace = true }
-codex-execpolicy = { workspace = true }
-codex-utils-absolute-path = { workspace = true }
 core_test_support = { workspace = true }
-os_info = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
+    "elicitation",
     "server",
     "transport-streamable-http-server",
 ] }
 serial_test = { workspace = true }
+tokio-tungstenite = { workspace = true }
 wiremock = { workspace = true }
 shlex = { workspace = true }

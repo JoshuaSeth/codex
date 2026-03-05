@@ -7,8 +7,8 @@ use codex_core::config_loader::ConfigLayerStack;
 use codex_core::config_loader::ConfigRequirements;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::features::Feature;
-use codex_core::protocol::DeprecationNoticeEvent;
-use codex_core::protocol::EventMsg;
+use codex_protocol::protocol::DeprecationNoticeEvent;
+use codex_protocol::protocol::EventMsg;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_absolute_path;
@@ -26,10 +26,14 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
     let server = start_mock_server().await;
 
     let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::UnifiedExec);
+        let mut features = config.features.get().clone();
+        features.enable(Feature::UnifiedExec);
+        features
+            .record_legacy_usage_force("use_experimental_unified_exec_tool", Feature::UnifiedExec);
         config
             .features
-            .record_legacy_usage_force("use_experimental_unified_exec_tool", Feature::UnifiedExec);
+            .set(features)
+            .expect("test config should allow managed feature metadata updates");
         config.use_experimental_unified_exec_tool = true;
     });
 
@@ -50,7 +54,7 @@ async fn emits_deprecation_notice_for_legacy_feature_flag() -> anyhow::Result<()
     assert_eq!(
         details.as_deref(),
         Some(
-            "Enable it with `--enable unified_exec` or `[features].unified_exec` in config.toml. See https://github.com/openai/codex/blob/main/docs/config.md#feature-flags for details."
+            "Enable it with `--enable unified_exec` or `[features].unified_exec` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details."
         ),
     );
 
@@ -113,75 +117,48 @@ async fn emits_deprecation_notice_for_experimental_instructions_file() -> anyhow
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn emits_deprecation_notice_for_web_search_feature_flags() -> anyhow::Result<()> {
+async fn emits_deprecation_notice_for_web_search_feature_flag_values() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let server = start_mock_server().await;
+    for enabled in [true, false] {
+        let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_config(|config| {
-        let mut entries = BTreeMap::new();
-        entries.insert("web_search_request".to_string(), true);
-        config.features.apply_map(&entries);
-    });
+        let mut builder = test_codex().with_config(move |config| {
+            let mut entries = BTreeMap::new();
+            entries.insert("web_search_request".to_string(), enabled);
+            let mut features = config.features.get().clone();
+            features.apply_map(&entries);
+            config
+                .features
+                .set(features)
+                .expect("test config should allow managed feature map updates");
+        });
 
-    let TestCodex { codex, .. } = builder.build(&server).await?;
+        let TestCodex { codex, .. } = builder.build(&server).await?;
 
-    let notice = wait_for_event_match(&codex, |event| match event {
-        EventMsg::DeprecationNotice(ev) if ev.summary.contains("[features].web_search_request") => {
-            Some(ev.clone())
-        }
-        _ => None,
-    })
-    .await;
+        let notice = wait_for_event_match(&codex, |event| match event {
+            EventMsg::DeprecationNotice(ev)
+                if ev.summary.contains("[features].web_search_request") =>
+            {
+                Some(ev.clone())
+            }
+            _ => None,
+        })
+        .await;
 
-    let DeprecationNoticeEvent { summary, details } = notice;
-    assert_eq!(
-        summary,
-        "`[features].web_search_request` is deprecated. Use `web_search` instead.".to_string(),
-    );
-    assert_eq!(
-        details.as_deref(),
-        Some(
-            "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml."
-        ),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn emits_deprecation_notice_for_disabled_web_search_feature_flag() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-
-    let mut builder = test_codex().with_config(|config| {
-        let mut entries = BTreeMap::new();
-        entries.insert("web_search_request".to_string(), false);
-        config.features.apply_map(&entries);
-    });
-
-    let TestCodex { codex, .. } = builder.build(&server).await?;
-
-    let notice = wait_for_event_match(&codex, |event| match event {
-        EventMsg::DeprecationNotice(ev) if ev.summary.contains("[features].web_search_request") => {
-            Some(ev.clone())
-        }
-        _ => None,
-    })
-    .await;
-
-    let DeprecationNoticeEvent { summary, details } = notice;
-    assert_eq!(
-        summary,
-        "`[features].web_search_request` is deprecated. Use `web_search` instead.".to_string(),
-    );
-    assert_eq!(
-        details.as_deref(),
-        Some(
-            "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml."
-        ),
-    );
+        let DeprecationNoticeEvent { summary, details } = notice;
+        assert_eq!(
+            summary,
+            "`[features].web_search_request` is deprecated because web search is enabled by default."
+                .to_string(),
+        );
+        assert_eq!(
+            details.as_deref(),
+            Some(
+                "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
+            ),
+        );
+    }
 
     Ok(())
 }
