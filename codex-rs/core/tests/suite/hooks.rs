@@ -14,6 +14,8 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
+use std::time::Duration;
+use std::time::Instant;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_and_stop_hooks_run_and_tool_hook_can_override_timeout() -> Result<()> {
@@ -145,6 +147,39 @@ else:
     assert!(
         stop_event["response_items"].as_array().is_some(),
         "expected response_items in stop hook payload: {stop_event}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_hook_blocks_turn_completion() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_config(|config| {
+        config.stop_hook_command = Some(vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 0.5".to_string(),
+        ]);
+    })
+    .await?;
+
+    mount_sse_sequence(
+        harness.server(),
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    let started_at = Instant::now();
+    harness.submit("say done").await?;
+    assert!(
+        started_at.elapsed() >= Duration::from_millis(450),
+        "expected stop hook to delay turn completion"
     );
 
     Ok(())

@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
+use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
@@ -16,16 +17,17 @@ use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
 use codex_cli::login::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
-use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
 use codex_execpolicy::ExecPolicyCheckCommand;
+use codex_protocol::protocol::FinalOutput;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
 use codex_tui::update_action::UpdateAction;
+use codex_utils_cli::CliConfigOverrides;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -413,10 +415,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
         return Vec::new();
     }
 
-    let mut lines = vec![format!(
-        "{}",
-        codex_core::protocol::FinalOutput::from(token_usage)
-    )];
+    let mut lines = vec![format!("{}", FinalOutput::from(token_usage))];
 
     if let Some(resume_cmd) =
         codex_core::util::resume_command(thread_name.as_deref(), conversation_id)
@@ -491,11 +490,13 @@ fn run_execpolicycheck(cmd: ExecPolicyCheckCommand) -> anyhow::Result<()> {
     cmd.run()
 }
 
-fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Result<()> {
+async fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Result<()> {
     match cmd.subcommand {
         DebugAppServerSubcommand::SendMessageV2(cmd) => {
             let codex_bin = std::env::current_exe()?;
             codex_app_server_test_client::send_message_v2(&codex_bin, &[], cmd.user_message, &None)
+                .await?;
+            Ok(())
         }
     }
 }
@@ -568,13 +569,13 @@ fn stage_str(stage: codex_core::features::Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
-    arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
-        cli_main(codex_linux_sandbox_exe).await?;
+    arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
+        cli_main(arg0_paths).await?;
         Ok(())
     })
 }
 
-async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,
@@ -588,13 +589,19 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
 
     match subcommand {
         None => {
-            prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
-            let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
+            prepend_config_flags(
+                &mut interactive.config_overrides,
+                root_config_overrides.clone(),
+            );
+            let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
         }
         Some(Subcommand::Exec(mut exec_cli)) => {
-            prepend_config_flags(&mut exec_cli.config_overrides, &root_config_overrides);
-            codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
+            prepend_config_flags(
+                &mut exec_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::ExecAsync(exec_async_cli)) => {
             crate::exec_async_cmd::run_exec_async(exec_async_cli, &root_config_overrides)?;
@@ -614,21 +621,24 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
-            prepend_config_flags(&mut exec_cli.config_overrides, &root_config_overrides);
-            codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
+            prepend_config_flags(
+                &mut exec_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::McpServer) => {
-            codex_mcp_server::run_main(codex_linux_sandbox_exe, root_config_overrides).await?;
+            codex_mcp_server::run_main(arg0_paths.clone(), root_config_overrides).await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             // Propagate any root-level config overrides (e.g. `-c key=value`).
-            prepend_config_flags(&mut mcp_cli.config_overrides, &root_config_overrides);
+            prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
             None => {
                 codex_app_server::run_main(
-                    codex_linux_sandbox_exe,
+                    arg0_paths.clone(),
                     root_config_overrides,
                     codex_core::config_loader::LoaderOverrides::default(),
                     app_server_cli.analytics_default_enabled,
@@ -683,7 +693,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                     config_overrides,
                 )
             };
-            let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
+            let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
         }
         Some(Subcommand::Fork(ForkCommand {
@@ -700,11 +710,14 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 all,
                 config_overrides,
             );
-            let exit_info = run_interactive_tui(interactive, codex_linux_sandbox_exe).await?;
+            let exit_info = run_interactive_tui(interactive, arg0_paths.clone()).await?;
             handle_app_exit(exit_info)?;
         }
         Some(Subcommand::Login(mut login_cli)) => {
-            prepend_config_flags(&mut login_cli.config_overrides, &root_config_overrides);
+            prepend_config_flags(
+                &mut login_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
             match login_cli.action {
                 Some(LoginSubcommand::Status) => {
                     run_login_status(login_cli.config_overrides).await;
@@ -732,52 +745,71 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Some(Subcommand::Logout(mut logout_cli)) => {
-            prepend_config_flags(&mut logout_cli.config_overrides, &root_config_overrides);
+            prepend_config_flags(
+                &mut logout_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
             run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             print_completion(completion_cli);
         }
         Some(Subcommand::Cloud(mut cloud_cli)) => {
-            prepend_config_flags(&mut cloud_cli.config_overrides, &root_config_overrides);
-            codex_cloud_tasks::run_main(cloud_cli, codex_linux_sandbox_exe).await?;
+            prepend_config_flags(
+                &mut cloud_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            codex_cloud_tasks::run_main(cloud_cli, arg0_paths.codex_linux_sandbox_exe.clone())
+                .await?;
         }
         Some(Subcommand::Sandbox(sandbox_args)) => match sandbox_args.cmd {
             SandboxCommand::Macos(mut seatbelt_cli) => {
-                prepend_config_flags(&mut seatbelt_cli.config_overrides, &root_config_overrides);
+                prepend_config_flags(
+                    &mut seatbelt_cli.config_overrides,
+                    root_config_overrides.clone(),
+                );
                 codex_cli::debug_sandbox::run_command_under_seatbelt(
                     seatbelt_cli,
-                    codex_linux_sandbox_exe,
+                    arg0_paths.codex_linux_sandbox_exe.clone(),
                 )
                 .await?;
             }
             SandboxCommand::Linux(mut landlock_cli) => {
-                prepend_config_flags(&mut landlock_cli.config_overrides, &root_config_overrides);
+                prepend_config_flags(
+                    &mut landlock_cli.config_overrides,
+                    root_config_overrides.clone(),
+                );
                 codex_cli::debug_sandbox::run_command_under_landlock(
                     landlock_cli,
-                    codex_linux_sandbox_exe,
+                    arg0_paths.codex_linux_sandbox_exe.clone(),
                 )
                 .await?;
             }
             SandboxCommand::Windows(mut windows_cli) => {
-                prepend_config_flags(&mut windows_cli.config_overrides, &root_config_overrides);
+                prepend_config_flags(
+                    &mut windows_cli.config_overrides,
+                    root_config_overrides.clone(),
+                );
                 codex_cli::debug_sandbox::run_command_under_windows(
                     windows_cli,
-                    codex_linux_sandbox_exe,
+                    arg0_paths.codex_linux_sandbox_exe.clone(),
                 )
                 .await?;
             }
         },
         Some(Subcommand::Debug(DebugCommand { subcommand })) => match subcommand {
             DebugSubcommand::AppServer(cmd) => {
-                run_debug_app_server_command(cmd)?;
+                run_debug_app_server_command(cmd).await?;
             }
         },
         Some(Subcommand::Execpolicy(ExecpolicyCommand { sub })) => match sub {
             ExecpolicySubcommand::Check(cmd) => run_execpolicycheck(cmd)?,
         },
         Some(Subcommand::Apply(mut apply_cli)) => {
-            prepend_config_flags(&mut apply_cli.config_overrides, &root_config_overrides);
+            prepend_config_flags(
+                &mut apply_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
             run_apply_command(apply_cli, None).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
@@ -898,14 +930,16 @@ fn maybe_print_under_development_feature_warning(
 /// CLI-specific ones specified after the subcommand (if any).
 fn prepend_config_flags(
     subcommand_config_overrides: &mut CliConfigOverrides,
-    cli_config_overrides: &CliConfigOverrides,
+    cli_config_overrides: CliConfigOverrides,
 ) {
-    subcommand_config_overrides.prepend_from(cli_config_overrides);
+    subcommand_config_overrides
+        .raw_overrides
+        .splice(0..0, cli_config_overrides.raw_overrides);
 }
 
 async fn run_interactive_tui(
     mut interactive: TuiCli,
-    codex_linux_sandbox_exe: Option<PathBuf>,
+    arg0_paths: Arg0DispatchPaths,
 ) -> std::io::Result<AppExitInfo> {
     resolve_git_branch_override(&mut interactive).await?;
     if let Some(prompt) = interactive.prompt.take() {
@@ -931,7 +965,7 @@ async fn run_interactive_tui(
         }
     }
 
-    codex_tui::run_main(interactive, codex_linux_sandbox_exe).await
+    codex_tui::run_main(interactive, arg0_paths).await
 }
 
 async fn resolve_git_branch_override(cli: &mut TuiCli) -> std::io::Result<()> {
@@ -990,7 +1024,7 @@ fn finalize_resume_interactive(
     merge_interactive_cli_flags(&mut interactive, resume_cli);
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
-    prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
+    prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
 
     interactive
 }
@@ -1016,7 +1050,7 @@ fn finalize_fork_interactive(
     merge_interactive_cli_flags(&mut interactive, fork_cli);
 
     // Propagate any root-level config overrides (e.g. `-c key=value`).
-    prepend_config_flags(&mut interactive.config_overrides, &root_config_overrides);
+    prepend_config_flags(&mut interactive.config_overrides, root_config_overrides);
 
     interactive
 }

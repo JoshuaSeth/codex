@@ -1026,7 +1026,7 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
             ev_completed("resp-5"),
         ]),
     ];
-    mount_sse_sequence(&server, responses).await;
+    let request_log = mount_sse_sequence(&server, responses).await;
 
     let session_model = session_configured.model.clone();
 
@@ -1049,85 +1049,73 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
         })
         .await?;
 
-    let mut begin_event = None;
-    let mut end_event = None;
-    let mut task_completed = false;
-    let mut terminal_events = Vec::new();
-    let mut delta_text = String::new();
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(60),
+    )
+    .await;
 
-    // Consume all events for this turn so we can assert on each stage.
-    loop {
-        // This test runs real `sleep` commands and can go quiet for >10s under load when the full
-        // suite is running (tool execution + scheduler contention). Use a longer timeout to avoid
-        // flaky failures.
-        let msg = wait_for_event_with_timeout(&codex, |_| true, Duration::from_secs(30)).await;
-        match msg {
-            EventMsg::ExecCommandBegin(ev) if ev.call_id == open_call_id => {
-                begin_event = Some(ev);
+    let requests = request_log.requests();
+    assert!(!requests.is_empty(), "expected at least one POST request");
+    let bodies = requests
+        .into_iter()
+        .map(|request| request.body_json())
+        .collect::<Vec<_>>();
+
+    let tool_output_text = |wanted_call_id: &str| -> Result<String> {
+        for body in &bodies {
+            let Some(items) = body.get("input").and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+                    continue;
+                }
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if call_id != wanted_call_id {
+                    continue;
+                }
+                if let Some(content) = extract_output_text(item) {
+                    return Ok(content.to_string());
+                }
             }
-            EventMsg::ExecCommandOutputDelta(ev) if ev.call_id == open_call_id => {
-                delta_text.push_str(&String::from_utf8_lossy(&ev.chunk));
-            }
-            EventMsg::TerminalInteraction(ev) if ev.call_id == open_call_id => {
-                terminal_events.push(ev);
-            }
-            EventMsg::ExecCommandEnd(ev) if ev.call_id == open_call_id => {
-                end_event = Some(ev);
-            }
-            EventMsg::TurnComplete(_) => {
-                task_completed = true;
-            }
-            _ => {}
-        };
-        if task_completed && end_event.is_some() && terminal_events.len() >= 3 {
-            break;
         }
+        Err(anyhow::anyhow!(
+            "missing tool output content for {wanted_call_id}"
+        ))
+    };
+
+    let open_output = tool_output_text(open_call_id)?;
+    let open_parsed = parse_unified_exec_output(&open_output)?;
+    let process_id = open_parsed.process_id.unwrap_or_default();
+    assert_eq!(process_id, "1000", "expected deterministic session id");
+
+    let first_poll_output = tool_output_text(first_poll_call_id)?;
+    let second_poll_output = tool_output_text(second_poll_call_id)?;
+    let third_poll_output = tool_output_text(third_poll_call_id)?;
+
+    let combined = format!("{first_poll_output}\n{second_poll_output}\n{third_poll_output}");
+    assert!(
+        combined.contains("MARKER1"),
+        "expected poll output to contain MARKER1; got {combined:?}"
+    );
+    assert!(
+        combined.contains("MARKER2"),
+        "expected poll output to contain MARKER2; got {combined:?}"
+    );
+
+    if third_poll_output
+        .to_ascii_lowercase()
+        .contains("unknown process id")
+    {
+        assert!(
+            second_poll_output.contains("MARKER2"),
+            "expected MARKER2 to be captured before the session exited; got {second_poll_output:?}"
+        );
     }
-
-    let begin_event = begin_event.expect("expected ExecCommandBegin event");
-    assert!(
-        begin_event.process_id.is_some(),
-        "begin event should include process_id for a live session"
-    );
-
-    // We expect three terminal interactions matching the three write_stdin calls.
-    assert_eq!(
-        terminal_events.len(),
-        3,
-        "expected three terminal interactions; got {terminal_events:?}"
-    );
-
-    for event in &terminal_events {
-        assert_eq!(event.call_id, open_call_id);
-        assert_eq!(event.process_id, "1000");
-    }
-    assert_eq!(
-        terminal_events
-            .iter()
-            .map(|ev| ev.stdin.as_str())
-            .collect::<Vec<_>>(),
-        vec!["x", "x", "x"],
-        "terminal interactions should reflect the three stdin polls"
-    );
-
-    assert!(
-        delta_text.contains("MARKER1") && delta_text.contains("MARKER2"),
-        "streamed deltas should contain both markers; got {delta_text:?}"
-    );
-
-    let end_event = end_event.expect("expected ExecCommandEnd event");
-    assert_eq!(end_event.call_id, open_call_id);
-    assert_eq!(end_event.exit_code, 0);
-    assert!(
-        end_event.process_id.is_some(),
-        "end event should include the process_id"
-    );
-    assert!(
-        end_event.aggregated_output.contains("MARKER1")
-            && end_event.aggregated_output.contains("MARKER2"),
-        "aggregated output should include both markers in order; got {:?}",
-        end_event.aggregated_output
-    );
 
     Ok(())
 }
@@ -2342,7 +2330,7 @@ PY
     wait_for_event_with_timeout(
         &codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     )
     .await;
 

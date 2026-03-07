@@ -2171,6 +2171,9 @@ impl App {
             AppEvent::CommitTick => {
                 self.chat_widget.on_commit_tick();
             }
+            AppEvent::MaybeSendNextQueuedInput => {
+                self.chat_widget.maybe_send_next_queued_input();
+            }
             AppEvent::CodexEvent(event) => {
                 self.enqueue_primary_event(event).await?;
             }
@@ -2256,6 +2259,9 @@ impl App {
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
+            }
+            AppEvent::RequestModelSelection { model, effort } => {
+                self.chat_widget.request_model_selection(model, effort);
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
-use codex_common::CliConfigOverrides;
+use codex_utils_cli::CliConfigOverrides;
 use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event as CrosstermEvent;
@@ -138,8 +138,8 @@ pub fn run_view(cli: ViewCli, root_overrides: &CliConfigOverrides) -> anyhow::Re
         let mut meta_new = ExecViewMetaV1::new(
             crate::exec_view_meta::RootOverrides {
                 raw_overrides: root_overrides.raw_overrides.clone(),
-                config_home: root_overrides.config_home.clone(),
-                config_file: root_overrides.config_file.clone(),
+                config_home: None,
+                config_file: None,
             },
             vec!["--json".to_string(), "--skip-git-repo-check".to_string()],
             stderr_path,

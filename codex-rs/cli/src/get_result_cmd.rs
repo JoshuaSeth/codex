@@ -1,6 +1,5 @@
 use anyhow::Context;
 use clap::Parser;
-use codex_common::CliConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::live_status::LiveStatusRecordV1;
 use codex_exec::exec_events::CommandExecutionItem;
@@ -10,6 +9,7 @@ use codex_exec::exec_events::PatchApplyStatus;
 use codex_exec::exec_events::ThreadEvent;
 use codex_exec::exec_events::ThreadItem;
 use codex_exec::exec_events::ThreadItemDetails;
+use codex_utils_cli::CliConfigOverrides;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -43,12 +43,9 @@ pub struct GetResultCli {
 
 pub fn run_get_result(
     cli: GetResultCli,
-    root_overrides: &CliConfigOverrides,
+    _root_overrides: &CliConfigOverrides,
 ) -> anyhow::Result<()> {
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
 
     let thread_id =
         codex_protocol::ThreadId::from_string(&cli.thread_id).context("invalid thread id")?;

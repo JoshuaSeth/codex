@@ -17,7 +17,10 @@ async fn quota_exceeded_emits_single_error_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
 
     mount_sse_once(
         &server,

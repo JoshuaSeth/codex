@@ -2064,7 +2064,10 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         .mount(&server)
         .await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
     let codex_fixture = builder.build(&server).await?;
     let codex = codex_fixture.codex.clone();
 

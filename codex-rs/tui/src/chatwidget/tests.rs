@@ -1820,6 +1820,7 @@ async fn make_chatwidget_manual(
         queued_user_messages: VecDeque::new(),
         pending_steers: VecDeque::new(),
         queued_message_edit_binding: crate::key_hint::alt(KeyCode::Up),
+        pending_model_selection: None,
         suppress_session_configured_redraw: false,
         pending_notification: None,
         quit_shortcut_expires_at: None,
@@ -3877,7 +3878,7 @@ async fn steer_enter_queues_while_plan_stream_is_active() {
 }
 
 #[tokio::test]
-async fn steer_enter_uses_pending_steers_while_turn_is_running_without_streaming() {
+async fn enter_queues_follow_up_while_turn_is_running_without_streaming() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.on_task_started();
@@ -3886,28 +3887,31 @@ async fn steer_enter_uses_pending_steers_while_turn_is_running_without_streaming
         .set_composer_text("queued while running".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert!(chat.queued_user_messages.is_empty());
-    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(chat.queued_user_messages.len(), 1);
     assert_eq!(
-        chat.pending_steers.front().unwrap().user_message.text,
+        chat.queued_user_messages.front().unwrap().text,
         "queued while running"
     );
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn { .. } => {}
-        other => panic!("expected Op::UserTurn, got {other:?}"),
-    }
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
     assert!(drain_insert_history(&mut rx).is_empty());
 
-    complete_user_message(&mut chat, "user-1", "queued while running");
-
-    assert!(chat.pending_steers.is_empty());
-    let inserted = drain_insert_history(&mut rx);
-    assert_eq!(inserted.len(), 1);
-    assert!(lines_to_single_string(&inserted[0]).contains("queued while running"));
+    chat.on_task_complete(None, false);
+    chat.maybe_send_next_queued_input();
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while running".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn steer_enter_uses_pending_steers_while_final_answer_stream_is_active() {
+async fn enter_queues_follow_up_while_final_answer_stream_is_active() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.on_task_started();
@@ -3922,28 +3926,31 @@ async fn steer_enter_uses_pending_steers_while_final_answer_stream_is_active() {
     );
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert!(chat.queued_user_messages.is_empty());
-    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(chat.queued_user_messages.len(), 1);
     assert_eq!(
-        chat.pending_steers.front().unwrap().user_message.text,
+        chat.queued_user_messages.front().unwrap().text,
         "queued while streaming"
     );
-    match next_submit_op(&mut op_rx) {
-        Op::UserTurn { .. } => {}
-        other => panic!("expected Op::UserTurn, got {other:?}"),
-    }
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
     assert!(drain_insert_history(&mut rx).is_empty());
 
-    complete_user_message(&mut chat, "user-1", "queued while streaming");
-
-    assert!(chat.pending_steers.is_empty());
-    let inserted = drain_insert_history(&mut rx);
-    assert_eq!(inserted.len(), 1);
-    assert!(lines_to_single_string(&inserted[0]).contains("queued while streaming"));
+    chat.on_task_complete(None, false);
+    chat.maybe_send_next_queued_input();
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn failed_pending_steer_submit_does_not_add_pending_preview() {
+async fn enter_queues_while_running_even_if_submit_channel_is_closed() {
     let (mut chat, mut rx, op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.on_task_started();
@@ -3957,7 +3964,11 @@ async fn failed_pending_steer_submit_does_not_add_pending_preview() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert!(chat.pending_steers.is_empty());
-    assert!(chat.queued_user_messages.is_empty());
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "queued while streaming"
+    );
     assert!(drain_insert_history(&mut rx).is_empty());
 }
 
@@ -4142,7 +4153,7 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
 }
 
 #[tokio::test]
-async fn steer_enter_during_final_stream_preserves_follow_up_prompts_in_order() {
+async fn enter_during_final_stream_preserves_queued_follow_up_order() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.on_task_started();
@@ -4157,17 +4168,21 @@ async fn steer_enter_during_final_stream_preserves_follow_up_prompts_in_order() 
         .set_composer_text("second follow-up".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert!(chat.queued_user_messages.is_empty());
-    assert_eq!(chat.pending_steers.len(), 2);
+    assert_eq!(chat.queued_user_messages.len(), 2);
     assert_eq!(
-        chat.pending_steers.front().unwrap().user_message.text,
+        chat.queued_user_messages.front().unwrap().text,
         "first follow-up"
     );
     assert_eq!(
-        chat.pending_steers.back().unwrap().user_message.text,
+        chat.queued_user_messages.back().unwrap().text,
         "second follow-up"
     );
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
+    assert!(drain_insert_history(&mut rx).is_empty());
 
+    chat.on_task_complete(None, false);
+    chat.maybe_send_next_queued_input();
     let first_items = match next_submit_op(&mut op_rx) {
         Op::UserTurn { items, .. } => items,
         other => panic!("expected Op::UserTurn, got {other:?}"),
@@ -4179,6 +4194,15 @@ async fn steer_enter_during_final_stream_preserves_follow_up_prompts_in_order() 
             text_elements: Vec::new(),
         }]
     );
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "second follow-up"
+    );
+
+    chat.on_task_started();
+    chat.on_task_complete(None, false);
+    chat.maybe_send_next_queued_input();
     let second_items = match next_submit_op(&mut op_rx) {
         Op::UserTurn { items, .. } => items,
         other => panic!("expected Op::UserTurn, got {other:?}"),
@@ -4190,25 +4214,7 @@ async fn steer_enter_during_final_stream_preserves_follow_up_prompts_in_order() 
             text_elements: Vec::new(),
         }]
     );
-    assert!(drain_insert_history(&mut rx).is_empty());
-
-    complete_user_message(&mut chat, "user-1", "first follow-up");
-
-    assert_eq!(chat.pending_steers.len(), 1);
-    assert_eq!(
-        chat.pending_steers.front().unwrap().user_message.text,
-        "second follow-up"
-    );
-    let first_insert = drain_insert_history(&mut rx);
-    assert_eq!(first_insert.len(), 1);
-    assert!(lines_to_single_string(&first_insert[0]).contains("first follow-up"));
-
-    complete_user_message(&mut chat, "user-2", "second follow-up");
-
-    assert!(chat.pending_steers.is_empty());
-    let second_insert = drain_insert_history(&mut rx);
-    assert_eq!(second_insert.len(), 1);
-    assert!(lines_to_single_string(&second_insert[0]).contains("second follow-up"));
+    assert!(chat.queued_user_messages.is_empty());
 }
 
 #[tokio::test]
@@ -6910,6 +6916,73 @@ async fn model_selection_popup_snapshot() {
 }
 
 #[tokio::test]
+async fn model_selection_popup_while_task_running_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.update_task_running_state();
+    chat.open_model_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("model_selection_popup_while_running", popup);
+}
+
+#[tokio::test]
+async fn queued_model_selection_is_applied_before_next_queued_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("model-a")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    while rx.try_recv().is_ok() {}
+    while op_rx.try_recv().is_ok() {}
+
+    chat.agent_turn_running = true;
+    chat.update_task_running_state();
+    chat.request_model_selection("model-b".to_string(), Some(ReasoningEffortConfig::High));
+
+    assert_eq!(chat.current_model(), "model-a");
+
+    let history = drain_insert_history(&mut rx);
+    assert!(
+        history
+            .last()
+            .map(|cell| lines_to_single_string(cell).contains("Queued model change"))
+            .unwrap_or(false),
+        "expected queued model selection info message"
+    );
+
+    chat.queued_user_messages.push_back("hello".into());
+    chat.refresh_pending_input_preview();
+
+    chat.on_task_complete(None, false);
+
+    // The ChatWidget doesn't process AppEvents in tests, so emulate the app loop by handling the
+    // queued-send event now.
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::MaybeSendNextQueuedInput) {
+            chat.maybe_send_next_queued_input();
+        }
+    }
+
+    let override_op = op_rx.try_recv().expect("expected OverrideTurnContext op");
+    match override_op {
+        Op::OverrideTurnContext { model, effort, .. } => {
+            assert_eq!(model.as_deref(), Some("model-b"));
+            assert_eq!(effort, Some(Some(ReasoningEffortConfig::High)));
+        }
+        other => panic!("expected OverrideTurnContext, got {other:?}"),
+    }
+
+    let submit_op = next_submit_op(&mut op_rx);
+    match submit_op {
+        Op::UserTurn { model, effort, .. } => {
+            assert_eq!(model, "model-b");
+            assert_eq!(effort, Some(ReasoningEffortConfig::High));
+        }
+        other => panic!("expected UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn personality_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2-codex")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -7279,11 +7352,17 @@ async fn single_reasoning_option_skips_selection() {
         events.push(ev);
     }
 
+    assert_eq!(
+        chat.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::High),
+        "expected reasoning effort to be applied automatically"
+    );
+
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev, AppEvent::UpdateReasoningEffort(Some(effort)) if *effort == ReasoningEffortConfig::High)),
-        "expected reasoning effort to be applied automatically; events: {events:?}"
+            .any(|ev| matches!(ev, AppEvent::PersistModelSelection { model, effort } if model == "model-with-single-reasoning" && *effort == Some(ReasoningEffortConfig::High))),
+        "expected reasoning selection to be persisted automatically; events: {events:?}"
     );
 }
 
@@ -7416,8 +7495,8 @@ async fn disabled_slash_command_while_task_running_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.bottom_pane.set_task_running(true);
 
-    // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model);
+    // Dispatch a command that is unavailable while a task runs (e.g., /review)
+    chat.dispatch_command(SlashCommand::Review);
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);

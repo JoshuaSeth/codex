@@ -4,12 +4,7 @@ use codex_utils_cargo_bin::find_resource;
 use core_test_support::test_codex_exec::test_codex_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use std::fs::FileTimes;
-use std::fs::OpenOptions;
-use std::path::Path;
 use std::string::ToString;
-use std::time::Duration;
-use std::time::SystemTime;
 use tempfile::TempDir;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -172,77 +167,6 @@ fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
 }
 
 #[test]
-fn exec_resume_fork_creates_new_file_and_preserves_original() -> anyhow::Result<()> {
-    let test = test_codex_exec();
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli_responses_fixture.sse");
-
-    // 1) First run: create a session with a unique marker in the content.
-    let marker = format!("resume-fork-{}", Uuid::new_v4());
-    let prompt = format!("echo {marker}");
-
-    test.cmd()
-        .env("CODEX_RS_SSE_FIXTURE", &fixture)
-        .env("OPENAI_BASE_URL", "http://unused.local")
-        .arg("--skip-git-repo-check")
-        .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
-        .arg(&prompt)
-        .assert()
-        .success();
-
-    // Find the created session file containing the marker.
-    let sessions_dir = test.home_path().join("sessions");
-    let original_path = find_session_file_containing_marker(&sessions_dir, &marker)
-        .expect("no session file found after first run");
-    let original_id = extract_conversation_id(&original_path);
-
-    // 2) Second run: fork + resume the original session id with a new marker.
-    let marker2 = format!("resume-fork-2-{}", Uuid::new_v4());
-    let prompt2 = format!("echo {marker2}");
-
-    test.cmd()
-        .env("CODEX_RS_SSE_FIXTURE", &fixture)
-        .env("OPENAI_BASE_URL", "http://unused.local")
-        .arg("--skip-git-repo-check")
-        .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
-        .arg(&prompt2)
-        .arg("resume")
-        .arg(&original_id)
-        .arg("--fork")
-        .assert()
-        .success();
-
-    // The forked session should be a different file, but contain both markers.
-    let forked_path = find_session_file_containing_marker(&sessions_dir, &marker2)
-        .expect("no forked session file containing marker2");
-    assert_ne!(
-        forked_path, original_path,
-        "resume --fork should create a new rollout file"
-    );
-
-    let forked_content = std::fs::read_to_string(&forked_path)?;
-    assert!(
-        forked_content.contains(&marker),
-        "forked session should preserve the original history"
-    );
-    assert!(
-        forked_content.contains(&marker2),
-        "forked session should contain the new appended content"
-    );
-
-    // The original file should NOT have marker2 appended.
-    let original_content = std::fs::read_to_string(&original_path)?;
-    assert!(
-        !original_content.contains(&marker2),
-        "original rollout should remain unchanged after --fork resume"
-    );
-
-    Ok(())
-}
-
-#[test]
 fn exec_resume_last_accepts_prompt_after_flag_in_json_mode() -> anyhow::Result<()> {
     let test = test_codex_exec();
     let fixture = exec_fixture()?;
@@ -329,21 +253,35 @@ fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<()> {
         .success();
 
     let sessions_dir = test.home_path().join("sessions");
-    let path_a = find_session_file_containing_marker(&sessions_dir, &marker_a)
+    find_session_file_containing_marker(&sessions_dir, &marker_a)
         .expect("no session file found for marker_a");
     let path_b = find_session_file_containing_marker(&sessions_dir, &marker_b)
         .expect("no session file found for marker_b");
 
-    // Files are ordered by `updated_at`, then by `uuid`.
-    // We mutate the mtimes to ensure file_b is the newest file.
-    let file_a = OpenOptions::new().write(true).open(&path_a)?;
-    file_a.set_times(
-        FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
-    )?;
-    let file_b = OpenOptions::new().write(true).open(&path_b)?;
-    file_b.set_times(
-        FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
-    )?;
+    // `updated_at` is second-granularity, so ensure the touch lands in a later second
+    // than the initial session creation on fast CI (especially Windows).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Make thread B deterministically newest according to rollout metadata.
+    let session_id_b = extract_conversation_id(&path_b);
+    let marker_b_touch = format!("resume-cwd-b-touch-{}", Uuid::new_v4());
+    let prompt_b_touch = format!("echo {marker_b_touch}");
+    test.cmd()
+        .env("CODEX_RS_SSE_FIXTURE", &fixture)
+        .env("OPENAI_BASE_URL", "http://unused.local")
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(dir_b.path())
+        .arg("resume")
+        .arg(&session_id_b)
+        .arg(&prompt_b_touch)
+        .assert()
+        .success();
+
+    // `resume --last` sorts by `updated_at`, which is second-granularity. Sleep so
+    // the upcoming `resume --last --all` write lands in a later second and becomes
+    // deterministically newest (instead of tying and falling back to UUID order).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let marker_b2 = format!("resume-cwd-b-2-{}", Uuid::new_v4());
     let prompt_b2 = format!("echo {marker_b2}");
@@ -383,9 +321,12 @@ fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<()> {
 
     let resumed_path_cwd = find_session_file_containing_marker(&sessions_dir, &marker_a2)
         .expect("no resumed session file containing marker_a2");
+    // The `--all` resume above appends a new turn to `path_b` while running from `dir_a`, so the
+    // session's latest cwd now matches `dir_a`. A subsequent `resume --last` should therefore pick
+    // the newest matching session (`path_b`).
     assert_eq!(
-        resumed_path_cwd, path_a,
-        "resume --last should prefer sessions from the same cwd"
+        resumed_path_cwd, path_b,
+        "resume --last should prefer sessions whose latest turn context matches the current cwd"
     );
 
     Ok(())

@@ -607,13 +607,29 @@ async fn run_websocket_response_stream(
             Message::Binary(_) => {
                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
             }
-            Message::Close(_) => {
-                return Err(ApiError::Stream(
-                    "websocket closed by server before response.completed".into(),
-                ));
+            Message::Ping(payload) => {
+                if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                    return Err(ApiError::Stream("websocket ping failed".into()));
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(frame) => {
+                let details = frame
+                    .as_ref()
+                    .map(|close| {
+                        let reason = close.reason.to_string();
+                        if reason.is_empty() {
+                            format!("code={}", close.code)
+                        } else {
+                            format!("code={}, reason={reason}", close.code)
+                        }
+                    })
+                    .unwrap_or_else(|| "no close frame".to_string());
+                return Err(ApiError::Stream(format!(
+                    "websocket closed by server before response.completed ({details})"
+                )));
             }
             Message::Frame(_) => {}
-            Message::Ping(_) | Message::Pong(_) => {}
         }
     }
 

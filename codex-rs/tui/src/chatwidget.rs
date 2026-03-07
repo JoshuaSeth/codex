@@ -522,6 +522,12 @@ pub(crate) enum ExternalEditorState {
     Active,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingModelSelection {
+    model: String,
+    effort: Option<ReasoningEffortConfig>,
+}
+
 /// Maintains the per-session UI state and interaction state machines for the chat screen.
 ///
 /// `ChatWidget` owns the state derived from the protocol event stream (history cells, streaming
@@ -633,6 +639,8 @@ pub(crate) struct ChatWidget {
     /// [`queued_message_edit_binding_for_terminal`] and propagated to
     /// `BottomPane` so the hint text matches the actual shortcut.
     queued_message_edit_binding: KeyBinding,
+    /// Model selection queued while an agent turn is in progress.
+    pending_model_selection: Option<PendingModelSelection>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -1577,8 +1585,9 @@ impl ChatWidget {
         if !from_replay {
             self.saw_plan_item_this_turn = false;
         }
+        self.apply_pending_model_selection();
         // If there is a queued user message, send exactly one now to begin the next turn.
-        self.maybe_send_next_queued_input();
+        self.app_event_tx.send(AppEvent::MaybeSendNextQueuedInput);
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
             response: last_agent_message.unwrap_or_default(),
@@ -1846,6 +1855,7 @@ impl ChatWidget {
         self.plan_stream_controller = None;
         self.pending_status_indicator_restore = false;
         self.request_status_line_branch_refresh();
+        self.apply_pending_model_selection();
         self.maybe_show_pending_rate_limit_prompt();
     }
 
@@ -1860,7 +1870,7 @@ impl ChatWidget {
 
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
-        self.maybe_send_next_queued_input();
+        self.app_event_tx.send(AppEvent::MaybeSendNextQueuedInput);
     }
 
     fn on_error(&mut self, message: String) {
@@ -1941,7 +1951,7 @@ impl ChatWidget {
 
         self.mcp_startup_status = None;
         self.update_task_running_state();
-        self.maybe_send_next_queued_input();
+        self.app_event_tx.send(AppEvent::MaybeSendNextQueuedInput);
         self.request_redraw();
     }
 
@@ -3123,6 +3133,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
+            pending_model_selection: None,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
             suppress_session_configured_redraw: false,
@@ -3309,6 +3320,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
+            pending_model_selection: None,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
             suppress_session_configured_redraw: false,
@@ -3479,6 +3491,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
+            pending_model_selection: None,
             show_welcome_banner: false,
             startup_tooltip_override: None,
             suppress_session_configured_redraw: true,
@@ -3657,8 +3670,10 @@ impl ChatWidget {
                     else {
                         return;
                     };
-                    let should_submit_now =
-                        self.is_session_configured() && !self.is_plan_streaming_in_tui();
+                    let should_submit_now = self.is_session_configured()
+                        && !self.bottom_pane.is_task_running()
+                        && !self.is_review_mode
+                        && !self.is_plan_streaming_in_tui();
                     if should_submit_now {
                         // Submitted is emitted when user submits.
                         // Reset any reasoning header only when we are actually submitting a turn.
@@ -5863,6 +5878,11 @@ impl ChatWidget {
         let mut header = ColumnRenderable::new();
         header.push(Line::from(title.bold()));
         header.push(Line::from(subtitle.dim()));
+        if self.agent_turn_running {
+            header.push(Line::from(
+                "Agent is running — selection will be applied before the next message.".dim(),
+            ));
+        }
         if let Some(warning) = self.model_menu_warning_line() {
             header.push(warning);
         }
@@ -6084,6 +6104,82 @@ impl ChatWidget {
         });
     }
 
+    pub(crate) fn request_model_selection(
+        &mut self,
+        model: String,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        if self.agent_turn_running {
+            self.queue_model_selection(model, effort);
+        } else {
+            self.apply_model_selection(model, effort);
+        }
+    }
+
+    fn queue_model_selection(&mut self, model: String, effort: Option<ReasoningEffortConfig>) {
+        let action = if self.pending_model_selection.is_some() {
+            "Updated queued model change"
+        } else {
+            "Queued model change"
+        };
+        self.pending_model_selection = Some(PendingModelSelection {
+            model: model.clone(),
+            effort,
+        });
+
+        let effort_label = effort
+            .map(Self::reasoning_effort_label)
+            .unwrap_or("default");
+        self.add_info_message(
+            format!(
+                "{action} to {model} (effort: {effort_label}). Will apply before the next message."
+            ),
+            None,
+        );
+        tracing::info!(
+            "Queued model selection: {model}, effort: {}",
+            effort
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "default".to_string())
+        );
+    }
+
+    fn apply_model_selection(&mut self, model: String, effort: Option<ReasoningEffortConfig>) {
+        self.submit_op(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some(model.clone()),
+            effort: Some(effort),
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        });
+        self.set_model(&model);
+        self.set_reasoning_effort(effort);
+        self.refresh_status_line();
+        self.request_redraw();
+        self.app_event_tx.send(AppEvent::PersistModelSelection {
+            model: model.clone(),
+            effort,
+        });
+        tracing::info!(
+            "Selected model: {model}, Selected effort: {}",
+            effort
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "default".to_string())
+        );
+    }
+
+    fn apply_pending_model_selection(&mut self) {
+        let Some(pending) = self.pending_model_selection.take() else {
+            return;
+        };
+        self.apply_model_selection(pending.model, pending.effort);
+    }
+
     fn model_selection_actions(
         model_for_action: String,
         effort_for_action: Option<ReasoningEffortConfig>,
@@ -6097,10 +6193,7 @@ impl ChatWidget {
                 });
                 return;
             }
-
-            tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-            tx.send(AppEvent::UpdateReasoningEffort(effort_for_action));
-            tx.send(AppEvent::PersistModelSelection {
+            tx.send(AppEvent::RequestModelSelection {
                 model: model_for_action.clone(),
                 effort: effort_for_action,
             });
@@ -6346,9 +6439,7 @@ impl ChatWidget {
                         effort: choice_effort,
                     });
                 } else {
-                    tx.send(AppEvent::UpdateModel(model_for_action.clone()));
-                    tx.send(AppEvent::UpdateReasoningEffort(choice_effort));
-                    tx.send(AppEvent::PersistModelSelection {
+                    tx.send(AppEvent::RequestModelSelection {
                         model: model_for_action.clone(),
                         effort: choice_effort,
                     });
@@ -6370,6 +6461,11 @@ impl ChatWidget {
         header.push(Line::from(
             format!("Select Reasoning Level for {model_slug}").bold(),
         ));
+        if self.agent_turn_running {
+            header.push(Line::from(
+                "Agent is running — selection will be applied before the next message.".dim(),
+            ));
+        }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
@@ -6391,20 +6487,8 @@ impl ChatWidget {
         }
     }
 
-    fn apply_model_and_effort_without_persist(
-        &self,
-        model: String,
-        effort: Option<ReasoningEffortConfig>,
-    ) {
-        self.app_event_tx.send(AppEvent::UpdateModel(model));
-        self.app_event_tx
-            .send(AppEvent::UpdateReasoningEffort(effort));
-    }
-
-    fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
-        self.apply_model_and_effort_without_persist(model.clone(), effort);
-        self.app_event_tx
-            .send(AppEvent::PersistModelSelection { model, effort });
+    fn apply_model_and_effort(&mut self, model: String, effort: Option<ReasoningEffortConfig>) {
+        self.request_model_selection(model, effort);
     }
 
     /// Open the permissions popup (alias for /permissions).
@@ -7948,7 +8032,7 @@ impl ChatWidget {
             return;
         }
         self.set_collaboration_mask(collaboration_mode);
-        let should_queue = self.is_plan_streaming_in_tui();
+        let should_queue = self.is_plan_streaming_in_tui() || self.bottom_pane.is_task_running();
         let user_message = UserMessage {
             text,
             local_images: Vec::new(),

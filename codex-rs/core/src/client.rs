@@ -287,11 +287,15 @@ impl ModelClient {
             return Ok(Vec::new());
         }
         let client_setup = self.current_client_setup().await?;
+        let mut api_provider = client_setup.api_provider;
+        // Remote compact requests are typically triggered under context pressure and can happen
+        // late in long-running sessions; use the stream disconnect retry budget here so transient
+        // 5xx/transport failures (for example upstream resets) get a stronger recovery window.
+        api_provider.retry.max_attempts = self.state.provider.stream_disconnect_max_retries();
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(otel_manager);
-        let client =
-            ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry));
+        let client = ApiCompactClient::new(transport, api_provider, client_setup.api_auth)
+            .with_telemetry(Some(request_telemetry));
 
         let instructions = prompt.base_instructions.text.clone();
         let payload = ApiCompactionInput {
