@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -25,9 +26,12 @@ use crate::contextual_user_message::TURN_ABORTED_OPEN_TAG;
 use crate::event_mapping::parse_turn_item;
 use crate::models_manager::manager::ModelsManager;
 use crate::protocol::EventMsg;
+use crate::protocol::TokenUsage;
 use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
+use crate::session_cost::SessionCostTurnEntry;
+use crate::session_cost::TurnCostTrackingState;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
@@ -50,6 +54,46 @@ pub(crate) use user_shell::execute_user_shell_command;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes were terminated. If any tools/commands were aborted, they may have partially executed; verify current state before retrying.";
+
+struct DrainedActiveTurn {
+    tasks: Vec<RunningTask>,
+    token_usage_at_turn_start: TokenUsage,
+    cost_tracking: Option<TurnCostTrackingState>,
+}
+
+fn turn_token_usage_delta(
+    total_token_usage: TokenUsage,
+    token_usage_at_turn_start: TokenUsage,
+) -> TokenUsage {
+    TokenUsage {
+        input_tokens: (total_token_usage.input_tokens - token_usage_at_turn_start.input_tokens)
+            .max(0),
+        cached_input_tokens: (total_token_usage.cached_input_tokens
+            - token_usage_at_turn_start.cached_input_tokens)
+            .max(0),
+        output_tokens: (total_token_usage.output_tokens - token_usage_at_turn_start.output_tokens)
+            .max(0),
+        reasoning_output_tokens: (total_token_usage.reasoning_output_tokens
+            - token_usage_at_turn_start.reasoning_output_tokens)
+            .max(0),
+        total_tokens: (total_token_usage.total_tokens - token_usage_at_turn_start.total_tokens)
+            .max(0),
+    }
+}
+
+fn should_record_cost_entry(turn_cost_entry: &SessionCostTurnEntry) -> bool {
+    turn_cost_entry.request_count > 0
+        || !turn_cost_entry.reported_usage.is_zero()
+        || !turn_cost_entry.errors.is_empty()
+}
+
+fn abort_reason_label(reason: &TurnAbortReason) -> &'static str {
+    match reason {
+        TurnAbortReason::Interrupted => "interrupted",
+        TurnAbortReason::Replaced => "replaced",
+        TurnAbortReason::ReviewEnded => "review_ended",
+    }
+}
 
 /// Thin wrapper that exposes the parts of [`Session`] task runners need.
 #[derive(Clone)]
@@ -192,8 +236,17 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
-        for task in self.take_all_running_tasks().await {
-            self.handle_task_abort(task, reason.clone()).await;
+        if let Some(drained_turn) = self.take_all_running_tasks().await {
+            let DrainedActiveTurn {
+                tasks,
+                token_usage_at_turn_start,
+                cost_tracking,
+            } = drained_turn;
+            for task in tasks {
+                self.handle_task_abort(task, reason.clone()).await;
+            }
+            self.record_aborted_turn_cost(reason.clone(), token_usage_at_turn_start, cost_tracking)
+                .await;
         }
         if reason == TurnAbortReason::Interrupted {
             self.close_unified_exec_processes().await;
@@ -213,6 +266,7 @@ impl Session {
         let mut pending_input = Vec::<ResponseInputItem>::new();
         let mut should_clear_active_turn = false;
         let mut token_usage_at_turn_start = None;
+        let mut cost_tracking = None;
         let mut turn_tool_calls = 0_u64;
         if let Some(at) = active.as_mut()
             && at.remove_task(&turn_context.sub_id)
@@ -221,6 +275,7 @@ impl Session {
             pending_input = ts.take_pending_input();
             turn_tool_calls = ts.tool_calls;
             token_usage_at_turn_start = Some(ts.token_usage_at_turn_start.clone());
+            cost_tracking = ts.cost_tracking.take();
             should_clear_active_turn = true;
         }
         if should_clear_active_turn {
@@ -253,6 +308,7 @@ impl Session {
             }
         }
         // Emit token usage metrics.
+        let mut turn_cost_entry = None;
         if let Some(token_usage_at_turn_start) = token_usage_at_turn_start {
             // TODO(jif): drop this
             let tmp_mem = (
@@ -269,23 +325,8 @@ impl Session {
                 &[tmp_mem],
             );
             let total_token_usage = self.total_token_usage().await.unwrap_or_default();
-            let turn_token_usage = crate::protocol::TokenUsage {
-                input_tokens: (total_token_usage.input_tokens
-                    - token_usage_at_turn_start.input_tokens)
-                    .max(0),
-                cached_input_tokens: (total_token_usage.cached_input_tokens
-                    - token_usage_at_turn_start.cached_input_tokens)
-                    .max(0),
-                output_tokens: (total_token_usage.output_tokens
-                    - token_usage_at_turn_start.output_tokens)
-                    .max(0),
-                reasoning_output_tokens: (total_token_usage.reasoning_output_tokens
-                    - token_usage_at_turn_start.reasoning_output_tokens)
-                    .max(0),
-                total_tokens: (total_token_usage.total_tokens
-                    - token_usage_at_turn_start.total_tokens)
-                    .max(0),
-            };
+            let turn_token_usage =
+                turn_token_usage_delta(total_token_usage, token_usage_at_turn_start);
             self.services.otel_manager.histogram(
                 "codex.turn.token_usage",
                 turn_token_usage.total_tokens,
@@ -311,6 +352,27 @@ impl Session {
                 turn_token_usage.reasoning_output_tokens,
                 &[("token_type", "reasoning_output"), tmp_mem],
             );
+
+            if let Some(cost_tracking) = cost_tracking {
+                turn_cost_entry = Some(SessionCostTurnEntry::from_tracking(
+                    cost_tracking,
+                    Utc::now().timestamp(),
+                    turn_token_usage,
+                ));
+            }
+        } else if let Some(cost_tracking) = cost_tracking {
+            turn_cost_entry = Some(SessionCostTurnEntry::from_tracking(
+                cost_tracking,
+                Utc::now().timestamp(),
+                crate::protocol::TokenUsage::default(),
+            ));
+        }
+
+        if let Some(turn_cost_entry) = turn_cost_entry
+            && should_record_cost_entry(&turn_cost_entry)
+            && let Some(cost_recorder) = self.services.cost_recorder.as_ref()
+        {
+            cost_recorder.record_turn(turn_cost_entry);
         }
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_context.sub_id.clone(),
@@ -323,20 +385,67 @@ impl Session {
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
         let mut active = self.active_turn.lock().await;
         let mut turn = ActiveTurn::default();
-        turn.turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start;
+        {
+            let mut turn_state = turn.turn_state.lock().await;
+            turn_state.token_usage_at_turn_start = token_usage_at_turn_start;
+            turn_state.cost_tracking = Some(TurnCostTrackingState::new(
+                task.turn_context.sub_id.clone(),
+                task.turn_context.model_info.slug.clone(),
+            ));
+        }
         turn.add_task(task);
         *active = Some(turn);
     }
 
-    async fn take_all_running_tasks(&self) -> Vec<RunningTask> {
+    async fn take_all_running_tasks(&self) -> Option<DrainedActiveTurn> {
         let mut active = self.active_turn.lock().await;
         match active.take() {
             Some(mut at) => {
                 at.clear_pending().await;
+                let (token_usage_at_turn_start, cost_tracking) = {
+                    let mut ts = at.turn_state.lock().await;
+                    (
+                        ts.token_usage_at_turn_start.clone(),
+                        ts.cost_tracking.take(),
+                    )
+                };
 
-                at.drain_tasks()
+                Some(DrainedActiveTurn {
+                    tasks: at.drain_tasks(),
+                    token_usage_at_turn_start,
+                    cost_tracking,
+                })
             }
-            None => Vec::new(),
+            None => None,
+        }
+    }
+
+    async fn record_aborted_turn_cost(
+        &self,
+        reason: TurnAbortReason,
+        token_usage_at_turn_start: TokenUsage,
+        cost_tracking: Option<TurnCostTrackingState>,
+    ) {
+        let Some(mut cost_tracking) = cost_tracking else {
+            return;
+        };
+
+        let total_token_usage = self.total_token_usage().await.unwrap_or_default();
+        let turn_token_usage = turn_token_usage_delta(total_token_usage, token_usage_at_turn_start);
+        if !cost_tracking.has_activity() && turn_token_usage.is_zero() {
+            return;
+        }
+
+        cost_tracking.record_error(format!("turn aborted: {}", abort_reason_label(&reason)));
+        let turn_cost_entry = SessionCostTurnEntry::from_tracking(
+            cost_tracking,
+            Utc::now().timestamp(),
+            turn_token_usage,
+        );
+        if should_record_cost_entry(&turn_cost_entry)
+            && let Some(cost_recorder) = self.services.cost_recorder.as_ref()
+        {
+            cost_recorder.record_turn(turn_cost_entry);
         }
     }
 

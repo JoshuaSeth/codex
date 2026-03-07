@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use crate::codex::TurnContext;
 use crate::protocol::ReviewDecision;
 use crate::protocol::TokenUsage;
+use crate::session_cost::TurnCostTrackingState;
 use crate::tasks::SessionTask;
 
 /// Metadata about the currently running turn.
@@ -76,6 +77,7 @@ pub(crate) struct TurnState {
     pending_input: Vec<ResponseInputItem>,
     pub(crate) tool_calls: u64,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    pub(crate) cost_tracking: Option<TurnCostTrackingState>,
 }
 
 impl TurnState {

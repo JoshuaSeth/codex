@@ -15,6 +15,7 @@ use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
+use crate::session_cost::TrackedTurnItemSource;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
@@ -93,16 +94,21 @@ async fn run_compact_task_inner(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
+    sess.begin_turn_cost_tracking(turn_context.as_ref()).await;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+    let compact_prompt_item: ResponseItem = initial_input_for_turn.clone().into();
+    sess.record_turn_tracked_items(
+        turn_context.as_ref(),
+        std::slice::from_ref(&compact_prompt_item),
+        TrackedTurnItemSource::Local,
+    )
+    .await;
 
     let mut history = sess.clone_history().await;
-    history.record_items(
-        &[initial_input_for_turn.into()],
-        turn_context.truncation_policy,
-    );
+    history.record_items(&[compact_prompt_item], turn_context.truncation_policy);
 
     let mut truncated_count = 0usize;
 
@@ -124,6 +130,8 @@ async fn run_compact_task_inner(
             personality: turn_context.personality,
             ..Default::default()
         };
+        sess.record_turn_request_estimate(turn_context.as_ref(), &prompt)
+            .await;
         let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
         let attempt_result = drain_to_completed(
             &sess,
@@ -422,6 +430,12 @@ async fn drain_to_completed(
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 sess.record_into_history(std::slice::from_ref(&item), turn_context)
                     .await;
+                sess.record_turn_tracked_items(
+                    turn_context,
+                    std::slice::from_ref(&item),
+                    TrackedTurnItemSource::ModelOutput,
+                )
+                .await;
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;

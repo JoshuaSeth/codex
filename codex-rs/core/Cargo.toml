@@ -98,6 +98,7 @@ time = { workspace = true, features = [
     "local-offset",
     "macros",
 ] }
+tiktoken-rs = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",

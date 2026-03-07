@@ -67,6 +67,7 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
+    sess.begin_turn_cost_tracking(turn_context.as_ref()).await;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -100,6 +101,13 @@ async fn run_remote_compact_task_inner_impl(
         personality: turn_context.personality,
         output_schema: None,
     };
+    sess.record_turn_request_estimate(turn_context.as_ref(), &prompt)
+        .await;
+    sess.record_turn_cost_error(
+        turn_context.as_ref(),
+        "responses/compact does not return token usage; reported usage excludes this compaction request",
+    )
+    .await;
 
     let mut new_history = sess
         .services

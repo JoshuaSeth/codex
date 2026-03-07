@@ -40,6 +40,10 @@ use crate::realtime_conversation::handle_close as handle_realtime_conversation_c
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use crate::rollout::session_index;
+use crate::session_cost::SessionCostRecorder;
+use crate::session_cost::SessionCostRecorderParams;
+use crate::session_cost::TrackedTurnItemSource;
+use crate::session_cost::estimate_request_tokens;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
@@ -1299,6 +1303,20 @@ impl Session {
         let rollout_path = rollout_recorder
             .as_ref()
             .map(|rec| rec.rollout_path.clone());
+        let cost_recorder = if config.ephemeral {
+            None
+        } else {
+            Some(SessionCostRecorder::new(SessionCostRecorderParams {
+                codex_home: config.codex_home.clone(),
+                session_id: conversation_id,
+                session_source: session_configuration.session_source.clone(),
+                provider_id: session_configuration
+                    .original_config_do_not_use
+                    .model_provider_id
+                    .clone(),
+                rollout_path: rollout_path.clone(),
+            }))
+        };
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -1512,6 +1530,7 @@ impl Session {
             unified_exec_manager: UnifiedExecProcessManager::new(
                 config.background_terminal_max_timeout,
             ),
+            cost_recorder,
             shell_zsh_path: config.zsh_path.clone(),
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(
@@ -1710,6 +1729,146 @@ impl Session {
             && let Err(e) = rec.persist().await
         {
             warn!("failed to materialize rollout recorder: {e}");
+        }
+    }
+
+    pub(crate) async fn begin_turn_cost_tracking(&self, turn_context: &TurnContext) {
+        let baseline_prompt_items = self
+            .clone_history()
+            .await
+            .for_prompt(&turn_context.model_info.input_modalities);
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut() {
+            if cost_tracking.baseline_prompt_items.is_none() {
+                cost_tracking.set_baseline_prompt_items(baseline_prompt_items);
+            }
+        }
+    }
+
+    pub(crate) async fn record_turn_tracked_items(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        source: TrackedTurnItemSource,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut() {
+            cost_tracking.record_turn_items(items, source);
+        }
+    }
+
+    pub(crate) async fn record_turn_request_estimate(
+        &self,
+        turn_context: &TurnContext,
+        prompt: &Prompt,
+    ) {
+        let tracking_snapshot = {
+            let mut active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return;
+            };
+            if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+                return;
+            }
+            let turn_state = active_turn.turn_state.lock().await;
+            turn_state.cost_tracking.clone()
+        };
+        let Some(tracking_snapshot) = tracking_snapshot else {
+            return;
+        };
+
+        let estimate =
+            estimate_request_tokens(prompt, &turn_context.model_info.slug, &tracking_snapshot);
+
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        let Some(cost_tracking) = turn_state.cost_tracking.as_mut() else {
+            return;
+        };
+        match estimate {
+            Ok((tokenizer, request_estimate)) => {
+                cost_tracking.record_request_estimate(
+                    turn_context.model_info.slug.clone(),
+                    tokenizer,
+                    request_estimate,
+                );
+            }
+            Err(err) => {
+                cost_tracking.record_error(format!("request estimate failed: {err:#}"));
+            }
+        }
+    }
+
+    pub(crate) async fn record_turn_cost_error(
+        &self,
+        turn_context: &TurnContext,
+        error: impl Into<String>,
+    ) {
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut() {
+            cost_tracking.record_error(error.into());
+        }
+    }
+
+    async fn reset_active_turn_cost_tracking_baseline(&self) {
+        let turn_context = {
+            let active = self.active_turn.lock().await;
+            active
+                .as_ref()
+                .and_then(|active_turn| active_turn.tasks.first())
+                .map(|(_, task)| Arc::clone(&task.turn_context))
+        };
+        let Some(turn_context) = turn_context else {
+            return;
+        };
+        let baseline_prompt_items = self
+            .clone_history()
+            .await
+            .for_prompt(&turn_context.model_info.input_modalities);
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return;
+        };
+        if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+            return;
+        }
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut() {
+            if cost_tracking.baseline_prompt_items.is_none() {
+                cost_tracking.set_baseline_prompt_items(baseline_prompt_items);
+            } else {
+                cost_tracking.reset_baseline_prompt_items(baseline_prompt_items);
+            }
         }
     }
 
@@ -2907,6 +3066,20 @@ impl Session {
         self.record_into_history(items, turn_context).await;
         self.persist_rollout_response_items(items).await;
         self.send_raw_response_items(turn_context, items).await;
+        self.record_turn_tracked_items(turn_context, items, TrackedTurnItemSource::Local)
+            .await;
+    }
+
+    pub(crate) async fn record_model_response_items(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) {
+        self.record_into_history(items, turn_context).await;
+        self.persist_rollout_response_items(items).await;
+        self.send_raw_response_items(turn_context, items).await;
+        self.record_turn_tracked_items(turn_context, items, TrackedTurnItemSource::ModelOutput)
+            .await;
     }
 
     /// Append ResponseItems to the in-memory conversation history only.
@@ -2982,8 +3155,11 @@ impl Session {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
-        let mut state = self.state.lock().await;
-        state.replace_history(items, reference_context_item);
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items, reference_context_item);
+        }
+        self.reset_active_turn_cost_tracking_baseline().await;
     }
 
     pub(crate) async fn replace_compacted_history(
@@ -4667,6 +4843,12 @@ mod handlers {
             sess.send_event_raw(event).await;
         }
 
+        if let Some(rec) = sess.services.cost_recorder.as_ref()
+            && let Err(err) = rec.flush().await
+        {
+            warn!("failed to flush session cost recorder: {err:#}");
+        }
+
         let event = Event {
             id: sub_id,
             msg: EventMsg::ShutdownComplete,
@@ -4945,6 +5127,7 @@ pub(crate) async fn run_turn(
         error!("Failed to run pre-sampling compact");
         return None;
     }
+    sess.begin_turn_cost_tracking(turn_context.as_ref()).await;
 
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
 
@@ -5287,11 +5470,15 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(CodexErr::InvalidImageRequest()) => {
-                let mut state = sess.state.lock().await;
                 error_or_panic(
                     "Invalid image detected; sanitizing tool output to prevent poisoning",
                 );
-                if state.history.replace_last_turn_images("Invalid image") {
+                let replaced = {
+                    let mut state = sess.state.lock().await;
+                    state.history.replace_last_turn_images("Invalid image")
+                };
+                if replaced {
+                    sess.reset_active_turn_cost_tracking_baseline().await;
                     continue;
                 }
                 let event = EventMsg::Error(ErrorEvent {
@@ -5618,6 +5805,8 @@ async fn run_sampling_request(
     );
     let mut retries = 0;
     loop {
+        sess.record_turn_request_estimate(turn_context.as_ref(), &prompt)
+            .await;
         let err = match try_run_sampling_request(
             Arc::clone(&router),
             Arc::clone(&sess),
@@ -8498,6 +8687,7 @@ mod tests {
             unified_exec_manager: UnifiedExecProcessManager::new(
                 config.background_terminal_max_timeout,
             ),
+            cost_recorder: None,
             shell_zsh_path: None,
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(
@@ -8907,6 +9097,7 @@ mod tests {
             unified_exec_manager: UnifiedExecProcessManager::new(
                 config.background_terminal_max_timeout,
             ),
+            cost_recorder: None,
             shell_zsh_path: None,
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             analytics_events_client: AnalyticsEventsClient::new(

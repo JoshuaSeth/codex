@@ -513,7 +513,6 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 ) -> Result<(), ApiError> {
-    let mut last_server_model: Option<String> = None;
     let request_text = match serde_json::to_string(&request_body) {
         Ok(text) => text,
         Err(err) => {
@@ -581,14 +580,6 @@ async fn run_websocket_response_stream(
                         let _ = tx_event.send(Ok(ResponseEvent::RateLimits(snapshot))).await;
                     }
                     continue;
-                }
-                if let Some(model) = event.response_model()
-                    && last_server_model.as_deref() != Some(model.as_str())
-                {
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::ServerModel(model.clone())))
-                        .await;
-                    last_server_model = Some(model);
                 }
                 match process_responses_event(event) {
                     Ok(Some(event)) => {

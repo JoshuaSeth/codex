@@ -56,7 +56,7 @@ pub(crate) async fn record_completed_response_item(
     turn_context: &TurnContext,
     item: &ResponseItem,
 ) {
-    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
+    sess.record_model_response_items(turn_context, std::slice::from_ref(item))
         .await;
     maybe_mark_thread_memory_mode_polluted_from_web_search(sess, turn_context, item).await;
     record_stage1_output_usage_for_completed_item(turn_context, item).await;

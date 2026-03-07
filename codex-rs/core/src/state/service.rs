@@ -13,6 +13,7 @@ use crate::mcp::McpManager;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
 use crate::plugins::PluginsManager;
+use crate::session_cost::SessionCostRecorder;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -32,6 +33,7 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<RwLock<McpConnectionManager>>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
+    pub(crate) cost_recorder: Option<SessionCostRecorder>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) shell_zsh_path: Option<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]

@@ -1635,15 +1635,21 @@ dependencies = [
  "codex-utils-cargo-bin",
  "codex-utils-cli",
  "codex-windows-sandbox",
+ "crossterm",
+ "dirs",
  "libc",
  "owo-colors",
  "predicates",
  "pretty_assertions",
+ "ratatui",
  "regex-lite",
+ "serde",
  "serde_json",
  "sqlx",
  "supports-color 3.0.2",
  "tempfile",
+ "textwrap 0.16.2",
+ "time",
  "tokio",
  "toml 0.9.11+spec-1.1.0",
  "tracing",
@@ -1856,6 +1862,7 @@ dependencies = [
  "test-case",
  "test-log",
  "thiserror 2.0.18",
+ "tiktoken-rs",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -1921,7 +1928,9 @@ dependencies = [
  "shlex",
  "supports-color 3.0.2",
  "tempfile",
+ "time",
  "tokio",
+ "toml 0.9.11+spec-1.1.0",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -3812,6 +3821,17 @@ checksum = "7cd915d99f24784cdc19fd37ef22b97e3ff0ae756c7e492e9fbfe897d61e2aec"
 dependencies = [
  "indenter",
  "once_cell",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "531e46835a22af56d1e3b66f04844bed63158bc094a628bec1d321d9b4c44bf2"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax 0.8.8",
 ]
 
 [[package]]
@@ -9541,6 +9561,21 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg 0.4.21",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a19830747d9034cd9da43a60eaa8e552dfda7712424aebf187b7a60126bae0d"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex",
+ "lazy_static",
+ "regex",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]

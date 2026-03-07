@@ -1,6 +1,7 @@
 //! Session-wide mutable state.
 
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TurnContextItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -70,12 +71,26 @@ impl SessionState {
         self.history.clone()
     }
 
-    pub(crate) fn replace_history(&mut self, items: Vec<ResponseItem>) {
+    pub(crate) fn replace_history(
+        &mut self,
+        items: Vec<ResponseItem>,
+        reference_context_item: Option<TurnContextItem>,
+    ) {
         self.history.replace(items);
+        self.history
+            .set_reference_context_item(reference_context_item);
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.history.set_token_info(info);
+    }
+
+    pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
+        self.history.set_reference_context_item(item);
+    }
+
+    pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
+        self.history.reference_context_item()
     }
 
     // Token/rate limit helpers
