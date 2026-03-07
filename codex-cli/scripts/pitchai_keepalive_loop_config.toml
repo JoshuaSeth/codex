@@ -1,0 +1,21 @@
+# PitchAI keepalive loop profile.
+#
+# WARNING:
+# - `stop_hook_command` runs after every completed agent turn, and Codex *waits* for it
+#   before emitting the turn completion event / exiting `codex exec`.
+# - The default below sleeps for 4 hours. Use only in dedicated automation contexts.
+#
+# Quick test override (sleep 10s instead of 4h):
+#   codex exec --config-file codex-cli/scripts/pitchai_keepalive_loop_config.toml \
+#     -c 'stop_hook_command=["bash","-lc","sleep 10"]' \
+#     "Say hello"
+profile = "keepalive-loop"
+
+# Keep the process alive for ~4h after every completed turn.
+stop_hook_command = ["bash", "-lc", "sleep 14400"]
+
+[profiles.keepalive-loop]
+# Designed for headless automation loops.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+

@@ -1,6 +1,5 @@
 use anyhow::Context;
 use clap::Parser;
-use codex_common::CliConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_exec::Cli as ExecCli;
 use codex_exec::exec_events::AgentMessageItem;
@@ -10,6 +9,7 @@ use codex_exec::exec_events::ThreadEvent;
 use codex_exec::exec_events::ThreadItem;
 use codex_exec::exec_events::ThreadItemDetails;
 use codex_exec::exec_events::ThreadStartedEvent;
+use codex_utils_cli::CliConfigOverrides;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs::File;
@@ -126,8 +126,8 @@ pub fn run_exec_view(cli: ExecViewCli, root_overrides: &CliConfigOverrides) -> a
         let mut meta = ExecViewMetaV1::new(
             RootOverrides {
                 raw_overrides: root_overrides.raw_overrides.clone(),
-                config_home: root_overrides.config_home.clone(),
-                config_file: root_overrides.config_file.clone(),
+                config_home: None,
+                config_file: None,
             },
             meta_exec_args,
             stderr_path,
@@ -163,15 +163,9 @@ pub fn run_exec_view(cli: ExecViewCli, root_overrides: &CliConfigOverrides) -> a
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("exec");
 
-    // Propagate root-level config overrides and config home/file selection.
+    // Propagate root-level config overrides.
     for raw in &root_overrides.raw_overrides {
         cmd.arg("-c").arg(raw);
-    }
-    if let Some(home) = &root_overrides.config_home {
-        cmd.arg("--config-home").arg(home);
-    }
-    if let Some(file) = &root_overrides.config_file {
-        cmd.arg("--config-file").arg(file);
     }
 
     let json_missing = !cli
@@ -205,8 +199,8 @@ pub fn run_exec_view(cli: ExecViewCli, root_overrides: &CliConfigOverrides) -> a
     let mut meta = ExecViewMetaV1::new(
         RootOverrides {
             raw_overrides: root_overrides.raw_overrides.clone(),
-            config_home: root_overrides.config_home.clone(),
-            config_file: root_overrides.config_file.clone(),
+            config_home: None,
+            config_file: None,
         },
         meta_exec_args,
         stderr_path.clone(),
@@ -309,11 +303,8 @@ pub(crate) fn write_thread_events_pointer(
     Ok(path)
 }
 
-pub(crate) fn codex_home_from_root_overrides(root_overrides: &CliConfigOverrides) -> PathBuf {
-    match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    }
+pub(crate) fn codex_home_from_root_overrides(_root_overrides: &CliConfigOverrides) -> PathBuf {
+    find_codex_home().unwrap_or_else(|_| default_codex_home())
 }
 
 pub(crate) fn extract_effective_prompt(exec_args: &[String]) -> Option<String> {
@@ -495,13 +486,10 @@ pub(crate) fn seed_events_file_from_rollout(
 }
 
 fn find_rollout_file_by_thread_id(
-    root_overrides: &CliConfigOverrides,
+    _root_overrides: &CliConfigOverrides,
     thread_id: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
     let sessions_dir = codex_home.join("sessions");
     let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
     find_rollout_files_recursive(&sessions_dir, thread_id, &mut matches)?;

@@ -136,11 +136,19 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn has_exited(&self) -> bool {
-        self.process_handle.has_exited()
+        let has_exited = self.process_handle.has_exited();
+        if has_exited {
+            self.cancellation_token.cancel();
+        }
+        has_exited
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {
-        self.process_handle.exit_code()
+        let exit_code = self.process_handle.exit_code();
+        if exit_code.is_some() {
+            self.cancellation_token.cancel();
+        }
+        exit_code
     }
 
     pub(super) fn terminate(&self) {

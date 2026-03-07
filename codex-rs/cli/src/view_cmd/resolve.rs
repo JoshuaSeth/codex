@@ -1,6 +1,6 @@
 use anyhow::Context;
-use codex_common::CliConfigOverrides;
 use codex_core::config::find_codex_home;
+use codex_utils_cli::CliConfigOverrides;
 use serde_json::Value;
 use std::fs::File;
 use std::fs::read_dir;
@@ -56,13 +56,10 @@ fn looks_like_thread_id(s: &str) -> bool {
 }
 
 fn read_thread_events_pointer(
-    root_overrides: &CliConfigOverrides,
+    _root_overrides: &CliConfigOverrides,
     thread_id: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
     let pointer = codex_home
         .join("live")
         .join(format!("{thread_id}.events.jsonl.path"));
@@ -150,11 +147,8 @@ fn events_file_has_thread_id(path: &Path, thread_id: &str) -> anyhow::Result<boo
     Ok(false)
 }
 
-fn exec_view_dir(root_overrides: &CliConfigOverrides) -> anyhow::Result<PathBuf> {
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+fn exec_view_dir(_root_overrides: &CliConfigOverrides) -> anyhow::Result<PathBuf> {
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
     Ok(codex_home.join("live").join("exec-view"))
 }
 

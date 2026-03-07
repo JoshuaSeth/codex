@@ -139,7 +139,6 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             // | SlashCommand::Undo
-            | SlashCommand::Model
             | SlashCommand::Fast
             | SlashCommand::Personality
             | SlashCommand::Approvals
@@ -164,6 +163,7 @@ impl SlashCommand {
             | SlashCommand::Clean
             | SlashCommand::Mcp
             | SlashCommand::Apps
+            | SlashCommand::Model
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

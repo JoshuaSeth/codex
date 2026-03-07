@@ -63,6 +63,7 @@ pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 // This is intentionally much larger than `MAX_YIELD_TIME_MS` so models can
 // long-poll for background terminal output without spamming repeated polls.
 pub(crate) const MAX_EMPTY_YIELD_TIME_MS: u64 = 2 * 60 * 60 * 1_000; // 2 hours
+pub(crate) const MAX_EMPTY_YIELD_TIME_MS_PITCHAI_CLI: u64 = 8 * 60 * 60 * 1_000; // 8 hours
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;

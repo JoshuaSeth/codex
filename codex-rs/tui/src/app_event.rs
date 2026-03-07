@@ -175,11 +175,24 @@ pub(crate) enum AppEvent {
     StopCommitAnimation,
     CommitTick,
 
+    /// Submit the next queued user message (if any) when idle.
+    MaybeSendNextQueuedInput,
+
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
 
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
+
+    /// Apply a model/effort selection.
+    ///
+    /// When the agent is currently running a turn, the selection is queued and
+    /// applied once the active turn completes (before any queued user messages
+    /// are sent).
+    RequestModelSelection {
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
 
     /// Update the active collaboration mask in the running app and widget.
     UpdateCollaborationMode(CollaborationModeMask),

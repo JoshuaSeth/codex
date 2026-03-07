@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
-use codex_common::CliConfigOverrides;
 use codex_core::config::find_codex_home;
+use codex_utils_cli::CliConfigOverrides;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -90,15 +90,9 @@ pub fn run_exec_async(
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("exec");
 
-    // Propagate root-level config overrides and config home/file selection.
+    // Propagate root-level config overrides.
     for raw in &root_overrides.raw_overrides {
         cmd.arg("-c").arg(raw);
-    }
-    if let Some(home) = &root_overrides.config_home {
-        cmd.arg("--config-home").arg(home);
-    }
-    if let Some(file) = &root_overrides.config_file {
-        cmd.arg("--config-file").arg(file);
     }
 
     let json_missing = !cli
@@ -131,8 +125,8 @@ pub fn run_exec_async(
     let mut meta = ExecViewMetaV1::new(
         RootOverrides {
             raw_overrides: root_overrides.raw_overrides.clone(),
-            config_home: root_overrides.config_home.clone(),
-            config_file: root_overrides.config_file.clone(),
+            config_home: None,
+            config_file: None,
         },
         meta_exec_args,
         stderr_path.clone(),
@@ -169,12 +163,8 @@ pub fn run_exec_async(
     Ok(())
 }
 
-fn default_events_path(root_overrides: &CliConfigOverrides) -> anyhow::Result<PathBuf> {
-    // If a custom config-home is specified, keep the events file alongside it so it’s easy to find.
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+fn default_events_path(_root_overrides: &CliConfigOverrides) -> anyhow::Result<PathBuf> {
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
 
     let dir = codex_home.join("live").join("exec-async");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;

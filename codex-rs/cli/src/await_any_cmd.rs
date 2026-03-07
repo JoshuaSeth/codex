@@ -1,9 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
-use codex_common::CliConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::live_status::LiveStatusRecordV1;
 use codex_protocol::ThreadId;
+use codex_utils_cli::CliConfigOverrides;
 use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -37,11 +37,8 @@ struct AwaitAnyResult {
     still_running: Vec<String>,
 }
 
-pub fn run_await_any(cli: AwaitAnyCli, root_overrides: &CliConfigOverrides) -> anyhow::Result<()> {
-    let codex_home = match &root_overrides.config_home {
-        Some(home) => home.clone(),
-        None => find_codex_home().unwrap_or_else(|_| default_codex_home()),
-    };
+pub fn run_await_any(cli: AwaitAnyCli, _root_overrides: &CliConfigOverrides) -> anyhow::Result<()> {
+    let codex_home = find_codex_home().unwrap_or_else(|_| default_codex_home());
 
     let targets = cli
         .thread_ids

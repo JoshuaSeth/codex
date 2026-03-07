@@ -35,7 +35,11 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use wiremock::Mock;
 use wiremock::ResponseTemplate;
+use wiremock::http::Method;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 fn approx_token_count(text: &str) -> i64 {
     i64::try_from(text.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
@@ -291,6 +295,113 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
                 ("Remote Post-Compaction History Layout", follow_up_request),
             ]
         )
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_retries_transient_503_with_stream_retry_budget() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let responses_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "BEFORE_COMPACT_REPLY"),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "AFTER_COMPACT_REPLY"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream connect error"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
+    let compact_mock = responses::mount_compact_json_once(
+        &server,
+        serde_json::json!({ "output": compacted_history }),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config({
+            let base_url = format!("{}/v1", server.uri());
+            move |config| {
+                config.model_provider.base_url = Some(base_url);
+                config.model_provider.wire_api = codex_core::WireApi::Responses;
+                // Disable generic unary retries so this test only passes if compact requests use
+                // the stream retry budget.
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(2);
+            }
+        });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger compact retry".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "after compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        responses_mock.requests().len(),
+        2,
+        "expected the follow-up turn to run after compact retry recovery"
+    );
+    assert_eq!(compact_mock.requests().len(), 1);
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let compact_attempts = requests
+        .iter()
+        .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses/compact"))
+        .count();
+    assert_eq!(
+        compact_attempts, 3,
+        "expected compact request retries: two transient 503s plus one success"
     );
 
     Ok(())

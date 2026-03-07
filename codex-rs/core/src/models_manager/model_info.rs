@@ -12,7 +12,6 @@ use codex_protocol::openai_models::default_input_modalities;
 use crate::config::Config;
 use crate::features::Feature;
 use crate::truncate::approx_bytes_for_tokens;
-use std::collections::HashSet;
 use tracing::warn;
 
 pub const BASE_INSTRUCTIONS: &str = include_str!("../../prompt.md");
@@ -53,16 +52,6 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
         model.model_messages = None;
     } else if !config.features.enabled(Feature::Personality) {
         model.model_messages = None;
-    }
-
-    if !config.experimental_supported_tools.is_empty() {
-        let mut seen: HashSet<String> =
-            model.experimental_supported_tools.iter().cloned().collect();
-        for tool in &config.experimental_supported_tools {
-            if seen.insert(tool.clone()) {
-                model.experimental_supported_tools.push(tool.clone());
-            }
-        }
     }
 
     model

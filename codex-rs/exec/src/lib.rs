@@ -9,21 +9,19 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
-mod prompt_sequence;
 
-use anyhow::Context;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
+use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader;
-use codex_common::oss::ensure_oss_provider_ready;
-use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::NewThread;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
 use codex_core::auth::enforce_login_restrictions;
+use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -32,57 +30,56 @@ use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::format_config_error_with_source;
+use codex_core::format_exec_policy_error_with_source;
 use codex_core::git_info::get_git_repo_root;
-use codex_core::live_status::LiveFrontend;
-use codex_core::live_status::LiveSessionStatus;
-use codex_core::live_status::LiveStatusRecordV1;
-use codex_core::live_status::LiveStatusWriter;
-use codex_core::live_status::LiveStatusWriterConfig;
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::RefreshStrategy;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::Event;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::Op;
-use codex_core::protocol::ReviewRequest;
-use codex_core::protocol::ReviewTarget;
-use codex_core::protocol::SessionSource;
+use codex_otel::set_parent_from_context;
+use codex_otel::traceparent_context_from_env;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewRequest;
+use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_oss::ensure_oss_provider_ready;
+use codex_utils_oss::get_default_model_for_oss_provider;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Read;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use supports_color::Stream;
-use time::OffsetDateTime;
-use time::format_description::FormatItem;
-use time::macros::format_description;
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
+use tracing::field;
 use tracing::info;
+use tracing::info_span;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::prompt_sequence::PromptSequenceRunner;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
-use codex_core::find_conversation_path_by_selector_str;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_core::find_thread_path_by_id_str;
+use codex_core::find_thread_path_by_name_str;
+
+const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
 enum InitialOperation {
     UserTurn {
@@ -99,9 +96,36 @@ struct ThreadEventEnvelope {
     thread_id: codex_protocol::ThreadId,
     thread: Arc<codex_core::CodexThread>,
     event: Event,
+    suppress_output: bool,
 }
 
-pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+struct ExecRunArgs {
+    command: Option<ExecCommand>,
+    config: Config,
+    cursor_ansi: bool,
+    dangerously_bypass_approvals_and_sandbox: bool,
+    exec_span: tracing::Span,
+    images: Vec<PathBuf>,
+    json_mode: bool,
+    last_message_file: Option<PathBuf>,
+    model_provider: Option<String>,
+    oss: bool,
+    output_schema_path: Option<PathBuf>,
+    prompt: Option<String>,
+    skip_git_repo_check: bool,
+    stderr_with_ansi: bool,
+}
+
+fn exec_root_span() -> tracing::Span {
+    info_span!(
+        "codex.exec",
+        otel.kind = "internal",
+        thread.id = field::Empty,
+        turn.id = field::Empty,
+    )
+}
+
+pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
@@ -117,7 +141,6 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         dangerously_bypass_approvals_and_sandbox,
         cwd,
         skip_git_repo_check,
-        prompt_sequence,
         add_dir,
         ephemeral,
         color,
@@ -125,36 +148,37 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         json: json_mode,
         sandbox_mode: sandbox_mode_cli_arg,
         prompt,
+        prompt_sequence: _,
         output_schema: output_schema_path,
         config_overrides,
+        progress_cursor,
     } = cli;
 
-    if prompt_sequence.is_some() {
-        if command.is_some() {
-            eprintln!(
-                "--prompt-sequence cannot be combined with exec subcommands like review or resume."
-            );
-            std::process::exit(1);
-        }
-        if prompt.is_some() {
-            eprintln!("PROMPT arguments cannot be provided when using --prompt-sequence.");
-            std::process::exit(1);
-        }
-        if !images.is_empty() {
-            eprintln!(
-                "--image is not supported together with --prompt-sequence. Attachments should be listed in the sequence file."
-            );
-            std::process::exit(1);
-        }
-    }
-
-    let (stdout_with_ansi, stderr_with_ansi) = match color {
+    let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
         cli::Color::Never => (false, false),
         cli::Color::Auto => (
             supports_color::on_cached(Stream::Stdout).is_some(),
             supports_color::on_cached(Stream::Stderr).is_some(),
         ),
+    };
+    let cursor_ansi = if progress_cursor {
+        true
+    } else {
+        match color {
+            cli::Color::Never => false,
+            cli::Color::Always => true,
+            cli::Color::Auto => {
+                if stderr_with_ansi || std::io::stderr().is_terminal() {
+                    true
+                } else {
+                    match std::env::var("TERM") {
+                        Ok(term) => !term.is_empty() && term != "dumb",
+                        Err(_) => false,
+                    }
+                }
+            }
+        }
     };
 
     // Build fmt layer (existing logging) to compose with OTEL layer.
@@ -240,7 +264,8 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
-    let cloud_requirements = cloud_requirements_loader(cloud_auth_manager, chatgpt_base_url);
+    let cloud_requirements =
+        cloud_requirements_loader(cloud_auth_manager, chatgpt_base_url, codex_home.clone());
 
     let model_provider = if oss {
         let resolved = resolve_oss_provider(
@@ -282,7 +307,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         sandbox_mode,
         cwd: resolved_cwd,
         model_provider: model_provider.clone(),
-        codex_linux_sandbox_exe,
+        service_tier: None,
+        codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
+        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
+        js_repl_node_path: None,
+        js_repl_node_module_dirs: None,
+        zsh_path: None,
         base_instructions: None,
         developer_instructions: None,
         personality: None,
@@ -300,6 +330,19 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         .cloud_requirements(cloud_requirements)
         .build()
         .await?;
+
+    #[allow(clippy::print_stderr)]
+    match check_execpolicy_for_warnings(&config.config_layer_stack).await {
+        Ok(None) => {}
+        Ok(Some(err)) | Err(err) => {
+            eprintln!(
+                "Error loading rules:\n{}",
+                format_exec_policy_error_with_source(&err)
+            );
+            std::process::exit(1);
+        }
+    }
+
     set_default_client_residency_requirement(config.enforce_residency.value());
 
     if let Err(err) = enforce_login_restrictions(&config) {
@@ -308,7 +351,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, false)
+        codex_core::otel_init::build_provider(
+            &config,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            DEFAULT_ANALYTICS_ENABLED,
+        )
     })) {
         Ok(Ok(otel)) => otel,
         Ok(Err(e)) => {
@@ -331,10 +379,53 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         .with(otel_logger_layer)
         .try_init();
 
+    let exec_span = exec_root_span();
+    if let Some(context) = traceparent_context_from_env() {
+        set_parent_from_context(&exec_span, context);
+    }
+    run_exec_session(ExecRunArgs {
+        command,
+        config,
+        cursor_ansi,
+        dangerously_bypass_approvals_and_sandbox,
+        exec_span: exec_span.clone(),
+        images,
+        json_mode,
+        last_message_file,
+        model_provider,
+        oss,
+        output_schema_path,
+        prompt,
+        skip_git_repo_check,
+        stderr_with_ansi,
+    })
+    .instrument(exec_span)
+    .await
+}
+
+async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+    let ExecRunArgs {
+        command,
+        config,
+        cursor_ansi,
+        dangerously_bypass_approvals_and_sandbox,
+        exec_span,
+        images,
+        json_mode,
+        last_message_file,
+        model_provider,
+        oss,
+        output_schema_path,
+        prompt,
+        skip_git_repo_check,
+        stderr_with_ansi,
+    } = args;
+
     let mut event_processor: Box<dyn EventProcessor> = match json_mode {
         true => Box::new(EventProcessorWithJsonOutput::new(last_message_file.clone())),
         _ => Box::new(EventProcessorWithHumanOutput::create_with_ansi(
-            stdout_with_ansi,
+            stderr_with_ansi,
+            cursor_ansi,
             &config,
             last_message_file.clone(),
         )),
@@ -365,10 +456,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     let default_cwd = config.cwd.to_path_buf();
-    let default_approval_policy = config.approval_policy.value();
-    let default_sandbox_policy = config.sandbox_policy.get();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
-    let default_summary = config.model_reasoning_summary;
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
@@ -389,10 +479,16 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         config.codex_home.clone(),
         auth_manager.clone(),
         SessionSource::Exec,
+        config.model_catalog.clone(),
+        CollaborationModesConfig {
+            default_mode_request_user_input: config
+                .features
+                .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
+        },
     ));
     let default_model = thread_manager
         .get_models_manager()
-        .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)
+        .get_default_model(&config.model, RefreshStrategy::OnlineIfUncached)
         .await;
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
@@ -401,14 +497,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         thread,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-        let mut resume_path = resolve_resume_path(&config, args).await?;
+        let resume_path = resolve_resume_path(&config, args).await?;
 
-        if let Some(path) = resume_path.as_ref() {
-            let thread_id = resolve_thread_id_for_resume(args, path).await?;
-            wait_for_thread_to_finish_if_running(&config.codex_home, &thread_id).await?;
-        }
-
-        if let Some(path) = resume_path.take() {
+        if let Some(path) = resume_path {
             thread_manager
                 .resume_thread_from_rollout(config.clone(), path, auth_manager.clone())
                 .await?
@@ -418,135 +509,66 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     } else {
         thread_manager.start_thread(config.clone()).await?
     };
+    let primary_thread_id_for_span = primary_thread_id.to_string();
+    exec_span.record("thread.id", primary_thread_id_for_span.as_str());
 
-    let cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
-    let mut live_status = match LiveStatusWriter::spawn(LiveStatusWriterConfig {
-        codex_home: config.codex_home.clone(),
-        thread_id: primary_thread_id,
-        frontend: LiveFrontend::Exec,
-        status: LiveSessionStatus::Running,
-        detail: None,
-        cwd: Some(config.cwd.clone()),
-        cli_version,
-        heartbeat_interval: None,
-    }) {
-        Ok(writer) => Some(writer),
-        Err(err) => {
-            warn!(?err, "failed to start live status writer");
-            None
+    let (initial_operation, prompt_summary) = match (command, prompt, images) {
+        (Some(ExecCommand::Review(review_cli)), _, _) => {
+            let review_request = build_review_request(review_cli)?;
+            let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
+            (InitialOperation::Review { review_request }, summary)
         }
-    };
-
-    let mut prompt_sequence_runner = match prompt_sequence {
-        Some(path) => Some(PromptSequenceRunner::load(&path)?),
-        None => None,
-    };
-
-    let output_schema = load_output_schema(output_schema_path);
-
-    let mut initial_sequence_entry = None;
-    if let Some(runner) = prompt_sequence_runner.as_mut() {
-        initial_sequence_entry = Some(runner.next_entry().ok_or_else(|| {
-            anyhow::anyhow!(
-                "prompt-sequence {} did not contain any steps",
-                runner.source().display()
+        (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
+            let prompt_arg = args
+                .prompt
+                .clone()
+                .or_else(|| {
+                    if args.last {
+                        args.session_id.clone()
+                    } else {
+                        None
+                    }
+                })
+                .or(root_prompt);
+            let prompt_text = resolve_prompt(prompt_arg);
+            let mut items: Vec<UserInput> = imgs
+                .into_iter()
+                .chain(args.images.into_iter())
+                .map(|path| UserInput::LocalImage { path })
+                .collect();
+            items.push(UserInput::Text {
+                text: prompt_text.clone(),
+                // CLI input doesn't track UI element ranges, so none are available here.
+                text_elements: Vec::new(),
+            });
+            let output_schema = load_output_schema(output_schema_path.clone());
+            (
+                InitialOperation::UserTurn {
+                    items,
+                    output_schema,
+                },
+                prompt_text,
             )
-        })?);
-    }
-
-    let (initial_operation, prompt_summary) = if let Some(entry) = initial_sequence_entry {
-        let description = format!(
-            "{} ({}/{})",
-            entry.description,
-            entry.index + 1,
-            entry.total
-        );
-        (
-            InitialOperation::UserTurn {
-                items: entry.items,
-                output_schema: output_schema.clone(),
-            },
-            description,
-        )
-    } else {
-        match (command, prompt, images) {
-            (Some(ExecCommand::Review(review_cli)), _, _) => {
-                let review_request = build_review_request(review_cli)?;
-                let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
-                (InitialOperation::Review { review_request }, summary)
-            }
-            (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-                if args.no_prompt && root_prompt.is_some() {
-                    eprintln!(
-                        "--no-prompt cannot be combined with a PROMPT argument or piped stdin input."
-                    );
-                    std::process::exit(1);
-                }
-
-                if args.no_prompt {
-                    let items: Vec<UserInput> = imgs
-                        .into_iter()
-                        .chain(args.images.into_iter())
-                        .map(|path| UserInput::LocalImage { path })
-                        .collect();
-                    (
-                        InitialOperation::UserTurn {
-                            items,
-                            output_schema: output_schema.clone(),
-                        },
-                        "(resume without prompt)".to_string(),
-                    )
-                } else {
-                    let prompt_arg = args
-                        .prompt
-                        .clone()
-                        .or_else(|| {
-                            if args.last {
-                                args.session_id.clone()
-                            } else {
-                                None
-                            }
-                        })
-                        .or(root_prompt);
-                    let prompt_text = resolve_prompt(prompt_arg);
-                    let mut items: Vec<UserInput> = imgs
-                        .into_iter()
-                        .chain(args.images.into_iter())
-                        .map(|path| UserInput::LocalImage { path })
-                        .collect();
-                    items.push(UserInput::Text {
-                        text: prompt_text.clone(),
-                        // CLI input doesn't track UI element ranges, so none are available here.
-                        text_elements: Vec::new(),
-                    });
-                    (
-                        InitialOperation::UserTurn {
-                            items,
-                            output_schema: output_schema.clone(),
-                        },
-                        prompt_text,
-                    )
-                }
-            }
-            (None, root_prompt, imgs) => {
-                let prompt_text = resolve_prompt(root_prompt);
-                let mut items: Vec<UserInput> = imgs
-                    .into_iter()
-                    .map(|path| UserInput::LocalImage { path })
-                    .collect();
-                items.push(UserInput::Text {
-                    text: prompt_text.clone(),
-                    // CLI input doesn't track UI element ranges, so none are available here.
-                    text_elements: Vec::new(),
-                });
-                (
-                    InitialOperation::UserTurn {
-                        items,
-                        output_schema: output_schema.clone(),
-                    },
-                    prompt_text,
-                )
-            }
+        }
+        (None, root_prompt, imgs) => {
+            let prompt_text = resolve_prompt(root_prompt);
+            let mut items: Vec<UserInput> = imgs
+                .into_iter()
+                .map(|path| UserInput::LocalImage { path })
+                .collect();
+            items.push(UserInput::Text {
+                text: prompt_text.clone(),
+                // CLI input doesn't track UI element ranges, so none are available here.
+                text_elements: Vec::new(),
+            });
+            let output_schema = load_output_schema(output_schema_path);
+            (
+                InitialOperation::UserTurn {
+                    items,
+                    output_schema,
+                },
+                prompt_text,
+            )
         }
     };
 
@@ -558,7 +580,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ThreadEventEnvelope>();
     let attached_threads = Arc::new(Mutex::new(HashSet::from([primary_thread_id])));
-    spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone());
+    spawn_thread_listener(primary_thread_id, thread.clone(), tx.clone(), false);
 
     {
         let thread = thread.clone();
@@ -586,7 +608,14 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                         match thread_manager.get_thread(thread_id).await {
                             Ok(thread) => {
                                 attached_threads.lock().await.insert(thread_id);
-                                spawn_thread_listener(thread_id, thread, tx.clone());
+                                let suppress_output =
+                                    is_agent_job_subagent(&thread.config_snapshot().await);
+                                spawn_thread_listener(
+                                    thread_id,
+                                    thread,
+                                    tx.clone(),
+                                    suppress_output,
+                                );
                             }
                             Err(err) => {
                                 warn!("failed to attach listener for thread {thread_id}: {err}")
@@ -602,7 +631,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         });
     }
 
-    match initial_operation {
+    let task_id = match initial_operation {
         InitialOperation::UserTurn {
             items,
             output_schema,
@@ -610,12 +639,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             let task_id = thread
                 .submit(Op::UserTurn {
                     items,
-                    cwd: default_cwd.clone(),
+                    cwd: default_cwd,
                     approval_policy: default_approval_policy,
                     sandbox_policy: default_sandbox_policy.clone(),
-                    model: default_model.clone(),
+                    model: default_model,
                     effort: default_effort,
-                    summary: default_summary,
+                    summary: None,
+                    service_tier: None,
                     final_output_json_schema: output_schema,
                     collaboration_mode: None,
                     personality: None,
@@ -630,6 +660,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             task_id
         }
     };
+    exec_span.record("turn.id", task_id.as_str());
 
     // Run the loop until the task is complete.
     // Track whether a fatal error was reported by the server so we can
@@ -641,20 +672,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             thread_id,
             thread,
             event,
+            suppress_output,
         } = envelope;
-        let is_primary_turn_complete =
-            thread_id == primary_thread_id && matches!(event.msg, EventMsg::TurnComplete(_));
-        let queued_sequence_step = if is_primary_turn_complete {
-            prompt_sequence_runner.as_mut().and_then(|runner| {
-                runner
-                    .has_remaining()
-                    .then(|| runner.next_entry())
-                    .flatten()
-            })
-        } else {
-            None
-        };
-
+        if suppress_output && should_suppress_agent_job_event(&event.msg) {
+            continue;
+        }
         if matches!(event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
@@ -670,12 +692,13 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                     server_name: ev.server_name.clone(),
                     request_id: ev.id.clone(),
                     decision: ElicitationAction::Cancel,
+                    content: None,
                 })
                 .await?;
         }
         if let EventMsg::McpStartupUpdate(update) = &event.msg
             && required_mcp_servers.contains(&update.server)
-            && let codex_core::protocol::McpStartupStatus::Failed { error } = &update.status
+            && let codex_protocol::protocol::McpStartupStatus::Failed { error } = &update.status
         {
             error_seen = true;
             eprintln!(
@@ -690,38 +713,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         if thread_id != primary_thread_id && matches!(&event.msg, EventMsg::TurnComplete(_)) {
             continue;
         }
-        let mut shutdown = event_processor.process_event(event);
-
-        if let Some(entry) = queued_sequence_step
-            && !shutdown_requested
-        {
-            info!(
-                "Prompt sequence: launching step {}/{} ({})",
-                entry.index + 1,
-                entry.total,
-                entry.description
-            );
-            thread
-                .submit(Op::UserTurn {
-                    items: entry.items,
-                    cwd: default_cwd.clone(),
-                    approval_policy: default_approval_policy,
-                    sandbox_policy: default_sandbox_policy.clone(),
-                    model: default_model.clone(),
-                    effort: default_effort,
-                    summary: default_summary,
-                    final_output_json_schema: output_schema.clone(),
-                    collaboration_mode: None,
-                    personality: None,
-                })
-                .await?;
-            shutdown = CodexStatus::Running;
-        }
-
+        let shutdown = event_processor.process_event(event);
         if thread_id != primary_thread_id && matches!(shutdown, CodexStatus::InitiateShutdown) {
             continue;
         }
-
         match shutdown {
             CodexStatus::Running => continue,
             CodexStatus::InitiateShutdown => {
@@ -735,154 +730,18 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
-    if let Some(writer) = live_status.take() {
-        let status = if error_seen {
-            LiveSessionStatus::Errored
-        } else {
-            LiveSessionStatus::Completed
-        };
-        writer
-            .shutdown(
-                status,
-                Some(if error_seen {
-                    "fatal error seen".to_string()
-                } else {
-                    "finished".to_string()
-                }),
-            )
-            .await;
-    }
-
     if error_seen {
-        anyhow::bail!("fatal error reported by server");
+        std::process::exit(1);
     }
 
     Ok(())
-}
-
-fn heartbeat_age_seconds(last_heartbeat_at: &str) -> Option<f64> {
-    let parsed = time::OffsetDateTime::parse(
-        last_heartbeat_at,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()?;
-    let now = time::OffsetDateTime::now_utc();
-    let diff = now - parsed;
-    Some(diff.whole_milliseconds() as f64 / 1000.0)
-}
-
-async fn resolve_thread_id_for_resume(
-    args: &crate::cli::ResumeArgs,
-    rollout_path: &Path,
-) -> anyhow::Result<codex_protocol::ThreadId> {
-    if let Some(selector) = args.session_id.as_deref()
-        && let Ok(id) = codex_protocol::ThreadId::from_string(selector)
-    {
-        return Ok(id);
-    }
-    read_thread_id_from_rollout_head(rollout_path).await
-}
-
-async fn read_thread_id_from_rollout_head(path: &Path) -> anyhow::Result<codex_protocol::ThreadId> {
-    use tokio::io::AsyncBufReadExt;
-
-    const HEAD_RECORD_LIMIT: usize = 25;
-
-    let file = fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open rollout {}", path.display()))?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut non_empty = 0usize;
-    while non_empty < HEAD_RECORD_LIMIT {
-        let line_opt = lines.next_line().await?;
-        let Some(line) = line_opt else {
-            break;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        non_empty += 1;
-
-        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
-            continue;
-        };
-        if let RolloutItem::SessionMeta(meta) = rollout_line.item {
-            return Ok(meta.meta.id);
-        }
-    }
-
-    anyhow::bail!(
-        "failed to resolve thread id from rollout {}",
-        path.display()
-    )
-}
-
-async fn wait_for_thread_to_finish_if_running(
-    codex_home: &Path,
-    thread_id: &codex_protocol::ThreadId,
-) -> anyhow::Result<()> {
-    let status_path = LiveStatusRecordV1::path_for(codex_home, thread_id);
-
-    let mut printed_wait_message = false;
-    loop {
-        let bytes = match fs::read(&status_path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed reading live status {}", status_path.display())
-                });
-            }
-        };
-        let value: Value = serde_json::from_slice(&bytes).with_context(|| {
-            format!("failed parsing live status json {}", status_path.display())
-        })?;
-
-        let alive = value
-            .get("alive")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if !alive {
-            return Ok(());
-        }
-
-        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if matches!(status, "completed" | "errored") {
-            return Ok(());
-        }
-
-        let last_heartbeat_at = value
-            .get("last_heartbeat_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let age_s = heartbeat_age_seconds(last_heartbeat_at).unwrap_or(f64::INFINITY);
-        if age_s > 30.0 {
-            // Best-effort: treat stale records as not-running so users can recover after a crash.
-            return Ok(());
-        }
-
-        if !printed_wait_message {
-            printed_wait_message = true;
-            eprintln!(
-                "Session {thread_id} appears to be running; waiting for it to finish before resuming (Ctrl+C to cancel)."
-            );
-        }
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                anyhow::bail!("interrupted while waiting for session {thread_id} to finish");
-            }
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-        }
-    }
 }
 
 fn spawn_thread_listener(
     thread_id: codex_protocol::ThreadId,
     thread: Arc<codex_core::CodexThread>,
     tx: tokio::sync::mpsc::UnboundedSender<ThreadEventEnvelope>,
+    suppress_output: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -895,6 +754,7 @@ fn spawn_thread_listener(
                         thread_id,
                         thread: Arc::clone(&thread),
                         event,
+                        suppress_output,
                     }) {
                         error!("Error sending event: {err:?}");
                         break;
@@ -915,11 +775,35 @@ fn spawn_thread_listener(
     });
 }
 
+fn is_agent_job_subagent(config: &codex_core::ThreadConfigSnapshot) -> bool {
+    match &config.session_source {
+        SessionSource::SubAgent(SubAgentSource::Other(source)) => source.starts_with("agent_job:"),
+        _ => false,
+    }
+}
+
+fn should_suppress_agent_job_event(msg: &EventMsg) -> bool {
+    !matches!(
+        msg,
+        EventMsg::ExecApprovalRequest(_)
+            | EventMsg::ApplyPatchApprovalRequest(_)
+            | EventMsg::RequestUserInput(_)
+            | EventMsg::DynamicToolCallRequest(_)
+            | EventMsg::DynamicToolCallResponse(_)
+            | EventMsg::ElicitationRequest(_)
+            | EventMsg::Error(_)
+            | EventMsg::Warning(_)
+            | EventMsg::DeprecationNotice(_)
+            | EventMsg::StreamError(_)
+            | EventMsg::ShutdownComplete
+    )
+}
+
 async fn resolve_resume_path(
     config: &Config,
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let resolved = if args.last {
+    if args.last {
         let default_provider_filter = vec![config.model_provider_id.clone()];
         let filter_cwd = if args.all {
             None
@@ -938,79 +822,23 @@ async fn resolve_resume_path(
         )
         .await
         {
-            Ok(path) => path,
+            Ok(path) => Ok(path),
             Err(e) => {
                 error!("Error listing threads: {e}");
-                None
+                Ok(None)
             }
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
-        find_conversation_path_by_selector_str(&config.codex_home, id_str).await?
+        if Uuid::parse_str(id_str).is_ok() {
+            let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        } else {
+            let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        }
     } else {
-        None
-    };
-
-    if args.fork {
-        let Some(path) = resolved.as_ref() else {
-            return Ok(None);
-        };
-        return Ok(Some(fork_rollout_file(&config.codex_home, path).await?));
+        Ok(None)
     }
-
-    Ok(resolved)
-}
-
-async fn fork_rollout_file(codex_home: &Path, source_path: &Path) -> anyhow::Result<PathBuf> {
-    let content = fs::read_to_string(source_path)
-        .await
-        .with_context(|| format!("failed to read {}", source_path.display()))?;
-    let mut lines = content.lines();
-    let first = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("rollout file missing session meta line"))?;
-    let mut first_json: Value = serde_json::from_str(first)
-        .with_context(|| format!("invalid session meta json in {}", source_path.display()))?;
-
-    let new_id = codex_protocol::ThreadId::default();
-
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let format: &[FormatItem] =
-        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
-    let ts_str = now
-        .format(format)
-        .with_context(|| "failed to format fork timestamp")?;
-
-    let payload = first_json
-        .get_mut("payload")
-        .ok_or_else(|| anyhow::anyhow!("session meta line missing payload"))?;
-    payload["id"] = Value::String(new_id.to_string());
-    payload["timestamp"] = Value::String(ts_str.clone());
-    first_json["timestamp"] = Value::String(ts_str.clone());
-
-    let mut dir = codex_home.to_path_buf();
-    dir.push("sessions");
-    dir.push(format!("{:04}", now.year()));
-    dir.push(format!("{:02}", u8::from(now.month())));
-    dir.push(format!("{:02}", now.day()));
-    fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("failed to create {}", dir.display()))?;
-
-    let filename = format!("rollout-{ts_str}-{new_id}.jsonl");
-    let dest_path = dir.join(filename);
-    let mut out = fs::File::create(&dest_path)
-        .await
-        .with_context(|| format!("failed to create {}", dest_path.display()))?;
-    out.write_all(serde_json::to_string(&first_json)?.as_bytes())
-        .await?;
-    out.write_all(b"\n").await?;
-
-    for line in lines {
-        out.write_all(line.as_bytes()).await?;
-        out.write_all(b"\n").await?;
-    }
-    out.flush().await?;
-    Ok(dest_path)
 }
 
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
@@ -1185,9 +1013,43 @@ fn build_review_request(args: ReviewArgs) -> anyhow::Result<ReviewRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_otel::set_parent_from_w3c_trace_context;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry::trace::TraceId;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-    use time::format_description::well_known::Rfc3339;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("codex-exec-tests");
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer))
+    }
+
+    #[test]
+    fn exec_defaults_analytics_to_enabled() {
+        assert_eq!(DEFAULT_ANALYTICS_ENABLED, true);
+    }
+
+    #[test]
+    fn exec_root_span_can_be_parented_from_trace_context() {
+        let subscriber = test_tracing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let parent = codex_protocol::protocol::W3cTraceContext {
+            traceparent: Some("00-00000000000000000000000000000077-0000000000000088-01".into()),
+            tracestate: Some("vendor=value".into()),
+        };
+        let exec_span = exec_root_span();
+        assert!(set_parent_from_w3c_trace_context(&exec_span, &parent));
+
+        let trace_id = exec_span.context().span().span_context().trace_id();
+        assert_eq!(
+            trace_id,
+            TraceId::from_hex("00000000000000000000000000000077").expect("trace id")
+        );
+    }
 
     #[test]
     fn builds_uncommitted_review_request() {
@@ -1249,123 +1111,6 @@ mod tests {
         };
 
         assert_eq!(request, expected);
-    }
-
-    #[tokio::test]
-    async fn resolves_thread_id_for_resume_from_rollout_head() {
-        let tmp = TempDir::new().expect("creates tempdir");
-        let rollout_path = tmp.path().join("rollout.jsonl");
-
-        let thread_id = codex_protocol::ThreadId::default();
-        let meta = codex_protocol::protocol::SessionMeta {
-            id: thread_id,
-            timestamp: "2026-01-01T00:00:00".to_string(),
-            ..Default::default()
-        };
-        let line = RolloutLine {
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-            item: RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
-                meta,
-                git: None,
-            }),
-        };
-        let json = serde_json::to_string(&line).expect("serialize rollout line");
-        tokio::fs::write(&rollout_path, format!("{json}\n"))
-            .await
-            .expect("write rollout file");
-
-        let args = crate::cli::ResumeArgs {
-            session_id: None,
-            last: false,
-            all: false,
-            fork: false,
-            images: Vec::new(),
-            prompt: None,
-            no_prompt: false,
-        };
-
-        let resolved = resolve_thread_id_for_resume(&args, &rollout_path)
-            .await
-            .expect("resolve thread id");
-        assert_eq!(resolved, thread_id);
-    }
-
-    #[tokio::test]
-    async fn waits_for_running_session_to_finish_before_resuming() {
-        let tmp = TempDir::new().expect("creates tempdir");
-        let codex_home = tmp.path();
-
-        let thread_id = codex_protocol::ThreadId::default();
-        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
-        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
-            .await
-            .expect("create live dir");
-
-        let now = time::OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .expect("format rfc3339");
-        let initial = serde_json::json!({
-            "alive": true,
-            "status": "running",
-            "last_heartbeat_at": now,
-        });
-        tokio::fs::write(&status_path, serde_json::to_vec(&initial).expect("json"))
-            .await
-            .expect("write live status");
-
-        let status_path_for_task = status_path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let done = serde_json::json!({
-                "alive": false,
-                "status": "completed",
-                "last_heartbeat_at": time::OffsetDateTime::now_utc()
-                    .format(&Rfc3339)
-                    .expect("format rfc3339"),
-            });
-            let _ = tokio::fs::write(
-                &status_path_for_task,
-                serde_json::to_vec(&done).expect("json"),
-            )
-            .await;
-        });
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
-        )
-        .await
-        .expect("wait returns")
-        .expect("ok");
-    }
-
-    #[tokio::test]
-    async fn does_not_block_on_stale_live_status() {
-        let tmp = TempDir::new().expect("creates tempdir");
-        let codex_home = tmp.path();
-
-        let thread_id = codex_protocol::ThreadId::default();
-        let status_path = LiveStatusRecordV1::path_for(codex_home, &thread_id);
-        tokio::fs::create_dir_all(status_path.parent().expect("live dir"))
-            .await
-            .expect("create live dir");
-
-        let stale = serde_json::json!({
-            "alive": true,
-            "status": "running",
-            "last_heartbeat_at": "1970-01-01T00:00:00Z",
-        });
-        tokio::fs::write(&status_path, serde_json::to_vec(&stale).expect("json"))
-            .await
-            .expect("write live status");
-
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            wait_for_thread_to_finish_if_running(codex_home, &thread_id),
-        )
-        .await
-        .expect("returns without blocking")
-        .expect("ok");
     }
 
     #[test]

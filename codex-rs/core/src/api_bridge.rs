@@ -55,10 +55,23 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
+                    let is_generic_bad_request =
+                        serde_json::from_str::<serde_json::Value>(&body_text)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("detail")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|detail| detail.eq_ignore_ascii_case("bad request"))
+                            })
+                            .unwrap_or(false);
+
                     if body_text
                         .contains("The image data you provided does not represent a valid image")
                     {
                         CodexErr::InvalidImageRequest()
+                    } else if is_generic_bad_request {
+                        CodexErr::Stream(body_text, None)
                     } else {
                         CodexErr::InvalidRequest(body_text)
                     }
@@ -216,6 +229,26 @@ mod tests {
                 .and_then(|snapshot| snapshot.limit_name.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn map_api_error_maps_generic_bad_request_to_stream() {
+        let body = serde_json::json!({
+            "detail": "Bad Request",
+        })
+        .to_string();
+
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_REQUEST,
+            url: Some("http://example.com/v1/responses".to_string()),
+            headers: Some(HeaderMap::new()),
+            body: Some(body),
+        }));
+
+        let CodexErr::Stream(message, None) = err else {
+            panic!("expected CodexErr::Stream, got {err:?}");
+        };
+        assert!(message.contains("Bad Request"));
     }
 }
 

@@ -112,6 +112,7 @@ async fn run_compact_task_inner(
 
     let mut truncated_count = 0usize;
 
+    let max_retries = turn_context.provider.stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
@@ -175,10 +176,6 @@ async fn run_compact_task_inner(
                 return Err(e);
             }
             Err(e) => {
-                let max_retries = match &e {
-                    CodexErr::Stream(..) => turn_context.provider.stream_disconnect_max_retries(),
-                    _ => turn_context.provider.stream_max_retries(),
-                };
                 if retries < max_retries {
                     retries += 1;
                     let delay = backoff(retries);

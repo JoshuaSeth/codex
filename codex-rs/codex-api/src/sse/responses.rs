@@ -159,6 +159,7 @@ struct ResponseCompletedOutputTokensDetails {
 pub struct ResponsesStreamEvent {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    headers: Option<Value>,
     response: Option<Value>,
     item: Option<Value>,
     delta: Option<String>,
@@ -169,6 +170,48 @@ pub struct ResponsesStreamEvent {
 impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// Returns the effective model reported by the server, if present.
+    ///
+    /// Precedence:
+    /// 1. `response.headers` for standard Responses stream events.
+    /// 2. top-level `headers` for websocket metadata events (for example
+    ///    `codex.response.metadata`).
+    pub fn response_model(&self) -> Option<String> {
+        let response_headers_model = self
+            .response
+            .as_ref()
+            .and_then(|response| response.get("headers"))
+            .and_then(header_openai_model_value_from_json);
+
+        match response_headers_model {
+            Some(model) => Some(model),
+            None => self
+                .headers
+                .as_ref()
+                .and_then(header_openai_model_value_from_json),
+        }
+    }
+}
+
+fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
+    let headers = value.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+        {
+            json_value_as_string(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn json_value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(items) => items.first().and_then(json_value_as_string),
+        _ => None,
     }
 }
 
@@ -220,15 +263,8 @@ pub fn process_responses_event(
         }
         "response.created" => {
             if let Some(resp_val) = event.response {
-                let response_id = resp_val
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let model = resp_val
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                return Ok(Some(ResponseEvent::Created { response_id, model }));
+                let _ = resp_val;
+                return Ok(Some(ResponseEvent::Created));
             }
         }
         "response.failed" => {
@@ -870,7 +906,7 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created { .. })
+            matches!(ev, ResponseEvent::Created)
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
