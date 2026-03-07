@@ -170,6 +170,14 @@ impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+
+    pub fn response_model(&self) -> Option<String> {
+        self.response
+            .as_ref()
+            .and_then(|response| response.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
 }
 
 #[derive(Debug)]

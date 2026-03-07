@@ -3287,7 +3287,7 @@ impl CodexMessageProcessor {
             }
         };
 
-        match RolloutRecorder::get_rollout_history(&rollout_path).await {
+        match RolloutRecorder::get_rollout_resume_history(&rollout_path).await {
             Ok(initial_history) => Some(initial_history),
             Err(err) => {
                 self.send_invalid_request_error(

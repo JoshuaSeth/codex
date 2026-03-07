@@ -1,11 +1,16 @@
 //! Session-wide mutable state.
 
+use codex_git::GhostCommit;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TurnContextItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::Deref;
 
+use crate::codex::PreviousTurnSettings;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
+use crate::context_manager::is_user_turn_boundary;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
@@ -17,14 +22,24 @@ pub(crate) struct SilentRerouteState {
     pub(crate) last_warned_turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhostSnapshotEntry {
+    pub(crate) turn_index: u64,
+    pub(crate) ghost_commit: GhostCommit,
+}
+
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
+    pub(crate) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
     pub(crate) dependency_env: HashMap<String, String>,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
+    pub(crate) connector_selection: HashSet<String>,
+    pub(crate) ghost_snapshots: Vec<GhostSnapshotEntry>,
+    pub(crate) user_turn_count: u64,
     /// Whether the session's initial context has been seeded into history.
     ///
     /// TODO(owen): This is a temporary solution to avoid updating a thread's updated_at
@@ -45,10 +60,14 @@ impl SessionState {
         Self {
             session_configuration,
             history,
+            previous_turn_settings: None,
             latest_rate_limits: None,
             server_reasoning_included: false,
             dependency_env: HashMap::new(),
             mcp_dependency_prompted: HashSet::new(),
+            connector_selection: HashSet::new(),
+            ghost_snapshots: Vec::new(),
+            user_turn_count: 0,
             initial_context_seeded: false,
             pending_resume_previous_model: None,
             startup_regular_task: None,
@@ -63,19 +82,58 @@ impl SessionState {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
-        self.history.record_items(items, policy);
+        for item in items {
+            let item_ref = item.deref();
+            if is_user_turn_boundary(item_ref) {
+                self.user_turn_count = self.user_turn_count.saturating_add(1);
+            }
+            if let ResponseItem::GhostSnapshot { ghost_commit } = item_ref {
+                self.ghost_snapshots.push(GhostSnapshotEntry {
+                    turn_index: self.user_turn_count,
+                    ghost_commit: ghost_commit.clone(),
+                });
+                continue;
+            }
+            self.history.record_items(std::iter::once(item), policy);
+        }
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
         self.history.clone()
     }
 
-    pub(crate) fn replace_history(&mut self, items: Vec<ResponseItem>) {
+    pub(crate) fn replace_history(
+        &mut self,
+        items: Vec<ResponseItem>,
+        reference_context_item: Option<TurnContextItem>,
+    ) {
+        self.user_turn_count = count_user_turns(&items);
         self.history.replace(items);
+        self.history
+            .set_reference_context_item(reference_context_item);
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.history.set_token_info(info);
+    }
+
+    pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
+        self.history.set_reference_context_item(item);
+    }
+
+    pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {
+        self.history.reference_context_item()
+    }
+
+    pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
+        self.previous_turn_settings.clone()
+    }
+
+    pub(crate) fn set_previous_turn_settings(
+        &mut self,
+        previous_turn_settings: Option<PreviousTurnSettings>,
+    ) {
+        self.previous_turn_settings = previous_turn_settings;
     }
 
     // Token/rate limit helpers
@@ -172,9 +230,74 @@ impl SessionState {
         self.active_mcp_tool_selection.clone()
     }
 
+    pub(crate) fn set_mcp_tool_selection(&mut self, tool_names: Vec<String>) {
+        self.active_mcp_tool_selection = Some(tool_names);
+    }
+
     pub(crate) fn clear_mcp_tool_selection(&mut self) {
         self.active_mcp_tool_selection = None;
     }
+
+    pub(crate) fn merge_connector_selection<I>(&mut self, connector_ids: I) -> HashSet<String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.connector_selection.extend(connector_ids);
+        self.connector_selection.clone()
+    }
+
+    pub(crate) fn get_connector_selection(&self) -> HashSet<String> {
+        self.connector_selection.clone()
+    }
+
+    pub(crate) fn clear_connector_selection(&mut self) {
+        self.connector_selection.clear();
+    }
+
+    pub(crate) fn set_user_turn_count(&mut self, user_turn_count: u64) {
+        self.user_turn_count = user_turn_count;
+    }
+
+    pub(crate) fn set_ghost_snapshots(&mut self, ghost_snapshots: Vec<GhostSnapshotEntry>) {
+        self.ghost_snapshots = ghost_snapshots;
+    }
+
+    pub(crate) fn ghost_snapshots(&self) -> Vec<GhostSnapshotEntry> {
+        self.ghost_snapshots.clone()
+    }
+
+    pub(crate) fn last_ghost_snapshot(&self) -> Option<GhostCommit> {
+        self.ghost_snapshots
+            .last()
+            .map(|entry| entry.ghost_commit.clone())
+    }
+
+    pub(crate) fn pop_last_ghost_snapshot(&mut self) -> Option<GhostCommit> {
+        self.ghost_snapshots.pop().map(|entry| entry.ghost_commit)
+    }
+
+    pub(crate) fn prune_ghost_snapshots_to_current_turn_count(&mut self) {
+        let user_turn_count = self.user_turn_count;
+        self.ghost_snapshots
+            .retain(|entry| entry.turn_index <= user_turn_count);
+    }
+
+    pub(crate) fn reanchor_ghost_snapshots_to_current_turn_count(&mut self) {
+        let user_turn_count = self.user_turn_count;
+        for entry in &mut self.ghost_snapshots {
+            entry.turn_index = user_turn_count;
+        }
+    }
+}
+
+fn count_user_turns(items: &[ResponseItem]) -> u64 {
+    u64::try_from(
+        items
+            .iter()
+            .filter(|item| is_user_turn_boundary(item))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 // Merge partial rate-limit updates: new fields overwrite existing values;
@@ -205,7 +328,9 @@ fn merge_rate_limit_fields(
 mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
+    use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
     use crate::protocol::RateLimitWindow;
+    use codex_protocol::models::ContentItem;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
@@ -396,6 +521,246 @@ mod tests {
                 }),
                 plan_type: Some(codex_protocol::account::PlanType::Plus),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn record_items_keeps_ghost_snapshots_out_of_prompt_history() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        state.record_items(
+            [&ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "real user turn".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            TruncationPolicy::Tokens(1_000),
+        );
+        let ghost_commit = GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new());
+
+        state.record_items(
+            [&ResponseItem::GhostSnapshot {
+                ghost_commit: ghost_commit.clone(),
+            }],
+            TruncationPolicy::Tokens(1_000),
+        );
+
+        assert_eq!(
+            state.clone_history().raw_items(),
+            &[ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "real user turn".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]
+        );
+        assert_eq!(
+            state.ghost_snapshots(),
+            vec![GhostSnapshotEntry {
+                turn_index: 1,
+                ghost_commit,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_history_counts_only_real_user_turns() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.replace_history(
+            vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: ENVIRONMENT_CONTEXT_FRAGMENT.wrap("<cwd>/tmp</cwd>".to_string()),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "real user turn".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(state.user_turn_count, 1);
+    }
+
+    #[tokio::test]
+    async fn ghost_snapshots_track_all_real_user_turn_boundaries() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.record_items(
+            [
+                &ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "turn 1".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+                &ResponseItem::GhostSnapshot {
+                    ghost_commit: GhostCommit::new(
+                        "ghost-1".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+                &ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "late pending input".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+                &ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "turn 2".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+                &ResponseItem::GhostSnapshot {
+                    ghost_commit: GhostCommit::new(
+                        "ghost-2".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+            ],
+            TruncationPolicy::Tokens(1_000),
+        );
+
+        assert_eq!(
+            state.ghost_snapshots(),
+            vec![
+                GhostSnapshotEntry {
+                    turn_index: 1,
+                    ghost_commit: GhostCommit::new(
+                        "ghost-1".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+                GhostSnapshotEntry {
+                    turn_index: 3,
+                    ghost_commit: GhostCommit::new(
+                        "ghost-2".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_ghost_snapshots_to_current_turn_count_drops_rolled_back_turns() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.set_ghost_snapshots(vec![
+            GhostSnapshotEntry {
+                turn_index: 1,
+                ghost_commit: GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new()),
+            },
+            GhostSnapshotEntry {
+                turn_index: 2,
+                ghost_commit: GhostCommit::new("ghost-2".to_string(), None, Vec::new(), Vec::new()),
+            },
+        ]);
+        state.set_user_turn_count(1);
+
+        state.prune_ghost_snapshots_to_current_turn_count();
+
+        assert_eq!(
+            state.ghost_snapshots(),
+            vec![GhostSnapshotEntry {
+                turn_index: 1,
+                ghost_commit: GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new(),),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn reanchor_ghost_snapshots_to_current_turn_count_matches_compacted_history() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+
+        state.set_ghost_snapshots(vec![
+            GhostSnapshotEntry {
+                turn_index: 5,
+                ghost_commit: GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new()),
+            },
+            GhostSnapshotEntry {
+                turn_index: 9,
+                ghost_commit: GhostCommit::new("ghost-2".to_string(), None, Vec::new(), Vec::new()),
+            },
+        ]);
+        state.replace_history(
+            vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "summary".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            None,
+        );
+
+        state.reanchor_ghost_snapshots_to_current_turn_count();
+
+        assert_eq!(
+            state.ghost_snapshots(),
+            vec![
+                GhostSnapshotEntry {
+                    turn_index: 1,
+                    ghost_commit: GhostCommit::new(
+                        "ghost-1".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+                GhostSnapshotEntry {
+                    turn_index: 1,
+                    ghost_commit: GhostCommit::new(
+                        "ghost-2".to_string(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                },
+            ]
         );
     }
 }

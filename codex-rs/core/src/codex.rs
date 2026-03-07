@@ -25,6 +25,7 @@ use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
+use crate::context_manager::is_user_turn_boundary;
 use crate::exec_policy::ExecPolicyManager;
 use crate::features::FEATURES;
 use crate::features::Feature;
@@ -91,6 +92,7 @@ use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
@@ -117,6 +119,8 @@ use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
 use serde_json;
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
@@ -181,6 +185,23 @@ pub enum SteerInputError {
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
     pub(crate) realtime_active: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct ResumeRolloutStateScan {
+    token_info: Option<TokenUsageInfo>,
+    active_selected_tools: Option<Vec<String>>,
+    ghost_snapshots: Vec<GhostSnapshotEntry>,
+}
+
+fn count_user_turns_in_history(items: &[ResponseItem]) -> u64 {
+    u64::try_from(
+        items
+            .iter()
+            .filter(|item| is_user_turn_boundary(item))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 use crate::exec_policy::ExecPolicyUpdateError;
@@ -266,6 +287,7 @@ use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
+use crate::state::GhostSnapshotEntry;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -1785,6 +1807,16 @@ impl Session {
         state.clear_mcp_tool_selection();
     }
 
+    pub(crate) async fn last_ghost_snapshot(&self) -> Option<codex_git::GhostCommit> {
+        let state = self.state.lock().await;
+        state.last_ghost_snapshot()
+    }
+
+    pub(crate) async fn pop_last_ghost_snapshot(&self) -> Option<codex_git::GhostCommit> {
+        let mut state = self.state.lock().await;
+        state.pop_last_ghost_snapshot()
+    }
+
     // Merges connector IDs into the session-level explicit connector selection.
     pub(crate) async fn merge_connector_selection(
         &self,
@@ -1827,6 +1859,8 @@ impl Session {
                 {
                     let mut state = self.state.lock().await;
                     state.set_reference_context_item(Some(turn_context.to_turn_context_item()));
+                    state.set_ghost_snapshots(Vec::new());
+                    state.set_user_turn_count(0);
                 }
                 self.set_previous_turn_settings(None).await;
                 // Ensure initial items are visible to immediate readers (e.g., tests, forks).
@@ -1836,12 +1870,37 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
-                let restored_tool_selection =
+                let mut restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                let mut restored_token_info = Self::last_token_info_from_rollout(&rollout_items);
+                let mut restored_ghost_snapshots =
+                    Self::extract_ghost_snapshots_from_rollout(&rollout_items);
+
+                match Self::scan_resume_rollout_state(resumed_history.rollout_path.as_path()).await
+                {
+                    Ok(scanned_state) => {
+                        if restored_tool_selection.is_none() {
+                            restored_tool_selection = scanned_state.active_selected_tools;
+                        }
+                        if restored_token_info.is_none() {
+                            restored_token_info = scanned_state.token_info;
+                        }
+                        restored_ghost_snapshots = scanned_state.ghost_snapshots;
+                    }
+                    Err(err) => {
+                        warn!(
+                            rollout_path = %resumed_history.rollout_path.display(),
+                            error = %err,
+                            "failed to scan resume rollout state"
+                        );
+                    }
+                }
 
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
+                let reconstructed_history = reconstructed_rollout.history;
+                let user_turn_count = count_user_turns_in_history(&reconstructed_history);
                 let previous_turn_settings = reconstructed_rollout.previous_turn_settings.clone();
                 self.set_previous_turn_settings(previous_turn_settings.clone())
                     .await;
@@ -1871,7 +1930,6 @@ impl Session {
                 }
 
                 // Always add response items to conversation history
-                let reconstructed_history = reconstructed_rollout.history;
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
@@ -1879,9 +1937,13 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                {
                     let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
+                    if let Some(info) = restored_token_info {
+                        state.set_token_info(Some(info));
+                    }
+                    state.set_ghost_snapshots(restored_ghost_snapshots);
+                    state.set_user_turn_count(user_turn_count);
                 }
                 if let Some(selected_tools) = restored_tool_selection {
                     self.set_mcp_tool_selection(selected_tools).await;
@@ -1896,10 +1958,14 @@ impl Session {
             InitialHistory::Forked(rollout_items) => {
                 let restored_tool_selection =
                     Self::extract_mcp_tool_selection_from_rollout(&rollout_items);
+                let restored_ghost_snapshots =
+                    Self::extract_ghost_snapshots_from_rollout(&rollout_items);
 
                 let reconstructed_rollout = self
                     .reconstruct_history_from_rollout(&turn_context, &rollout_items)
                     .await;
+                let reconstructed_history = reconstructed_rollout.history;
+                let user_turn_count = count_user_turns_in_history(&reconstructed_history);
                 self.set_previous_turn_settings(
                     reconstructed_rollout.previous_turn_settings.clone(),
                 )
@@ -1912,7 +1978,6 @@ impl Session {
                 }
 
                 // Always add response items to conversation history
-                let reconstructed_history = reconstructed_rollout.history;
                 if !reconstructed_history.is_empty() {
                     self.record_into_history(&reconstructed_history, &turn_context)
                         .await;
@@ -1920,9 +1985,13 @@ impl Session {
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
-                if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                {
                     let mut state = self.state.lock().await;
-                    state.set_token_info(Some(info));
+                    if let Some(info) = Self::last_token_info_from_rollout(&rollout_items) {
+                        state.set_token_info(Some(info));
+                    }
+                    state.set_ghost_snapshots(restored_ghost_snapshots);
+                    state.set_user_turn_count(user_turn_count);
                 }
                 if let Some(selected_tools) = restored_tool_selection {
                     self.set_mcp_tool_selection(selected_tools).await;
@@ -1960,6 +2029,68 @@ impl Session {
         })
     }
 
+    fn extract_ghost_snapshots_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Vec<GhostSnapshotEntry> {
+        let mut user_turn_count = 0_u64;
+        let mut ghost_snapshots = Vec::new();
+
+        for item in rollout_items {
+            Self::update_ghost_snapshots_from_rollout_item(
+                item,
+                &mut user_turn_count,
+                &mut ghost_snapshots,
+            );
+        }
+
+        ghost_snapshots
+    }
+
+    async fn scan_resume_rollout_state(path: &Path) -> std::io::Result<ResumeRolloutStateScan> {
+        let file = tokio::fs::File::open(path).await?;
+        let mut lines = BufReader::new(file).lines();
+        let mut state = ResumeRolloutStateScan::default();
+        let mut search_call_ids = HashSet::new();
+        let mut user_turn_count = 0_u64;
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let rollout_line = match serde_json::from_str::<RolloutLine>(&line) {
+                Ok(rollout_line) => rollout_line,
+                Err(err) => {
+                    trace!(
+                        rollout_path = %path.display(),
+                        error = %err,
+                        "failed to parse rollout line while scanning resume state"
+                    );
+                    continue;
+                }
+            };
+
+            if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = &rollout_line.item
+                && let Some(info) = event.info.clone()
+            {
+                state.token_info = Some(info);
+            }
+
+            Self::update_mcp_tool_selection_from_rollout_item(
+                &rollout_line.item,
+                &mut search_call_ids,
+                &mut state.active_selected_tools,
+            );
+            Self::update_ghost_snapshots_from_rollout_item(
+                &rollout_line.item,
+                &mut user_turn_count,
+                &mut state.ghost_snapshots,
+            );
+        }
+
+        Ok(state)
+    }
+
     fn extract_mcp_tool_selection_from_rollout(
         rollout_items: &[RolloutItem],
     ) -> Option<Vec<String>> {
@@ -1967,45 +2098,96 @@ impl Session {
         let mut active_selected_tools: Option<Vec<String>> = None;
 
         for item in rollout_items {
-            let RolloutItem::ResponseItem(response_item) = item else {
-                continue;
-            };
-            match response_item {
-                ResponseItem::FunctionCall { name, call_id, .. } => {
-                    if name == SEARCH_TOOL_BM25_TOOL_NAME {
-                        search_call_ids.insert(call_id.clone());
-                    }
-                }
-                ResponseItem::FunctionCallOutput { call_id, output } => {
-                    if !search_call_ids.contains(call_id) {
-                        continue;
-                    }
-                    let Some(content) = output.body.to_text() else {
-                        continue;
-                    };
-                    let Ok(payload) = serde_json::from_str::<Value>(&content) else {
-                        continue;
-                    };
-                    let Some(selected_tools) = payload
-                        .get("active_selected_tools")
-                        .and_then(Value::as_array)
-                    else {
-                        continue;
-                    };
-                    let Some(selected_tools) = selected_tools
-                        .iter()
-                        .map(|value| value.as_str().map(str::to_string))
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    active_selected_tools = Some(selected_tools);
-                }
-                _ => {}
-            }
+            Self::update_mcp_tool_selection_from_rollout_item(
+                item,
+                &mut search_call_ids,
+                &mut active_selected_tools,
+            );
         }
 
         active_selected_tools
+    }
+
+    fn update_mcp_tool_selection_from_rollout_item(
+        item: &RolloutItem,
+        search_call_ids: &mut HashSet<String>,
+        active_selected_tools: &mut Option<Vec<String>>,
+    ) {
+        let RolloutItem::ResponseItem(response_item) = item else {
+            return;
+        };
+
+        match response_item {
+            ResponseItem::FunctionCall { name, call_id, .. } => {
+                if name == SEARCH_TOOL_BM25_TOOL_NAME {
+                    search_call_ids.insert(call_id.clone());
+                }
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                if !search_call_ids.remove(call_id) {
+                    return;
+                }
+                let Some(content) = output.body.to_text() else {
+                    return;
+                };
+                let Ok(payload) = serde_json::from_str::<Value>(&content) else {
+                    return;
+                };
+                let Some(selected_tools) = payload
+                    .get("active_selected_tools")
+                    .and_then(Value::as_array)
+                else {
+                    return;
+                };
+                let Some(selected_tools) = selected_tools
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return;
+                };
+                *active_selected_tools = Some(selected_tools);
+            }
+            _ => {}
+        }
+    }
+
+    fn update_ghost_snapshots_from_rollout_item(
+        item: &RolloutItem,
+        user_turn_count: &mut u64,
+        ghost_snapshots: &mut Vec<GhostSnapshotEntry>,
+    ) {
+        match item {
+            RolloutItem::ResponseItem(response_item) => {
+                if is_user_turn_boundary(response_item) {
+                    *user_turn_count = user_turn_count.saturating_add(1);
+                }
+                if let ResponseItem::GhostSnapshot { ghost_commit } = response_item {
+                    ghost_snapshots.push(GhostSnapshotEntry {
+                        turn_index: *user_turn_count,
+                        ghost_commit: ghost_commit.clone(),
+                    });
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                *user_turn_count = user_turn_count.saturating_sub(u64::from(rollback.num_turns));
+                ghost_snapshots.retain(|entry| entry.turn_index <= *user_turn_count);
+            }
+            RolloutItem::EventMsg(EventMsg::UndoCompleted(event)) if event.success => {
+                ghost_snapshots.pop();
+            }
+            RolloutItem::Compacted(compacted) => {
+                if let Some(replacement_history) = &compacted.replacement_history {
+                    *user_turn_count = count_user_turns_in_history(replacement_history);
+                    for entry in ghost_snapshots.iter_mut() {
+                        entry.turn_index = *user_turn_count;
+                    }
+                }
+            }
+            RolloutItem::TurnContext(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::EventMsg(_) => {}
+        }
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -2992,8 +3174,11 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         compacted_item: CompactedItem,
     ) {
-        self.replace_history(items, reference_context_item.clone())
-            .await;
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items, reference_context_item.clone());
+            state.reanchor_ghost_snapshots_to_current_turn_count();
+        }
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
             .await;
@@ -4550,8 +4735,11 @@ mod handlers {
 
         // Replace with the raw items. We don't want to replace with a normalized
         // version of the history.
-        sess.replace_history(history.raw_items().to_vec(), None)
-            .await;
+        {
+            let mut state = sess.state.lock().await;
+            state.replace_history(history.raw_items().to_vec(), None);
+            state.prune_ghost_snapshots_to_current_turn_count();
+        }
         sess.recompute_token_usage(turn_context.as_ref()).await;
 
         sess.send_event_raw_flushed(Event {
@@ -6747,8 +6935,12 @@ mod tests {
     use opentelemetry::trace::TraceId;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
+    use std::fs;
+    use std::fs::File;
+    use std::io::Write;
     use std::path::Path;
     use std::time::Duration;
+    use tempfile::TempDir;
     use tokio::time::sleep;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::prelude::*;
@@ -7554,6 +7746,124 @@ mod tests {
 
         let actual = session.state.lock().await.token_info();
         assert_eq!(actual, Some(info2));
+    }
+
+    #[tokio::test]
+    async fn record_initial_history_scans_rollout_path_for_state_missing_from_compacted_tail() {
+        let (session, _turn_context) = make_session_and_context().await;
+        let temp = TempDir::new().expect("temp dir");
+        let rollout_path = temp.path().join("resume.jsonl");
+        let conversation_id = ThreadId::new();
+        let token_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                input_tokens: 8,
+                cached_input_tokens: 0,
+                output_tokens: 13,
+                reasoning_output_tokens: 0,
+                total_tokens: 21,
+            },
+            last_token_usage: TokenUsage {
+                input_tokens: 3,
+                cached_input_tokens: 0,
+                output_tokens: 5,
+                reasoning_output_tokens: 0,
+                total_tokens: 8,
+            },
+            model_context_window: Some(4_096),
+        };
+        let session_meta = RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                id: conversation_id,
+                forked_from_id: None,
+                timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+                cwd: temp.path().to_path_buf(),
+                originator: "test".to_string(),
+                cli_version: "test".to_string(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: Some("openai".to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        });
+        let search_call = function_call_rollout_item(SEARCH_TOOL_BM25_TOOL_NAME, "search-1");
+        let search_output = function_call_output_rollout_item(
+            "search-1",
+            &json!({
+                "active_selected_tools": ["mcp__codex_apps__calendar_list_events"],
+            })
+            .to_string(),
+        );
+        let ghost_commit =
+            codex_git::GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new());
+        let compaction = RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(vec![user_message("checkpoint summary")]),
+        });
+        let tail_message = RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "tail".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        });
+        let full_rollout = vec![
+            session_meta.clone(),
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: Some(token_info.clone()),
+                rate_limits: None,
+            })),
+            RolloutItem::ResponseItem(user_message("before compaction 1")),
+            RolloutItem::ResponseItem(user_message("before compaction 2")),
+            search_call,
+            search_output,
+            RolloutItem::ResponseItem(ResponseItem::GhostSnapshot {
+                ghost_commit: ghost_commit.clone(),
+            }),
+            compaction.clone(),
+            tail_message.clone(),
+        ];
+
+        let mut file = File::create(&rollout_path).expect("create rollout file");
+        for item in full_rollout {
+            let line = RolloutLine {
+                timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+                item,
+            };
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&line).expect("serialize rollout line")
+            )
+            .expect("write rollout line");
+        }
+        drop(file);
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id,
+                history: vec![session_meta, compaction, tail_message],
+                rollout_path: rollout_path.clone(),
+            }))
+            .await;
+
+        assert_eq!(session.state.lock().await.token_info(), Some(token_info));
+        assert_eq!(
+            session.get_mcp_tool_selection().await,
+            Some(vec!["mcp__codex_apps__calendar_list_events".to_string()])
+        );
+        assert_eq!(
+            session.state.lock().await.ghost_snapshots(),
+            vec![crate::state::GhostSnapshotEntry {
+                turn_index: 1,
+                ghost_commit,
+            }]
+        );
     }
 
     #[tokio::test]
