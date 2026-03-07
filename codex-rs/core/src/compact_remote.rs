@@ -85,14 +85,6 @@ async fn run_remote_compact_task_inner_impl(
             "trimmed history items before remote compaction"
         );
     }
-    // Required to keep `/undo` available after compaction
-    let ghost_snapshots: Vec<ResponseItem> = history
-        .raw_items()
-        .iter()
-        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
-        .cloned()
-        .collect();
-
     let prompt = Prompt {
         input: history.for_prompt(&turn_context.model_info.input_modalities),
         tools: vec![],
@@ -137,10 +129,6 @@ async fn run_remote_compact_task_inner_impl(
         initial_context_injection,
     )
     .await;
-
-    if !ghost_snapshots.is_empty() {
-        new_history.extend(ghost_snapshots);
-    }
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),

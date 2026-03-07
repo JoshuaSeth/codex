@@ -357,7 +357,7 @@ impl ThreadManager {
         rollout_path: PathBuf,
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewThread> {
-        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        let initial_history = RolloutRecorder::get_rollout_resume_history(&rollout_path).await?;
         Box::pin(self.resume_thread_with_history(config, initial_history, auth_manager, false))
             .await
     }
@@ -514,7 +514,7 @@ impl ThreadManagerState {
         session_source: SessionSource,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     ) -> CodexResult<NewThread> {
-        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        let initial_history = RolloutRecorder::get_rollout_resume_history(&rollout_path).await?;
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
