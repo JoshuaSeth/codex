@@ -1314,8 +1314,9 @@ mod tests {
 
         assert_eq!(resumed.conversation_id, thread_id);
         assert_eq!(
-            resumed.history,
-            vec![session_meta, latest_compaction, tail_message]
+            serde_json::to_value(&resumed.history).expect("serialize resumed history"),
+            serde_json::to_value(vec![session_meta, latest_compaction, tail_message])
+                .expect("serialize expected history")
         );
         Ok(())
     }
