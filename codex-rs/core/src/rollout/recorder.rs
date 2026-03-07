@@ -15,7 +15,9 @@ use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
+use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
@@ -592,6 +594,78 @@ impl RolloutRecorder {
         Ok((items, thread_id, parse_errors))
     }
 
+    async fn load_rollout_items_for_resume(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        trace!("Resuming rollout tail from {path:?}");
+        let file = tokio::fs::File::open(path).await?;
+        let mut lines = BufReader::new(file).lines();
+
+        let mut items: Vec<RolloutItem> = Vec::new();
+        let mut session_meta: Option<RolloutItem> = None;
+        let mut thread_id: Option<ThreadId> = None;
+        let mut parse_errors = 0usize;
+        let mut saw_non_empty_line = false;
+        let mut checkpoint_count = 0usize;
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            saw_non_empty_line = true;
+
+            let rollout_line = match serde_json::from_str::<RolloutLine>(&line) {
+                Ok(rollout_line) => rollout_line,
+                Err(err) => {
+                    trace!("failed to parse rollout line: {err}");
+                    parse_errors = parse_errors.saturating_add(1);
+                    continue;
+                }
+            };
+
+            match rollout_line.item {
+                RolloutItem::SessionMeta(meta_line) => {
+                    let meta_item = RolloutItem::SessionMeta(meta_line.clone());
+                    if thread_id.is_none() {
+                        thread_id = Some(meta_line.meta.id);
+                    }
+                    if session_meta.is_none() {
+                        session_meta = Some(meta_item.clone());
+                    }
+                    if items.is_empty() {
+                        items.push(meta_item);
+                    }
+                }
+                RolloutItem::Compacted(compacted) => {
+                    if compacted.replacement_history.is_some() {
+                        items.clear();
+                        if let Some(meta_item) = session_meta.as_ref() {
+                            items.push(meta_item.clone());
+                        }
+                        checkpoint_count = checkpoint_count.saturating_add(1);
+                    }
+                    items.push(RolloutItem::Compacted(compacted));
+                }
+                item => {
+                    items.push(item);
+                }
+            }
+        }
+
+        if !saw_non_empty_line {
+            return Err(IoError::other("empty session file"));
+        }
+
+        tracing::debug!(
+            "Resumed rollout tail with {} items, thread ID: {:?}, parse errors: {}, checkpoints kept from latest: {}",
+            items.len(),
+            thread_id,
+            parse_errors,
+            checkpoint_count,
+        );
+        Ok((items, thread_id, parse_errors))
+    }
+
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
         let (items, thread_id, _parse_errors) = Self::load_rollout_items(path).await?;
         let conversation_id = thread_id
@@ -602,6 +676,23 @@ impl RolloutRecorder {
         }
 
         info!("Resumed rollout successfully from {path:?}");
+        Ok(InitialHistory::Resumed(ResumedHistory {
+            conversation_id,
+            history: items,
+            rollout_path: path.to_path_buf(),
+        }))
+    }
+
+    pub async fn get_rollout_resume_history(path: &Path) -> std::io::Result<InitialHistory> {
+        let (items, thread_id, _parse_errors) = Self::load_rollout_items_for_resume(path).await?;
+        let conversation_id = thread_id
+            .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
+
+        if items.is_empty() {
+            return Ok(InitialHistory::New);
+        }
+
+        info!("Resumed rollout tail successfully from {path:?}");
         Ok(InitialHistory::Resumed(ResumedHistory {
             conversation_id,
             history: items,
@@ -1067,9 +1158,13 @@ mod tests {
     use crate::features::Feature;
     use chrono::TimeZone;
     use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::UserMessageEvent;
@@ -1112,6 +1207,117 @@ mod tests {
         });
         writeln!(file, "{user_event}")?;
         Ok(path)
+    }
+
+    fn response_message(role: &str, text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![if role == "assistant" {
+                ContentItem::OutputText {
+                    text: text.to_string(),
+                }
+            } else {
+                ContentItem::InputText {
+                    text: text.to_string(),
+                }
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_rollout_resume_history_keeps_only_tail_after_latest_compaction()
+    -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let uuid = Uuid::from_u128(4242);
+        let ts = "2025-01-03T12-00-00";
+        let path = home
+            .path()
+            .join("sessions/2025/01/03")
+            .join(format!("rollout-{ts}-{uuid}.jsonl"));
+        fs::create_dir_all(
+            path.parent()
+                .expect("rollout path should have parent directory"),
+        )?;
+
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let session_meta = RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                forked_from_id: Some(ThreadId::new()),
+                timestamp: ts.to_string(),
+                cwd: ".".into(),
+                originator: "test_originator".into(),
+                cli_version: "test_version".into(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: Some("test-provider".into()),
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        });
+        let old_message = RolloutItem::ResponseItem(response_message("assistant", "old history"));
+        let first_compaction = RolloutItem::Compacted(CompactedItem {
+            message: "first".to_string(),
+            replacement_history: Some(vec![response_message("user", "first checkpoint")]),
+        });
+        let between_compactions =
+            RolloutItem::ResponseItem(response_message("assistant", "between"));
+        let latest_compaction = RolloutItem::Compacted(CompactedItem {
+            message: "latest".to_string(),
+            replacement_history: Some(vec![response_message("user", "latest checkpoint")]),
+        });
+        let tail_message = RolloutItem::ResponseItem(response_message("assistant", "tail"));
+
+        let rollout_lines = vec![
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: session_meta.clone(),
+            },
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: old_message,
+            },
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: first_compaction,
+            },
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: between_compactions,
+            },
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: latest_compaction.clone(),
+            },
+            RolloutLine {
+                timestamp: ts.to_string(),
+                item: tail_message.clone(),
+            },
+        ];
+
+        let mut file = File::create(&path)?;
+        for line in rollout_lines {
+            writeln!(file, "{}", serde_json::to_string(&line)?)?;
+        }
+        drop(file);
+
+        let history = RolloutRecorder::get_rollout_resume_history(path.as_path()).await?;
+        let InitialHistory::Resumed(resumed) = history else {
+            panic!("expected resumed rollout history");
+        };
+
+        assert_eq!(resumed.conversation_id, thread_id);
+        assert_eq!(
+            resumed.history,
+            vec![session_meta, latest_compaction, tail_message]
+        );
+        Ok(())
     }
 
     #[tokio::test]

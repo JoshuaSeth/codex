@@ -10,7 +10,6 @@ use crate::tasks::SessionTaskContext;
 use async_trait::async_trait;
 use codex_git::RestoreGhostCommitOptions;
 use codex_git::restore_ghost_commit_with_options;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -68,25 +67,12 @@ impl SessionTask for UndoTask {
             return None;
         }
 
-        let history = sess.clone_history().await;
-        let mut items = history.raw_items().to_vec();
         let mut completed = UndoCompletedEvent {
             success: false,
             message: None,
         };
 
-        let Some((idx, ghost_commit)) =
-            items
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(idx, item)| match item {
-                    ResponseItem::GhostSnapshot { ghost_commit } => {
-                        Some((idx, ghost_commit.clone()))
-                    }
-                    _ => None,
-                })
-        else {
+        let Some(ghost_commit) = sess.last_ghost_snapshot().await else {
             completed.message = Some("No ghost snapshot available to undo.".to_string());
             sess.send_event(ctx.as_ref(), EventMsg::UndoCompleted(completed))
                 .await;
@@ -104,9 +90,7 @@ impl SessionTask for UndoTask {
 
         match restore_result {
             Ok(Ok(())) => {
-                items.remove(idx);
-                let reference_context_item = sess.reference_context_item().await;
-                sess.replace_history(items, reference_context_item).await;
+                let _ = sess.pop_last_ghost_snapshot().await;
                 let short_id: String = commit_id.chars().take(7).collect();
                 info!(commit_id = commit_id, "Undo restored ghost snapshot");
                 completed.success = true;
