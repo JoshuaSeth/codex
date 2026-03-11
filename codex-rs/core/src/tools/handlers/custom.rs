@@ -116,7 +116,14 @@ impl ToolHandler for CustomToolHandler {
 
         let dependency_env = session.dependency_env().await;
         if !dependency_env.is_empty() {
-            exec_params.env.extend(dependency_env);
+            exec_params.env.extend(dependency_env.clone());
+        }
+
+        let mut explicit_env_overrides = turn.shell_environment_policy.r#set.clone();
+        for key in dependency_env.keys() {
+            if let Some(value) = exec_params.env.get(key) {
+                explicit_env_overrides.insert(key.clone(), value.clone());
+            }
         }
 
         // Approval policy guard for explicit escalation in non-OnRequest modes.
@@ -124,11 +131,11 @@ impl ToolHandler for CustomToolHandler {
             .sandbox_permissions
             .requires_escalated_permissions()
             && !matches!(
-                turn.approval_policy,
+                turn.approval_policy.value(),
                 codex_protocol::protocol::AskForApproval::OnRequest
             )
         {
-            let approval_policy = turn.approval_policy;
+            let approval_policy = turn.approval_policy.value();
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command - you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -139,8 +146,8 @@ impl ToolHandler for CustomToolHandler {
             &exec_params.command,
             &exec_params.cwd,
             exec_params.expiration.timeout_ms(),
-            session.as_ref(),
-            turn.as_ref(),
+            session.clone(),
+            turn.clone(),
             Some(&tracker),
             &call_id,
             tool_name.as_str(),
@@ -165,8 +172,8 @@ impl ToolHandler for CustomToolHandler {
             .exec_policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &exec_params.command,
-                approval_policy: turn.approval_policy,
-                sandbox_policy: &turn.sandbox_policy,
+                approval_policy: turn.approval_policy.value(),
+                sandbox_policy: turn.sandbox_policy.get(),
                 sandbox_permissions: exec_params.sandbox_permissions,
                 prefix_rule: None,
             })
@@ -177,16 +184,18 @@ impl ToolHandler for CustomToolHandler {
             cwd: exec_params.cwd.clone(),
             timeout_ms: exec_params.expiration.timeout_ms(),
             env: exec_params.env.clone(),
+            explicit_env_overrides,
             network: exec_params.network.clone(),
             sandbox_permissions: exec_params.sandbox_permissions,
+            additional_permissions: None,
             justification: exec_params.justification.clone(),
             exec_approval_requirement,
         };
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = ShellRuntime::new();
         let tool_ctx = ToolCtx {
-            session: session.as_ref(),
-            turn: turn.as_ref(),
+            session: session.clone(),
+            turn: turn.clone(),
             call_id: call_id.clone(),
             tool_name: tool_name.clone(),
         };
@@ -195,10 +204,11 @@ impl ToolHandler for CustomToolHandler {
                 &mut runtime,
                 &req,
                 &tool_ctx,
-                turn.as_ref(),
-                turn.approval_policy,
+                &turn,
+                turn.approval_policy.value(),
             )
-            .await;
+            .await
+            .map(|result| result.output);
         let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, None);
         let content = emitter.finish(event_ctx, out).await?;
 

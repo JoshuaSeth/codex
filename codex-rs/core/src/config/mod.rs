@@ -1592,6 +1592,10 @@ pub struct ConfigOverrides {
     pub ephemeral: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
+    /// When non-empty, enforce a strict filesystem scope for workspace-write:
+    /// reads and writes are restricted to these roots (plus platform defaults
+    /// needed for execution), and default temp writable roots are disabled.
+    pub strict_sandbox_roots: Vec<PathBuf>,
 }
 
 /// Resolves the OSS provider from CLI override, profile config, or global config.
@@ -1734,6 +1738,7 @@ impl Config {
             tools_web_search_request: override_tools_web_search_request,
             ephemeral,
             additional_writable_roots,
+            strict_sandbox_roots,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1786,6 +1791,10 @@ impl Config {
             .into_iter()
             .map(|path| AbsolutePathBuf::resolve_path_against_base(path, &resolved_cwd))
             .collect::<Result<Vec<_>, _>>()?;
+        let strict_sandbox_roots: Vec<AbsolutePathBuf> = strict_sandbox_roots
+            .into_iter()
+            .map(|path| AbsolutePathBuf::resolve_path_against_base(path, &resolved_cwd))
+            .collect::<Result<Vec<_>, _>>()?;
         let active_project = cfg
             .get_active_project(&resolved_cwd)
             .unwrap_or(ProjectConfig { trust_level: None });
@@ -1805,15 +1814,46 @@ impl Config {
             &resolved_cwd,
             Some(&constrained_sandbox_policy),
         );
+        let strict_fs_scope_enabled = !strict_sandbox_roots.is_empty();
+        if strict_fs_scope_enabled {
+            match &mut sandbox_policy {
+                SandboxPolicy::WorkspaceWrite {
+                    writable_roots,
+                    read_only_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                    ..
+                } => {
+                    *writable_roots = strict_sandbox_roots.clone();
+                    *read_only_access = ReadOnlyAccess::Restricted {
+                        include_platform_defaults: true,
+                        readable_roots: strict_sandbox_roots,
+                    };
+                    *exclude_tmpdir_env_var = true;
+                    *exclude_slash_tmp = true;
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "strict sandbox roots require workspace-write sandbox mode; got {}",
+                            other
+                        ),
+                    ));
+                }
+            }
+        }
         if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &mut sandbox_policy {
-            let memories_root = memory_root(&codex_home);
-            std::fs::create_dir_all(&memories_root)?;
-            let memories_root = AbsolutePathBuf::from_absolute_path(&memories_root)?;
-            if !writable_roots
-                .iter()
-                .any(|existing| existing == &memories_root)
-            {
-                writable_roots.push(memories_root);
+            if !strict_fs_scope_enabled {
+                let memories_root = memory_root(&codex_home);
+                std::fs::create_dir_all(&memories_root)?;
+                let memories_root = AbsolutePathBuf::from_absolute_path(&memories_root)?;
+                if !writable_roots
+                    .iter()
+                    .any(|existing| existing == &memories_root)
+                {
+                    writable_roots.push(memories_root);
+                }
             }
             for path in additional_writable_roots {
                 if !writable_roots.iter().any(|existing| existing == &path) {
@@ -3213,6 +3253,91 @@ trust_level = "trusted"
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn strict_sandbox_roots_scope_workspace_write_policy() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace_root = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root)?;
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides {
+                cwd: Some(workspace_root.clone()),
+                sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+                strict_sandbox_roots: vec![workspace_root.clone()],
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )?;
+
+        if cfg!(target_os = "windows") {
+            match config.permissions.sandbox_policy.get() {
+                SandboxPolicy::ReadOnly { .. } => {}
+                other => panic!("expected read-only policy on Windows, got {other:?}"),
+            }
+        } else {
+            let expected_root = AbsolutePathBuf::from_absolute_path(&workspace_root)?;
+            match config.permissions.sandbox_policy.get() {
+                SandboxPolicy::WorkspaceWrite {
+                    writable_roots,
+                    read_only_access,
+                    exclude_tmpdir_env_var,
+                    exclude_slash_tmp,
+                    ..
+                } => {
+                    assert_eq!(writable_roots, &vec![expected_root.clone()]);
+                    assert_eq!(
+                        read_only_access,
+                        &ReadOnlyAccess::Restricted {
+                            include_platform_defaults: true,
+                            readable_roots: vec![expected_root.clone()],
+                        }
+                    );
+                    assert!(*exclude_tmpdir_env_var);
+                    assert!(*exclude_slash_tmp);
+
+                    let memories_root = codex_home.path().join("memories");
+                    assert!(
+                        !writable_roots
+                            .iter()
+                            .any(|root| root.as_path() == memories_root),
+                        "strict scope should not auto-add memories root"
+                    );
+                }
+                other => panic!("expected workspace-write policy, got {other:?}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn strict_sandbox_roots_require_workspace_write_mode() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace_root = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root)?;
+
+        let err = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides {
+                cwd: Some(workspace_root.clone()),
+                sandbox_mode: Some(SandboxMode::ReadOnly),
+                strict_sandbox_roots: vec![workspace_root],
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("strict roots should fail outside workspace-write");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string()
+                .contains("strict sandbox roots require workspace-write"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 

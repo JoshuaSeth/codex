@@ -20,7 +20,10 @@ use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::NewThread;
 use codex_core::OLLAMA_OSS_PROVIDER_ID;
 use codex_core::ThreadManager;
+use codex_core::auth::AuthMode;
+use codex_core::auth::CODEX_API_KEY_ENV_VAR;
 use codex_core::auth::enforce_login_restrictions;
+use codex_core::auth::is_force_api_key_auth_enabled;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -142,6 +145,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cwd,
         skip_git_repo_check,
         add_dir,
+        strict_dir,
         ephemeral,
         color,
         last_message_file,
@@ -194,13 +198,29 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .with_writer(std::io::stderr)
         .with_filter(env_filter);
 
-    let sandbox_mode = if full_auto {
+    if !strict_dir.is_empty() && dangerously_bypass_approvals_and_sandbox {
+        return Err(anyhow::anyhow!(
+            "--strict-dir cannot be combined with --dangerously-bypass-approvals-and-sandbox"
+        ));
+    }
+
+    let mut sandbox_mode = if full_auto {
         Some(SandboxMode::WorkspaceWrite)
     } else if dangerously_bypass_approvals_and_sandbox {
         Some(SandboxMode::DangerFullAccess)
     } else {
         sandbox_mode_cli_arg.map(Into::<SandboxMode>::into)
     };
+    if !strict_dir.is_empty() {
+        if let Some(mode) = sandbox_mode
+            && mode != SandboxMode::WorkspaceWrite
+        {
+            return Err(anyhow::anyhow!(
+                "--strict-dir requires workspace-write sandbox mode (remove --sandbox or use --sandbox workspace-write)"
+            ));
+        }
+        sandbox_mode = Some(SandboxMode::WorkspaceWrite);
+    }
 
     // Parse `-c` overrides from the CLI.
     let cli_kv_overrides = match config_overrides.parse_overrides() {
@@ -212,7 +232,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let resolved_cwd = cwd.clone();
+    let resolved_cwd = cwd.clone().or_else(|| strict_dir.first().cloned());
     let config_cwd = match resolved_cwd.as_deref() {
         Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
         None => AbsolutePathBuf::current_dir()?,
@@ -322,6 +342,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
         additional_writable_roots: add_dir,
+        strict_sandbox_roots: strict_dir,
     };
 
     let config = ConfigBuilder::default()
@@ -475,6 +496,40 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         true,
         config.cli_auth_credentials_store_mode,
     );
+    let codex_api_key_present = std::env::var(CODEX_API_KEY_ENV_VAR)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let force_api_key_auth = is_force_api_key_auth_enabled();
+    let stored_auth = codex_core::CodexAuth::from_auth_storage(
+        &config.codex_home,
+        config.cli_auth_credentials_store_mode,
+    )
+    .ok()
+    .flatten();
+    if codex_api_key_present && stored_auth.is_some() && !force_api_key_auth {
+        eprintln!(
+            "⚠ {CODEX_API_KEY_ENV_VAR} is set, but implicit API-key fallback is disabled. Codex is using shared auth from $CODEX_HOME/auth.json (PitchAI preferred). To force API-key mode for this run only, set CODEX_FORCE_API_KEY_AUTH=1."
+        );
+    }
+    if codex_api_key_present && stored_auth.is_none() && !force_api_key_auth {
+        eprintln!(
+            "⚠ {CODEX_API_KEY_ENV_VAR} is set, but implicit API-key fallback is disabled. Configure shared/broker auth in $CODEX_HOME/auth.json, or explicitly force API-key mode with CODEX_FORCE_API_KEY_AUTH=1."
+        );
+    }
+    if codex_api_key_present && force_api_key_auth {
+        eprintln!(
+            "⚠ Forced API-key mode is active ({CODEX_API_KEY_ENV_VAR} + CODEX_FORCE_API_KEY_AUTH=1). This bypasses PitchAI's default shared/broker auth workflow and should only be used for explicit break-glass operation."
+        );
+    }
+    if auth_manager
+        .auth_cached()
+        .as_ref()
+        .is_some_and(|auth| auth.auth_mode() == AuthMode::ApiKey)
+    {
+        eprintln!(
+            "⚠ Codex is running in API-key auth mode. At PitchAI, shared ChatGPT auth in $CODEX_HOME/auth.json is the preferred/default workflow."
+        );
+    }
     let thread_manager = Arc::new(ThreadManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),

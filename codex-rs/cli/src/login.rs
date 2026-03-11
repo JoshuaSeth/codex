@@ -19,6 +19,7 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const PITCHAI_API_KEY_POLICY_WARNING: &str = "PitchAI policy: shared/broker auth in $CODEX_HOME/auth.json is the default. API-key auth is explicit-only, must not be used as fallback, and automation should prefer auth-token-server lease flow.";
 
 fn print_login_server_start(actual_port: u16, auth_url: &str) {
     eprintln!(
@@ -90,6 +91,7 @@ pub async fn run_login_with_api_key(
     ) {
         Ok(_) => {
             eprintln!("{LOGIN_SUCCESS_MESSAGE}");
+            eprintln!("⚠ {PITCHAI_API_KEY_POLICY_WARNING}");
             std::process::exit(0);
         }
         Err(e) => {
@@ -104,7 +106,7 @@ pub fn read_api_key_from_stdin() -> String {
 
     if stdin.is_terminal() {
         eprintln!(
-            "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
+            "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`.\n⚠ {PITCHAI_API_KEY_POLICY_WARNING}"
         );
         std::process::exit(1);
     }
@@ -229,6 +231,7 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
             AuthMode::ApiKey => match auth.get_token() {
                 Ok(api_key) => {
                     eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
+                    eprintln!("⚠ {PITCHAI_API_KEY_POLICY_WARNING}");
                     std::process::exit(0);
                 }
                 Err(e) => {

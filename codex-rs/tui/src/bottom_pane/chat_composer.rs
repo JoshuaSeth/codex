@@ -818,8 +818,9 @@ impl ChatComposer {
     ///   [`PasteBurst::clear_after_explicit_paste`].
     ///
     /// We intentionally do not use `clear_window_after_non_char()` here: it clears timing state
-    /// without emitting any buffered text, which can leave a non-empty buffer unable to flush
-    /// later (because `flush_if_due()` relies on `last_plain_char_time` to time out).
+    /// without emitting buffered text. `PasteBurst::flush_if_due()` has a defensive recovery path,
+    /// but this explicit flush-first ordering preserves intended semantics and avoids fallback
+    /// behavior.
     pub(crate) fn set_disable_paste_burst(&mut self, disabled: bool) {
         let was_disabled = self.disable_paste_burst;
         self.disable_paste_burst = disabled;
@@ -3025,10 +3026,8 @@ impl ChatComposer {
 
         // Flush any buffered burst before applying a non-char input (arrow keys, etc).
         //
-        // `clear_window_after_non_char()` clears `last_plain_char_time`. If we cleared that while
-        // `PasteBurst.buffer` is non-empty, `flush_if_due()` would no longer have a timestamp to
-        // time out against, and the buffered paste could remain stuck until another plain char
-        // arrives.
+        // `clear_window_after_non_char()` clears `last_plain_char_time`. Flush buffered content
+        // before clearing so burst semantics stay explicit and deterministic.
         if !matches!(input.code, KeyCode::Char(_) | KeyCode::Enter)
             && let Some(pasted) = self.paste_burst.flush_before_modified_input()
         {

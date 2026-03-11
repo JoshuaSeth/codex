@@ -6,7 +6,10 @@ use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(
+    version,
+    after_long_help = "PitchAI auth policy:\n  - Default: managed shared auth in $CODEX_HOME/auth.json (typically broker-issued).\n  - `CODEX_API_KEY` is never used as implicit fallback.\n  - API-key mode is explicit-only (`CODEX_FORCE_API_KEY_AUTH=1`).\n\nPitchAI automation/broker notes:\n  - Runners can lease auth from auth-token-server via `CODEX_AUTH_BROKER_URL` + `CODEX_AUTH_BROKER_TOKEN`.\n  - On usage/rate limits, the runner can report lease outcome, fetch fresh auth, and auto-continue the same thread.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies workspace-write sandbox and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Commands continue to run normally; approval policy still governs escalation."
+)]
 pub struct Cli {
     /// Action to perform. If omitted, runs a new non-interactive session.
     #[command(subcommand)]
@@ -74,6 +77,20 @@ pub struct Cli {
     /// Additional directories that should be writable alongside the primary workspace.
     #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
+
+    /// Enforce strict filesystem scope for this session.
+    ///
+    /// Reads and writes are restricted to these directories (plus required
+    /// platform read defaults), `/tmp` and `$TMPDIR` are excluded from writable
+    /// roots, and `workspace-write` sandbox mode is implied. Shell command
+    /// behavior remains unchanged; approvals still apply.
+    #[arg(
+        long = "strict-dir",
+        alias = "restrict-dir",
+        value_name = "DIR",
+        value_hint = clap::ValueHint::DirPath
+    )]
+    pub strict_dir: Vec<PathBuf>,
 
     /// Run without persisting session files to disk.
     #[arg(long = "ephemeral", global = true, default_value_t = false)]

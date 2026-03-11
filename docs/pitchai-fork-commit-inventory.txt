@@ -1,0 +1,98 @@
+# PitchAI fork commit inventory (non-merge commits)
+# Generated: 2026-03-10
+# Command: git log --no-merges --oneline upstream/main..main
+
+8da8d9f13 codex: fix rollout recorder test after merge
+c4d4bd3a7 codex: track session token costs
+3ac07ba52 Checkpoint dirty main worktree
+da2c05e1d Bound live session memory to prompt-visible history
+ae40e8149 core: raise default stream retry budget
+1e0738a13 core: retry stream disconnects up to 30x
+cc7beea2d core: avoid repeating silent reroute warnings
+4883de251 core: allow 2h unified exec long-polls
+d93cabc3f tui: preserve newer queued drafts when editing
+b388694af core: deflake unified exec delayed output test
+4292aa2de tui: queue submissions while a turn is running
+523a11378 cli: render collab tool calls in view
+11ce84689 tui/core: show silent reroute notice without aborting turns
+97ae4c13c core: detect silent model reroutes and force gpt-5.2 xhigh
+cb832443b Docs: remove pending-tool workflow references
+72df2b22b Add PitchAI mailbox tagger tools
+ddbc65e57 tui: keep current cwd on resume
+7d03ea839 Fix queued input handling on stream disconnect
+b6901f990 PitchAI: live status + resume cwd/git context
+9dc9b9dda core: wait for delivered pending tool results
+cd05ee828 feat(resume): refresh environment and add --branch
+6f627a4ce feat(resume): support session selectors
+0b7fe01e2 docs: clarify path resolution for custom tool commands
+41892c392 docs+smoke: validate custom tools and hooks
+8b7504ae8 docs: add PitchAI upstream sync notes
+aa2b1834b fix: derive Serialize for CustomToolToml
+da9d12df1 feat: support git_prepared queue metadata
+ed54128f2 chore(pitchai): move dispatcher out of codex repo
+268cc29ff chore(pitchai): pass UI basic auth env
+ce9da3c4f feat(pitchai): add dispatcher status UI
+62a512b50 feat(pitchai): add latest event polling
+e7f21ab18 feat(pitchai): add run polling endpoints
+8f40243d4 feat(pitchai): dispatch git repo + branch
+327bfa157 feat(pitchai): dispatch pre/post commands
+e2a3bb918 chore(pitchai): ignore local dispatcher data
+8238ff6fe feat(pitchai): host codex dispatcher + resume --fork
+e01dcd8a8 feat: allow codex job to drain multiple queued items
+6a8fd17ae feat: allow reusing persisted auth.json when secret missing
+b19f55494 feat: enforce email approvals + http dispatch
+845a08eaf chore: fix telegram bot debug log indent
+0d3b72d20 chore: avoid utcnow warnings in telegram bot
+d40ea5e52 feat: stop-hook telegram metadata + dedup
+44715e44e feat: generic codex job runner configurable via env
+1aaeb24c8 fix: include Elise assets in codex-agent image
+facaff194 fix: prevent telegram webhook retry loops
+fd6b3534e docs: add telegram dispatch repro steps
+8ac30404b chore: log webhook secret mismatch hashes
+6bc723bf6 fix: Azure Files-safe prompt filenames in Telegram dispatcher
+b1436b559 PitchAI: add Telegram ad-hoc dispatch (prompt queue)
+7f338916b docs: add Elise Telegram dispatch plan
+6eec888c6 docs: add Elise agent deployment guide
+58b80d505 PitchAI: add Elise polling job (Graph app-only)
+b0495f073 Add Telegram stop hook to SharePoint inbox job
+5e1509923 PitchAI: fix SharePoint MoveFileByPath regression
+19bb1c121 PitchAI: make SharePoint moves more robust
+15b1ee1a7 PitchAI: escape Telegram Markdown in stop-hook
+3b2478f8a PitchAI: make SharePoint move_file accept folder dest
+80cd1ef2c PitchAI: allow prompt override in container job
+0b4fe6be4 PitchAI: enable experimental tools via config
+bd8e4499f PitchAI: enable read_file tool + enforce max-files limit
+0b2f2e799 PitchAI: configurable model tier + safer inbox triage
+bb93a89d2 PitchAI: tighten inbox triage prompt output
+b581d61a5 PitchAI: add container job runner script
+f0efdd306 PitchAI: SharePoint inbox tools + container config
+7ba7eeba9 pitchai: port hooks/profiles/custom tools to upstream 0.76.0
+92c85fae7 feat(exec): add prompt sequence runner
+4c711b448 Improve ask_colleague runtime and config
+005bc0b30 feat: improve --config-file resolution
+54c0b8ed3 feat: add prompt extend instructions to orchestrator profile
+6ecbcb57e chore: disable timeout for ask_colleague in orchestrator profile
+924646110 refactor: store orchestrator profile under .codex
+bceda5498 chore: move orchestrator profile to repo root
+4e1116ab1 chore: update stop-hook message formatting for clarity
+12a321e22 chore: report only folder name in telegram stop-hook
+05c2d1cfe chore: streamline telegram stop-hook output
+1b1c9096d chore: simplify telegram stop-hook message
+e49cc95fa feat: add scheduled codex morning runner
+5c57ffdaa fix: error when --config-file path is missing
+5732f2020 feat: add Elise automation helpers and profiles
+3bd96e1e3 feat: add pending tool hibernation and deliver CLI
+9093784a8 feat: allow tool hooks to override shell timeouts
+9dee0ef20 Add web-agent profiles and devtools hook log
+5ab5fb818 Add custom tool runtime and Elise helpers
+1161039e2 Allow replacing last tool output when resuming
+1695e53a7 Add config-driven default cwd with profile override
+bbc99ea28 feat: add pending custom tool shutdown knob
+eeca20185 feat: add stop-hook telemetry and telegram logger
+997f70922 feat: support config-defined CLI tools and document codex-dev
+86982d18e Add base_prompt_extend hook for user messages
+b8e5dc9ab Enhance session viewer UI and document profiles
+eb14ae297 Ignore local env artifacts
+bd5d42200 Add FastAPI conversation visualizer
+98e0fb33b Support per-run config home overrides
+fb1bbdbd5 Add tool hook support

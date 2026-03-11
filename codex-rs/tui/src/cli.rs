@@ -5,7 +5,10 @@ use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(
+    version,
+    after_long_help = "Strict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies workspace-write sandbox and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Commands continue to run normally; approval policy still governs escalation."
+)]
 pub struct Cli {
     /// Optional user prompt to start the session.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
@@ -105,6 +108,20 @@ pub struct Cli {
     /// Additional directories that should be writable alongside the primary workspace.
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
+
+    /// Enforce strict filesystem scope for this session.
+    ///
+    /// Reads and writes are restricted to these directories (plus required
+    /// platform read defaults), `/tmp` and `$TMPDIR` are excluded from writable
+    /// roots, and `workspace-write` sandbox mode is implied. Shell command
+    /// behavior remains unchanged; approvals still apply.
+    #[arg(
+        long = "strict-dir",
+        alias = "restrict-dir",
+        value_name = "DIR",
+        value_hint = ValueHint::DirPath
+    )]
+    pub strict_dir: Vec<PathBuf>,
 
     /// Disable alternate screen mode
     ///

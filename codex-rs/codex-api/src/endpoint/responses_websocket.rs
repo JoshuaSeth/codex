@@ -8,8 +8,10 @@ use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
 use crate::sse::responses::ResponsesStreamEvent;
 use crate::sse::responses::process_responses_event;
+use crate::sse::responses::queue_response_event_with_synthesized_output_item_done;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
+use codex_protocol::models::ResponseItem;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -513,6 +515,7 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
 ) -> Result<(), ApiError> {
+    let mut active_output_item: Option<ResponseItem> = None;
     let request_text = match serde_json::to_string(&request_body) {
         Ok(text) => text,
         Err(err) => {
@@ -583,9 +586,19 @@ async fn run_websocket_response_stream(
                 }
                 match process_responses_event(event) {
                     Ok(Some(event)) => {
-                        let is_completed = matches!(event, ResponseEvent::Completed { .. });
-                        let _ = tx_event.send(Ok(event)).await;
-                        if is_completed {
+                        let mut saw_completed = false;
+                        for event in queue_response_event_with_synthesized_output_item_done(
+                            event,
+                            &mut active_output_item,
+                        ) {
+                            let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                            let _ = tx_event.send(Ok(event)).await;
+                            if is_completed {
+                                saw_completed = true;
+                                break;
+                            }
+                        }
+                        if saw_completed {
                             break;
                         }
                     }
@@ -773,6 +786,54 @@ mod tests {
             .expect("expected websocket error payload to be parsed");
         let api_error = map_wrapped_websocket_error_event(wrapped_error, payload);
         assert!(api_error.is_none());
+    }
+
+    #[test]
+    fn websocket_event_queue_synthesizes_missing_output_item_done() {
+        let payloads = vec![
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "arguments": "{\"command\":\"echo hi\"}",
+                    "call_id": "call-1"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+        ];
+
+        let mut active_output_item: Option<ResponseItem> = None;
+        let mut mapped_events: Vec<ResponseEvent> = Vec::new();
+        for payload in payloads {
+            let event = serde_json::from_value::<ResponsesStreamEvent>(payload)
+                .expect("deserialize websocket payload");
+            let mapped = process_responses_event(event)
+                .expect("map response event")
+                .expect("response event should be mapped");
+            mapped_events.extend(queue_response_event_with_synthesized_output_item_done(
+                mapped,
+                &mut active_output_item,
+            ));
+        }
+
+        assert!(matches!(
+            &mapped_events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall { call_id, .. }) if call_id == "call-1"
+        ));
+        assert!(matches!(
+            &mapped_events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. }) if call_id == "call-1"
+        ));
+        assert!(matches!(
+            &mapped_events[2],
+            ResponseEvent::Completed { response_id, .. } if response_id == "resp-1"
+        ));
     }
 
     #[test]

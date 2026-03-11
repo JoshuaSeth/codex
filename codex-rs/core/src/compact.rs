@@ -27,6 +27,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
+use http::StatusCode;
 use tracing::error;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
@@ -111,6 +112,7 @@ async fn run_compact_task_inner(
     history.record_items(&[compact_prompt_item], turn_context.truncation_policy);
 
     let mut truncated_count = 0usize;
+    let mut oversize_trim_batch = 1usize;
 
     let max_retries = turn_context.provider.stream_max_retries();
     let mut retries = 0;
@@ -159,18 +161,40 @@ async fn run_compact_task_inner(
             Err(CodexErr::Interrupted) => {
                 return Err(CodexErr::Interrupted);
             }
-            Err(e @ CodexErr::ContextWindowExceeded) => {
+            Err(e) if should_trim_history_after_compact_error(&e) => {
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
+                    // Grow the trim batch exponentially so very large histories can recover quickly.
+                    let max_removable = turn_input_len.saturating_sub(1);
+                    let trim_batch = oversize_trim_batch.min(max_removable).max(1);
+                    let history_len_before = history.raw_items().len();
+                    let mut removed_any = false;
+                    for _ in 0..trim_batch {
+                        let history_len = history.raw_items().len();
+                        if history_len <= 1 {
+                            break;
+                        }
+                        history.remove_first_item();
+                        removed_any = true;
+                    }
+                    let removed_count =
+                        history_len_before.saturating_sub(history.raw_items().len());
+                    if !removed_any || removed_count == 0 {
+                        let event = EventMsg::Error(e.to_error_event(None));
+                        sess.send_event(&turn_context, event).await;
+                        return Err(e);
+                    }
                     error!(
-                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
+                        "Compaction request exceeded limits; removing {removed_count} oldest history item(s) (batch={trim_batch}). Error: {e}"
                     );
-                    history.remove_first_item();
-                    truncated_count += 1;
+                    truncated_count += removed_count;
+                    oversize_trim_batch = oversize_trim_batch.saturating_mul(2).min(64);
                     retries = 0;
                     continue;
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
+                if matches!(e, CodexErr::ContextWindowExceeded) {
+                    sess.set_total_tokens_full(turn_context.as_ref()).await;
+                }
                 let event = EventMsg::Error(e.to_error_event(None));
                 sess.send_event(&turn_context, event).await;
                 return Err(e);
@@ -231,6 +255,26 @@ async fn run_compact_task_inner(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(())
+}
+
+fn should_trim_history_after_compact_error(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::ContextWindowExceeded => true,
+        CodexErr::Stream(message, _) => is_oversize_stream_error(message),
+        CodexErr::UnexpectedStatus(unexpected) => {
+            unexpected.status == StatusCode::PAYLOAD_TOO_LARGE
+        }
+        _ => false,
+    }
+}
+
+fn is_oversize_stream_error(message: &str) -> bool {
+    let normalized = message
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>();
+    normalized.contains("code=1009") || normalized.contains("payloadtoolarge")
 }
 
 pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
@@ -449,6 +493,8 @@ async fn drain_to_completed(
 mod tests {
 
     use super::*;
+    use crate::error::UnexpectedResponseError;
+    use http::StatusCode;
     use pretty_assertions::assert_eq;
 
     async fn process_compacted_history_with_test_session(
@@ -569,6 +615,26 @@ do things
         let collected = collect_user_messages(&items);
 
         assert_eq!(vec!["real user message".to_string()], collected);
+    }
+
+    #[test]
+    fn oversize_stream_error_detection_matches_websocket_1009() {
+        assert!(is_oversize_stream_error(
+            "websocket closed by server before response.completed (code=1009)"
+        ));
+    }
+
+    #[test]
+    fn trim_history_error_detection_matches_payload_too_large_status() {
+        let err = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: "payload too large".to_string(),
+            url: Some("https://chatgpt.com/backend-api/codex/responses".to_string()),
+            cf_ray: None,
+            request_id: None,
+        });
+
+        assert!(should_trim_history_after_compact_error(&err));
     }
 
     #[test]

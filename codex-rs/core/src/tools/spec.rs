@@ -3,6 +3,7 @@ use crate::client_common::tools::FreeformToolFormat;
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::config::AgentRoleConfig;
+use crate::config::types::CustomToolToml;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::mcp_connection_manager::ToolInfo;
@@ -34,6 +35,8 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use toml::Value as TomlValue;
+use tracing::error;
 
 const SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE: &str =
     include_str!("../../templates/search_tool/tool_description.md");
@@ -72,6 +75,7 @@ pub(crate) struct ToolsConfig {
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
+    pub custom_tools: Vec<ConfigCustomTool>,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -79,6 +83,19 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) features: &'a Features,
     pub(crate) web_search_mode: Option<WebSearchMode>,
     pub(crate) session_source: SessionSource,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigCustomTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: JsonSchema,
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub with_escalated_permissions: Option<bool>,
+    pub parallel: bool,
 }
 
 impl ToolsConfig {
@@ -172,6 +189,7 @@ impl ToolsConfig {
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
+            custom_tools: Vec::new(),
         }
     }
 
@@ -182,6 +200,11 @@ impl ToolsConfig {
 
     pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
         self.allow_login_shell = allow_login_shell;
+        self
+    }
+
+    pub fn with_custom_tools_from_config(mut self, effective_config: &TomlValue) -> Self {
+        self.custom_tools = build_custom_tool_specs_from_effective_config(effective_config);
         self
     }
 }
@@ -1728,6 +1751,76 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
+fn build_custom_tool_specs_from_effective_config(
+    effective_config: &TomlValue,
+) -> Vec<ConfigCustomTool> {
+    let Some(root) = effective_config.as_table() else {
+        return Vec::new();
+    };
+    let Some(custom_tools_value) = root.get("custom_tools") else {
+        return Vec::new();
+    };
+    let entries = match custom_tools_value
+        .clone()
+        .try_into::<HashMap<String, CustomToolToml>>()
+    {
+        Ok(entries) => entries,
+        Err(err) => {
+            error!(?err, "failed to parse custom_tools from effective config");
+            return Vec::new();
+        }
+    };
+
+    let mut names = entries.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+
+    let mut specs = Vec::new();
+    for name in names {
+        let Some(entry) = entries.get(&name) else {
+            continue;
+        };
+        if entry.command.is_empty() {
+            error!(tool = %name, "custom tool must provide a non-empty command");
+            continue;
+        }
+
+        let mut schema_value = entry.parameters.clone().unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        });
+        sanitize_json_schema(&mut schema_value);
+
+        match serde_json::from_value::<JsonSchema>(schema_value) {
+            Ok(parameters) => {
+                let description = entry
+                    .description
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("Run {}", entry.command[0]));
+                specs.push(ConfigCustomTool {
+                    name: name.clone(),
+                    description,
+                    parameters,
+                    command: entry.command.clone(),
+                    cwd: entry.cwd.clone(),
+                    env: entry.env.clone().unwrap_or_default(),
+                    timeout_ms: entry.timeout_ms,
+                    with_escalated_permissions: entry.with_escalated_permissions,
+                    parallel: entry.parallel.unwrap_or(false),
+                });
+            }
+            Err(err) => {
+                error!(tool = %name, ?err, "failed to parse custom tool schema");
+            }
+        }
+    }
+
+    specs
+}
+
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
@@ -1737,6 +1830,7 @@ pub(crate) fn build_specs(
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::ArtifactsHandler;
+    use crate::tools::handlers::CustomToolHandler;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::JsReplHandler;
@@ -1943,6 +2037,22 @@ pub(crate) fn build_specs(
         builder.register_handler("resume_agent", multi_agent_handler.clone());
         builder.register_handler("wait", multi_agent_handler.clone());
         builder.register_handler("close_agent", multi_agent_handler);
+    }
+
+    if !config.custom_tools.is_empty() {
+        let custom_handler = Arc::new(CustomToolHandler::new(config.custom_tools.clone()));
+        for tool in &config.custom_tools {
+            builder.push_spec_with_parallel_support(
+                ToolSpec::Function(ResponsesApiTool {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    strict: false,
+                    parameters: tool.parameters.clone(),
+                }),
+                tool.parallel,
+            );
+            builder.register_handler(tool.name.clone(), custom_handler.clone());
+        }
     }
 
     if config.agent_jobs_tools {
@@ -2219,6 +2329,40 @@ mod tests {
             strip_descriptions_tool(&mut a);
             strip_descriptions_tool(&mut e);
             assert_eq!(a, e, "spec mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn test_build_specs_includes_custom_tools_from_effective_config() {
+        let model_info = model_info_from_models_json("gpt-5-codex");
+        let features = Features::with_defaults();
+        let effective_config = toml::Value::Table(toml::toml! {
+            [custom_tools.execute_python]
+            command = ["python3", "/tmp/execute_python_tool.py"]
+            description = "Execute python"
+            parameters = { type = "object", required = ["code"], properties = { code = { type = "string" } }, additionalProperties = false }
+            parallel = true
+        });
+
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        })
+        .with_custom_tools_from_config(&effective_config);
+        let (tools, _) = build_specs(&config, None, None, &[]).build();
+
+        let tool = find_tool(&tools, "execute_python");
+        assert!(tool.supports_parallel_tool_calls);
+        match &tool.spec {
+            ToolSpec::Function(ResponsesApiTool { parameters, .. }) => {
+                let JsonSchema::Object { required, .. } = parameters else {
+                    panic!("expected execute_python schema to be an object");
+                };
+                assert_eq!(required.as_ref(), Some(&vec!["code".to_string()]));
+            }
+            other => panic!("expected execute_python function tool, got {other:?}"),
         }
     }
 

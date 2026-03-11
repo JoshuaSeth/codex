@@ -47,7 +47,8 @@
 //!   not render this char until it either becomes part of a burst (`BeginBufferFromPending`) or
 //!   flushes as a normal typed char (`FlushResult::Typed`).
 //! - `last_plain_char_time`/`consecutive_plain_char_burst`: the timing/count heuristic for
-//!   "paste-like" streams.
+//!   "paste-like" streams; once buffering is active, `last_plain_char_time` also tracks recent
+//!   burst activity for idle-timeout flushing.
 //! - `burst_window_until`: the Enter suppression window ("Enter inserts newline") that outlives the
 //!   buffer itself.
 //!
@@ -89,9 +90,9 @@
 //! - `flush_before_modified_input()` returns the buffered text (and/or a pending first ASCII char)
 //!   so the caller can apply it through the normal paste path before handling an unrelated input.
 //! - `clear_window_after_non_char()` clears the *classification window* so subsequent typing does
-//!   not get grouped into the previous burst. It assumes the caller has already flushed any buffer
-//!   because it clears `last_plain_char_time`, which means `flush_if_due()` will not flush a
-//!   non-empty buffer until another plain char updates the timestamp.
+//!   not get grouped into the previous burst. Callers should still flush first. As a safeguard,
+//!   `flush_if_due()` self-recovers inconsistent state (`buffer`/`pending_first_char` present but
+//!   `last_plain_char_time` missing) by draining immediately instead of leaving capture stuck.
 //!
 //! # States (Conceptually)
 //!
@@ -295,14 +296,37 @@ impl PasteBurst {
     ///   suppression) and no burst followed before the timeout elapsed.
     /// - [`FlushResult::None`] when the timeout has not elapsed, or there is nothing to flush.
     pub fn flush_if_due(&mut self, now: Instant) -> FlushResult {
+        if self.last_plain_char_time.is_none() {
+            // Defensive recovery for inconsistent state (for example, if timing metadata was
+            // cleared while buffered content still existed). Do not leave paste capture active
+            // forever; drain immediately.
+            if self.is_active_internal() {
+                self.active = false;
+                let mut out = std::mem::take(&mut self.buffer);
+                if let Some((ch, _at)) = self.pending_first_char.take() {
+                    out.push(ch);
+                }
+                return if out.is_empty() {
+                    FlushResult::None
+                } else {
+                    FlushResult::Paste(out)
+                };
+            }
+            if let Some((ch, _at)) = self.pending_first_char.take() {
+                return FlushResult::Typed(ch);
+            }
+            return FlushResult::None;
+        }
+
         let timeout = if self.is_active_internal() {
             PASTE_BURST_ACTIVE_IDLE_TIMEOUT
         } else {
             PASTE_BURST_CHAR_INTERVAL
         };
-        let timed_out = self
-            .last_plain_char_time
-            .is_some_and(|t| now.duration_since(t) > timeout);
+        let Some(last_plain_char_time) = self.last_plain_char_time else {
+            return FlushResult::None;
+        };
+        let timed_out = now.duration_since(last_plain_char_time) > timeout;
         if timed_out && self.is_active_internal() {
             self.active = false;
             let out = std::mem::take(&mut self.buffer);
@@ -328,6 +352,7 @@ impl PasteBurst {
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
             self.buffer.push('\n');
+            self.last_plain_char_time = Some(now);
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true
         } else {
@@ -352,12 +377,14 @@ impl PasteBurst {
             self.buffer.push_str(&grabbed);
         }
         self.active = true;
+        self.last_plain_char_time = Some(now);
         self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
     }
 
     /// Append a char into the burst buffer.
     pub fn append_char_to_buffer(&mut self, ch: char, now: Instant) {
         self.buffer.push(ch);
+        self.last_plain_char_time = Some(now);
         self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
     }
 
@@ -568,5 +595,33 @@ mod tests {
         assert!(burst.newline_should_insert_instead_of_submit(t2));
         let t3 = t1 + PASTE_ENTER_SUPPRESS_WINDOW + Duration::from_millis(1);
         assert!(!burst.newline_should_insert_instead_of_submit(t3));
+    }
+
+    /// Behavior: if timing metadata is cleared while buffered paste text still exists, the next
+    /// flush tick should recover by draining immediately instead of staying "active" forever.
+    #[test]
+    fn flush_if_due_recovers_buffer_when_timestamp_is_missing() {
+        let mut burst = PasteBurst::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            burst.on_plain_char('a', t0),
+            CharDecision::RetainFirstChar
+        ));
+
+        let t1 = t0 + Duration::from_millis(1);
+        assert!(matches!(
+            burst.on_plain_char('b', t1),
+            CharDecision::BeginBufferFromPending
+        ));
+        burst.append_char_to_buffer('b', t1);
+
+        burst.clear_window_after_non_char();
+        assert!(burst.is_active());
+
+        assert!(matches!(
+            burst.flush_if_due(t1),
+            FlushResult::Paste(ref s) if s == "ab"
+        ));
+        assert!(!burst.is_active());
     }
 }

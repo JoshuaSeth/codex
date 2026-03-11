@@ -107,6 +107,10 @@ exclude_tmpdir_env_var = false
 # Exclude /tmp from writable roots. Default: false
 exclude_slash_tmp = false
 
+# For one-off strict filesystem scoping (read+write limited to explicit roots),
+# use CLI flags instead:
+#   codex --strict-dir /abs/path --strict-dir /another/path
+
 ################################################################################
 # Shell Environment Policy for spawned processes
 ################################################################################
@@ -278,8 +282,8 @@ experimental_use_freeform_apply_patch = false
 # base_url = "https://api.openai.com/v1"         # default if unset
 # wire_api = "responses"                         # "responses" | "chat" (default varies)
 # # requires_openai_auth = true                    # built-in OpenAI defaults to true
-# # request_max_retries = 4                        # default 4; max 100
-# # stream_max_retries = 5                         # default 5;  max 100
+# # request_max_retries = 3                        # default 3; max 100
+# # stream_max_retries = 3                         # default 3; max 100
 # # stream_idle_timeout_ms = 300000                # default 300_000 (5m)
 # # experimental_bearer_token = "sk-example"      # optional dev-only direct bearer token
 # # http_headers = { "X-Example" = "value" }

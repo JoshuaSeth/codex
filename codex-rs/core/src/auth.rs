@@ -362,6 +362,7 @@ impl ChatgptAuth {
 
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
+pub const CODEX_FORCE_API_KEY_AUTH_ENV_VAR: &str = "CODEX_FORCE_API_KEY_AUTH";
 
 pub fn read_openai_api_key_from_env() -> Option<String> {
     env::var(OPENAI_API_KEY_ENV_VAR)
@@ -375,6 +376,13 @@ pub fn read_codex_api_key_from_env() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+pub fn is_force_api_key_auth_enabled() -> bool {
+    env::var(CODEX_FORCE_API_KEY_AUTH_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
@@ -554,13 +562,20 @@ fn load_auth(
         CodexAuth::from_auth_dot_json(codex_home, auth_dot_json, storage_mode, client)
     };
 
-    // API key via env var takes precedence over any other auth method.
-    if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
+    // PitchAI fork policy:
+    // - Shared managed auth (`auth.json` / keyring, including broker-issued auth.json)
+    //   is the default workflow.
+    // - `CODEX_API_KEY` must not act as implicit fallback.
+    // - API-key mode is only enabled when explicitly forced with
+    //   `CODEX_FORCE_API_KEY_AUTH=1`.
+    let codex_api_key = enable_codex_api_key_env
+        .then(read_codex_api_key_from_env)
+        .flatten();
+    let force_api_key_auth =
+        enable_codex_api_key_env && codex_api_key.is_some() && is_force_api_key_auth_enabled();
+    if force_api_key_auth && let Some(api_key) = codex_api_key.as_deref() {
         let client = crate::default_client::create_client();
-        return Ok(Some(CodexAuth::from_api_key_with_client(
-            api_key.as_str(),
-            client,
-        )));
+        return Ok(Some(CodexAuth::from_api_key_with_client(api_key, client)));
     }
 
     // External ChatGPT auth tokens live in the in-memory (ephemeral) store. Always check this
@@ -581,13 +596,12 @@ fn load_auth(
 
     // Fall back to the configured persistent store (file/keyring/auto) for managed auth.
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
-    let auth_dot_json = match storage.load()? {
-        Some(auth) => auth,
-        None => return Ok(None),
-    };
+    if let Some(auth_dot_json) = storage.load()? {
+        let auth = build_auth(auth_dot_json, auth_credentials_store_mode)?;
+        return Ok(Some(auth));
+    }
 
-    let auth = build_auth(auth_dot_json, auth_credentials_store_mode)?;
-    Ok(Some(auth))
+    Ok(None)
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
@@ -1715,8 +1729,9 @@ mod tests {
 
     #[tokio::test]
     #[serial(codex_api_key)]
-    async fn enforce_login_restrictions_blocks_env_api_key_when_chatgpt_required() {
+    async fn enforce_login_restrictions_blocks_forced_env_api_key_when_chatgpt_required() {
         let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+        let _force_guard = EnvVarGuard::set(CODEX_FORCE_API_KEY_AUTH_ENV_VAR, "1");
         let codex_home = tempdir().unwrap();
 
         let config = build_config(codex_home.path(), Some(ForcedLoginMethod::Chatgpt), None).await;
@@ -1727,6 +1742,75 @@ mod tests {
             err.to_string()
                 .contains("ChatGPT login is required, but an API key is currently being used.")
         );
+    }
+
+    #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn load_auth_prefers_storage_over_env_api_key_by_default() {
+        let _env_guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_string()),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let auth = super::load_auth(codex_home.path(), true, AuthCredentialsStoreMode::File)
+            .expect("load auth should succeed")
+            .expect("auth should be present");
+        assert_eq!(auth.auth_mode(), AuthMode::Chatgpt);
+    }
+
+    #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn load_auth_ignores_env_api_key_without_force_when_no_storage() {
+        let _env_guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+        let codex_home = tempdir().unwrap();
+
+        let auth = super::load_auth(codex_home.path(), true, AuthCredentialsStoreMode::File)
+            .expect("load auth should succeed");
+        assert!(auth.is_none(), "env API key must not be implicit fallback");
+    }
+
+    #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn load_auth_can_force_env_api_key_when_no_storage() {
+        let _env_guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+        let _force_guard = EnvVarGuard::set(CODEX_FORCE_API_KEY_AUTH_ENV_VAR, "1");
+        let codex_home = tempdir().unwrap();
+
+        let auth = super::load_auth(codex_home.path(), true, AuthCredentialsStoreMode::File)
+            .expect("load auth should succeed")
+            .expect("forced env API key should load");
+        assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
+        assert_eq!(auth.api_key(), Some("sk-env"));
+    }
+
+    #[tokio::test]
+    #[serial(codex_api_key)]
+    async fn load_auth_can_force_env_api_key_over_storage() {
+        let _env_guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+        let _force_guard = EnvVarGuard::set(CODEX_FORCE_API_KEY_AUTH_ENV_VAR, "1");
+        let codex_home = tempdir().unwrap();
+        let _jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_string()),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let auth = super::load_auth(codex_home.path(), true, AuthCredentialsStoreMode::File)
+            .expect("load auth should succeed")
+            .expect("auth should be present");
+        assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
+        assert_eq!(auth.api_key(), Some("sk-env"));
     }
 
     #[test]

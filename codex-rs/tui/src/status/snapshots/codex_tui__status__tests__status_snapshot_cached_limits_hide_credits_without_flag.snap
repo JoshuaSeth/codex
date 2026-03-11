@@ -13,7 +13,7 @@ expression: sanitized
 │  Model:            gpt-5.1-codex (reasoning none, summaries auto)   │
 │  Directory: [[workspace]]                                           │
 │  Permissions:      Custom (read-only, on-request)                   │
-│  Agents.md:        <none>                                           │
+│  Agents.md:        /root/code/worktrees/dft/wt-2/AGENTS.md          │
 │                                                                     │
 │  Token usage:      1.05K total  (700 input + 350 output)            │
 │  Context window:   100% left (1.45K used / 272K)                    │

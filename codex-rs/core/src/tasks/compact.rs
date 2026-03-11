@@ -35,7 +35,33 @@ impl SessionTask for CompactTask {
                 1,
                 &[("type", "remote")],
             );
-            crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
+            match crate::compact_remote::run_remote_compact_task(session.clone(), ctx.clone()).await
+            {
+                Ok(()) => Ok(()),
+                Err(err) if crate::compact_remote::should_fallback_to_local_compact(&err) => {
+                    let _ = session.services.otel_manager.counter(
+                        "codex.task.compact",
+                        1,
+                        &[("type", "local_fallback")],
+                    );
+                    let fallback_reason =
+                        if crate::compact_remote::is_remote_compact_payload_too_large(&err) {
+                            "payload exceeded backend size limits"
+                        } else {
+                            "request failed"
+                        };
+                    session
+                        .notify_background_event(
+                            ctx.as_ref(),
+                            format!(
+                                "Remote compact {fallback_reason}; falling back to local compaction."
+                            ),
+                        )
+                        .await;
+                    crate::compact::run_compact_task(session.clone(), ctx, input).await
+                }
+                Err(err) => Err(err),
+            }
         } else {
             let _ = session.services.otel_manager.counter(
                 "codex.task.compact",

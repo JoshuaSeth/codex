@@ -27,6 +27,8 @@ use tracing::debug;
 use tracing::trace;
 
 const X_REASONING_INCLUDED_HEADER: &str = "x-reasoning-included";
+const OPENAI_MODEL_HEADER: &str = "openai-model";
+const X_OPENAI_MODEL_HEADER: &str = "x-openai-model";
 
 /// Streams SSE events from an on-disk fixture for tests.
 pub fn stream_from_fixture(
@@ -45,7 +47,13 @@ pub fn stream_from_fixture(
     let reader = std::io::Cursor::new(content);
     let stream = ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
-    tokio::spawn(process_sse(Box::pin(stream), tx_event, idle_timeout, None));
+    tokio::spawn(process_sse(
+        Box::pin(stream),
+        tx_event,
+        idle_timeout,
+        None,
+        None,
+    ));
     Ok(ResponseStream { rx_event })
 }
 
@@ -59,6 +67,12 @@ pub fn spawn_response_stream(
     let models_etag = stream_response
         .headers
         .get("X-Models-Etag")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let server_model = stream_response
+        .headers
+        .get(OPENAI_MODEL_HEADER)
+        .or_else(|| stream_response.headers.get(X_OPENAI_MODEL_HEADER))
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
     let reasoning_included = stream_response
@@ -86,7 +100,14 @@ pub fn spawn_response_stream(
                 .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
                 .await;
         }
-        process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
+        process_sse(
+            stream_response.bytes,
+            tx_event,
+            idle_timeout,
+            telemetry,
+            server_model,
+        )
+        .await;
     });
 
     ResponseStream { rx_event }
@@ -378,15 +399,67 @@ fn append_output_text_delta(item: &mut ResponseItem, delta: &str) {
     }
 }
 
+pub(crate) fn queue_response_event_with_synthesized_output_item_done(
+    event: ResponseEvent,
+    active_output_item: &mut Option<ResponseItem>,
+) -> Vec<ResponseEvent> {
+    let mut queue = Vec::new();
+
+    match &event {
+        ResponseEvent::OutputItemAdded(item) => {
+            if let Some(pending) = active_output_item.take() {
+                queue.push(ResponseEvent::OutputItemDone(pending));
+            }
+            *active_output_item = Some(item.clone());
+        }
+        ResponseEvent::OutputItemDone(_) => {
+            *active_output_item = None;
+        }
+        ResponseEvent::OutputTextDelta(delta) => {
+            if let Some(item) = active_output_item.as_mut() {
+                append_output_text_delta(item, delta);
+            }
+        }
+        ResponseEvent::Completed { .. } => {
+            if let Some(pending) = active_output_item.take() {
+                queue.push(ResponseEvent::OutputItemDone(pending));
+            }
+        }
+        ResponseEvent::Created
+        | ResponseEvent::ReasoningSummaryDelta { .. }
+        | ResponseEvent::ReasoningContentDelta { .. }
+        | ResponseEvent::ReasoningSummaryPartAdded { .. }
+        | ResponseEvent::RateLimits(_)
+        | ResponseEvent::ModelsEtag(_)
+        | ResponseEvent::ServerModel(_)
+        | ResponseEvent::ServerReasoningIncluded(_) => {}
+    }
+
+    queue.push(event);
+    queue
+}
+
 pub async fn process_sse(
     stream: ByteStream,
     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
+    initial_server_model: Option<String>,
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut active_output_item: Option<ResponseItem> = None;
+    let mut last_server_model = initial_server_model
+        .as_ref()
+        .map(|model| model.to_ascii_lowercase());
+    if let Some(model) = initial_server_model
+        && tx_event
+            .send(Ok(ResponseEvent::ServerModel(model)))
+            .await
+            .is_err()
+    {
+        return;
+    }
 
     loop {
         let start = Instant::now();
@@ -425,37 +498,26 @@ pub async fn process_sse(
                 continue;
             }
         };
+        if let Some(model) = event.response_model() {
+            let normalized = model.to_ascii_lowercase();
+            if last_server_model.as_ref() != Some(&normalized) {
+                last_server_model = Some(normalized);
+                if tx_event
+                    .send(Ok(ResponseEvent::ServerModel(model)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
 
         match process_responses_event(event) {
             Ok(Some(event)) => {
-                let mut queue: Vec<ResponseEvent> = Vec::new();
-
-                match &event {
-                    ResponseEvent::OutputItemAdded(item) => {
-                        if let Some(pending) = active_output_item.take() {
-                            queue.push(ResponseEvent::OutputItemDone(pending));
-                        }
-                        active_output_item = Some(item.clone());
-                    }
-                    ResponseEvent::OutputItemDone(_) => {
-                        active_output_item = None;
-                    }
-                    ResponseEvent::OutputTextDelta(delta) => {
-                        if let Some(item) = active_output_item.as_mut() {
-                            append_output_text_delta(item, delta);
-                        }
-                    }
-                    ResponseEvent::Completed { .. } => {
-                        if let Some(pending) = active_output_item.take() {
-                            queue.push(ResponseEvent::OutputItemDone(pending));
-                        }
-                    }
-                    _ => {}
-                }
-
-                queue.push(event);
-
-                for event in queue {
+                for event in queue_response_event_with_synthesized_output_item_done(
+                    event,
+                    &mut active_output_item,
+                ) {
                     let is_completed = matches!(event, ResponseEvent::Completed { .. });
                     if tx_event.send(Ok(event)).await.is_err() {
                         return;
@@ -547,7 +609,13 @@ mod tests {
         let stream =
             ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
-        tokio::spawn(process_sse(Box::pin(stream), tx, idle_timeout(), None));
+        tokio::spawn(process_sse(
+            Box::pin(stream),
+            tx,
+            idle_timeout(),
+            None,
+            None,
+        ));
 
         let mut events = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -573,7 +641,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
         let stream = ReaderStream::new(std::io::Cursor::new(body))
             .map_err(|err| TransportError::Network(err.to_string()));
-        tokio::spawn(process_sse(Box::pin(stream), tx, idle_timeout(), None));
+        tokio::spawn(process_sse(
+            Box::pin(stream),
+            tx,
+            idle_timeout(),
+            None,
+            None,
+        ));
 
         let mut out = Vec::new();
         while let Some(ev) = rx.recv().await {
@@ -648,6 +722,79 @@ mod tests {
             }
             other => panic!("unexpected third event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn emits_server_model_from_response_headers() {
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp1",
+                "headers": {
+                    "OpenAI-Model": "gpt-5.2"
+                }
+            }
+        })
+        .to_string();
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": { "id": "resp1" }
+        })
+        .to_string();
+
+        let sse1 = format!("event: response.created\ndata: {created}\n\n");
+        let sse2 = format!("event: response.completed\ndata: {completed}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes(), sse2.as_bytes()]).await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[0],
+            Ok(ResponseEvent::ServerModel(model)) if model == "gpt-5.2"
+        );
+        assert_matches!(&events[1], Ok(ResponseEvent::Created));
+        assert_matches!(
+            &events[2],
+            Ok(ResponseEvent::Completed { response_id, .. }) if response_id == "resp1"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_model_emits_once_for_same_model() {
+        let metadata = json!({
+            "type": "codex.response.metadata",
+            "headers": {
+                "OpenAI-Model": "gpt-5.2"
+            }
+        })
+        .to_string();
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp1",
+                "headers": {
+                    "OpenAI-Model": "gpt-5.2"
+                }
+            }
+        })
+        .to_string();
+        let completed = json!({
+            "type": "response.completed",
+            "response": { "id": "resp1" }
+        })
+        .to_string();
+
+        let sse1 = format!("event: codex.response.metadata\ndata: {metadata}\n\n");
+        let sse2 = format!("event: response.created\ndata: {created}\n\n");
+        let sse3 = format!("event: response.completed\ndata: {completed}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes(), sse2.as_bytes(), sse3.as_bytes()]).await;
+        let server_model_count = events
+            .iter()
+            .filter(|event| matches!(event, Ok(ResponseEvent::ServerModel(_))))
+            .count();
+        assert_eq!(server_model_count, 1);
     }
 
     #[tokio::test]
@@ -789,7 +936,7 @@ mod tests {
         let stream: ByteStream = Box::pin(stream);
 
         let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
-        tokio::spawn(process_sse(stream, tx, idle_timeout(), None));
+        tokio::spawn(process_sse(stream, tx, idle_timeout(), None, None));
 
         let events = tokio::time::timeout(Duration::from_millis(1000), async {
             let mut events = Vec::new();

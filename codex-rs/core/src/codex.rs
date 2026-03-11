@@ -358,6 +358,9 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
+const FORCED_STREAM_MAX_RETRIES: u64 = 30;
+const DECODE_RESPONSE_BODY_MATCH: &str = "errordecodingresponsebody";
+const PROCESSING_REQUEST_ERROR_MATCH: &str = "anerroroccurredwhileprocessingyourrequest";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -757,6 +760,7 @@ impl TurnContext {
             self.collaboration_mode
                 .with_updates(Some(model.clone()), Some(reasoning_effort), None);
         let features = self.features.clone();
+        let effective_config = config.config_layer_stack.effective_config();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
@@ -764,7 +768,8 @@ impl TurnContext {
             session_source: self.session_source.clone(),
         })
         .with_allow_login_shell(self.tools_config.allow_login_shell)
-        .with_agent_roles(config.agent_roles.clone());
+        .with_agent_roles(config.agent_roles.clone())
+        .with_custom_tools_from_config(&effective_config);
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -1131,6 +1136,7 @@ impl Session {
         let provider_for_context = provider;
         let otel_manager_for_context = otel_manager;
         let per_turn_config = Arc::new(per_turn_config);
+        let effective_config = per_turn_config.config_layer_stack.effective_config();
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
@@ -1139,7 +1145,8 @@ impl Session {
             session_source: session_source.clone(),
         })
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
-        .with_agent_roles(per_turn_config.agent_roles.clone());
+        .with_agent_roles(per_turn_config.agent_roles.clone())
+        .with_custom_tools_from_config(&effective_config);
 
         let cwd = session_configuration.cwd.clone();
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
@@ -4218,6 +4225,10 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     handlers::compact(&sess, sub.id.clone()).await;
                     false
                 }
+                Op::RepairConversation => {
+                    handlers::repair_conversation(&sess, sub.id.clone()).await;
+                    false
+                }
                 Op::DropMemories => {
                     handlers::drop_memories(&sess, &config, sub.id.clone()).await;
                     false
@@ -4301,6 +4312,7 @@ mod handlers {
     use crate::mcp::auth::compute_auth_statuses;
     use crate::mcp::collect_mcp_snapshot_from_manager;
     use crate::review_prompts::resolve_review_request;
+    use crate::rollout::RolloutRecorder;
     use crate::rollout::session_index;
     use crate::tasks::CompactTask;
     use crate::tasks::UndoTask;
@@ -4312,6 +4324,7 @@ mod handlers {
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::ListCustomPromptsResponseEvent;
     use codex_protocol::protocol::ListRemoteSkillsResponseEvent;
     use codex_protocol::protocol::ListSkillsResponseEvent;
@@ -4810,6 +4823,160 @@ mod handlers {
         .await;
     }
 
+    pub async fn repair_conversation(sess: &Arc<Session>, sub_id: String) {
+        let has_active_turn = { sess.active_turn.lock().await.is_some() };
+        if has_active_turn {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "Cannot run /fix while a turn is in progress.".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        sess.flush_rollout().await;
+
+        let rollout_path = {
+            let rollout = sess.services.rollout.lock().await;
+            let Some(recorder) = rollout.as_ref() else {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Session persistence is disabled; cannot run /fix.".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                })
+                .await;
+                return;
+            };
+            recorder.rollout_path().to_path_buf()
+        };
+
+        let initial_history =
+            match RolloutRecorder::get_rollout_history(rollout_path.as_path()).await {
+                Ok(initial_history) => initial_history,
+                Err(err) => {
+                    sess.send_event_raw(Event {
+                        id: sub_id,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: format!(
+                                "Failed reading rollout history from {}: {err}",
+                                rollout_path.display()
+                            ),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    })
+                    .await;
+                    return;
+                }
+            };
+
+        let InitialHistory::Resumed(resumed_history) = initial_history else {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: format!(
+                        "Rollout file {} does not contain resumable history.",
+                        rollout_path.display()
+                    ),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            })
+            .await;
+            return;
+        };
+
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        let rollout_items = resumed_history.history;
+        let mut restored_tool_selection =
+            Session::extract_mcp_tool_selection_from_rollout(&rollout_items);
+        let mut restored_token_info = Session::last_token_info_from_rollout(&rollout_items);
+        let mut restored_ghost_snapshots =
+            Session::extract_ghost_snapshots_from_rollout(&rollout_items);
+
+        match Session::scan_resume_rollout_state(rollout_path.as_path()).await {
+            Ok(scanned_state) => {
+                if restored_tool_selection.is_none() {
+                    restored_tool_selection = scanned_state.active_selected_tools;
+                }
+                if restored_token_info.is_none() {
+                    restored_token_info = scanned_state.token_info;
+                }
+                restored_ghost_snapshots = scanned_state.ghost_snapshots;
+            }
+            Err(err) => {
+                warn!(
+                    rollout_path = %rollout_path.display(),
+                    error = %err,
+                    "failed to scan rollout state during /fix"
+                );
+            }
+        }
+
+        let reconstructed_rollout = sess
+            .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+            .await;
+        let rebuilt_history_len = reconstructed_rollout.history.len();
+        sess.replace_history(
+            reconstructed_rollout.history,
+            reconstructed_rollout.reference_context_item,
+        )
+        .await;
+        sess.set_previous_turn_settings(reconstructed_rollout.previous_turn_settings)
+            .await;
+        {
+            let mut state = sess.state.lock().await;
+            state.set_token_info(restored_token_info);
+            state.set_ghost_snapshots(restored_ghost_snapshots);
+        }
+        if let Some(selected_tools) = restored_tool_selection {
+            sess.set_mcp_tool_selection(selected_tools).await;
+        } else {
+            sess.clear_mcp_tool_selection().await;
+        }
+
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Warning(WarningEvent {
+                message: format!(
+                    "Reloaded full rollout history from {} ({} items). Running local repair compaction.",
+                    rollout_path.display(),
+                    rebuilt_history_len
+                ),
+            }),
+        })
+        .await;
+
+        if let Err(err) = crate::compact::run_inline_auto_compact_task(
+            Arc::clone(sess),
+            Arc::clone(&turn_context),
+            crate::compact::InitialContextInjection::DoNotInject,
+        )
+        .await
+        {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: format!("Conversation repair compaction failed: {err}"),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Warning(WarningEvent {
+                message: "Conversation repair completed.".to_string(),
+            }),
+        })
+        .await;
+    }
+
     pub async fn drop_memories(sess: &Arc<Session>, config: &Arc<Config>, sub_id: String) {
         let mut errors = Vec::new();
 
@@ -5100,6 +5267,7 @@ async fn spawn_review_thread(
     let _ = review_features.disable(crate::features::Feature::WebSearchRequest);
     let _ = review_features.disable(crate::features::Feature::WebSearchCached);
     let review_web_search_mode = WebSearchMode::Disabled;
+    let effective_config = config.config_layer_stack.effective_config();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         features: &review_features,
@@ -5107,7 +5275,8 @@ async fn spawn_review_thread(
         session_source: parent_turn_context.session_source.clone(),
     })
     .with_allow_login_shell(config.permissions.allow_login_shell)
-    .with_agent_roles(config.agent_roles.clone());
+    .with_agent_roles(config.agent_roles.clone())
+    .with_custom_tools_from_config(&effective_config);
 
     let review_prompt = resolved.prompt.clone();
     let provider = parent_turn_context.provider.clone();
@@ -5728,12 +5897,35 @@ async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
-        run_inline_remote_auto_compact_task(
+        match run_inline_remote_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             initial_context_injection,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(err) if crate::compact_remote::should_fallback_to_local_compact(&err) => {
+                let fallback_reason =
+                    if crate::compact_remote::is_remote_compact_payload_too_large(&err) {
+                        "payload exceeded backend size limits"
+                    } else {
+                        "request failed"
+                    };
+                sess.notify_background_event(
+                    turn_context.as_ref(),
+                    format!("Remote compact {fallback_reason}; falling back to local compaction."),
+                )
+                .await;
+                run_inline_auto_compact_task(
+                    Arc::clone(sess),
+                    Arc::clone(turn_context),
+                    initial_context_injection,
+                )
+                .await?;
+            }
+            Err(err) => return Err(err),
+        }
     } else {
         run_inline_auto_compact_task(
             Arc::clone(sess),
@@ -5916,6 +6108,64 @@ fn build_prompt(
         output_schema: turn_context.final_output_json_schema.clone(),
     }
 }
+
+fn stream_retry_budget_for_error(turn_context: &TurnContext, err: &CodexErr) -> u64 {
+    let configured_max_retries = turn_context.provider.stream_max_retries();
+    if should_force_stream_retry_budget(err) {
+        configured_max_retries.max(FORCED_STREAM_MAX_RETRIES)
+    } else {
+        configured_max_retries
+    }
+}
+
+fn should_force_stream_retry_budget(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::Stream(message, _) => {
+            let normalized = normalize_for_retry_matching(message);
+            normalized.contains(DECODE_RESPONSE_BODY_MATCH)
+                || normalized.contains(PROCESSING_REQUEST_ERROR_MATCH)
+        }
+        CodexErr::UnexpectedStatus(unexpected_response) => {
+            (unexpected_response.status.as_u16() == 400
+                && is_generic_bad_request_body(&unexpected_response.body))
+                || normalize_for_retry_matching(&unexpected_response.body)
+                    .contains(PROCESSING_REQUEST_ERROR_MATCH)
+        }
+        _ => false,
+    }
+}
+
+fn is_generic_bad_request_body(body: &str) -> bool {
+    if body.trim().eq_ignore_ascii_case("bad request") {
+        return true;
+    }
+
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .map(|detail| detail.eq_ignore_ascii_case("bad request"))
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_for_retry_matching(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+fn should_retry_sampling_error(err: &CodexErr) -> bool {
+    !matches!(err, CodexErr::Interrupted | CodexErr::TurnAborted)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -5989,12 +6239,13 @@ async fn run_sampling_request(
             Err(err) => err,
         };
 
-        if !err.is_retryable() {
+        if !should_retry_sampling_error(&err) {
             return Err(err);
         }
 
-        // Use the configured provider-specific stream retry budget.
-        let max_retries = turn_context.provider.stream_max_retries();
+        // Use the configured provider-specific stream retry budget, but force a higher budget
+        // for flaky transport/body-decoding and generic 400 retries.
+        let max_retries = stream_retry_budget_for_error(turn_context.as_ref(), &err);
         if retries >= max_retries
             && client_session
                 .try_switch_fallback_transport(&turn_context.otel_manager, &turn_context.model_info)
@@ -7203,6 +7454,46 @@ mod tests {
         assert_eq!(parsed.citations, vec!["doc".to_string()]);
         assert_eq!(tail.visible_text, "");
         assert_eq!(tail.citations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn should_retry_sampling_error_allows_non_interrupt_errors() {
+        let err = CodexErr::UnexpectedStatus(crate::error::UnexpectedResponseError {
+            status: http::StatusCode::BAD_REQUEST,
+            body: "bad request".to_string(),
+            url: None,
+            cf_ray: None,
+            request_id: None,
+        });
+        assert!(should_retry_sampling_error(&err));
+    }
+
+    #[test]
+    fn should_force_stream_retry_budget_for_processing_request_stream_errors() {
+        let err = CodexErr::Stream(
+            "An error occurred while processing your request.\nPlease include the request ID 123 in your message."
+                .to_string(),
+            None,
+        );
+        assert!(should_force_stream_retry_budget(&err));
+    }
+
+    #[test]
+    fn should_force_stream_retry_budget_for_processing_request_unexpected_status_body() {
+        let err = CodexErr::UnexpectedStatus(crate::error::UnexpectedResponseError {
+            status: http::StatusCode::INTERNAL_SERVER_ERROR,
+            body: r#"{"detail":"An error occurred while processing your request."}"#.to_string(),
+            url: None,
+            cf_ray: None,
+            request_id: None,
+        });
+        assert!(should_force_stream_retry_budget(&err));
+    }
+
+    #[test]
+    fn should_retry_sampling_error_rejects_abort_and_interrupt() {
+        assert!(!should_retry_sampling_error(&CodexErr::Interrupted));
+        assert!(!should_retry_sampling_error(&CodexErr::TurnAborted));
     }
 
     #[test]

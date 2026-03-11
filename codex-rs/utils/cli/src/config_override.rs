@@ -37,6 +37,17 @@ pub struct CliConfigOverrides {
 }
 
 impl CliConfigOverrides {
+    /// Prepends overrides from `other` so they have lower precedence than
+    /// values already stored in `self` (later entries win when applied).
+    pub fn prepend_from(&mut self, other: &Self) {
+        if other.raw_overrides.is_empty() {
+            return;
+        }
+        let mut merged = other.raw_overrides.clone();
+        merged.extend(std::mem::take(&mut self.raw_overrides));
+        self.raw_overrides = merged;
+    }
+
     /// Parse the raw strings captured from the CLI into a list of `(path,
     /// value)` tuples where `value` is a `serde_json::Value`.
     pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
@@ -196,5 +207,20 @@ mod tests {
         let tbl = v.as_table().expect("table");
         assert_eq!(tbl.get("a").unwrap().as_integer(), Some(1));
         assert_eq!(tbl.get("b").unwrap().as_integer(), Some(2));
+    }
+
+    #[test]
+    fn prepend_from_keeps_other_entries_first() {
+        let mut current = CliConfigOverrides {
+            raw_overrides: vec!["a=1".to_string(), "b=2".to_string()],
+        };
+        let base = CliConfigOverrides {
+            raw_overrides: vec!["x=9".to_string()],
+        };
+        current.prepend_from(&base);
+        assert_eq!(
+            current.raw_overrides,
+            vec!["x=9".to_string(), "a=1".to_string(), "b=2".to_string()]
+        );
     }
 }

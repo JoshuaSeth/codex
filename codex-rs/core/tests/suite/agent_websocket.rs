@@ -12,6 +12,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 use std::time::Duration;
 
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
@@ -245,6 +246,78 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
         handshake.header("openai-beta"),
         Some(WS_V2_BETA_HEADER_VALUE.to_string())
     );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_v2_synthesizes_tool_done_when_missing() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let call_id = "shell-command-call";
+    let arguments = serde_json::to_string(&json!({
+        "command": "echo websocket"
+    }))
+    .expect("serialize shell args");
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![
+            ev_response_created("resp-1"),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "shell_command",
+                    "arguments": arguments
+                }
+            }),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ],
+    ]])
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ResponsesWebsocketsV2)
+            .expect("test config should allow feature update");
+    });
+
+    let test = builder.build_with_websocket_server(&server).await?;
+    test.submit_turn_with_policy(
+        "run the echo command",
+        test.config.permissions.sandbox_policy.get().clone(),
+    )
+    .await?;
+
+    let connection = server.single_connection();
+    assert_eq!(
+        connection.len(),
+        3,
+        "expected follow-up response.create carrying function_call_output"
+    );
+
+    let second_turn = connection
+        .get(2)
+        .expect("missing follow-up request")
+        .body_json();
+    assert_eq!(second_turn["type"].as_str(), Some("response.create"));
+    assert_eq!(second_turn["previous_response_id"].as_str(), Some("resp-1"));
+    let input_items = second_turn
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("follow-up input array");
+    assert!(input_items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+    }));
 
     server.shutdown().await;
     Ok(())

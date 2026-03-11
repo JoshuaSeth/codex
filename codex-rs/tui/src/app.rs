@@ -710,7 +710,7 @@ fn normalize_harness_overrides_for_cwd(
     mut overrides: ConfigOverrides,
     base_cwd: &Path,
 ) -> Result<ConfigOverrides> {
-    if overrides.additional_writable_roots.is_empty() {
+    if overrides.additional_writable_roots.is_empty() && overrides.strict_sandbox_roots.is_empty() {
         return Ok(overrides);
     }
 
@@ -720,6 +720,13 @@ fn normalize_harness_overrides_for_cwd(
         normalized.push(absolute.into_path_buf());
     }
     overrides.additional_writable_roots = normalized;
+
+    let mut strict_normalized = Vec::with_capacity(overrides.strict_sandbox_roots.len());
+    for root in overrides.strict_sandbox_roots.drain(..) {
+        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd)?;
+        strict_normalized.push(absolute.into_path_buf());
+    }
+    overrides.strict_sandbox_roots = strict_normalized;
     Ok(overrides)
 }
 
@@ -3731,6 +3738,7 @@ mod tests {
 
         let overrides = ConfigOverrides {
             additional_writable_roots: vec![PathBuf::from("rel")],
+            strict_sandbox_roots: vec![PathBuf::from("strict")],
             ..Default::default()
         };
         let normalized = normalize_harness_overrides_for_cwd(overrides, &base_cwd)?;
@@ -3738,6 +3746,10 @@ mod tests {
         assert_eq!(
             normalized.additional_writable_roots,
             vec![base_cwd.join("rel")]
+        );
+        assert_eq!(
+            normalized.strict_sandbox_roots,
+            vec![base_cwd.join("strict")]
         );
         Ok(())
     }

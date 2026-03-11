@@ -5782,6 +5782,16 @@ async fn slash_memory_update_submits_update_memories_op() {
 }
 
 #[tokio::test]
+async fn slash_fix_submits_repair_conversation_op() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(false);
+
+    chat.dispatch_command(SlashCommand::Fix);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::RepairConversation)));
+}
+
+#[tokio::test]
 async fn slash_resume_opens_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 

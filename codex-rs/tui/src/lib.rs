@@ -228,7 +228,14 @@ pub use public_widgets::composer_input::ComposerInput;
 // (tests access modules directly within the crate)
 
 pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::Result<AppExitInfo> {
-    let (sandbox_mode, approval_policy) = if cli.full_auto {
+    if !cli.strict_dir.is_empty() && cli.dangerously_bypass_approvals_and_sandbox {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--strict-dir cannot be combined with --dangerously-bypass-approvals-and-sandbox",
+        ));
+    }
+
+    let (mut sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
             Some(AskForApproval::OnRequest),
@@ -244,6 +251,17 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
             cli.approval_policy.map(Into::into),
         )
     };
+    if !cli.strict_dir.is_empty() {
+        if let Some(mode) = sandbox_mode
+            && mode != SandboxMode::WorkspaceWrite
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--strict-dir requires workspace-write sandbox mode (remove --sandbox or use --sandbox workspace-write)",
+            ));
+        }
+        sandbox_mode = Some(SandboxMode::WorkspaceWrite);
+    }
 
     // Map the legacy --search flag to the canonical web_search mode.
     if cli.web_search {
@@ -277,7 +295,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
         }
     };
 
-    let cwd = cli.cwd.clone();
+    let cwd = cli.cwd.clone().or_else(|| cli.strict_dir.first().cloned());
     let config_cwd = match cwd.as_deref() {
         Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
         None => AbsolutePathBuf::current_dir()?,
@@ -368,6 +386,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
     };
 
     let additional_dirs = cli.add_dir.clone();
+    let strict_dirs = cli.strict_dir.clone();
 
     let overrides = ConfigOverrides {
         model,
@@ -380,6 +399,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
+        strict_sandbox_roots: strict_dirs,
         ..Default::default()
     };
 

@@ -70,3 +70,49 @@ async fn accepts_multiple_add_dir_flags() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Verify that the --strict-dir flag is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn accepts_strict_dir_flag() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("response_1"),
+        responses::ev_assistant_message("response_1", "Strict directory accepted"),
+        responses::ev_completed("response_1"),
+    ]);
+    responses::mount_sse_once(&server, body).await;
+
+    let strict_root = tempfile::tempdir()?;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("--strict-dir")
+        .arg(strict_root.path())
+        .arg("test with strict directory")
+        .assert()
+        .code(0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rejects_strict_dir_with_dangerous_bypass() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let strict_root = tempfile::tempdir()?;
+
+    test.cmd()
+        .arg("--skip-git-repo-check")
+        .arg("--strict-dir")
+        .arg(strict_root.path())
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("test")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "--strict-dir cannot be combined with --dangerously-bypass-approvals-and-sandbox",
+        ));
+
+    Ok(())
+}

@@ -75,7 +75,8 @@ use codex_core::terminal::TerminalName;
     // `codex-x86_64-unknown-linux-musl`, but the help output should always use
     // the generic `codex` command name that users run.
     bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]",
+    after_long_help = "PitchAI auth policy:\n  - Default path is shared/broker auth in $CODEX_HOME/auth.json.\n  - `CODEX_API_KEY` is not an implicit fallback.\n  - API-key mode is explicit-only and should be considered break-glass.\n\nPitchAI automation notes:\n  - The generic runner can lease auth from auth-token-server (`CODEX_AUTH_BROKER_URL`, `CODEX_AUTH_BROKER_TOKEN`).\n  - Usage/rate-limit outcomes can trigger broker lease refresh + in-process auto-continue.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies `--sandbox workspace-write` and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Shell command behavior is unchanged; approval policy still controls command escalation."
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -290,13 +291,16 @@ enum ExecpolicySubcommand {
 }
 
 #[derive(Debug, Parser)]
+#[command(
+    after_long_help = "PitchAI login/auth guidance:\n  - Prefer shared/broker auth in $CODEX_HOME/auth.json.\n  - API-key login is explicit-only; it is not used as automatic fallback.\n  - For automation, prefer auth-token-server lease flow rather than static API keys."
+)]
 struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
     #[arg(
         long = "with-api-key",
-        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
+        help = "Read the API key from stdin (explicit-only mode; never used as implicit fallback). PitchAI default is shared/broker auth via $CODEX_HOME/auth.json. Example: `printenv OPENAI_API_KEY | codex login --with-api-key`"
     )]
     with_api_key: bool,
 
@@ -732,7 +736,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         .await;
                     } else if login_cli.api_key.is_some() {
                         eprintln!(
-                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
+                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`. At PitchAI, default to shared/broker auth via $CODEX_HOME/auth.json."
                         );
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
@@ -1095,6 +1099,9 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if !subcommand_cli.add_dir.is_empty() {
         interactive.add_dir.extend(subcommand_cli.add_dir);
     }
+    if !subcommand_cli.strict_dir.is_empty() {
+        interactive.strict_dir.extend(subcommand_cli.strict_dir);
+    }
     if let Some(prompt) = subcommand_cli.prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -1116,8 +1123,10 @@ fn print_completion(cmd: CompletionCommand) {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use codex_core::protocol::TokenUsage;
     use codex_protocol::ThreadId;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_utils_cli::ApprovalModeCliArg;
+    use codex_utils_cli::SandboxModeCliArg;
     use pretty_assertions::assert_eq;
 
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
@@ -1353,11 +1362,11 @@ mod tests {
         assert_eq!(interactive.config_profile.as_deref(), Some("my-profile"));
         assert_matches!(
             interactive.sandbox_mode,
-            Some(codex_common::SandboxModeCliArg::WorkspaceWrite)
+            Some(SandboxModeCliArg::WorkspaceWrite)
         );
         assert_matches!(
             interactive.approval_policy,
-            Some(codex_common::ApprovalModeCliArg::OnRequest)
+            Some(ApprovalModeCliArg::OnRequest)
         );
         assert!(interactive.full_auto);
         assert_eq!(
@@ -1393,6 +1402,28 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_merges_strict_dirs() {
+        let interactive = finalize_resume_from_args(
+            [
+                "codex",
+                "resume",
+                "--strict-dir",
+                "/tmp/strict-a",
+                "--strict-dir",
+                "/tmp/strict-b",
+            ]
+            .as_ref(),
+        );
+        assert_eq!(
+            interactive.strict_dir,
+            vec![
+                std::path::PathBuf::from("/tmp/strict-a"),
+                std::path::PathBuf::from("/tmp/strict-b")
+            ]
+        );
     }
 
     #[test]

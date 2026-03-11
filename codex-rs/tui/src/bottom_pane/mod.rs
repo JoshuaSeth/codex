@@ -366,6 +366,10 @@ impl BottomPane {
             if key_event.kind == KeyEventKind::Release {
                 return InputResult::None;
             }
+            let was_view_in_paste_burst = self
+                .view_stack
+                .last()
+                .is_some_and(|view| view.is_in_paste_burst());
 
             // We need three pieces of information after routing the key:
             // whether Esc completed the view, whether the view finished for any
@@ -398,7 +402,7 @@ impl BottomPane {
             } else if view_complete {
                 self.view_stack.clear();
                 self.on_active_view_complete();
-            } else if view_in_paste_burst {
+            } else if view_in_paste_burst && !was_view_in_paste_burst {
                 self.request_redraw_in(ChatComposer::recommended_paste_flush_delay());
             }
             self.request_redraw();
@@ -426,11 +430,12 @@ impl BottomPane {
                 self.request_redraw();
                 return InputResult::None;
             }
+            let was_in_paste_burst = self.composer.is_in_paste_burst();
             let (input_result, needs_redraw) = self.composer.handle_key_event(key_event);
             if needs_redraw {
                 self.request_redraw();
             }
-            if self.composer.is_in_paste_burst() {
+            if self.composer.is_in_paste_burst() && !was_in_paste_burst {
                 self.request_redraw_in(ChatComposer::recommended_paste_flush_delay());
             }
             input_result

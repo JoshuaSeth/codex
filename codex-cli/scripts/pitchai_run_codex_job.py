@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+PitchAI generic Codex runner.
+
+Authentication policy:
+- Preferred/default: auth-token-server broker mode (`CODEX_AUTH_BROKER_URL` +
+  `CODEX_AUTH_BROKER_TOKEN`) which leases an `auth.json` and writes it to
+  `$CODEX_HOME/auth.json`.
+- Legacy/non-broker mode: `CODEX_AUTH_JSON_B64` can still seed `auth.json`.
+- This runner never injects `CODEX_API_KEY` into the child process.
+
+Usage-limit recovery in broker mode:
+- On rate/usage limit outcomes (`usage_limit_reached`, `insufficient_quota`,
+  `429`), the runner reports the lease outcome to the broker, acquires a fresh
+  lease (new auth payload), rewrites `auth.json`, and auto-continues the same
+  conversation in-process.
+- Auto-continue knobs:
+  - `PITCHAI_BROKER_USAGE_LIMIT_AUTO_CONTINUE_MAX` (default: 8)
+  - `PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_INITIAL_S` (default: 5)
+  - `PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_MAX_S` (default: 120)
+  - `PITCHAI_BROKER_AUTO_CONTINUE_PROMPT` (default: "continue")
+"""
 from __future__ import annotations
 
 import base64
@@ -12,6 +33,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 @dataclass
@@ -44,6 +67,12 @@ class QueuedWorkItem:
     queue_processing_path: Path
 
 
+@dataclass(frozen=True)
+class BrokerLease:
+    lease_id: str
+    account_id: str
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -70,22 +99,33 @@ def _write_state(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def _decode_auth_json(config_home: Path) -> None:
-    config_home.mkdir(parents=True, exist_ok=True)
-    auth_path = config_home / "auth.json"
-    b64 = os.getenv("CODEX_AUTH_JSON_B64", "").strip()
-    if not b64:
-        if auth_path.exists():
-            return
-        raise RuntimeError("Missing required environment variable: CODEX_AUTH_JSON_B64")
-
-    auth_path.write_bytes(base64.b64decode(b64.encode("utf-8")))
+def _write_auth_file(auth_path: Path, auth_bytes: bytes) -> None:
+    auth_path.write_bytes(auth_bytes)
     try:
         os.chmod(auth_path, 0o600)
     except PermissionError:
         # Azure Files mounts do not always support chmod (CIFS), but Codex can
         # still read the credentials file.
         pass
+
+
+def _decode_auth_json(config_home: Path) -> BrokerLease | None:
+    config_home.mkdir(parents=True, exist_ok=True)
+    auth_path = config_home / "auth.json"
+    broker_cfg = _broker_config()
+    if broker_cfg is not None:
+        lease = _acquire_broker_lease(broker_cfg)
+        _write_auth_file(auth_path, lease["auth_bytes"])
+        return BrokerLease(lease_id=lease["lease_id"], account_id=lease["account_id"])
+
+    b64 = os.getenv("CODEX_AUTH_JSON_B64", "").strip()
+    if not b64:
+        if auth_path.exists():
+            return None
+        raise RuntimeError("Missing required environment variable: CODEX_AUTH_JSON_B64")
+
+    _write_auth_file(auth_path, base64.b64decode(b64.encode("utf-8")))
+    return None
 
 
 def _model_args() -> tuple[list[str], list[str]]:
@@ -164,6 +204,178 @@ def _sanitize_key(value: str) -> str:
     value = value.strip()
     value = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
     return value[:80] if value else "default"
+
+
+def _broker_config() -> dict[str, str] | None:
+    url = (os.getenv("CODEX_AUTH_BROKER_URL") or "").strip()
+    token = (os.getenv("CODEX_AUTH_BROKER_TOKEN") or "").strip()
+    if not url and not token:
+        return None
+    if not url or not token:
+        raise RuntimeError("Both CODEX_AUTH_BROKER_URL and CODEX_AUTH_BROKER_TOKEN are required")
+
+    timeout_raw = (os.getenv("CODEX_AUTH_BROKER_TIMEOUT_S") or "15").strip()
+    timeout_s = str(max(1.0, min(float(timeout_raw or "15"), 120.0)))
+    client_name = (os.getenv("CODEX_AUTH_BROKER_CLIENT_NAME") or "").strip() or "pitchai-dispatch-runner"
+    affinity_key = (os.getenv("PITCHAI_STATE_KEY") or "").strip() or "default"
+    return {
+        "url": url.rstrip("/"),
+        "token": token,
+        "timeout_s": timeout_s,
+        "client_name": client_name,
+        "affinity_key": affinity_key,
+    }
+
+
+def _http_json(method: str, url: str, *, token: str, payload: dict[str, Any] | None, timeout_s: float) -> dict[str, Any]:
+    data = None
+    headers = {"Authorization": f"Bearer {token}"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib_request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - explicit operator config
+            raw = resp.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Broker request failed {method} {url}: {exc.code}: {body}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Broker request failed {method} {url}: {exc}") from exc
+    obj = json.loads(raw or "{}")
+    if not isinstance(obj, dict):
+        raise RuntimeError(f"Broker response from {url} is not a JSON object")
+    return obj
+
+
+def _acquire_broker_lease(cfg: dict[str, str]) -> dict[str, Any]:
+    payload = _http_json(
+        "POST",
+        f"{cfg['url']}/v1/leases",
+        token=cfg["token"],
+        timeout_s=float(cfg["timeout_s"]),
+        payload={
+            "client_name": cfg["client_name"],
+            "affinity_key": cfg["affinity_key"],
+            "lease_reason": "pitchai-dispatch-runner",
+        },
+    )
+    auth_json_b64 = str(payload.get("auth_json_b64") or "").strip()
+    if not auth_json_b64:
+        raise RuntimeError("Broker lease response missing auth_json_b64")
+    return {
+        "lease_id": str(payload["lease_id"]),
+        "account_id": str(payload["account_id"]),
+        "auth_bytes": base64.b64decode(auth_json_b64.encode("utf-8")),
+    }
+
+
+def _report_broker_lease(
+    cfg: dict[str, str],
+    lease: BrokerLease,
+    *,
+    outcome: str,
+    updated_auth_bytes: bytes | None,
+    detail: str | None,
+) -> None:
+    payload: dict[str, Any] = {"outcome": outcome, "detail": detail}
+    if updated_auth_bytes is not None:
+        payload["updated_auth_json_b64"] = base64.b64encode(updated_auth_bytes).decode("ascii")
+    _http_json(
+        "POST",
+        f"{cfg['url']}/v1/leases/{lease.lease_id}/report",
+        token=cfg["token"],
+        timeout_s=float(cfg["timeout_s"]),
+        payload=payload,
+    )
+
+
+def _materialized_auth_bytes(config_home: Path) -> bytes | None:
+    auth_path = config_home / "auth.json"
+    if auth_path.exists():
+        return auth_path.read_bytes()
+    return None
+
+
+def _refresh_broker_lease(cfg: CodexRunConfig, broker_cfg: dict[str, str]) -> BrokerLease:
+    lease = _acquire_broker_lease(broker_cfg)
+    auth_path = cfg.codex_home / "auth.json"
+    _write_auth_file(auth_path, lease["auth_bytes"])
+    return BrokerLease(lease_id=lease["lease_id"], account_id=lease["account_id"])
+
+
+def _run_codex_json_stream(
+    cmd: list[str],
+    *,
+    child_env: dict[str, str],
+    prompt_path: Optional[Path],
+    inline_prompt: Optional[str],
+) -> tuple[int, list[str], Optional[str]]:
+    output_lines: list[str] = []
+    captured_thread_id: Optional[str] = None
+    proc: Optional[subprocess.Popen[str]] = None
+    prompt_fh = None
+    try:
+        if prompt_path is not None:
+            prompt_fh = prompt_path.open("rb")
+            proc = subprocess.Popen(
+                cmd + ["-"],
+                stdin=prompt_fh,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                env=child_env,
+                text=True,
+                bufsize=1,
+            )
+        else:
+            proc = subprocess.Popen(
+                cmd + ["-"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                env=child_env,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdin is not None
+            proc.stdin.write((inline_prompt or "").rstrip("\n") + "\n")
+            proc.stdin.close()
+
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if len(output_lines) < 400:
+                output_lines.append(line.rstrip("\n"))
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(evt, dict) and evt.get("type") == "thread.started":
+                tid = evt.get("thread_id")
+                if isinstance(tid, str) and tid.strip():
+                    captured_thread_id = tid.strip()
+        rc = int(proc.wait())
+    finally:
+        if prompt_fh is not None:
+            prompt_fh.close()
+    return rc, output_lines, captured_thread_id
+
+
+def _classify_broker_outcome(lines: list[str], rc: int) -> tuple[str, str | None]:
+    combined = "\n".join(lines).strip()
+    if "usage_limit_reached" in combined or "insufficient_quota" in combined or "429 Too Many Requests" in combined:
+        return ("usage_limit_reached", combined[:4000] or None)
+    if (
+        "refresh_token_expired" in combined
+        or "refresh_token_reused" in combined
+        or "refresh_token_invalidated" in combined
+        or "Please log out and sign in again" in combined
+    ):
+        return ("auth_invalid", combined[:4000] or None)
+    if rc == 0:
+        return ("success", None)
+    return ("runner_error", combined[:4000] or None)
 
 
 def _load_meta(path: Path) -> dict[str, Any]:
@@ -367,9 +579,42 @@ def _spawn_codex(
     fork: bool,
     persist_thread_id: bool,
 ) -> int:
+    """
+    Run `codex exec` and, in broker mode, auto-continue after usage-limit errors.
+
+    Behavior:
+    - First attempt uses the queued/file prompt.
+    - If usage/rate limit is detected and broker auth is configured, the runner:
+      1) reports outcome for the active lease,
+      2) acquires a new lease (`/v1/leases`),
+      3) rewrites `$CODEX_HOME/auth.json`,
+      4) retries by resuming the same thread with a short "continue" prompt.
+    - Non-usage failures are returned immediately to preserve fail-fast behavior.
+    """
     cfg.codex_home.mkdir(parents=True, exist_ok=True)
     cfg.workdir.mkdir(parents=True, exist_ok=True)
-    _decode_auth_json(cfg.codex_home)
+    broker_cfg = _broker_config()
+    broker_lease = _decode_auth_json(cfg.codex_home)
+
+    try:
+        max_usage_auto_continue = int(os.getenv("PITCHAI_BROKER_USAGE_LIMIT_AUTO_CONTINUE_MAX", "8") or "8")
+    except ValueError:
+        max_usage_auto_continue = 8
+    max_usage_auto_continue = max(0, min(max_usage_auto_continue, 64))
+
+    try:
+        usage_backoff_initial_s = float(os.getenv("PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_INITIAL_S", "5") or "5")
+    except ValueError:
+        usage_backoff_initial_s = 5.0
+    usage_backoff_initial_s = max(0.0, min(usage_backoff_initial_s, 600.0))
+
+    try:
+        usage_backoff_max_s = float(os.getenv("PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_MAX_S", "120") or "120")
+    except ValueError:
+        usage_backoff_max_s = 120.0
+    usage_backoff_max_s = max(usage_backoff_initial_s, min(usage_backoff_max_s, 7200.0))
+
+    continue_prompt = (os.getenv("PITCHAI_BROKER_AUTO_CONTINUE_PROMPT") or "").strip() or "continue"
 
     model_args, config_overrides = _model_args()
 
@@ -387,36 +632,104 @@ def _spawn_codex(
         *model_args,
         *config_overrides,
     ]
-    if resume_id:
-        base_cmd.extend(["resume", resume_id])
-        if fork:
-            base_cmd.append("--fork")
+    child_env = dict(os.environ)
+    child_env.pop("CODEX_API_KEY", None)
 
-    with cfg.prompt_path.open("rb") as prompt_fh:
-        proc = subprocess.Popen(
-            base_cmd + ["-"],
-            stdin=prompt_fh,
-            stdout=subprocess.PIPE,
-            stderr=sys.stderr,
-            text=True,
-            bufsize=1,
+    captured_thread_id: Optional[str] = None
+    resume_for_attempt = resume_id
+    usage_continue_attempts = 0
+    final_rc = 1
+    fork_applied = False
+    attempt_number = 0
+    while True:
+        attempt_number += 1
+        cmd = list(base_cmd)
+        if resume_for_attempt:
+            cmd.extend(["resume", resume_for_attempt])
+            if fork and not fork_applied:
+                cmd.append("--fork")
+                fork_applied = True
+
+        prompt_path = cfg.prompt_path if (attempt_number == 1 or not resume_for_attempt) else None
+        inline_prompt = None if prompt_path is not None else continue_prompt
+        rc, output_lines, attempt_thread_id = _run_codex_json_stream(
+            cmd,
+            child_env=child_env,
+            prompt_path=prompt_path,
+            inline_prompt=inline_prompt,
         )
+        final_rc = rc
 
-        captured_thread_id: Optional[str] = None
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+        if attempt_thread_id:
+            captured_thread_id = attempt_thread_id
+            resume_for_attempt = attempt_thread_id
+
+        outcome, detail = _classify_broker_outcome(output_lines, rc)
+        if broker_cfg is not None and broker_lease is not None:
             try:
-                evt = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(evt, dict) and evt.get("type") == "thread.started":
-                tid = evt.get("thread_id")
-                if isinstance(tid, str) and tid.strip():
-                    captured_thread_id = tid.strip()
+                _report_broker_lease(
+                    broker_cfg,
+                    broker_lease,
+                    outcome=outcome,
+                    updated_auth_bytes=_materialized_auth_bytes(cfg.codex_home),
+                    detail=detail,
+                )
+            except Exception as exc:
+                print(
+                    f"[broker] failed to report lease {broker_lease.lease_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-        rc = proc.wait()
+        if rc == 0:
+            break
+
+        if outcome != "usage_limit_reached" or broker_cfg is None:
+            break
+
+        if usage_continue_attempts >= max_usage_auto_continue:
+            print(
+                f"[broker] usage limit reached again; auto-continue budget exhausted ({usage_continue_attempts}/{max_usage_auto_continue})",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+
+        try:
+            broker_lease = _refresh_broker_lease(cfg, broker_cfg)
+        except Exception as exc:
+            print(
+                f"[broker] failed to refresh lease after usage limit: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+
+        usage_continue_attempts += 1
+        if not resume_for_attempt and resume_id:
+            resume_for_attempt = resume_id
+
+        if resume_for_attempt:
+            print(
+                f"[broker] usage limit reached; swapped auth lease and auto-continuing on {resume_for_attempt} ({usage_continue_attempts}/{max_usage_auto_continue})",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[broker] usage limit reached before thread id was observed; swapped auth lease and retrying original prompt ({usage_continue_attempts}/{max_usage_auto_continue})",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        delay_s = min(usage_backoff_max_s, usage_backoff_initial_s * (2 ** (usage_continue_attempts - 1)))
+        if delay_s > 0:
+            print(
+                f"[broker] sleeping {delay_s:.1f}s before auto-continue",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay_s)
 
     if captured_thread_id and persist_thread_id:
         state = _read_state(cfg.state_path)
@@ -424,7 +737,7 @@ def _spawn_codex(
             state["thread_id"] = captured_thread_id
             _write_state(cfg.state_path, state)
 
-    return int(rc)
+    return int(final_rc)
 
 def _run_hook_commands(
     commands: list[str],

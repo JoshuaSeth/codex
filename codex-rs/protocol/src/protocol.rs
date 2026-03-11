@@ -409,6 +409,10 @@ pub enum Op {
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
 
+    /// Reload thread history from the full rollout JSONL and run a local
+    /// compaction pass to repair oversized/broken resume payloads.
+    RepairConversation,
+
     /// Drop all persisted memory artifacts and memory-tracking DB rows.
     DropMemories,
 

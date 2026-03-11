@@ -320,10 +320,10 @@ Non-char input must not leak burst state across unrelated actions:
 
 ### Pitfalls worth calling out
 
-- `PasteBurst::clear_window_after_non_char` clears `last_plain_char_time`. If you call it while
-  `buffer` is non-empty and _haven’t already flushed_, `flush_if_due()` no longer has a timestamp
-  to time out against, so the buffered text may never flush. Treat `clear_window_after_non_char` as
-  “drop classification context after flush”, not “flush”.
+- `PasteBurst::clear_window_after_non_char` clears `last_plain_char_time`. The intended contract
+  remains “flush first, then clear classification context.” `flush_if_due()` now has a defensive
+  recovery path for inconsistent state, but callers should not rely on that fallback as normal
+  flow.
 - `PasteBurst::flush_if_due` uses a strict `>` comparison, so tests and UI ticks should cross the
   threshold by at least 1ms (see `PasteBurst::recommended_flush_delay`).
 

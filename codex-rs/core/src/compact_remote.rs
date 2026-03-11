@@ -19,6 +19,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use futures::TryFutureExt;
+use http::StatusCode;
 use tracing::error;
 use tracing::info;
 
@@ -45,6 +46,23 @@ pub(crate) async fn run_remote_compact_task(
     run_remote_compact_task_inner(&sess, &turn_context, InitialContextInjection::DoNotInject).await
 }
 
+pub(crate) fn is_remote_compact_payload_too_large(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::UnexpectedStatus(unexpected) => {
+            unexpected.status == StatusCode::PAYLOAD_TOO_LARGE
+                && unexpected
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url.contains("/responses/compact"))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn should_fallback_to_local_compact(err: &CodexErr) -> bool {
+    is_remote_compact_payload_too_large(err) || err.is_retryable()
+}
+
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -53,10 +71,12 @@ async fn run_remote_compact_task_inner(
     if let Err(err) =
         run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await
     {
-        let event = EventMsg::Error(
-            err.to_error_event(Some("Error running remote compact task".to_string())),
-        );
-        sess.send_event(turn_context, event).await;
+        if !should_fallback_to_local_compact(&err) {
+            let event = EventMsg::Error(
+                err.to_error_event(Some("Error running remote compact task".to_string())),
+            );
+            sess.send_event(turn_context, event).await;
+        }
         return Err(err);
     }
     Ok(())
@@ -101,7 +121,7 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
-    let mut new_history = sess
+    let compact_result = sess
         .services
         .model_client
         .compact_conversation_history(
@@ -121,7 +141,15 @@ async fn run_remote_compact_task_inner_impl(
             );
             Err(err)
         })
-        .await?;
+        .await;
+    let mut new_history = match compact_result {
+        Ok(new_history) => new_history,
+        Err(err) => {
+            sess.emit_turn_item_completed(turn_context, compaction_item)
+                .await;
+            return Err(err);
+        }
+    };
     new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -276,4 +304,52 @@ fn trim_function_call_history_to_fit_context_window(
     }
 
     deleted_items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_remote_compact_payload_too_large;
+    use super::should_fallback_to_local_compact;
+    use crate::error::CodexErr;
+    use crate::error::UnexpectedResponseError;
+    use http::StatusCode;
+
+    #[test]
+    fn payload_too_large_for_compact_endpoint_is_detected() {
+        let err = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: "payload too large".to_string(),
+            url: Some("https://chatgpt.com/backend-api/codex/responses/compact".to_string()),
+            cf_ray: None,
+            request_id: None,
+        });
+
+        assert!(is_remote_compact_payload_too_large(&err));
+    }
+
+    #[test]
+    fn payload_too_large_for_other_endpoint_is_not_detected() {
+        let err = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: "payload too large".to_string(),
+            url: Some("https://chatgpt.com/backend-api/codex/responses".to_string()),
+            cf_ray: None,
+            request_id: None,
+        });
+
+        assert!(!is_remote_compact_payload_too_large(&err));
+    }
+
+    #[test]
+    fn retryable_remote_compact_errors_are_marked_for_local_fallback() {
+        let err = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+            status: StatusCode::BAD_GATEWAY,
+            body: "bad gateway".to_string(),
+            url: Some("https://chatgpt.com/backend-api/codex/responses/compact".to_string()),
+            cf_ray: None,
+            request_id: None,
+        });
+
+        assert!(should_fallback_to_local_compact(&err));
+    }
 }

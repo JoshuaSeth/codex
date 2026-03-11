@@ -2,15 +2,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_config::CONFIG_TOML_FILE;
 use codex_core::features::Feature;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -26,6 +29,8 @@ use core_test_support::test_codex::test_codex;
 use regex_lite::Regex;
 use serde_json::Value;
 use serde_json::json;
+use tempfile::TempDir;
+use toml::toml;
 
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
@@ -339,6 +344,97 @@ async fn unified_exec_spec_toggle_end_to_end() -> Result<()> {
     assert!(
         tools_enabled.iter().any(|name| name == "write_stdin"),
         "tools list should include write_stdin when enabled: {tools_enabled:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_defined_custom_tools_are_included_in_request_body() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = vec![sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-1"),
+    ])];
+    let mock = mount_sse_sequence(&server, responses).await;
+
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        let user_config_path =
+            AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
+                .expect("absolute user config path");
+        config.config_layer_stack = config.config_layer_stack.with_user_config(
+            &user_config_path,
+            toml! {
+                [custom_tools.execute_python]
+                command = ["/bin/echo", "execute_python"]
+                description = "Execute python"
+                parameters = { type = "object", additionalProperties = false, required = ["code"], properties = { code = { type = "string" } } }
+                timeout_ms = 60000
+            }
+            .into(),
+        );
+    });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn_with_policies(
+        "list tools",
+        AskForApproval::Never,
+        SandboxPolicy::DangerFullAccess,
+    )
+    .await?;
+
+    let first_body = mock.single_request().body_json();
+    let tools = tool_names(&first_body);
+    assert!(
+        tools.iter().any(|name| name == "execute_python"),
+        "expected config-defined execute_python tool in request body: {tools:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_config_file_custom_tools_are_included_in_request_body() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = vec![sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-1"),
+    ])];
+    let mock = mount_sse_sequence(&server, responses).await;
+
+    let home = Arc::new(TempDir::new()?);
+    fs::write(
+        home.path().join(CONFIG_TOML_FILE),
+        r#"
+[custom_tools.execute_python]
+command = ["/bin/echo", "execute_python"]
+description = "Execute python"
+parameters = { type = "object", additionalProperties = false, required = ["code"], properties = { code = { type = "string" } } }
+timeout_ms = 60000
+"#,
+    )?;
+
+    let mut builder = test_codex().with_model("gpt-5.4").with_home(home);
+    let test = builder.build(&server).await?;
+
+    test.submit_turn_with_policies(
+        "list tools",
+        AskForApproval::Never,
+        SandboxPolicy::DangerFullAccess,
+    )
+    .await?;
+
+    let first_body = mock.single_request().body_json();
+    let tools = tool_names(&first_body);
+    assert!(
+        tools.iter().any(|name| name == "execute_python"),
+        "expected user config execute_python tool in request body: {tools:?}"
     );
 
     Ok(())

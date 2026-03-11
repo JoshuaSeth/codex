@@ -83,12 +83,16 @@ codex --sandbox read-only
 # Allow the agent to write within the current workspace while still blocking network access
 codex --sandbox workspace-write
 
+# Strictly scope filesystem reads+writes to selected directories
+codex --strict-dir /path/to/repo --strict-dir /path/to/shared-lib
+
 # Danger! Disable sandboxing entirely (only do this if you are already running in a container or other isolated env)
 codex --sandbox danger-full-access
 ```
 
 The same setting can be persisted in `~/.codex/config.toml` via the top-level `sandbox_mode = "MODE"` key, e.g. `sandbox_mode = "workspace-write"`.
 In `workspace-write`, Codex also includes `~/.codex/memories` in its writable roots so memory maintenance does not require an extra approval.
+When `--strict-dir` is provided, Codex forces `workspace-write`, restricts file reads/writes to those roots (plus required platform read defaults), and disables default writable temp roots (`/tmp`, `$TMPDIR`).
 
 ## Code Organization
 
