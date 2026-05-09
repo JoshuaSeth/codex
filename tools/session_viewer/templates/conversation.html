@@ -18,6 +18,46 @@
   </details>
   {% endif %}
 </section>
+<nav class="mode-tabs">
+  <a href="/conversations/{{ session.meta.conversation_id }}?view=combined" class="mode-tab{% if view_mode == 'combined' %} active{% endif %}">Combined</a>
+  <a href="/conversations/{{ session.meta.conversation_id }}?view=assistant-messages" class="mode-tab{% if view_mode == 'assistant-messages' %} active{% endif %}">Assistant Messages</a>
+  <a href="/conversations/{{ session.meta.conversation_id }}?view=timeline" class="mode-tab{% if view_mode == 'timeline' %} active{% endif %}">Timeline</a>
+</nav>
+{% if view_mode in ('combined', 'assistant-messages') %}
+<section class="assistant-messages">
+  <div class="section-heading">
+    <h3>Parsed Assistant Messages</h3>
+    <span class="section-count">{{ session.assistant_messages | length }} items</span>
+  </div>
+  {% if session.assistant_messages %}
+    {% for item in session.assistant_messages %}
+    <article class="assistant-message assistant-message-{{ item.source_kind }}">
+      <div class="assistant-message-header">
+        <div>
+          <strong>{{ item.source_label }}</strong>
+          <span class="timestamp">{{ item.timestamp.strftime('%H:%M:%S') }}</span>
+        </div>
+        <span class="source-pill">{{ item.source_kind }}</span>
+      </div>
+      {% if item.body_html %}
+      <div class="body markdown">{{ item.body_html | safe }}</div>
+      {% else %}
+      <p class="body">{{ item.body | replace('\n', '<br/>') | safe }}</p>
+      {% endif %}
+      <details class="assistant-message-raw">
+        <summary>Raw event</summary>
+        <pre>{{ item.raw | tojson(indent=2) }}</pre>
+      </details>
+    </article>
+    {% endfor %}
+  {% else %}
+  <section class="card empty-state">
+    <p>No assistant messages were parsed from this rollout.</p>
+  </section>
+  {% endif %}
+</section>
+{% endif %}
+{% if view_mode in ('combined', 'timeline') %}
 <section class="timeline">
 {% for card in session.cards %}
   {% if card.presentation != 'hidden' %}
@@ -64,4 +104,5 @@
   {% endif %}
 {% endfor %}
 </section>
+{% endif %}
 {% endblock %}

@@ -16,6 +16,7 @@ use codex_core::ThreadSortKey;
 use codex_core::auth::AuthMode;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::check_execpolicy_for_warnings;
+use codex_core::config::CompletionGateConfig;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -29,6 +30,8 @@ use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::find_thread_path_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
+use codex_core::non_stop_expires_at_after;
+use codex_core::normalize_thread_id_selector_str;
 use codex_core::path_utils;
 use codex_core::read_session_meta_line;
 use codex_core::state_db::get_state_db;
@@ -55,8 +58,6 @@ use tracing::error;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
-use uuid::Uuid;
-
 mod additional_dirs;
 mod app;
 mod app_backtrack;
@@ -387,6 +388,17 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
 
     let additional_dirs = cli.add_dir.clone();
     let strict_dirs = cli.strict_dir.clone();
+    let completion_gate = load_completion_gate_config(
+        cli.completion_criteria.clone(),
+        cli.completion_criteria_file.clone(),
+        cli.completion_judge_model.clone(),
+        cli.completion_judge_base_url.clone(),
+        cli.completion_judge_api_key_env.clone(),
+        cli.completion_judge_timeout_ms,
+        cli.completion_judge_max_retries,
+        cli.completion_judge_max_assistant_messages,
+        cli.completion_judge_max_user_messages,
+    );
 
     let overrides = ConfigOverrides {
         model,
@@ -398,6 +410,23 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
+        persistent: cli.persistent.then_some(true),
+        non_stop: cli
+            .non_stop
+            .then_some(true)
+            .or(cli.non_stop_for.map(|_| true))
+            .or(cli.non_stop_budget.map(|_| true)),
+        voice_mode: cli.voice.then_some(true),
+        non_stop_expires_at: cli
+            .non_stop_for
+            .map(non_stop_expires_at_after)
+            .transpose()
+            .unwrap_or_else(|err| {
+                eprintln!("Invalid `--non-stop-for`: {err}");
+                std::process::exit(2);
+            }),
+        non_stop_budget: cli.non_stop_budget,
+        completion_gate,
         additional_writable_roots: additional_dirs,
         strict_sandbox_roots: strict_dirs,
         ..Default::default()
@@ -683,21 +712,23 @@ async fn run_ratatui_app(
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
     let session_selection = if use_fork {
         if let Some(id_str) = cli.fork_session_id.as_deref() {
-            let is_uuid = Uuid::parse_str(id_str).is_ok();
-            let path = if is_uuid {
-                find_thread_path_by_id_str(&config.codex_home, id_str).await?
+            let normalized_thread_id = normalize_thread_id_selector_str(id_str);
+            let path = if let Some(normalized_thread_id) = normalized_thread_id.as_deref() {
+                find_thread_path_by_id_str(&config.codex_home, normalized_thread_id).await?
             } else {
                 find_thread_path_by_name_str(&config.codex_home, id_str).await?
             };
             match path {
                 Some(path) => {
-                    let thread_id =
-                        match resolve_session_thread_id(path.as_path(), is_uuid.then_some(id_str))
-                            .await
-                        {
-                            Some(thread_id) => thread_id,
-                            None => return missing_session_exit(id_str, "fork"),
-                        };
+                    let thread_id = match resolve_session_thread_id(
+                        path.as_path(),
+                        normalized_thread_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Some(thread_id) => thread_id,
+                        None => return missing_session_exit(id_str, "fork"),
+                    };
                     resume_picker::SessionSelection::Fork(resume_picker::SessionTarget {
                         path,
                         thread_id,
@@ -771,9 +802,9 @@ async fn run_ratatui_app(
             resume_picker::SessionSelection::StartFresh
         }
     } else if let Some(id_str) = cli.resume_session_id.as_deref() {
-        let is_uuid = Uuid::parse_str(id_str).is_ok();
-        let path = if is_uuid {
-            find_thread_path_by_id_str(&config.codex_home, id_str).await?
+        let normalized_thread_id = normalize_thread_id_selector_str(id_str);
+        let path = if let Some(normalized_thread_id) = normalized_thread_id.as_deref() {
+            find_thread_path_by_id_str(&config.codex_home, normalized_thread_id).await?
         } else {
             find_thread_path_by_name_str(&config.codex_home, id_str).await?
         };
@@ -781,7 +812,7 @@ async fn run_ratatui_app(
             Some(path) => {
                 let thread_id = match resolve_session_thread_id(
                     path.as_path(),
-                    is_uuid.then_some(id_str),
+                    normalized_thread_id.as_deref(),
                 )
                 .await
                 {
@@ -963,12 +994,79 @@ async fn run_ratatui_app(
     app_result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn load_completion_gate_config(
+    criteria: Option<String>,
+    criteria_file: Option<PathBuf>,
+    judge_model: Option<String>,
+    judge_base_url: Option<String>,
+    judge_api_key_env: Option<String>,
+    timeout_ms: Option<u64>,
+    max_retries: Option<u32>,
+    max_assistant_messages: Option<usize>,
+    max_user_messages: Option<usize>,
+) -> Option<CompletionGateConfig> {
+    let criteria = match (criteria, criteria_file) {
+        (Some(criteria), None) => Some(criteria),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(err) => {
+                eprintln!(
+                    "Failed to read completion criteria file {}: {err}",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces mutual exclusivity"),
+    };
+
+    if criteria.is_none()
+        && (judge_model.is_some()
+            || judge_base_url.is_some()
+            || judge_api_key_env.is_some()
+            || timeout_ms.is_some()
+            || max_retries.is_some()
+            || max_assistant_messages.is_some()
+            || max_user_messages.is_some())
+    {
+        eprintln!(
+            "Completion-judge overrides require `--completion-criteria` or `--completion-criteria-file`."
+        );
+        std::process::exit(1);
+    }
+
+    let criteria = criteria.map(|text| text.trim().to_string());
+    let Some(criteria) = criteria else {
+        return None;
+    };
+    if criteria.is_empty() {
+        eprintln!("Completion criteria cannot be empty.");
+        std::process::exit(1);
+    }
+
+    Some(CompletionGateConfig {
+        criteria,
+        judge_model,
+        judge_base_url,
+        judge_api_key_env,
+        timeout_ms: timeout_ms.unwrap_or(CompletionGateConfig::DEFAULT_TIMEOUT_MS),
+        max_retries: max_retries.unwrap_or(CompletionGateConfig::DEFAULT_MAX_RETRIES),
+        max_assistant_messages: max_assistant_messages
+            .unwrap_or(CompletionGateConfig::DEFAULT_MAX_ASSISTANT_MESSAGES),
+        max_user_messages: max_user_messages
+            .unwrap_or(CompletionGateConfig::DEFAULT_MAX_USER_MESSAGES),
+    })
+}
+
 pub(crate) async fn resolve_session_thread_id(
     path: &Path,
     id_str_if_uuid: Option<&str>,
 ) -> Option<ThreadId> {
     match id_str_if_uuid {
-        Some(id_str) => ThreadId::from_string(id_str).ok(),
+        Some(id_str) => normalize_thread_id_selector_str(id_str)
+            .and_then(|normalized| ThreadId::from_string(&normalized).ok()),
         None => read_session_meta_line(path)
             .await
             .ok()
@@ -1345,6 +1443,23 @@ mod tests {
             .expect("expected cwd");
         assert_eq!(cwd, second);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_session_thread_id_accepts_missing_leading_zeroes() {
+        let thread_id = resolve_session_thread_id(
+            Path::new("/unused"),
+            Some("19d1f63-7251-7c41-a001-e945ccf4f9a1"),
+        )
+        .await;
+
+        assert_eq!(
+            thread_id,
+            Some(
+                ThreadId::from_string("019d1f63-7251-7c41-a001-e945ccf4f9a1")
+                    .expect("valid thread id"),
+            )
+        );
     }
 
     #[tokio::test]

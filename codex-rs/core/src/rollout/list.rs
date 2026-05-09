@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use std::cmp::Reverse;
 use std::ffi::OsStr;
 use std::io::{self};
-use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,7 +16,6 @@ use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
 use crate::protocol::EventMsg;
 use crate::state_db;
-use codex_file_search as file_search;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -899,12 +897,7 @@ async fn collect_flat_files_by_updated_at(
         if *scanned_files >= MAX_SCAN_FILES {
             break;
         }
-        if !entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-        {
+        if !entry.file_type().await?.is_file() {
             continue;
         }
         let file_name = entry.file_name();
@@ -1167,15 +1160,47 @@ fn truncate_to_seconds(dt: OffsetDateTime) -> Option<OffsetDateTime> {
     dt.replace_nanosecond(0).ok()
 }
 
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+pub fn normalize_thread_id_selector_str(id_str: &str) -> Option<String> {
+    if let Ok(uuid) = Uuid::parse_str(id_str) {
+        return Some(uuid.to_string());
+    }
+
+    let mut normalized = String::with_capacity(36);
+    let groups = id_str.split('-').collect::<Vec<_>>();
+    if groups.len() != UUID_GROUP_LENGTHS.len() {
+        return None;
+    }
+
+    for (index, (group, expected_len)) in groups.iter().zip(UUID_GROUP_LENGTHS).enumerate() {
+        if group.is_empty()
+            || group.len() > expected_len
+            || !group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        for _ in 0..(expected_len - group.len()) {
+            normalized.push('0');
+        }
+        normalized.push_str(&group.to_ascii_lowercase());
+        if index + 1 != UUID_GROUP_LENGTHS.len() {
+            normalized.push('-');
+        }
+    }
+
+    Uuid::parse_str(&normalized).ok()?;
+    Some(normalized)
+}
+
 async fn find_thread_path_by_id_str_in_subdir(
     codex_home: &Path,
     subdir: &str,
     id_str: &str,
 ) -> io::Result<Option<PathBuf>> {
-    // Validate UUID format early.
-    if Uuid::parse_str(id_str).is_err() {
+    let Some(normalized_id_str) = normalize_thread_id_selector_str(id_str) else {
         return Ok(None);
-    }
+    };
 
     // Prefer DB lookup, then fall back to rollout file search.
     // TODO(jif): sqlite migration phase 1
@@ -1184,7 +1209,7 @@ async fn find_thread_path_by_id_str_in_subdir(
         ARCHIVED_SESSIONS_SUBDIR => Some(true),
         _ => None,
     };
-    let thread_id = ThreadId::from_string(id_str).ok();
+    let thread_id = ThreadId::from_string(&normalized_id_str).ok();
     let state_db_ctx = state_db::open_if_present(codex_home, "").await;
     if let Some(state_db_ctx) = state_db_ctx.as_deref()
         && let Some(thread_id) = thread_id
@@ -1200,7 +1225,7 @@ async fn find_thread_path_by_id_str_in_subdir(
             return Ok(Some(db_path));
         }
         tracing::error!(
-            "state db returned stale rollout path for thread {id_str}: {}",
+            "state db returned stale rollout path for thread {normalized_id_str}: {}",
             db_path.display()
         );
         state_db::record_discrepancy("find_thread_path_by_id_str_in_subdir", "stale_db_path");
@@ -1211,22 +1236,55 @@ async fn find_thread_path_by_id_str_in_subdir(
     if !root.exists() {
         return Ok(None);
     }
-    // This is safe because we know the values are valid.
-    #[allow(clippy::unwrap_used)]
-    let limit = NonZero::new(1).unwrap();
-    let options = file_search::FileSearchOptions {
-        limit,
-        compute_indices: false,
-        respect_gitignore: false,
-        ..Default::default()
+
+    let Some(target_id) = Uuid::parse_str(&normalized_id_str).ok() else {
+        return Ok(None);
     };
+    let mut found = None;
 
-    let results = file_search::run(id_str, vec![root], options, None)
-        .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
+    let mut dir = tokio::fs::read_dir(&root).await?;
+    while let Some(entry) = dir.next_entry().await? {
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
+            continue;
+        }
+        if parse_timestamp_uuid_from_filename(name_str).is_some_and(|(_ts, id)| id == target_id) {
+            found = Some(entry.path());
+            break;
+        }
+    }
 
-    let found = results.matches.into_iter().next().map(|m| m.full_path());
+    if found.is_none() {
+        let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u16>().ok()).await?;
+        'outer: for (_year, year_path) in year_dirs.iter() {
+            let month_dirs = collect_dirs_desc(year_path, |s| s.parse::<u8>().ok()).await?;
+            for (_month, month_path) in month_dirs.iter() {
+                let day_dirs = collect_dirs_desc(month_path, |s| s.parse::<u8>().ok()).await?;
+                for (_day, day_path) in day_dirs.iter() {
+                    for (_ts, id, path) in collect_rollout_day_files(day_path).await? {
+                        if id == target_id {
+                            found = Some(path);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(found_path) = found.as_ref() {
-        tracing::debug!("state db missing rollout path for thread {id_str}");
+        tracing::debug!("state db missing rollout path for thread {normalized_id_str}");
         state_db::record_discrepancy("find_thread_path_by_id_str_in_subdir", "falling_back");
         state_db::read_repair_rollout_path(
             state_db_ctx.as_deref(),
@@ -1278,8 +1336,8 @@ pub async fn find_conversation_path_by_selector_str(
     codex_home: &Path,
     selector: &str,
 ) -> io::Result<Option<PathBuf>> {
-    if Uuid::parse_str(selector).is_ok() {
-        return find_thread_path_by_id_str(codex_home, selector).await;
+    if let Some(normalized_id_str) = normalize_thread_id_selector_str(selector) {
+        return find_thread_path_by_id_str(codex_home, &normalized_id_str).await;
     }
 
     let selector_path = Path::new(selector);

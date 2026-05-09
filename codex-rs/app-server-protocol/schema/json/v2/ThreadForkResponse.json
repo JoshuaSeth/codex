@@ -345,6 +345,23 @@
       ],
       "type": "string"
     },
+    "CompletionGateInfo": {
+      "properties": {
+        "criteria": {
+          "type": "string"
+        },
+        "judge_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "criteria"
+      ],
+      "type": "object"
+    },
     "DynamicToolCallOutputContentItem": {
       "oneOf": [
         {
@@ -1929,6 +1946,16 @@
     "approvalPolicy": {
       "$ref": "#/definitions/AskForApproval"
     },
+    "completionGate": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompletionGateInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "cwd": {
       "type": "string"
     },
@@ -1963,6 +1990,9 @@
     },
     "thread": {
       "$ref": "#/definitions/Thread"
+    },
+    "voiceMode": {
+      "type": "boolean"
     }
   },
   "required": [
@@ -1971,7 +2001,8 @@
     "model",
     "modelProvider",
     "sandbox",
-    "thread"
+    "thread",
+    "voiceMode"
   ],
   "title": "ThreadForkResponse",
   "type": "object"

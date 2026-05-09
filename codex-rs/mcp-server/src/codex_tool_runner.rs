@@ -214,6 +214,13 @@ async fn run_codex_tool_session_inner(
                     .await;
 
                 match event.msg {
+                    EventMsg::CompletionGateStarted(_)
+                    | EventMsg::CompletionGateDecision(_)
+                    | EventMsg::CompletionGateBlockedStop(_)
+                    | EventMsg::CompletionGateError(_)
+                    | EventMsg::NonStopModeUpdated(_) => {
+                        continue;
+                    }
                     EventMsg::ExecApprovalRequest(ev) => {
                         let approval_id = ev.effective_approval_id();
                         let ExecApprovalRequestEvent {
@@ -368,6 +375,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::RequestUserInput(_)
                     | EventMsg::DynamicToolCallRequest(_)
                     | EventMsg::DynamicToolCallResponse(_)
+                    | EventMsg::TurnCompleteDeferredByNonStop(_)
                     | EventMsg::ContextCompacted(_)
                     | EventMsg::ModelReroute(_)
                     | EventMsg::ThreadRolledBack(_)

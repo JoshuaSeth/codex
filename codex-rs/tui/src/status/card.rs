@@ -2,15 +2,21 @@ use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::with_border_with_inner_width;
+use crate::status_indicator_widget::fmt_elapsed_compact;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_core::non_stop_is_active;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompletionGateBlockedStopEvent;
+use codex_protocol::protocol::CompletionGateDecisionEvent;
+use codex_protocol::protocol::CompletionGateErrorEvent;
+use codex_protocol::protocol::CompletionGateInfo;
 use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TokenUsage;
@@ -63,6 +69,7 @@ pub(crate) struct StatusTokenUsageData {
 struct StatusHistoryCell {
     model_name: String,
     model_details: Vec<String>,
+    non_stop: Option<String>,
     directory: PathBuf,
     permissions: String,
     agents_summary: String,
@@ -72,6 +79,10 @@ struct StatusHistoryCell {
     thread_name: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
+    completion_gate: Option<CompletionGateInfo>,
+    completion_gate_last_decision: Option<CompletionGateDecisionEvent>,
+    completion_gate_last_blocked_stop: Option<CompletionGateBlockedStopEvent>,
+    completion_gate_last_error: Option<CompletionGateErrorEvent>,
     token_usage: StatusTokenUsageData,
     rate_limits: StatusRateLimitData,
 }
@@ -108,6 +119,10 @@ pub(crate) fn new_status_output(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -126,6 +141,10 @@ pub(crate) fn new_status_output_with_rate_limits(
     model_name: &str,
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    completion_gate: Option<CompletionGateInfo>,
+    completion_gate_last_decision: Option<CompletionGateDecisionEvent>,
+    completion_gate_last_blocked_stop: Option<CompletionGateBlockedStopEvent>,
+    completion_gate_last_error: Option<CompletionGateErrorEvent>,
 ) -> CompositeHistoryCell {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let card = StatusHistoryCell::new(
@@ -142,6 +161,10 @@ pub(crate) fn new_status_output_with_rate_limits(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        completion_gate,
+        completion_gate_last_decision,
+        completion_gate_last_blocked_stop,
+        completion_gate_last_error,
     );
 
     CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)])
@@ -163,6 +186,10 @@ impl StatusHistoryCell {
         model_name: &str,
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
+        completion_gate: Option<CompletionGateInfo>,
+        completion_gate_last_decision: Option<CompletionGateDecisionEvent>,
+        completion_gate_last_blocked_stop: Option<CompletionGateBlockedStopEvent>,
+        completion_gate_last_error: Option<CompletionGateErrorEvent>,
     ) -> Self {
         let mut config_entries = vec![
             ("workdir", config.cwd.display().to_string()),
@@ -191,7 +218,37 @@ impl StatusHistoryCell {
                     .unwrap_or_else(|| "auto".to_string()),
             ));
         }
+        if config.non_stop {
+            let non_stop_value = match (config.non_stop_expires_at, config.non_stop_budget) {
+                (Some(expires_at), budget)
+                    if non_stop_is_active(config.non_stop, Some(expires_at), now.timestamp()) =>
+                {
+                    let timed = format!(
+                        "timed ({})",
+                        fmt_elapsed_compact(
+                            u64::try_from(expires_at - now.timestamp()).unwrap_or_default()
+                        )
+                    );
+                    match budget {
+                        Some(budget) => format!("{timed}, {budget} stops"),
+                        None => timed,
+                    }
+                }
+                (Some(_), Some(budget)) => format!("timed (elapsed), {budget} stops"),
+                (Some(_), None) => "timed (elapsed)".to_string(),
+                (None, Some(budget)) => format!("{budget} stops"),
+                (None, None) => "on".to_string(),
+            };
+            config_entries.push(("non-stop", non_stop_value));
+        }
+        if config.voice_mode {
+            config_entries.push(("voice", "on".to_string()));
+        }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
+        let non_stop = config_entries
+            .iter()
+            .find(|(key, _)| *key == "non-stop")
+            .map(|(_, value)| value.clone());
         let approval = config_entries
             .iter()
             .find(|(k, _)| *k == "approval")
@@ -256,6 +313,7 @@ impl StatusHistoryCell {
         Self {
             model_name,
             model_details,
+            non_stop,
             directory: config.cwd.clone(),
             permissions,
             agents_summary,
@@ -265,6 +323,10 @@ impl StatusHistoryCell {
             thread_name,
             session_id,
             forked_from,
+            completion_gate,
+            completion_gate_last_decision,
+            completion_gate_last_blocked_stop,
+            completion_gate_last_error,
             token_usage,
             rate_limits,
         }
@@ -462,6 +524,30 @@ impl HistoryCell for StatusHistoryCell {
         if self.collaboration_mode.is_some() {
             push_label(&mut labels, &mut seen, "Collaboration mode");
         }
+        if self.completion_gate.is_some() {
+            push_label(&mut labels, &mut seen, "Completion gate");
+            push_label(&mut labels, &mut seen, "Completion criterion");
+            if self
+                .completion_gate
+                .as_ref()
+                .and_then(|gate| gate.judge_model.as_ref())
+                .is_some()
+            {
+                push_label(&mut labels, &mut seen, "Gate judge");
+            }
+        }
+        if self.completion_gate_last_decision.is_some() {
+            push_label(&mut labels, &mut seen, "Gate verdict");
+        }
+        if self.completion_gate_last_blocked_stop.is_some() {
+            push_label(&mut labels, &mut seen, "Gate continue");
+        }
+        if self.completion_gate_last_error.is_some() {
+            push_label(&mut labels, &mut seen, "Gate error");
+        }
+        if self.non_stop.is_some() {
+            push_label(&mut labels, &mut seen, "Non-stop");
+        }
         push_label(&mut labels, &mut seen, "Token usage");
         if self.token_usage.context_window.is_some() {
             push_label(&mut labels, &mut seen, "Context window");
@@ -502,6 +588,9 @@ impl HistoryCell for StatusHistoryCell {
         if let Some(model_provider) = self.model_provider.as_ref() {
             lines.push(formatter.line("Model provider", vec![Span::from(model_provider.clone())]));
         }
+        if let Some(non_stop) = self.non_stop.as_ref() {
+            lines.push(formatter.line("Non-stop", vec![Span::from(non_stop.clone())]));
+        }
         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
         lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
         lines.push(formatter.line("Agents.md", vec![Span::from(self.agents_summary.clone())]));
@@ -515,6 +604,62 @@ impl HistoryCell for StatusHistoryCell {
         }
         if let Some(collab_mode) = self.collaboration_mode.as_ref() {
             lines.push(formatter.line("Collaboration mode", vec![Span::from(collab_mode.clone())]));
+        }
+        if let Some(completion_gate) = self.completion_gate.as_ref() {
+            lines.push(formatter.line("Completion gate", vec!["enabled".into()]));
+            if let Some(judge_model) = completion_gate.judge_model.as_ref() {
+                lines.push(formatter.line("Gate judge", vec![Span::from(judge_model.clone())]));
+            }
+            let completion_criterion_lines = adaptive_wrap_lines(
+                [Line::from(formatter.full_spans(
+                    "Completion criterion",
+                    vec![Span::from(completion_gate.criteria.clone())],
+                ))],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(completion_criterion_lines);
+        }
+        if let Some(decision) = self.completion_gate_last_decision.as_ref() {
+            let verdict_spans = if decision.allow_stop {
+                vec![
+                    "allowed stop".green(),
+                    " — ".dim(),
+                    decision.reason.clone().into(),
+                ]
+            } else {
+                vec![
+                    "blocked stop".yellow(),
+                    " — ".dim(),
+                    decision.reason.clone().into(),
+                ]
+            };
+            let verdict_lines = adaptive_wrap_lines(
+                [Line::from(
+                    formatter.full_spans("Gate verdict", verdict_spans),
+                )],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(verdict_lines);
+        }
+        if let Some(blocked_stop) = self.completion_gate_last_blocked_stop.as_ref() {
+            let continue_lines = adaptive_wrap_lines(
+                [Line::from(formatter.full_spans(
+                    "Gate continue",
+                    vec![Span::from(blocked_stop.continue_prompt.clone())],
+                ))],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(continue_lines);
+        }
+        if let Some(error) = self.completion_gate_last_error.as_ref() {
+            let error_lines = adaptive_wrap_lines(
+                [Line::from(formatter.full_spans(
+                    "Gate error",
+                    vec![Span::from(error.message.clone()).red()],
+                ))],
+                RtOptions::new(available_inner_width),
+            );
+            lines.extend(error_lines);
         }
         if let Some(session) = self.session_id.as_ref() {
             lines.push(formatter.line("Session", vec![Span::from(session.clone())]));

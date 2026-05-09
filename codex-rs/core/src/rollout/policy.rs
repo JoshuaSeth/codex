@@ -113,6 +113,9 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
             }
         }
         EventMsg::Error(_)
+        | EventMsg::CompletionGateDecision(_)
+        | EventMsg::CompletionGateBlockedStop(_)
+        | EventMsg::CompletionGateError(_)
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::PatchApplyEnd(_)
@@ -127,6 +130,9 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_) => Some(EventPersistenceMode::Extended),
         EventMsg::Warning(_)
+        | EventMsg::CompletionGateStarted(_)
+        | EventMsg::TurnCompleteDeferredByNonStop(_)
+        | EventMsg::NonStopModeUpdated(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)

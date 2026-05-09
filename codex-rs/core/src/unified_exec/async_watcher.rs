@@ -119,17 +119,25 @@ pub(crate) fn spawn_exit_watcher(
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
+        // Release the retained session immediately on exit so stale entries do
+        // not count toward warning/prune thresholds while trailing output
+        // drains and the end event is emitted.
+        session_ref
+            .services
+            .unified_exec_manager
+            .release_process_id(&process_id)
+            .await;
         output_drained.notified().await;
 
         let exit_code = process.exit_code().unwrap_or(-1);
         let duration = Instant::now().saturating_duration_since(started_at);
         emit_exec_end_for_unified_exec(
-            session_ref,
+            Arc::clone(&session_ref),
             turn_ref,
             call_id,
             command,
             cwd,
-            Some(process_id),
+            Some(process_id.clone()),
             transcript,
             String::new(),
             exit_code,

@@ -1,0 +1,6 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 7136
+expression: rendered
+---
+• Non-stop mode disabled for this session. Normal completion is allowed again. Live user sends queue normally unless another mode changes that.

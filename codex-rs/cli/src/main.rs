@@ -76,7 +76,7 @@ use codex_core::terminal::TerminalName;
     // the generic `codex` command name that users run.
     bin_name = "codex",
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]",
-    after_long_help = "PitchAI auth policy:\n  - Default path is shared/broker auth in $CODEX_HOME/auth.json.\n  - `CODEX_API_KEY` is not an implicit fallback.\n  - API-key mode is explicit-only and should be considered break-glass.\n\nPitchAI automation notes:\n  - The generic runner can lease auth from auth-token-server (`CODEX_AUTH_BROKER_URL`, `CODEX_AUTH_BROKER_TOKEN`).\n  - Usage/rate-limit outcomes can trigger broker lease refresh + in-process auto-continue.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies `--sandbox workspace-write` and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Shell command behavior is unchanged; approval policy still controls command escalation."
+    after_long_help = "PitchAI auth policy:\n  - Default path is shared/broker auth in $CODEX_HOME/auth.json.\n  - `CODEX_API_KEY` is not an implicit fallback.\n  - API-key mode is explicit-only and should be considered break-glass.\n\nPitchAI automation notes:\n  - The generic runner can lease auth from auth-token-server (`CODEX_AUTH_BROKER_URL`, `CODEX_AUTH_BROKER_TOKEN`).\n  - Usage/rate-limit outcomes can trigger broker lease refresh + in-process auto-continue.\n\nPersistent terminal mode:\n  - Use `--persistent` to keep the turn alive while any session terminal is still running.\n  - Codex will not accept an assistant-only response as terminal until those terminals exit.\n  - This is opt-in because intentionally leaving a shell open keeps the turn running.\n\nNon-stop mode:\n  - Use `--non-stop` to forbid normal turn completion entirely.\n  - Use `--non-stop-for <DURATION>` to keep that behavior only until the timeout expires; after that, the next normal final answer may stop.\n  - Use `--non-stop-budget <COUNT>` to keep that behavior only until COUNT normal stop attempts have been reached.\n  - In interactive sessions, use `/non-stop [on|off|status|<duration>|on <duration>]` to override that behavior at runtime.\n  - Use `/deep <N>` to arm the next `N` new turns with 4 extra candidate-stop follow-ups before normal stopping resumes.\n  - While a non-stop turn is running, submitted messages open a mode picker: steer now, release after the next normal-stop boundary, or schedule a timed release.\n  - The explicit queue shortcut uses that same picker, defaulting to the next normal-stop boundary option.\n  - Codex keeps sampling until it is externally interrupted, aborted, otherwise forced to stop, or the configured budget is exhausted.\n  - This is stronger than `--persistent` and can intentionally run forever.\n\nVoice mode:\n  - Use `--voice` to pair Codex with the Dispatch browser voice cockpit.\n  - Assistant speech starts streaming once enough visible text exists, not only after the final answer.\n  - Use `/voice [on|off|status]` in the TUI to inspect or override the live session setting.\n  - Finalized live transcripts steer directly into the running turn when a turn is active, or submit a fresh new turn after the prior one has stopped.\n  - Add `--non-stop` as well if you want voice mode to keep auto-continuing instead of stopping normally.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies `--sandbox workspace-write` and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Shell command behavior is unchanged; approval policy still controls command escalation."
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -1102,6 +1102,48 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if !subcommand_cli.strict_dir.is_empty() {
         interactive.strict_dir.extend(subcommand_cli.strict_dir);
     }
+    if subcommand_cli.persistent {
+        interactive.persistent = true;
+    }
+    if subcommand_cli.non_stop {
+        interactive.non_stop = true;
+    }
+    if subcommand_cli.voice {
+        interactive.voice = true;
+    }
+    if let Some(non_stop_for) = subcommand_cli.non_stop_for {
+        interactive.non_stop = true;
+        interactive.non_stop_for = Some(non_stop_for);
+    }
+    if let Some(criteria) = subcommand_cli.completion_criteria {
+        interactive.completion_criteria = Some(criteria);
+        interactive.completion_criteria_file = None;
+    }
+    if let Some(criteria_file) = subcommand_cli.completion_criteria_file {
+        interactive.completion_criteria_file = Some(criteria_file);
+        interactive.completion_criteria = None;
+    }
+    if let Some(judge_model) = subcommand_cli.completion_judge_model {
+        interactive.completion_judge_model = Some(judge_model);
+    }
+    if let Some(judge_base_url) = subcommand_cli.completion_judge_base_url {
+        interactive.completion_judge_base_url = Some(judge_base_url);
+    }
+    if let Some(judge_api_key_env) = subcommand_cli.completion_judge_api_key_env {
+        interactive.completion_judge_api_key_env = Some(judge_api_key_env);
+    }
+    if let Some(timeout_ms) = subcommand_cli.completion_judge_timeout_ms {
+        interactive.completion_judge_timeout_ms = Some(timeout_ms);
+    }
+    if let Some(max_retries) = subcommand_cli.completion_judge_max_retries {
+        interactive.completion_judge_max_retries = Some(max_retries);
+    }
+    if let Some(max_assistant_messages) = subcommand_cli.completion_judge_max_assistant_messages {
+        interactive.completion_judge_max_assistant_messages = Some(max_assistant_messages);
+    }
+    if let Some(max_user_messages) = subcommand_cli.completion_judge_max_user_messages {
+        interactive.completion_judge_max_user_messages = Some(max_user_messages);
+    }
     if let Some(prompt) = subcommand_cli.prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -1423,6 +1465,36 @@ mod tests {
                 std::path::PathBuf::from("/tmp/strict-a"),
                 std::path::PathBuf::from("/tmp/strict-b")
             ]
+        );
+    }
+
+    #[test]
+    fn resume_merges_persistent_flag() {
+        let interactive = finalize_resume_from_args(["codex", "resume", "--persistent"].as_ref());
+        assert!(interactive.persistent);
+    }
+
+    #[test]
+    fn resume_merges_non_stop_flag() {
+        let interactive = finalize_resume_from_args(["codex", "resume", "--non-stop"].as_ref());
+        assert!(interactive.non_stop);
+    }
+
+    #[test]
+    fn resume_merges_voice_without_forcing_non_stop() {
+        let interactive = finalize_resume_from_args(["codex", "resume", "--voice"].as_ref());
+        assert!(interactive.voice);
+        assert!(!interactive.non_stop);
+    }
+
+    #[test]
+    fn resume_merges_non_stop_timeout_flag() {
+        let interactive =
+            finalize_resume_from_args(["codex", "resume", "--non-stop-for", "45m"].as_ref());
+        assert!(interactive.non_stop);
+        assert_eq!(
+            interactive.non_stop_for,
+            Some(std::time::Duration::from_secs(45 * 60))
         );
     }
 

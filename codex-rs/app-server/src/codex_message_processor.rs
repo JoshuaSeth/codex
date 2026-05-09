@@ -1747,10 +1747,12 @@ impl CodexMessageProcessor {
                     model: config_snapshot.model,
                     model_provider: config_snapshot.model_provider_id,
                     service_tier: config_snapshot.service_tier,
+                    voice_mode: config_snapshot.voice_mode,
                     cwd: config_snapshot.cwd,
                     approval_policy: config_snapshot.approval_policy.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
                     reasoning_effort: config_snapshot.reasoning_effort,
+                    completion_gate: config_snapshot.completion_gate,
                 };
 
                 listener_task_context
@@ -2983,6 +2985,7 @@ impl CodexMessageProcessor {
                 thread,
                 session_configured,
             }) => {
+                let config_snapshot = thread.config_snapshot().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
                     self.send_internal_error(
@@ -3033,13 +3036,15 @@ impl CodexMessageProcessor {
 
                 let response = ThreadResumeResponse {
                     thread,
-                    model: session_configured.model,
-                    model_provider: session_configured.model_provider_id,
-                    service_tier: session_configured.service_tier,
-                    cwd: session_configured.cwd,
-                    approval_policy: session_configured.approval_policy.into(),
-                    sandbox: session_configured.sandbox_policy.into(),
-                    reasoning_effort: session_configured.reasoning_effort,
+                    model: config_snapshot.model,
+                    model_provider: config_snapshot.model_provider_id,
+                    service_tier: config_snapshot.service_tier,
+                    voice_mode: config_snapshot.voice_mode,
+                    cwd: config_snapshot.cwd,
+                    approval_policy: config_snapshot.approval_policy.into(),
+                    sandbox: config_snapshot.sandbox_policy.into(),
+                    reasoning_effort: config_snapshot.reasoning_effort,
+                    completion_gate: config_snapshot.completion_gate,
                 };
 
                 self.outgoing.send_response(request_id, response).await;
@@ -3490,6 +3495,7 @@ impl CodexMessageProcessor {
 
         let NewThread {
             thread_id,
+            thread,
             session_configured,
             ..
         } = match self
@@ -3521,6 +3527,7 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        let config_snapshot = thread.config_snapshot().await;
 
         let SessionConfiguredEvent { rollout_path, .. } = session_configured;
         let Some(rollout_path) = rollout_path else {
@@ -3595,13 +3602,15 @@ impl CodexMessageProcessor {
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
-            model: session_configured.model,
-            model_provider: session_configured.model_provider_id,
-            service_tier: session_configured.service_tier,
-            cwd: session_configured.cwd,
-            approval_policy: session_configured.approval_policy.into(),
-            sandbox: session_configured.sandbox_policy.into(),
-            reasoning_effort: session_configured.reasoning_effort,
+            model: config_snapshot.model,
+            model_provider: config_snapshot.model_provider_id,
+            service_tier: config_snapshot.service_tier,
+            voice_mode: config_snapshot.voice_mode,
+            cwd: config_snapshot.cwd,
+            approval_policy: config_snapshot.approval_policy.into(),
+            sandbox: config_snapshot.sandbox_policy.into(),
+            reasoning_effort: config_snapshot.reasoning_effort,
+            completion_gate: config_snapshot.completion_gate,
         };
 
         self.outgoing.send_response(request_id, response).await;
@@ -5144,6 +5153,8 @@ impl CodexMessageProcessor {
                     service_tier: params.service_tier,
                     collaboration_mode,
                     personality: params.personality,
+                    non_stop: None,
+                    completion_gate: None,
                 })
                 .await;
         }
@@ -6384,10 +6395,12 @@ async fn handle_pending_thread_resume_request(
         model,
         model_provider_id,
         service_tier,
+        voice_mode,
         approval_policy,
         sandbox_policy,
         cwd,
         reasoning_effort,
+        completion_gate,
         ..
     } = pending.config_snapshot;
     let response = ThreadResumeResponse {
@@ -6395,10 +6408,12 @@ async fn handle_pending_thread_resume_request(
         model,
         model_provider: model_provider_id,
         service_tier,
+        voice_mode,
         cwd,
         approval_policy: approval_policy.into(),
         sandbox: sandbox_policy.into(),
         reasoning_effort,
+        completion_gate,
     };
     outgoing.send_response(request_id, response).await;
     outgoing
@@ -7289,6 +7304,10 @@ mod tests {
             model: "gpt-5".to_string(),
             model_provider_id: "openai".to_string(),
             service_tier: Some(codex_protocol::config_types::ServiceTier::Flex),
+            non_stop: false,
+            voice_mode: false,
+            non_stop_expires_at: None,
+            non_stop_budget: None,
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
             cwd: PathBuf::from("/tmp"),
@@ -7296,6 +7315,7 @@ mod tests {
             reasoning_effort: None,
             personality: None,
             session_source: SessionSource::Cli,
+            completion_gate: None,
         };
 
         assert_eq!(

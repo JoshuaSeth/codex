@@ -1,4 +1,5 @@
 use super::new_status_output;
+use super::new_status_output_with_rate_limits;
 use super::rate_limit_snapshot_display;
 use crate::history_cell::HistoryCell;
 use chrono::Duration as ChronoDuration;
@@ -11,6 +12,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompletionGateDecisionEvent;
+use codex_protocol::protocol::CompletionGateInfo;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
@@ -234,6 +237,49 @@ async fn status_permissions_non_default_workspace_write_is_custom() {
         permissions_text,
         Some("Custom (workspace-write with network access, on-request)")
     );
+}
+
+#[tokio::test]
+async fn status_snapshot_includes_timed_non_stop() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.non_stop = true;
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    config.non_stop_expires_at = Some(reset_at_from(&captured_at, 30 * 60));
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage::default();
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output(
+        &config,
+        &auth_manager,
+        None,
+        &usage,
+        &None,
+        None,
+        None,
+        None,
+        None,
+        captured_at,
+        &model_slug,
+        None,
+        None,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert_snapshot!(sanitized);
 }
 
 #[tokio::test]
@@ -1027,4 +1073,64 @@ async fn status_context_window_uses_last_usage() {
         !context_line.contains("102K"),
         "context line should not use total aggregated tokens, got: {context_line}"
     );
+}
+
+#[tokio::test]
+async fn status_snapshot_includes_completion_gate_details() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.cwd = PathBuf::from("/workspace/tests");
+
+    let auth_manager = test_auth_manager(&config);
+    let usage = TokenUsage {
+        input_tokens: 1_000,
+        cached_input_tokens: 0,
+        output_tokens: 400,
+        reasoning_output_tokens: 50,
+        total_tokens: 1_450,
+    };
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+    let token_info = token_info_for(&model_slug, &config, &usage);
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 6, 1, 12, 0, 0)
+        .single()
+        .expect("timestamp");
+    let session_id =
+        ThreadId::from_string("019ce433-3c37-7ad0-a1b3-6bf12eb33ccc").expect("session id");
+
+    let composite = new_status_output_with_rate_limits(
+        &config,
+        &auth_manager,
+        Some(&token_info),
+        &usage,
+        &Some(session_id),
+        Some("completion-gate-demo".to_string()),
+        None,
+        &[],
+        None,
+        now,
+        &model_slug,
+        Some("default"),
+        Some(Some(ReasoningEffort::Medium)),
+        Some(CompletionGateInfo {
+            criteria: "Stop only after verification passes.".to_string(),
+            judge_model: Some("gpt-5.1-mini".to_string()),
+        }),
+        Some(CompletionGateDecisionEvent {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            criteria_hash: "abc123".to_string(),
+            judge_model: "gpt-5.1-mini".to_string(),
+            request_id: None,
+            latency_ms: 187,
+            allow_stop: false,
+            reason: "Verification output is still missing.".to_string(),
+        }),
+        None,
+        None,
+    );
+
+    let sanitized = sanitize_directory(render_lines(&composite.display_lines(80))).join("\n");
+    assert_snapshot!(sanitized);
 }

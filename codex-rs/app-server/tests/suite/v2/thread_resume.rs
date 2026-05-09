@@ -144,11 +144,26 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
-    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    let resume_result = resume_resp.result.clone();
+    let ThreadResumeResponse {
+        thread,
+        completion_gate,
+        voice_mode,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
     assert_eq!(thread.id, conversation_id);
+    assert!(!voice_mode);
+    assert_eq!(
+        resume_result
+            .get("voiceMode")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "thread/resume should serialize `voiceMode: false` by default"
+    );
     assert_eq!(thread.preview, preview);
     assert_eq!(thread.model_provider, "mock_provider");
+    assert_eq!(completion_gate, None);
     assert!(thread.path.as_ref().expect("thread path").is_absolute());
     assert_eq!(thread.cwd, PathBuf::from("/"));
     assert_eq!(thread.cli_version, "0.0.0");

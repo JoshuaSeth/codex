@@ -73,7 +73,31 @@ pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
+pub const VOICE_TRANSCRIPT_OPEN_TAG: &str = "<voice_transcript>";
+pub const VOICE_TRANSCRIPT_CLOSE_TAG: &str = "</voice_transcript>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
+
+pub fn wrap_voice_transcript(text: &str) -> String {
+    format!("{VOICE_TRANSCRIPT_OPEN_TAG}\n{text}\n{VOICE_TRANSCRIPT_CLOSE_TAG}")
+}
+
+pub fn unwrap_voice_transcript(text: &str) -> Option<String> {
+    let trimmed_start = text.trim_start();
+    let body = trimmed_start.strip_prefix(VOICE_TRANSCRIPT_OPEN_TAG)?;
+    let body = body.strip_prefix('\n').unwrap_or(body);
+    let body = body.trim_end();
+    let body = body.strip_suffix(VOICE_TRANSCRIPT_CLOSE_TAG)?;
+    Some(body.trim_end_matches('\n').to_string())
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum UserMessageSource {
+    #[default]
+    Typed,
+    Voice,
+}
 
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -157,6 +181,75 @@ pub struct ConversationAudioParams {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ConversationTextParams {
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CompletionGateInfo {
+    pub criteria: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub judge_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+pub struct CompletionGateSettingsUpdate {
+    /// Use `Some(Some(_))` to set criteria, `Some(None)` to disable the gate,
+    /// or `None` to keep the current criteria unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub criteria: Option<Option<String>>,
+
+    /// Use `Some(Some(_))` to set a judge model override, `Some(None)` to
+    /// clear it, or `None` to leave the current value unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub judge_model: Option<Option<String>>,
+
+    /// Optional base URL override for the judge call.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub judge_base_url: Option<Option<String>>,
+
+    /// Optional environment-variable override for the judge API key.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "string | null")]
+    pub judge_api_key_env: Option<Option<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub timeout_ms: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_retries: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_assistant_messages: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_user_messages: Option<usize>,
 }
 
 /// Submission operation
@@ -302,6 +395,43 @@ pub enum Op {
         /// Updated personality preference.
         #[serde(skip_serializing_if = "Option::is_none")]
         personality: Option<Personality>,
+
+        /// Updated non-stop preference for subsequent turns.
+        ///
+        /// `Some(true)` enables the fork-specific "never stop normally"
+        /// behavior, `Some(false)` disables it again, and `None` leaves the
+        /// existing runtime override unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        non_stop: Option<bool>,
+
+        /// Updated completion-gate settings for subsequent candidate-stop
+        /// boundaries in this session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion_gate: Option<CompletionGateSettingsUpdate>,
+    },
+
+    /// Update the runtime non-stop policy for subsequent turns.
+    SetNonStopMode {
+        /// Whether non-stop mode is enabled.
+        enabled: bool,
+
+        /// Optional Unix-second deadline after which normal completion is
+        /// allowed again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+    },
+
+    /// Enable or disable continuous voice mode for subsequent turns.
+    SetVoiceMode {
+        /// Whether voice mode is enabled.
+        enabled: bool,
+    },
+
+    /// Apply a one-shot forced-continuation budget to the next user turn only.
+    SetNextTurnDeepFollowUpBudget {
+        /// Number of candidate-stop boundaries that must continue before normal
+        /// completion is allowed again.
+        budget: u32,
     },
 
     /// Approve a command execution
@@ -1018,6 +1148,18 @@ pub enum EventMsg {
     /// indicates the turn continued but the user should still be notified.
     Warning(WarningEvent),
 
+    /// Completion gate started judging a candidate stop boundary.
+    CompletionGateStarted(CompletionGateStartedEvent),
+
+    /// Completion gate produced an allow/deny decision.
+    CompletionGateDecision(CompletionGateDecisionEvent),
+
+    /// Completion gate denied stop and injected a continuation prompt.
+    CompletionGateBlockedStop(CompletionGateBlockedStopEvent),
+
+    /// Completion gate failed closed while evaluating a candidate stop.
+    CompletionGateError(CompletionGateErrorEvent),
+
     /// Realtime conversation lifecycle start event.
     RealtimeConversationStarted(RealtimeConversationStartedEvent),
 
@@ -1045,6 +1187,19 @@ pub enum EventMsg {
     /// v1 wire format uses `task_complete`; accept `turn_complete` for v2 interop.
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
+
+    /// Agent would have completed the turn here, but `--non-stop` forced one
+    /// more follow-up round instead.
+    ///
+    /// This is a fork-specific boundary marker for UIs that want to inject a
+    /// message exactly at the next "normal stop" point without allowing the
+    /// turn to finish yet.
+    #[serde(rename = "turn_complete_deferred_by_non_stop")]
+    TurnCompleteDeferredByNonStop(TurnCompleteDeferredByNonStopEvent),
+
+    /// Runtime update for timed or untimed non-stop mode.
+    #[serde(rename = "non_stop_mode_updated")]
+    NonStopModeUpdated(NonStopModeUpdatedEvent),
 
     /// Usage update for the current session, including totals and last turn.
     /// Optional means unknown — UIs should not display when `None`.
@@ -1516,6 +1671,55 @@ pub struct WarningEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CompletionGateStartedEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub criteria_hash: String,
+    pub judge_model: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CompletionGateDecisionEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub criteria_hash: String,
+    pub judge_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub request_id: Option<String>,
+    pub latency_ms: u64,
+    pub allow_stop: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CompletionGateBlockedStopEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub criteria_hash: String,
+    pub judge_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub request_id: Option<String>,
+    pub latency_ms: u64,
+    pub reason: String,
+    pub continue_prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CompletionGateErrorEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub criteria_hash: String,
+    pub judge_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub request_id: Option<String>,
+    pub latency_ms: u64,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
@@ -1535,6 +1739,12 @@ pub struct ContextCompactedEvent;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {
+    pub turn_id: String,
+    pub last_agent_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct TurnCompleteDeferredByNonStopEvent {
     pub turn_id: String,
     pub last_agent_message: Option<String>,
 }
@@ -2861,6 +3071,25 @@ pub struct SessionConfiguredEvent {
     /// Path in which the rollout is stored. Can be `None` for ephemeral threads
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollout_path: Option<PathBuf>,
+
+    /// Fork-specific runtime override for sessions that must never stop
+    /// through normal completion logic.
+    pub non_stop: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion_gate: Option<CompletionGateInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq, Eq)]
+pub struct NonStopModeUpdatedEvent {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stop_attempt_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -3581,6 +3810,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
 
@@ -3600,6 +3831,7 @@ mod tests {
                 "history_log_id": 0,
                 "history_entry_count": 0,
                 "rollout_path": format!("{}", rollout_file.path().display()),
+                "non_stop": false,
             }
         });
         assert_eq!(expected, serde_json::to_value(&event)?);

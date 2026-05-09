@@ -13,6 +13,8 @@ pub(crate) const TURN_ABORTED_OPEN_TAG: &str = "<turn_aborted>";
 pub(crate) const TURN_ABORTED_CLOSE_TAG: &str = "</turn_aborted>";
 pub(crate) const SUBAGENT_NOTIFICATION_OPEN_TAG: &str = "<subagent_notification>";
 pub(crate) const SUBAGENT_NOTIFICATION_CLOSE_TAG: &str = "</subagent_notification>";
+pub(crate) const COMPLETION_GATE_FEEDBACK_OPEN_TAG: &str = "<completion_gate_feedback>";
+pub(crate) const COMPLETION_GATE_FEEDBACK_CLOSE_TAG: &str = "</completion_gate_feedback>";
 
 #[derive(Clone, Copy)]
 pub(crate) struct ContextualUserFragmentDefinition {
@@ -84,6 +86,11 @@ pub(crate) const SUBAGENT_NOTIFICATION_FRAGMENT: ContextualUserFragmentDefinitio
         SUBAGENT_NOTIFICATION_OPEN_TAG,
         SUBAGENT_NOTIFICATION_CLOSE_TAG,
     );
+pub(crate) const COMPLETION_GATE_FEEDBACK_FRAGMENT: ContextualUserFragmentDefinition =
+    ContextualUserFragmentDefinition::new(
+        COMPLETION_GATE_FEEDBACK_OPEN_TAG,
+        COMPLETION_GATE_FEEDBACK_CLOSE_TAG,
+    );
 
 const CONTEXTUAL_USER_FRAGMENTS: &[ContextualUserFragmentDefinition] = &[
     AGENTS_MD_FRAGMENT,
@@ -92,6 +99,7 @@ const CONTEXTUAL_USER_FRAGMENTS: &[ContextualUserFragmentDefinition] = &[
     USER_SHELL_COMMAND_FRAGMENT,
     TURN_ABORTED_FRAGMENT,
     SUBAGENT_NOTIFICATION_FRAGMENT,
+    COMPLETION_GATE_FEEDBACK_FRAGMENT,
 ];
 
 pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
@@ -128,6 +136,13 @@ mod tests {
             SUBAGENT_NOTIFICATION_FRAGMENT
                 .matches_text("<SUBAGENT_NOTIFICATION>{}</subagent_notification>")
         );
+    }
+
+    #[test]
+    fn detects_completion_gate_feedback_fragment() {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: "<completion_gate_feedback>\nbody\n</completion_gate_feedback>".to_string(),
+        }));
     }
 
     #[test]

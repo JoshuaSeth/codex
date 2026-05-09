@@ -7,6 +7,8 @@
 use super::*;
 use crate::app_event::AppEvent;
 use crate::app_event::ExitMode;
+use crate::app_event::NonStopSubmitMenuDefault;
+use crate::app_event::NonStopSubmitMode;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_event_sender::AppEventSender;
@@ -18,6 +20,7 @@ use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
 use codex_core::CodexAuth;
+use codex_core::DEEP_FORCE_CONTINUE_ITERATIONS;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
@@ -92,12 +95,15 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnCompleteDeferredByNonStopEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UndoCompletedEvent;
 use codex_protocol::protocol::UndoStartedEvent;
+use codex_protocol::protocol::UserMessageSource;
 use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::protocol::wrap_voice_transcript;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
@@ -110,11 +116,11 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
-#[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -188,6 +194,8 @@ async fn resumed_initial_messages_render_history() {
         ]),
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -291,6 +299,8 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
         })]),
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -351,6 +361,8 @@ async fn replayed_user_message_preserves_remote_image_urls() {
         })]),
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -413,6 +425,8 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: None,
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -460,6 +474,8 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
         })]),
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -512,6 +528,8 @@ async fn replayed_user_message_with_only_local_images_does_not_render_history_ce
         })]),
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
 
     chat.handle_codex_event(Event {
@@ -618,6 +636,8 @@ async fn submission_preserves_text_elements_and_local_images() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -701,6 +721,8 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -795,6 +817,8 @@ async fn enter_with_only_remote_images_submits_user_turn() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -859,6 +883,8 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -898,6 +924,8 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -937,6 +965,8 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -977,6 +1007,8 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: Some(rollout_file.path().to_path_buf()),
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "initial".into(),
@@ -1170,6 +1202,7 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
         remote_image_urls: remote_image_urls.clone(),
         text_elements: text_elements.clone(),
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     });
 
     assert_eq!(chat.bottom_pane.composer_text(), text);
@@ -1215,6 +1248,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: first_elements,
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     });
     chat.queued_user_messages.push_back(UserMessage {
         text: second_text,
@@ -1225,6 +1259,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: second_elements,
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     });
     chat.refresh_pending_input_preview();
 
@@ -1295,6 +1330,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     });
     chat.refresh_pending_input_preview();
 
@@ -1357,6 +1393,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         local_images: attachments,
         remote_image_urls: vec!["https://example.com/a.png".to_string()],
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1423,6 +1460,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         local_images: attachments,
         remote_image_urls: Vec::new(),
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1811,16 +1849,28 @@ async fn make_chatwidget_manual(
         retry_status_header: None,
         pending_status_indicator_restore: false,
         suppress_queue_autosend: false,
+        pause_queue_autosend_after_error: false,
         thread_id: None,
         thread_name: None,
         forked_from: None,
+        completion_gate: None,
+        completion_gate_last_decision: None,
+        completion_gate_last_error: None,
+        completion_gate_last_blocked_stop: None,
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
+        queued_non_stop_boundary_messages: VecDeque::new(),
+        queued_user_message_edit_active: false,
+        queued_user_messages_newer: VecDeque::new(),
         pending_steers: VecDeque::new(),
         queued_message_edit_binding: crate::key_hint::alt(KeyCode::Up),
         pending_model_selection: None,
+        pending_non_stop_override: None,
+        pending_voice_mode_override: None,
+        delayed_non_stop_messages: VecDeque::new(),
+        pending_deep_request_count: 0,
         suppress_session_configured_redraw: false,
         pending_notification: None,
         quit_shortcut_expires_at: None,
@@ -1939,6 +1989,33 @@ fn drain_insert_history(
         }
     }
     out
+}
+
+fn apply_chatwidget_app_events(
+    chat: &mut ChatWidget,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) {
+    let mut deferred = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::OpenNonStopTimedSubmitSelection { user_message } => {
+                chat.open_non_stop_timed_submit_selection(user_message);
+            }
+            AppEvent::SubmitNonStopUserMessage { user_message, mode } => {
+                chat.submit_non_stop_user_message(user_message, mode);
+            }
+            AppEvent::RestoreSubmittedDraft { user_message } => {
+                chat.restore_submitted_draft(user_message);
+            }
+            AppEvent::MaybeSendNextQueuedInput => {
+                chat.maybe_send_next_queued_input();
+            }
+            other => deferred.push(other),
+        }
+    }
+    for event in deferred {
+        chat.app_event_tx.send(event);
+    }
 }
 
 fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
@@ -2800,6 +2877,144 @@ async fn submit_user_message_with_mode_allows_same_mode_during_running_turn() {
 }
 
 #[tokio::test]
+async fn submit_user_message_with_mode_opens_selector_in_non_stop_mode() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+    let plan_mask =
+        collaboration_modes::mask_for_kind(chat.models_manager.as_ref(), ModeKind::Plan)
+            .expect("expected plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask.clone());
+    chat.on_task_started();
+
+    chat.submit_user_message_with_mode("Continue planning.".to_string(), plan_mask);
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(popup.contains("Running non-stop turn"));
+    assert!(popup.contains("Steer now"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            collaboration_mode:
+                Some(CollaborationMode {
+                    mode: ModeKind::Plan,
+                    ..
+                }),
+            personality: None,
+            ..
+        } => {}
+        other => panic!("expected Op::UserTurn with plan collab mode, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_enqueue_in_args_supports_minutes_seconds_and_hours() {
+    assert_eq!(
+        parse_enqueue_in_args("5 check later").unwrap(),
+        (std::time::Duration::from_secs(5 * 60), "check later")
+    );
+    assert_eq!(
+        parse_enqueue_in_args("30s check sooner").unwrap(),
+        (std::time::Duration::from_secs(30), "check sooner")
+    );
+    assert_eq!(
+        parse_enqueue_in_args("2h check much later").unwrap(),
+        (
+            std::time::Duration::from_secs(2 * 60 * 60),
+            "check much later"
+        )
+    );
+}
+
+#[tokio::test]
+async fn slash_enqueue_in_requires_non_stop_mode() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(
+        SlashCommand::EnqueueIn,
+        "5 continue later".to_string(),
+        Vec::new(),
+    );
+
+    assert!(chat.delayed_non_stop_messages.is_empty());
+    assert!(matches!(op_rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected enqueue-in error");
+    assert!(
+        rendered.contains("only available when `--non-stop` is enabled"),
+        "expected non-stop requirement error, got {rendered:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slash_enqueue_in_releases_as_steer_in_non_stop_mode() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+    chat.bottom_pane.set_composer_text(
+        "/enqueue-in 1 Continue after the timer.".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::EnqueueIn,
+        "1 Continue after the timer.".to_string(),
+        Vec::new(),
+    );
+
+    assert_eq!(chat.delayed_non_stop_messages.len(), 1);
+    assert!(chat.pending_steers.is_empty());
+    assert!(matches!(op_rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected enqueue-in confirmation");
+    assert!(
+        rendered.contains("Scheduled non-stop message release in 1m 00s."),
+        "expected scheduling confirmation, got {rendered:?}"
+    );
+
+    let release_at = chat
+        .delayed_non_stop_messages
+        .front()
+        .expect("expected scheduled non-stop message")
+        .release_at;
+    chat.release_due_scheduled_non_stop_messages_at(release_at);
+    assert!(chat.delayed_non_stop_messages.is_empty());
+    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(
+        chat.pending_steers.front().unwrap().user_message.text,
+        "Continue after the timer."
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => {
+            assert_eq!(
+                items,
+                vec![UserInput::Text {
+                    text: "Continue after the timer.".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected delayed Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn submit_user_message_with_mode_submits_when_plan_stream_is_not_active() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -3401,6 +3616,7 @@ fn pending_steer(text: &str) -> PendingSteer {
         compare_key: PendingSteerCompareKey {
             message: text.to_string(),
             image_count: 0,
+            source: UserMessageSource::Typed,
         },
     }
 }
@@ -3425,6 +3641,7 @@ fn complete_user_message_for_inputs(chat: &mut ChatWidget, item_id: &str, conten
             item: TurnItem::UserMessage(UserMessageItem {
                 id: item_id.to_string(),
                 content,
+                source: UserMessageSource::Typed,
             }),
         }),
     });
@@ -3526,20 +3743,95 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         composer: None,
         pending_steers: VecDeque::new(),
         queued_user_messages: VecDeque::new(),
+        queued_user_message_edit_active: false,
+        queued_user_messages_newer: VecDeque::new(),
+        delayed_non_stop_messages: VecDeque::new(),
+        queued_non_stop_boundary_messages: VecDeque::new(),
+        pause_queue_autosend_after_error: true,
+        non_stop: true,
+        voice_mode: false,
+        non_stop_expires_at: None,
+        non_stop_budget: None,
+        pending_non_stop_override: Some(NonStopModeOverride {
+            enabled: false,
+            expires_at: None,
+            budget: None,
+        }),
+        pending_voice_mode_override: None,
+        pending_deep_request_count: 2,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
         active_collaboration_mask: chat.active_collaboration_mask.clone(),
         agent_turn_running: true,
     }));
 
     assert!(chat.agent_turn_running);
+    assert!(chat.config.non_stop);
+    assert_eq!(
+        chat.pending_non_stop_override,
+        Some(NonStopModeOverride {
+            enabled: false,
+            expires_at: None,
+            budget: None,
+        })
+    );
+    assert_eq!(chat.pending_deep_request_count, 2);
     assert!(chat.turn_sleep_inhibitor.is_turn_running());
     assert!(chat.bottom_pane.is_task_running());
 
     chat.restore_thread_input_state(None);
 
     assert!(!chat.agent_turn_running);
+    assert_eq!(chat.pending_non_stop_override, None);
+    assert_eq!(chat.pending_deep_request_count, 0);
     assert!(!chat.turn_sleep_inhibitor.is_turn_running());
     assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn restore_thread_input_state_releases_overdue_delayed_non_stop_messages() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+    chat.bottom_pane.set_composer_text(
+        "/enqueue-in 1 Resume from restored state.".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::EnqueueIn,
+        "1 Resume from restored state.".to_string(),
+        Vec::new(),
+    );
+    let _ = drain_insert_history(&mut rx);
+    let mut input_state = chat
+        .capture_thread_input_state()
+        .expect("expected captured input state");
+    input_state
+        .delayed_non_stop_messages
+        .front_mut()
+        .expect("expected captured delayed non-stop message")
+        .release_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+    let (mut restored, _rx, mut restored_op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    restored.thread_id = Some(ThreadId::new());
+    restored.config.non_stop = true;
+    restored.restore_thread_input_state(Some(input_state));
+
+    assert!(restored.delayed_non_stop_messages.is_empty());
+    assert_eq!(restored.pending_steers.len(), 1);
+    assert_eq!(
+        restored.pending_steers.front().unwrap().user_message.text,
+        "Resume from restored state."
+    );
+    assert_matches!(
+        next_submit_op(&mut restored_op_rx),
+        Op::UserTurn { items, .. } if items == vec![UserInput::Text {
+            text: "Resume from restored state.".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -3573,6 +3865,142 @@ async fn alt_up_edits_most_recent_queued_message() {
         chat.queued_user_messages.front().unwrap().text,
         "first queued"
     );
+}
+
+#[tokio::test]
+async fn alt_up_walks_back_to_older_queued_message_without_dropping_newer_follow_ups() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.queued_message_edit_binding = crate::key_hint::alt(KeyCode::Up);
+    chat.bottom_pane
+        .set_queued_message_edit_binding(crate::key_hint::alt(KeyCode::Up));
+    chat.bottom_pane.set_task_running(true);
+
+    for message in [
+        "first queued",
+        "second queued",
+        "third queued",
+        "fourth queued",
+    ] {
+        chat.queued_user_messages
+            .push_back(UserMessage::from(message));
+    }
+    chat.refresh_pending_input_preview();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "fourth queued");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec![
+            "first queued".to_string(),
+            "second queued".to_string(),
+            "third queued".to_string(),
+        ]
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "third queued");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec![
+            "first queued".to_string(),
+            "second queued".to_string(),
+            "fourth queued".to_string(),
+        ]
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(chat.bottom_pane.composer_text(), "second queued");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec![
+            "first queued".to_string(),
+            "third queued".to_string(),
+            "fourth queued".to_string(),
+        ]
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec![
+            "first queued".to_string(),
+            "second queued".to_string(),
+            "third queued".to_string(),
+            "fourth queued".to_string(),
+        ]
+    );
+    assert!(!chat.queued_user_message_edit_active);
+    assert!(chat.queued_user_messages_newer.is_empty());
+}
+
+#[tokio::test]
+async fn restore_thread_input_state_preserves_queued_edit_context_and_newer_follow_ups() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.queued_message_edit_binding = crate::key_hint::alt(KeyCode::Up);
+    chat.bottom_pane
+        .set_queued_message_edit_binding(crate::key_hint::alt(KeyCode::Up));
+    chat.bottom_pane.set_task_running(true);
+
+    for message in ["first queued", "second queued", "third queued"] {
+        chat.queued_user_messages
+            .push_back(UserMessage::from(message));
+    }
+    chat.refresh_pending_input_preview();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    let input_state = chat
+        .capture_thread_input_state()
+        .expect("expected thread input state");
+
+    let (mut restored, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    restored.queued_message_edit_binding = crate::key_hint::alt(KeyCode::Up);
+    restored
+        .bottom_pane
+        .set_queued_message_edit_binding(crate::key_hint::alt(KeyCode::Up));
+    restored.restore_thread_input_state(Some(input_state));
+
+    assert_eq!(restored.bottom_pane.composer_text(), "second queued");
+    assert!(restored.queued_user_message_edit_active);
+    assert_eq!(
+        restored.queued_user_message_texts(),
+        vec!["first queued".to_string(), "third queued".to_string()]
+    );
+
+    restored.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(restored.bottom_pane.composer_text(), "first queued");
+    assert_eq!(
+        restored.queued_user_message_texts(),
+        vec!["second queued".to_string(), "third queued".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn queued_edit_context_blocks_queue_autosend_until_edit_finishes() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.queued_message_edit_binding = crate::key_hint::alt(KeyCode::Up);
+    chat.bottom_pane
+        .set_queued_message_edit_binding(crate::key_hint::alt(KeyCode::Up));
+    chat.bottom_pane.set_task_running(true);
+
+    for message in ["first queued", "second queued", "third queued"] {
+        chat.queued_user_messages
+            .push_back(UserMessage::from(message));
+    }
+    chat.refresh_pending_input_preview();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+
+    chat.bottom_pane.set_task_running(false);
+    chat.maybe_send_next_queued_input();
+
+    assert_eq!(chat.bottom_pane.composer_text(), "second queued");
+    assert_eq!(
+        chat.queued_user_message_texts(),
+        vec!["first queued".to_string(), "third queued".to_string()]
+    );
+    assert_no_submit_op(&mut op_rx);
 }
 
 async fn assert_shift_left_edits_most_recent_queued_message_for_terminal(
@@ -3911,6 +4339,204 @@ async fn enter_queues_follow_up_while_turn_is_running_without_streaming() {
 }
 
 #[tokio::test]
+async fn non_stop_submit_selection_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.open_non_stop_submit_selection(
+        "steer while running".into(),
+        NonStopSubmitMenuDefault::SteerNow,
+    );
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("non_stop_submit_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn non_stop_timed_submit_selection_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.open_non_stop_timed_submit_selection("release later".into());
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("non_stop_timed_submit_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn enter_while_turn_is_running_in_non_stop_mode_opens_submit_selector() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("steer while running".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.queued_non_stop_boundary_messages.is_empty());
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(popup.contains("Running non-stop turn"));
+    assert!(popup.contains("Steer now"));
+    assert!(popup.contains("After next normal stop"));
+}
+
+#[tokio::test]
+async fn confirming_default_non_stop_submit_selector_steers_immediately() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("steer while running".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(
+        chat.pending_steers.front().unwrap().user_message.text,
+        "steer while running"
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "steer while running".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn selecting_timed_release_from_non_stop_submit_selector_schedules_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("release later".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+
+    assert!(chat.pending_steers.is_empty());
+    assert_eq!(chat.delayed_non_stop_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+    let remaining = chat
+        .delayed_non_stop_messages
+        .front()
+        .expect("expected timed message")
+        .release_at
+        .saturating_duration_since(Instant::now());
+    assert!(
+        remaining.as_secs() >= 299 && remaining.as_secs() <= 300,
+        "expected about a 5 minute delay, got {remaining:?}"
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected timed scheduling confirmation");
+    assert!(rendered.contains("Scheduled non-stop message release in 5m 00s."));
+}
+
+#[tokio::test]
+async fn explicit_queue_shortcut_queues_for_next_normal_stop_in_non_stop_mode() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("queue while running".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+
+    assert!(chat.queued_user_messages.is_empty());
+    assert_eq!(chat.queued_non_stop_boundary_messages.len(), 1);
+    assert_eq!(
+        chat.queued_non_stop_boundary_messages.front().unwrap().text,
+        "queue while running"
+    );
+    assert!(chat.pending_steers.is_empty());
+    assert_no_submit_op(&mut op_rx);
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected next-stop queue confirmation");
+    assert!(rendered.contains("Queued message for the next normal stop boundary."));
+
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnCompleteDeferredByNonStop(TurnCompleteDeferredByNonStopEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("done for now".to_string()),
+        }),
+    });
+
+    assert!(chat.queued_non_stop_boundary_messages.is_empty());
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queue while running".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn next_normal_stop_message_promotes_into_regular_queue_on_real_turn_complete() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.non_stop = true;
+    chat.on_task_started();
+
+    chat.submit_non_stop_user_message(
+        "after the next stop".into(),
+        NonStopSubmitMode::AfterNextNormalStop,
+    );
+    assert_eq!(chat.queued_non_stop_boundary_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+
+    while rx.try_recv().is_ok() {}
+    chat.on_task_complete(Some("done".to_string()), false);
+
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::MaybeSendNextQueuedInput) {
+            chat.maybe_send_next_queued_input();
+        }
+    }
+
+    assert!(chat.queued_non_stop_boundary_messages.is_empty());
+    assert!(chat.queued_user_messages.is_empty());
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "after the next stop".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn enter_queues_follow_up_while_final_answer_stream_is_active() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -4035,6 +4661,7 @@ fn rendered_user_message_event_from_inputs_matches_flattened_user_message_shape(
             ],
             vec![local_image],
             vec!["https://example.com/remote.png".to_string()],
+            UserMessageSource::Typed,
         )
     );
 }
@@ -4095,6 +4722,7 @@ async fn item_completed_pops_pending_steer_with_local_image_and_text_elements() 
         remote_image_urls: Vec::new(),
         text_elements,
         mention_bindings: Vec::new(),
+        source: UserMessageSource::Typed,
     });
 
     match next_submit_op(&mut op_rx) {
@@ -4215,6 +4843,92 @@ async fn enter_during_final_stream_preserves_queued_follow_up_order() {
         }]
     );
     assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn usage_limit_error_pauses_queued_follow_up_autosend() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.queued_user_messages
+        .push_back("first queued follow-up".into());
+    chat.queued_user_messages
+        .push_back("second queued follow-up".into());
+
+    drain_insert_history(&mut rx);
+    chat.handle_codex_event(Event {
+        id: "usage-limit".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "You've hit your usage limit.".to_string(),
+            codex_error_info: Some(CodexErrorInfo::UsageLimitExceeded),
+        }),
+    });
+
+    assert!(chat.pause_queue_autosend_after_error);
+    assert_eq!(chat.queued_user_messages.len(), 2);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "first queued follow-up"
+    );
+    assert_eq!(
+        chat.queued_user_messages.back().unwrap().text,
+        "second queued follow-up"
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    chat.maybe_send_next_queued_input();
+    assert_eq!(chat.queued_user_messages.len(), 2);
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn explicit_send_after_error_resumes_paused_queue() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.queued_user_messages
+        .push_back("queued follow-up".into());
+
+    drain_insert_history(&mut rx);
+    chat.handle_codex_event(Event {
+        id: "usage-limit".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "You've hit your usage limit.".to_string(),
+            codex_error_info: Some(CodexErrorInfo::UsageLimitExceeded),
+        }),
+    });
+
+    assert!(chat.pause_queue_autosend_after_error);
+    assert_no_submit_op(&mut op_rx);
+
+    chat.submit_user_message_direct("manual recovery prompt".into());
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "manual recovery prompt".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(!chat.pause_queue_autosend_after_error);
+
+    chat.on_task_started();
+    chat.on_task_complete(None, false);
+    apply_chatwidget_app_events(&mut chat, &mut rx);
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued follow-up".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -5260,6 +5974,8 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
         initial_messages: None,
         network_proxy: None,
         rollout_path: None,
+        non_stop: false,
+        completion_gate: None,
     };
     chat.handle_codex_event(Event {
         id: "configured".into(),
@@ -5823,6 +6539,760 @@ async fn slash_rollout_displays_current_path() {
     assert!(
         rendered.contains(&rollout_path.display().to_string()),
         "expected rollout path to be shown: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn slash_completion_criteria_sets_gate_and_emits_override() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(
+        SlashCommand::CompletionCriteria,
+        "Stop only after the tests pass.".to_string(),
+        Vec::new(),
+    );
+
+    let override_op = op_rx.try_recv().expect("expected completion gate override");
+    match override_op {
+        Op::OverrideTurnContext {
+            completion_gate: Some(update),
+            ..
+        } => {
+            assert_eq!(
+                update,
+                codex_protocol::protocol::CompletionGateSettingsUpdate {
+                    criteria: Some(Some("Stop only after the tests pass.".to_string())),
+                    judge_model: None,
+                    judge_base_url: None,
+                    judge_api_key_env: None,
+                    timeout_ms: None,
+                    max_retries: None,
+                    max_assistant_messages: None,
+                    max_user_messages: None,
+                }
+            );
+        }
+        other => panic!("expected completion gate override, got {other:?}"),
+    }
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected completion gate info message");
+    assert!(
+        rendered.contains("Completion gate enabled"),
+        "expected completion gate confirmation, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Stop only after the tests pass."),
+        "expected completion gate criterion in message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_status_reports_current_value() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command(SlashCommand::NonStop);
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected non-stop status message");
+    assert!(
+        rendered.contains("Non-stop mode is disabled."),
+        "expected disabled non-stop status, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_voice_status_reports_current_value() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command(SlashCommand::Voice);
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected voice status message");
+    assert_snapshot!("slash_voice_status_reports_current_value", rendered);
+}
+
+#[tokio::test]
+#[serial]
+async fn slash_voice_on_without_auth_reports_error() {
+    struct EnvRestore {
+        speech_token: Option<String>,
+        dispatch_token: Option<String>,
+        basic_auth: Option<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.speech_token.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_CODEX_SPEECH_TOKEN", value),
+                    None => std::env::remove_var("PITCHAI_CODEX_SPEECH_TOKEN"),
+                }
+                match self.dispatch_token.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_DISPATCH_TOKEN", value),
+                    None => std::env::remove_var("PITCHAI_DISPATCH_TOKEN"),
+                }
+                match self.basic_auth.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH", value),
+                    None => std::env::remove_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH"),
+                }
+            }
+        }
+    }
+
+    let _env_restore = EnvRestore {
+        speech_token: std::env::var("PITCHAI_CODEX_SPEECH_TOKEN").ok(),
+        dispatch_token: std::env::var("PITCHAI_DISPATCH_TOKEN").ok(),
+        basic_auth: std::env::var("PITCHAI_CODEX_SPEECH_BASIC_AUTH").ok(),
+    };
+    unsafe {
+        std::env::remove_var("PITCHAI_CODEX_SPEECH_TOKEN");
+        std::env::remove_var("PITCHAI_DISPATCH_TOKEN");
+        std::env::remove_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH");
+    }
+
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Voice, "on".to_string(), Vec::new());
+
+    assert!(!chat.config.voice_mode);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected voice error message");
+    assert!(
+        rendered.contains("Voice mode requires Dispatcher speech auth"),
+        "expected voice auth error, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn slash_voice_on_with_auth_keeps_non_stop_disabled() {
+    struct EnvRestore {
+        speech_token: Option<String>,
+        dispatch_token: Option<String>,
+        basic_auth: Option<String>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match self.speech_token.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_CODEX_SPEECH_TOKEN", value),
+                    None => std::env::remove_var("PITCHAI_CODEX_SPEECH_TOKEN"),
+                }
+                match self.dispatch_token.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_DISPATCH_TOKEN", value),
+                    None => std::env::remove_var("PITCHAI_DISPATCH_TOKEN"),
+                }
+                match self.basic_auth.as_ref() {
+                    Some(value) => std::env::set_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH", value),
+                    None => std::env::remove_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH"),
+                }
+            }
+        }
+    }
+
+    let _env_restore = EnvRestore {
+        speech_token: std::env::var("PITCHAI_CODEX_SPEECH_TOKEN").ok(),
+        dispatch_token: std::env::var("PITCHAI_DISPATCH_TOKEN").ok(),
+        basic_auth: std::env::var("PITCHAI_CODEX_SPEECH_BASIC_AUTH").ok(),
+    };
+    unsafe {
+        std::env::set_var("PITCHAI_CODEX_SPEECH_TOKEN", "test-voice-token");
+        std::env::remove_var("PITCHAI_DISPATCH_TOKEN");
+        std::env::remove_var("PITCHAI_CODEX_SPEECH_BASIC_AUTH");
+    }
+
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Voice, "on".to_string(), Vec::new());
+
+    assert!(chat.config.voice_mode);
+    assert!(!chat.config.non_stop);
+    assert_eq!(chat.config.non_stop_expires_at, None);
+    assert_matches!(op_rx.try_recv(), Ok(Op::SetVoiceMode { enabled: true }));
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected voice enable message");
+    assert_snapshot!("slash_voice_on_with_auth_keeps_non_stop_disabled", rendered);
+}
+
+#[tokio::test]
+async fn slash_voice_off_updates_runtime_override_and_emits_override() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.voice_mode = true;
+    chat.config.non_stop = true;
+
+    chat.dispatch_command_with_args(SlashCommand::Voice, "off".to_string(), Vec::new());
+
+    assert!(!chat.config.voice_mode);
+    assert!(chat.config.non_stop);
+    assert_matches!(op_rx.try_recv(), Ok(Op::SetVoiceMode { enabled: false }));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected voice disable message");
+    assert!(
+        rendered.contains("Voice mode disabled"),
+        "expected voice disable confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_voice_queues_while_task_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command_with_args(SlashCommand::Voice, "on".to_string(), Vec::new());
+
+    assert_eq!(chat.pending_voice_mode_override, Some(true));
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected queued voice message");
+    assert_snapshot!("slash_voice_queues_while_task_running", rendered);
+}
+
+#[tokio::test]
+async fn slash_voice_input_submits_wrapped_transcript_and_renders_voice_history() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command_with_args(
+        SlashCommand::VoiceInput,
+        "spoken operator follow-up from the browser voice cockpit".to_string(),
+        Vec::new(),
+    );
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: wrap_voice_transcript(
+                    "spoken operator follow-up from the browser voice cockpit"
+                ),
+                text_elements: Vec::new(),
+            }]
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected voice transcript history");
+    assert_snapshot!(
+        "slash_voice_input_submits_wrapped_transcript_and_renders_voice_history",
+        rendered
+    );
+}
+
+#[tokio::test]
+async fn slash_voice_input_clears_composer_after_submit() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.bottom_pane.set_composer_text(
+        "/voice-input spoken operator follow-up from the browser voice cockpit".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: wrap_voice_transcript(
+                    "spoken operator follow-up from the browser voice cockpit"
+                ),
+                text_elements: Vec::new(),
+            }]
+    );
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+}
+
+#[tokio::test]
+async fn slash_voice_input_running_turn_steers_immediately() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.voice_mode = true;
+    chat.on_task_started();
+
+    chat.dispatch_command_with_args(
+        SlashCommand::VoiceInput,
+        "spoken operator follow-up from the browser voice cockpit".to_string(),
+        Vec::new(),
+    );
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: wrap_voice_transcript(
+                    "spoken operator follow-up from the browser voice cockpit"
+                ),
+                text_elements: Vec::new(),
+            }]
+    );
+    assert_eq!(chat.pending_steers.len(), 1);
+    assert_eq!(
+        chat.pending_steers[0].user_message.source,
+        UserMessageSource::Voice
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected immediate voice transcript history");
+    assert_snapshot!(
+        "slash_voice_input_running_turn_renders_immediately",
+        rendered
+    );
+}
+
+#[tokio::test]
+async fn slash_voice_input_running_turn_dedupes_committed_user_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.voice_mode = true;
+    chat.on_task_started();
+
+    chat.dispatch_command_with_args(
+        SlashCommand::VoiceInput,
+        "spoken operator follow-up from the browser voice cockpit".to_string(),
+        Vec::new(),
+    );
+
+    assert_matches!(op_rx.try_recv(), Ok(Op::UserTurn { .. }));
+    let _ = drain_insert_history(&mut rx);
+
+    complete_user_message_for_inputs(
+        &mut chat,
+        "user-voice-1",
+        vec![UserInput::Text {
+            text: wrap_voice_transcript("spoken operator follow-up from the browser voice cockpit"),
+            text_elements: Vec::new(),
+        }],
+    );
+
+    assert!(chat.pending_steers.is_empty());
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "committed voice transcript should not render twice"
+    );
+}
+
+#[tokio::test]
+async fn slash_deep_sets_pending_turn_count() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(SlashCommand::Deep, "2".to_string(), Vec::new());
+
+    assert_eq!(chat.pending_deep_request_count, 2);
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected deep status message");
+    assert_snapshot!("slash_deep_sets_pending_turn_count", rendered);
+}
+
+#[tokio::test]
+async fn deep_budget_arms_next_new_turns_only() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.dispatch_command_with_args(SlashCommand::Deep, "2".to_string(), Vec::new());
+
+    chat.submit_user_message_direct("first".into());
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNextTurnDeepFollowUpBudget { budget })
+            if budget == DEEP_FORCE_CONTINUE_ITERATIONS
+    );
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: "first".to_string(),
+                text_elements: Vec::new(),
+            }]
+    );
+    assert_eq!(chat.pending_deep_request_count, 1);
+    while op_rx.try_recv().is_ok() {}
+
+    chat.submit_user_message_direct("second".into());
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNextTurnDeepFollowUpBudget { budget })
+            if budget == DEEP_FORCE_CONTINUE_ITERATIONS
+    );
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: "second".to_string(),
+                text_elements: Vec::new(),
+            }]
+    );
+    assert_eq!(chat.pending_deep_request_count, 0);
+    while op_rx.try_recv().is_ok() {}
+
+    chat.submit_user_message_direct("third".into());
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: "third".to_string(),
+                text_elements: Vec::new(),
+            }]
+    );
+    while let Ok(op) = op_rx.try_recv() {
+        assert!(
+            !matches!(op, Op::SetNextTurnDeepFollowUpBudget { .. }),
+            "unexpected deep budget op after budget exhausted: {op:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deep_budget_does_not_consume_on_live_steer() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.agent_turn_running = true;
+    chat.bottom_pane.set_task_running(true);
+    chat.pending_deep_request_count = 1;
+
+    chat.submit_user_message_direct("steer now".into());
+
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::UserTurn { items, .. })
+            if items == vec![UserInput::Text {
+                text: "steer now".to_string(),
+                text_elements: Vec::new(),
+            }]
+    );
+    assert_eq!(chat.pending_deep_request_count, 1);
+    while let Ok(op) = op_rx.try_recv() {
+        assert!(
+            !matches!(op, Op::SetNextTurnDeepFollowUpBudget { .. }),
+            "unexpected deep budget op for steer submission: {op:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn slash_non_stop_status_reports_elapsed_timeout() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.non_stop = true;
+    chat.config.non_stop_expires_at = Some(codex_core::current_unix_timestamp() - 1);
+
+    chat.dispatch_command(SlashCommand::NonStop);
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected non-stop status message");
+    assert_snapshot!("slash_non_stop_status_elapsed_timeout", rendered);
+    assert!(
+        rendered.contains("timeout has elapsed"),
+        "expected elapsed-timeout hint, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_on_updates_runtime_override_and_emits_override() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "on".to_string(), Vec::new());
+
+    assert!(chat.config.non_stop);
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNonStopMode {
+            enabled: true,
+            expires_at: None,
+        })
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected non-stop enable message");
+    assert!(
+        rendered.contains("Non-stop mode enabled"),
+        "expected enable confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_duration_updates_runtime_override_and_emits_override() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    let before = codex_core::current_unix_timestamp();
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "30m".to_string(), Vec::new());
+
+    assert!(chat.config.non_stop);
+    let expires_at = chat
+        .config
+        .non_stop_expires_at
+        .expect("expected timed non-stop deadline");
+    assert!((before + 1795..=before + 1805).contains(&expires_at));
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNonStopMode {
+            enabled: true,
+            expires_at: Some(value),
+        }) if value == expires_at
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected timed non-stop enable message");
+    assert!(
+        rendered.contains("Timed non-stop mode enabled"),
+        "expected timed enable confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_off_updates_runtime_override_and_emits_override() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.non_stop = true;
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "off".to_string(), Vec::new());
+
+    assert!(!chat.config.non_stop);
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNonStopMode {
+            enabled: false,
+            expires_at: None,
+        })
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected non-stop disable message");
+    assert!(
+        rendered.contains("Non-stop mode disabled"),
+        "expected disable confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_queues_while_task_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "on".to_string(), Vec::new());
+
+    assert_eq!(
+        chat.pending_non_stop_override,
+        Some(NonStopModeOverride {
+            enabled: true,
+            expires_at: None,
+            budget: None,
+        })
+    );
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected queued non-stop message");
+    assert_snapshot!("slash_non_stop_queues_while_task_running", rendered);
+    assert!(
+        rendered.contains("Queued non-stop change"),
+        "expected queued non-stop confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_non_stop_off_applies_immediately_while_non_stop_turn_is_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.non_stop = true;
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "off".to_string(), Vec::new());
+
+    assert!(!chat.config.non_stop);
+    assert_eq!(chat.pending_non_stop_override, None);
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNonStopMode {
+            enabled: false,
+            expires_at: None,
+        })
+    );
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected non-stop disable message");
+    assert_snapshot!(
+        "slash_non_stop_off_applies_immediately_while_non_stop_turn_is_running",
+        rendered
+    );
+    assert!(
+        rendered.contains("Non-stop mode disabled"),
+        "expected immediate disable confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_enqueue_in_rejects_after_non_stop_timeout() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.config.non_stop = true;
+    chat.config.non_stop_expires_at = Some(codex_core::current_unix_timestamp() - 1);
+
+    chat.dispatch_command_with_args(
+        SlashCommand::EnqueueIn,
+        "1 Resume later.".to_string(),
+        Vec::new(),
+    );
+
+    assert!(chat.delayed_non_stop_messages.is_empty());
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|lines| lines_to_single_string(lines))
+        .expect("expected enqueue-in error message");
+    assert!(
+        rendered.contains("currently active"),
+        "expected inactive non-stop error, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn queued_non_stop_override_is_applied_before_next_queued_message() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command_with_args(SlashCommand::NonStop, "on".to_string(), Vec::new());
+    assert_eq!(
+        chat.pending_non_stop_override,
+        Some(NonStopModeOverride {
+            enabled: true,
+            expires_at: None,
+            budget: None,
+        })
+    );
+
+    chat.queued_user_messages.push_back("hello".into());
+    chat.refresh_pending_input_preview();
+
+    while rx.try_recv().is_ok() {}
+
+    chat.on_task_complete(None, false);
+
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AppEvent::MaybeSendNextQueuedInput) {
+            chat.maybe_send_next_queued_input();
+        }
+    }
+
+    assert!(chat.config.non_stop);
+    assert_eq!(chat.pending_non_stop_override, None);
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::SetNonStopMode {
+            enabled: true,
+            expires_at: None,
+        })
+    );
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+}
+
+#[tokio::test]
+async fn slash_completion_criteria_clear_disables_gate() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+
+    chat.dispatch_command_with_args(
+        SlashCommand::CompletionCriteria,
+        "Stop only after the tests pass.".to_string(),
+        Vec::new(),
+    );
+    let _ = op_rx
+        .try_recv()
+        .expect("expected initial completion gate override");
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command_with_args(
+        SlashCommand::CompletionCriteria,
+        "clear".to_string(),
+        Vec::new(),
+    );
+
+    let override_op = op_rx.try_recv().expect("expected clear override");
+    match override_op {
+        Op::OverrideTurnContext {
+            completion_gate: Some(update),
+            ..
+        } => {
+            assert_eq!(
+                update,
+                codex_protocol::protocol::CompletionGateSettingsUpdate {
+                    criteria: Some(None),
+                    judge_model: None,
+                    judge_base_url: None,
+                    judge_api_key_env: None,
+                    timeout_ms: None,
+                    max_retries: None,
+                    max_assistant_messages: None,
+                    max_user_messages: None,
+                }
+            );
+        }
+        other => panic!("expected completion gate clear override, got {other:?}"),
+    }
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected completion gate clear message");
+    assert!(
+        rendered.contains("Completion gate disabled"),
+        "expected completion gate clear confirmation, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_completion_criteria_is_available_while_task_running() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.bottom_pane.set_task_running(true);
+
+    chat.dispatch_command_with_args(
+        SlashCommand::CompletionCriteria,
+        "Stop only after verification.".to_string(),
+        Vec::new(),
+    );
+
+    assert!(
+        matches!(
+            op_rx.try_recv(),
+            Ok(Op::OverrideTurnContext {
+                completion_gate: Some(_),
+                ..
+            })
+        ),
+        "expected completion gate override while task is running"
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .last()
+        .map(|cell| lines_to_single_string(cell))
+        .expect("expected completion gate status message");
+    assert!(
+        !rendered.contains("disabled while a task is in progress"),
+        "completion gate should remain available during task execution"
     );
 }
 
@@ -7129,6 +8599,31 @@ async fn server_overloaded_error_does_not_switch_models() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn server_overloaded_error_pauses_queued_follow_up_autosend() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.queued_user_messages
+        .push_back("queued after overload".into());
+
+    drain_insert_history(&mut rx);
+    chat.handle_codex_event(Event {
+        id: "err-overloaded".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "server overloaded".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+        }),
+    });
+
+    assert!(chat.pause_queue_autosend_after_error);
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+    chat.maybe_send_next_queued_input();
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]

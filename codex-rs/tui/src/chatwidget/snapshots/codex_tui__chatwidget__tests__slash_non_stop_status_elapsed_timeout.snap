@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• Non-stop mode is enabled with an expired timeout. The timeout has elapsed. Codex will stop at the next normal final answer instead of auto-continuing.

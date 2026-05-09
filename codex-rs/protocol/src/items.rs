@@ -7,7 +7,9 @@ use crate::protocol::ContextCompactedEvent;
 use crate::protocol::EventMsg;
 use crate::protocol::ImageGenerationEndEvent;
 use crate::protocol::UserMessageEvent;
+use crate::protocol::UserMessageSource;
 use crate::protocol::WebSearchEndEvent;
+use crate::protocol::unwrap_voice_transcript;
 use crate::user_input::ByteRange;
 use crate::user_input::TextElement;
 use crate::user_input::UserInput;
@@ -33,6 +35,8 @@ pub enum TurnItem {
 pub struct UserMessageItem {
     pub id: String,
     pub content: Vec<UserInput>,
+    #[serde(default)]
+    pub source: UserMessageSource,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -116,9 +120,11 @@ impl Default for ContextCompactionItem {
 
 impl UserMessageItem {
     pub fn new(content: &[UserInput]) -> Self {
+        let source = detect_user_message_source(content);
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             content: content.to_vec(),
+            source,
         }
     }
 
@@ -126,7 +132,7 @@ impl UserMessageItem {
         // Legacy user-message events flatten only text inputs into `message` and
         // rebase text element ranges onto that concatenated text.
         EventMsg::UserMessage(UserMessageEvent {
-            message: self.message(),
+            message: self.raw_message(),
             images: Some(self.image_urls()),
             local_images: self.local_image_paths(),
             text_elements: self.text_elements(),
@@ -134,6 +140,15 @@ impl UserMessageItem {
     }
 
     pub fn message(&self) -> String {
+        let message = self.raw_message();
+        if self.source == UserMessageSource::Voice {
+            unwrap_voice_transcript(&message).unwrap_or(message)
+        } else {
+            message
+        }
+    }
+
+    pub fn raw_message(&self) -> String {
         self.content
             .iter()
             .map(|c| match c {
@@ -189,6 +204,17 @@ impl UserMessageItem {
                 _ => None,
             })
             .collect()
+    }
+}
+
+fn detect_user_message_source(content: &[UserInput]) -> UserMessageSource {
+    let Some([UserInput::Text { text, .. }]) = content.first_chunk::<1>() else {
+        return UserMessageSource::Typed;
+    };
+    if unwrap_voice_transcript(text).is_some() {
+        UserMessageSource::Voice
+    } else {
+        UserMessageSource::Typed
     }
 }
 
@@ -281,5 +307,27 @@ impl TurnItem {
             TurnItem::Reasoning(item) => item.as_legacy_events(show_raw_agent_reasoning),
             TurnItem::ContextCompaction(item) => vec![item.as_legacy_event()],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::wrap_voice_transcript;
+
+    #[test]
+    fn voice_wrapped_user_message_uses_voice_source_and_unwrapped_legacy_text() {
+        let item = UserMessageItem::new(&[UserInput::Text {
+            text: wrap_voice_transcript("hello from voice"),
+            text_elements: Vec::new(),
+        }]);
+
+        assert_eq!(item.source, UserMessageSource::Voice);
+        assert_eq!(item.message(), "hello from voice".to_string());
+
+        let EventMsg::UserMessage(event) = item.as_legacy_event() else {
+            panic!("expected user message event");
+        };
+        assert_eq!(event.message, wrap_voice_transcript("hello from voice"));
     }
 }

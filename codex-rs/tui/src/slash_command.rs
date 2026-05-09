@@ -38,6 +38,16 @@ pub enum SlashCommand {
     Copy,
     Mention,
     Status,
+    #[strum(serialize = "non-stop")]
+    NonStop,
+    Voice,
+    #[strum(serialize = "voice-input")]
+    VoiceInput,
+    Deep,
+    #[strum(serialize = "completion-criteria")]
+    CompletionCriteria,
+    #[strum(serialize = "enqueue-in")]
+    EnqueueIn,
     DebugConfig,
     Statusline,
     Theme,
@@ -84,6 +94,18 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::NonStop => "enable, disable, time-bound, or inspect non-stop mode",
+            SlashCommand::Voice => "enable, disable, or inspect continuous voice mode",
+            SlashCommand::VoiceInput => "submit a live voice transcript",
+            SlashCommand::Deep => {
+                "force the next n new turns through 4 extra candidate-stop checks"
+            }
+            SlashCommand::CompletionCriteria => {
+                "set, clear, or inspect the completion gate criterion"
+            }
+            SlashCommand::EnqueueIn => {
+                "schedule a delayed user message release for a non-stop turn"
+            }
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
@@ -128,6 +150,12 @@ impl SlashCommand {
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Fast
+                | SlashCommand::NonStop
+                | SlashCommand::Voice
+                | SlashCommand::VoiceInput
+                | SlashCommand::Deep
+                | SlashCommand::CompletionCriteria
+                | SlashCommand::EnqueueIn
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -161,6 +189,12 @@ impl SlashCommand {
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::NonStop
+            | SlashCommand::Voice
+            | SlashCommand::VoiceInput
+            | SlashCommand::Deep
+            | SlashCommand::CompletionCriteria
+            | SlashCommand::EnqueueIn
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Clean

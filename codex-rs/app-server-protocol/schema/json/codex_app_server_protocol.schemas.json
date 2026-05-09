@@ -1868,6 +1868,194 @@
           "type": "object"
         },
         {
+          "description": "Completion gate started judging a candidate stop boundary.",
+          "properties": {
+            "criteria_hash": {
+              "type": "string"
+            },
+            "judge_model": {
+              "type": "string"
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "completion_gate_started"
+              ],
+              "title": "CompletionGateStartedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria_hash",
+            "judge_model",
+            "thread_id",
+            "turn_id",
+            "type"
+          ],
+          "title": "CompletionGateStartedEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Completion gate produced an allow/deny decision.",
+          "properties": {
+            "allow_stop": {
+              "type": "boolean"
+            },
+            "criteria_hash": {
+              "type": "string"
+            },
+            "judge_model": {
+              "type": "string"
+            },
+            "latency_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "completion_gate_decision"
+              ],
+              "title": "CompletionGateDecisionEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "allow_stop",
+            "criteria_hash",
+            "judge_model",
+            "latency_ms",
+            "reason",
+            "thread_id",
+            "turn_id",
+            "type"
+          ],
+          "title": "CompletionGateDecisionEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Completion gate denied stop and injected a continuation prompt.",
+          "properties": {
+            "continue_prompt": {
+              "type": "string"
+            },
+            "criteria_hash": {
+              "type": "string"
+            },
+            "judge_model": {
+              "type": "string"
+            },
+            "latency_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "completion_gate_blocked_stop"
+              ],
+              "title": "CompletionGateBlockedStopEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "continue_prompt",
+            "criteria_hash",
+            "judge_model",
+            "latency_ms",
+            "reason",
+            "thread_id",
+            "turn_id",
+            "type"
+          ],
+          "title": "CompletionGateBlockedStopEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Completion gate failed closed while evaluating a candidate stop.",
+          "properties": {
+            "criteria_hash": {
+              "type": "string"
+            },
+            "judge_model": {
+              "type": "string"
+            },
+            "latency_ms": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thread_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "completion_gate_error"
+              ],
+              "title": "CompletionGateErrorEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "criteria_hash",
+            "judge_model",
+            "latency_ms",
+            "message",
+            "thread_id",
+            "turn_id",
+            "type"
+          ],
+          "title": "CompletionGateErrorEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Realtime conversation lifecycle start event.",
           "properties": {
             "session_id": {
@@ -2065,6 +2253,69 @@
             "type"
           ],
           "title": "TaskCompleteEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Agent would have completed the turn here, but `--non-stop` forced one more follow-up round instead.\n\nThis is a fork-specific boundary marker for UIs that want to inject a message exactly at the next \"normal stop\" point without allowing the turn to finish yet.",
+          "properties": {
+            "last_agent_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "turn_complete_deferred_by_non_stop"
+              ],
+              "title": "TurnCompleteDeferredByNonStopEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "turn_id",
+            "type"
+          ],
+          "title": "TurnCompleteDeferredByNonStopEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Runtime update for timed or untimed non-stop mode.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "expires_at": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stop_attempt_budget": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "non_stop_mode_updated"
+              ],
+              "title": "NonStopModeUpdatedEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "enabled",
+            "type"
+          ],
+          "title": "NonStopModeUpdatedEventMsg",
           "type": "object"
         },
         {
@@ -2325,6 +2576,16 @@
               ],
               "description": "When to escalate for approval for execution"
             },
+            "completion_gate": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/v2/CompletionGateInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "cwd": {
               "description": "Working directory that should be treated as the *root* of the session.",
               "type": "string"
@@ -2378,6 +2639,10 @@
                 }
               ],
               "description": "Runtime proxy bind addresses, when the managed proxy was started for this session."
+            },
+            "non_stop": {
+              "description": "Fork-specific runtime override for sessions that must never stop through normal completion logic.",
+              "type": "boolean"
             },
             "reasoning_effort": {
               "anyOf": [
@@ -2440,6 +2705,7 @@
             "history_log_id",
             "model",
             "model_provider_id",
+            "non_stop",
             "sandbox_policy",
             "session_id",
             "type"
@@ -7445,6 +7711,14 @@
             "id": {
               "type": "string"
             },
+            "source": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/UserMessageSource"
+                }
+              ],
+              "default": "typed"
+            },
             "type": {
               "enum": [
                 "UserMessage"
@@ -7641,6 +7915,13 @@
           "type": "object"
         }
       ]
+    },
+    "UserMessageSource": {
+      "enum": [
+        "typed",
+        "voice"
+      ],
+      "type": "string"
     },
     "W3cTraceContext": {
       "properties": {
@@ -8800,6 +9081,23 @@
           "declined"
         ],
         "type": "string"
+      },
+      "CompletionGateInfo": {
+        "properties": {
+          "criteria": {
+            "type": "string"
+          },
+          "judge_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "criteria"
+        ],
+        "type": "object"
       },
       "Config": {
         "additionalProperties": true,
@@ -13329,6 +13627,16 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "completionGate": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CompletionGateInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cwd": {
             "type": "string"
           },
@@ -13363,6 +13671,9 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
+          },
+          "voiceMode": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -13371,7 +13682,8 @@
           "model",
           "modelProvider",
           "sandbox",
-          "thread"
+          "thread",
+          "voiceMode"
         ],
         "title": "ThreadForkResponse",
         "type": "object"
@@ -14436,6 +14748,16 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "completionGate": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CompletionGateInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cwd": {
             "type": "string"
           },
@@ -14470,6 +14792,9 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
+          },
+          "voiceMode": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -14478,7 +14803,8 @@
           "model",
           "modelProvider",
           "sandbox",
-          "thread"
+          "thread",
+          "voiceMode"
         ],
         "title": "ThreadResumeResponse",
         "type": "object"
@@ -14674,6 +15000,16 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "completionGate": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CompletionGateInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cwd": {
             "type": "string"
           },
@@ -14708,6 +15044,9 @@
           },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
+          },
+          "voiceMode": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -14716,7 +15055,8 @@
           "model",
           "modelProvider",
           "sandbox",
-          "thread"
+          "thread",
+          "voiceMode"
         ],
         "title": "ThreadStartResponse",
         "type": "object"

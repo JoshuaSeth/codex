@@ -1,0 +1,6 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 6725
+expression: rendered
+---
+• Voice mode enabled for this session. Assistant speech will stream to Dispatcher during the turn. Live transcripts submit directly into a running turn, or start a fresh new turn once Codex has stopped. Enable `/non-stop on` separately if you want voice mode to keep auto-continuing.

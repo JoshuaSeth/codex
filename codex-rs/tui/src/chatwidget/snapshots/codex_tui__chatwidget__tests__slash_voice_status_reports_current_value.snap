@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• Voice mode is disabled. Use `/voice on` to stream assistant speech to Dispatcher during the turn and accept immediate live transcript injection.

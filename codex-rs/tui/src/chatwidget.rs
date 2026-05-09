@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +39,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use self::realtime::PendingSteerCompareKey;
+use crate::app_event::NonStopSubmitMenuDefault;
+use crate::app_event::NonStopSubmitMode;
 use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 use crate::audio_device::list_realtime_audio_device_names;
@@ -52,12 +55,14 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
+use codex_core::DEEP_FORCE_CONTINUE_ITERATIONS;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
 use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::current_unix_timestamp;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::find_thread_name_by_id;
@@ -66,6 +71,9 @@ use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::local_git_branches;
 use codex_core::mcp::McpManager;
 use codex_core::models_manager::manager::ModelsManager;
+use codex_core::non_stop_expires_at_after;
+use codex_core::non_stop_is_active;
+use codex_core::parse_non_stop_duration;
 use codex_core::plugins::PluginsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
@@ -100,6 +108,11 @@ use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CompletionGateBlockedStopEvent;
+use codex_protocol::protocol::CompletionGateDecisionEvent;
+use codex_protocol::protocol::CompletionGateErrorEvent;
+use codex_protocol::protocol::CompletionGateInfo;
+use codex_protocol::protocol::CompletionGateSettingsUpdate;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
@@ -121,6 +134,7 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
+use codex_protocol::protocol::NonStopModeUpdatedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -137,10 +151,13 @@ use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::UndoCompletedEvent;
 use codex_protocol::protocol::UndoStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::UserMessageSource;
 use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::protocol::WebSearchBeginEvent;
 use codex_protocol::protocol::WebSearchEndEvent;
+use codex_protocol::protocol::unwrap_voice_transcript;
+use codex_protocol::protocol::wrap_voice_transcript;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
@@ -616,9 +633,25 @@ pub(crate) struct ChatWidget {
     // Set when commentary output completes; once stream queues go idle we restore the status row.
     pending_status_indicator_restore: bool,
     suppress_queue_autosend: bool,
+    /// Pause automatic follow-up submission after a turn-ending error.
+    ///
+    /// This is an integral fork behavior. PitchAI operators often queue
+    /// several follow-ups behind a long-running turn. If an upstream merge
+    /// removes this guard, the first terminal error immediately drains the
+    /// backlog one message at a time, reproducing the same failure for every
+    /// queued prompt before the operator can react.
+    ///
+    /// Keep this paired with the "direct submit clears the pause" behavior
+    /// below. The queue must stay frozen after errors until the operator
+    /// intentionally sends a fresh message.
+    pause_queue_autosend_after_error: bool,
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
+    completion_gate: Option<CompletionGateInfo>,
+    completion_gate_last_decision: Option<CompletionGateDecisionEvent>,
+    completion_gate_last_error: Option<CompletionGateErrorEvent>,
+    completion_gate_last_blocked_stop: Option<CompletionGateBlockedStopEvent>,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
     show_welcome_banner: bool,
@@ -627,8 +660,30 @@ pub(crate) struct ChatWidget {
     // When resuming an existing session (selected via resume picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
-    // User messages queued while a turn is in progress
+    // User messages queued while a turn is in progress.
     queued_user_messages: VecDeque<UserMessage>,
+    /// True when the composer currently holds a queued follow-up that was
+    /// popped out of `queued_user_messages` for editing.
+    ///
+    /// This is an integral fork behavior. PitchAI operators often walk back
+    /// through several queued follow-ups to revise an older one while keeping
+    /// the later drafts intact. A plain `pop_back()` edit implementation looks
+    /// reasonable, but it regresses this workflow: once the composer already
+    /// contains queued message `N`, popping queued message `N-1` without
+    /// tracking the current edit silently destroys `N`.
+    ///
+    /// Keep this state paired with `queued_user_messages_newer`. If an
+    /// upstream merge removes either piece, editing an older queued message
+    /// starts dropping the newer queued follow-ups again.
+    queued_user_message_edit_active: bool,
+    /// Queued follow-ups that are newer than the queued draft currently being
+    /// edited in the composer.
+    ///
+    /// When the user presses the queued-message edit shortcut repeatedly, we
+    /// move the in-composer queued draft here before restoring the next older
+    /// draft from `queued_user_messages`. That preserves the full queue order
+    /// instead of truncating everything after the edited item.
+    queued_user_messages_newer: VecDeque<UserMessage>,
     // Steers already submitted to core but not yet committed into history.
     //
     // The bottom pane shows these above queued drafts until core records the
@@ -641,6 +696,47 @@ pub(crate) struct ChatWidget {
     queued_message_edit_binding: KeyBinding,
     /// Model selection queued while an agent turn is in progress.
     pending_model_selection: Option<PendingModelSelection>,
+    /// Non-stop mode change queued behind the currently running turn.
+    ///
+    /// This is an integral fork behavior. Operators often decide mid-turn
+    /// that the *next* turn should switch into or out of `--non-stop`, while
+    /// still allowing the current turn to finish under its original stop
+    /// policy. If an upstream merge removes this queued override, `/non-stop`
+    /// entered during a running turn mutates the active turn instead of the
+    /// next one, which regresses the follow-up workflow.
+    pending_non_stop_override: Option<NonStopModeOverride>,
+    /// Voice mode change queued behind the currently running turn.
+    ///
+    /// Voice mode changes must follow the same "next turn, not this turn"
+    /// rule as `/non-stop`: when an operator enables or disables voice during
+    /// a running task, the active turn should keep its current behavior and
+    /// the new mode should apply right before the next queued turn starts.
+    pending_voice_mode_override: Option<bool>,
+    /// Delayed user messages created by `/enqueue-in`.
+    ///
+    /// This is an integral fork behavior for `--non-stop`. Operators often
+    /// need to inject a follow-up into a deliberately never-ending turn after
+    /// some wall-clock delay. If an upstream merge drops this queue, the only
+    /// remaining behaviors are "steer immediately" or "do nothing", which
+    /// breaks the timed intervention workflow.
+    delayed_non_stop_messages: VecDeque<ScheduledNonStopMessage>,
+    /// Number of future *new turns* armed by `/deep`.
+    ///
+    /// This is fork-specific operator control: the next `n` queued or freshly
+    /// submitted turns each receive a bounded four-step forced-continuation
+    /// budget. Immediate steers into an already-running turn must not consume
+    /// this counter.
+    pending_deep_request_count: usize,
+    /// User messages queued for the next point where `--non-stop` prevented a
+    /// normal `TurnComplete`.
+    ///
+    /// This is an integral fork behavior. Operators often want to let the
+    /// current never-ending turn keep running, but inject a follow-up exactly
+    /// at the next "it would have stopped here" boundary. If an upstream merge
+    /// drops this queue or the boundary event that drives it, the workflow
+    /// regresses back to only two bad choices: "steer immediately" or
+    /// "manually wait and race the model".
+    queued_non_stop_boundary_messages: VecDeque<UserMessage>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -744,6 +840,7 @@ pub(crate) struct UserMessage {
     remote_image_urls: Vec<String>,
     text_elements: Vec<TextElement>,
     mention_bindings: Vec<MentionBinding>,
+    source: UserMessageSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -772,6 +869,18 @@ pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
     pending_steers: VecDeque<UserMessage>,
     queued_user_messages: VecDeque<UserMessage>,
+    queued_user_message_edit_active: bool,
+    queued_user_messages_newer: VecDeque<UserMessage>,
+    delayed_non_stop_messages: VecDeque<ScheduledNonStopMessage>,
+    queued_non_stop_boundary_messages: VecDeque<UserMessage>,
+    pause_queue_autosend_after_error: bool,
+    non_stop: bool,
+    voice_mode: bool,
+    non_stop_expires_at: Option<i64>,
+    non_stop_budget: Option<u32>,
+    pending_non_stop_override: Option<NonStopModeOverride>,
+    pending_voice_mode_override: Option<bool>,
+    pending_deep_request_count: usize,
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
     agent_turn_running: bool,
@@ -786,6 +895,7 @@ impl From<String> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            source: UserMessageSource::Typed,
         }
     }
 }
@@ -799,6 +909,7 @@ impl From<&str> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            source: UserMessageSource::Typed,
         }
     }
 }
@@ -806,6 +917,64 @@ impl From<&str> for UserMessage {
 struct PendingSteer {
     user_message: UserMessage,
     compare_key: PendingSteerCompareKey,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ScheduledNonStopMessage {
+    user_message: UserMessage,
+    release_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NonStopModeOverride {
+    enabled: bool,
+    expires_at: Option<i64>,
+    budget: Option<u32>,
+}
+
+const NON_STOP_SUBMIT_SELECTION_VIEW_ID: &str = "non-stop-submit-selection";
+const NON_STOP_TIMED_SUBMIT_SELECTION_VIEW_ID: &str = "non-stop-timed-submit-selection";
+
+fn parse_enqueue_in_args(args: &str) -> Result<(Duration, &str), &'static str> {
+    let trimmed = args.trim();
+    let Some(split_at) = trimmed.find(char::is_whitespace) else {
+        return Err("Usage: /enqueue-in <delay> <message>");
+    };
+    let (delay_token, remainder) = trimmed.split_at(split_at);
+    let message = remainder.trim();
+    if message.is_empty() {
+        return Err("Usage: /enqueue-in <delay> <message>");
+    }
+
+    let (amount_text, unit) = match delay_token.chars().last() {
+        Some(unit @ ('s' | 'S' | 'm' | 'M' | 'h' | 'H')) => (
+            &delay_token[..delay_token.len().saturating_sub(1)],
+            Some(unit),
+        ),
+        Some(_) => (delay_token, None),
+        None => return Err("Usage: /enqueue-in <delay> <message>"),
+    };
+    if amount_text.is_empty() {
+        return Err("Usage: /enqueue-in <delay> <message>");
+    }
+
+    let amount = amount_text
+        .parse::<u64>()
+        .map_err(|_| "Delay must be a positive integer (plain numbers mean minutes).")?;
+    if amount == 0 {
+        return Err("Delay must be greater than zero.");
+    }
+
+    let multiplier_secs = match unit.map(|value| value.to_ascii_lowercase()) {
+        None | Some('m') => 60,
+        Some('s') => 1,
+        Some('h') => 60 * 60,
+        Some(_) => return Err("Delay suffix must be s, m, or h."),
+    };
+    let seconds = amount
+        .checked_mul(multiplier_secs)
+        .ok_or("Delay is too large.")?;
+    Ok((Duration::from_secs(seconds), message))
 }
 
 pub(crate) fn create_initial_user_message(
@@ -831,6 +1000,7 @@ pub(crate) fn create_initial_user_message(
             remote_image_urls: Vec::new(),
             text_elements,
             mention_bindings: Vec::new(),
+            source: UserMessageSource::Typed,
         })
     }
 }
@@ -861,6 +1031,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         local_images,
         remote_image_urls,
         mention_bindings,
+        source,
     } = message;
     if local_images.is_empty() {
         return UserMessage {
@@ -869,6 +1040,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
             local_images,
             remote_image_urls,
             mention_bindings,
+            source,
         };
     }
 
@@ -925,6 +1097,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         remote_image_urls,
         text_elements: rebuilt_elements,
         mention_bindings,
+        source,
     }
 }
 
@@ -1191,9 +1364,47 @@ impl ChatWidget {
         self.thread_id = Some(event.session_id);
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
+        self.completion_gate = event.completion_gate.clone();
+        self.completion_gate_last_decision = None;
+        self.completion_gate_last_error = None;
+        self.completion_gate_last_blocked_stop = None;
         self.current_rollout_path = event.rollout_path.clone();
         self.current_cwd = Some(event.cwd.clone());
         self.config.cwd = event.cwd.clone();
+        self.config.non_stop = event.non_stop;
+        self.config.non_stop_expires_at = None;
+        self.config.non_stop_budget = None;
+        self.config.completion_gate = event.completion_gate.clone().map(|gate| {
+            let existing_gate = self.config.completion_gate.clone();
+            codex_core::config::CompletionGateConfig {
+                criteria: gate.criteria,
+                judge_model: gate.judge_model,
+                judge_base_url: existing_gate
+                    .as_ref()
+                    .and_then(|existing| existing.judge_base_url.clone()),
+                judge_api_key_env: existing_gate
+                    .as_ref()
+                    .and_then(|existing| existing.judge_api_key_env.clone()),
+                timeout_ms: existing_gate
+                    .as_ref()
+                    .map(|existing| existing.timeout_ms)
+                    .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_TIMEOUT_MS),
+                max_retries: existing_gate
+                    .as_ref()
+                    .map(|existing| existing.max_retries)
+                    .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_MAX_RETRIES),
+                max_assistant_messages: existing_gate
+                    .as_ref()
+                    .map(|existing| existing.max_assistant_messages)
+                    .unwrap_or(
+                        codex_core::config::CompletionGateConfig::DEFAULT_MAX_ASSISTANT_MESSAGES,
+                    ),
+                max_user_messages: existing_gate
+                    .as_ref()
+                    .map(|existing| existing.max_user_messages)
+                    .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_MAX_USER_MESSAGES),
+            }
+        });
         if let Err(err) = self
             .config
             .permissions
@@ -1259,7 +1470,7 @@ impl ChatWidget {
             self.prefetch_connectors();
         }
         if let Some(user_message) = self.initial_user_message.take() {
-            self.submit_user_message(user_message);
+            self.submit_user_message_direct(user_message);
         }
         if let Some(forked_from_id) = forked_from_id {
             self.emit_forked_thread_event(forked_from_id);
@@ -1267,6 +1478,48 @@ impl ChatWidget {
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
+    }
+
+    fn on_non_stop_mode_updated(&mut self, event: NonStopModeUpdatedEvent) {
+        self.config.non_stop = event.enabled;
+        self.config.non_stop_expires_at = event.expires_at;
+        self.config.non_stop_budget = event.stop_attempt_budget;
+        self.request_redraw();
+    }
+
+    fn on_completion_gate_decision(&mut self, event: CompletionGateDecisionEvent) {
+        self.completion_gate_last_decision = Some(event);
+        self.completion_gate_last_blocked_stop = None;
+        self.completion_gate_last_error = None;
+    }
+
+    fn on_completion_gate_blocked_stop(&mut self, event: CompletionGateBlockedStopEvent) {
+        self.completion_gate_last_blocked_stop = Some(event.clone());
+        self.add_plain_history_lines(vec![
+            vec![
+                "• ".dim(),
+                "Completion gate blocked stop".yellow(),
+                ": ".dim(),
+                event.reason.clone().into(),
+            ]
+            .into(),
+            vec![
+                "  ".into(),
+                "Continue prompt: ".dim(),
+                event.continue_prompt.into(),
+            ]
+            .into(),
+        ]);
+    }
+
+    fn on_completion_gate_error(&mut self, event: CompletionGateErrorEvent) {
+        self.completion_gate_last_error = Some(event.clone());
+        self.completion_gate_last_blocked_stop = None;
+        self.add_to_history(history_cell::new_warning_event(format!(
+            "Completion gate failed closed: {}",
+            event.message
+        )));
+        self.request_redraw();
     }
 
     fn emit_forked_thread_event(&self, forked_from_id: ThreadId) {
@@ -1574,10 +1827,11 @@ impl ChatWidget {
         self.unified_exec_wait_streak = None;
         self.request_redraw();
 
+        self.promote_non_stop_boundary_messages_to_front_of_queue();
         let had_pending_steers = !self.pending_steers.is_empty();
         self.refresh_pending_input_preview();
 
-        if !from_replay && self.queued_user_messages.is_empty() && !had_pending_steers {
+        if !from_replay && self.queued_user_messages_is_empty() && !had_pending_steers {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -1586,6 +1840,8 @@ impl ChatWidget {
             self.saw_plan_item_this_turn = false;
         }
         self.apply_pending_model_selection();
+        self.apply_pending_non_stop_override();
+        self.apply_pending_voice_mode_override();
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.app_event_tx.send(AppEvent::MaybeSendNextQueuedInput);
         // Emit a notification when the turn completes (suppressed if focused).
@@ -1600,7 +1856,7 @@ impl ChatWidget {
         if !self.collaboration_modes_enabled() {
             return;
         }
-        if !self.queued_user_messages.is_empty() {
+        if !self.queued_user_messages_is_empty() {
             return;
         }
         if self.active_mode_kind() != ModeKind::Plan {
@@ -1855,12 +2111,16 @@ impl ChatWidget {
         self.plan_stream_controller = None;
         self.pending_status_indicator_restore = false;
         self.request_status_line_branch_refresh();
+        self.promote_non_stop_boundary_messages_to_front_of_queue();
         self.apply_pending_model_selection();
+        self.apply_pending_non_stop_override();
+        self.apply_pending_voice_mode_override();
         self.maybe_show_pending_rate_limit_prompt();
     }
 
     fn on_server_overloaded_error(&mut self, message: String) {
         self.finalize_turn();
+        self.pause_queue_autosend_after_error = self.has_pending_auto_follow_ups();
 
         let message = if message.trim().is_empty() {
             "Codex is currently experiencing high load.".to_string()
@@ -1870,16 +2130,13 @@ impl ChatWidget {
 
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
-        self.app_event_tx.send(AppEvent::MaybeSendNextQueuedInput);
     }
 
     fn on_error(&mut self, message: String) {
         self.finalize_turn();
+        self.pause_queue_autosend_after_error = self.has_pending_auto_follow_ups();
         self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
-
-        // After an error ends the turn, try sending the next queued input.
-        self.maybe_send_next_queued_input();
     }
 
     fn on_warning(&mut self, message: impl Into<String>) {
@@ -1988,7 +2245,7 @@ impl ChatWidget {
     /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
     /// restore.
     fn drain_pending_messages_for_restore(&mut self) -> Option<UserMessage> {
-        if self.pending_steers.is_empty() && self.queued_user_messages.is_empty() {
+        if self.pending_steers.is_empty() && self.queued_user_messages_is_empty() {
             return None;
         }
 
@@ -1998,6 +2255,7 @@ impl ChatWidget {
             local_images: self.bottom_pane.composer_local_images(),
             remote_image_urls: self.bottom_pane.remote_image_urls(),
             mention_bindings: self.bottom_pane.composer_mention_bindings(),
+            source: UserMessageSource::Typed,
         };
 
         let mut to_merge: Vec<UserMessage> = self
@@ -2006,12 +2264,24 @@ impl ChatWidget {
             .map(|steer| steer.user_message)
             .collect();
         to_merge.extend(self.queued_user_messages.drain(..));
-        if !existing_message.text.is_empty()
-            || !existing_message.local_images.is_empty()
-            || !existing_message.remote_image_urls.is_empty()
-        {
-            to_merge.push(existing_message);
+        if self.queued_user_message_edit_active {
+            if !existing_message.text.is_empty()
+                || !existing_message.local_images.is_empty()
+                || !existing_message.remote_image_urls.is_empty()
+            {
+                to_merge.push(existing_message);
+            }
+            to_merge.extend(self.queued_user_messages_newer.drain(..));
+        } else {
+            to_merge.extend(self.queued_user_messages_newer.drain(..));
+            if !existing_message.text.is_empty()
+                || !existing_message.local_images.is_empty()
+                || !existing_message.remote_image_urls.is_empty()
+            {
+                to_merge.push(existing_message);
+            }
         }
+        self.queued_user_message_edit_active = false;
 
         let mut combined = UserMessage {
             text: String::new(),
@@ -2019,6 +2289,7 @@ impl ChatWidget {
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
             mention_bindings: Vec::new(),
+            source: UserMessageSource::Typed,
         };
         let total_remote_images = to_merge
             .iter()
@@ -2036,6 +2307,7 @@ impl ChatWidget {
                 local_images,
                 remote_image_urls,
                 mention_bindings,
+                ..
             } = remap_placeholders_for_message(message, &mut next_image_label);
             append_text_with_rebased_elements(
                 &mut combined.text,
@@ -2058,6 +2330,7 @@ impl ChatWidget {
             remote_image_urls,
             text_elements,
             mention_bindings,
+            ..
         } = user_message;
         let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
         self.set_remote_image_urls(remote_image_urls);
@@ -2086,6 +2359,18 @@ impl ChatWidget {
                 .map(|pending| pending.user_message.clone())
                 .collect(),
             queued_user_messages: self.queued_user_messages.clone(),
+            queued_user_message_edit_active: self.queued_user_message_edit_active,
+            queued_user_messages_newer: self.queued_user_messages_newer.clone(),
+            delayed_non_stop_messages: self.delayed_non_stop_messages.clone(),
+            queued_non_stop_boundary_messages: self.queued_non_stop_boundary_messages.clone(),
+            pause_queue_autosend_after_error: self.pause_queue_autosend_after_error,
+            non_stop: self.config.non_stop,
+            voice_mode: self.config.voice_mode,
+            non_stop_expires_at: self.config.non_stop_expires_at,
+            non_stop_budget: self.config.non_stop_budget,
+            pending_non_stop_override: self.pending_non_stop_override,
+            pending_voice_mode_override: self.pending_voice_mode_override,
+            pending_deep_request_count: self.pending_deep_request_count,
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
             agent_turn_running: self.agent_turn_running,
@@ -2128,6 +2413,18 @@ impl ChatWidget {
             self.queued_user_messages = input_state.pending_steers;
             self.queued_user_messages
                 .extend(input_state.queued_user_messages);
+            self.queued_user_message_edit_active = input_state.queued_user_message_edit_active;
+            self.queued_user_messages_newer = input_state.queued_user_messages_newer;
+            self.delayed_non_stop_messages = input_state.delayed_non_stop_messages;
+            self.queued_non_stop_boundary_messages = input_state.queued_non_stop_boundary_messages;
+            self.pause_queue_autosend_after_error = input_state.pause_queue_autosend_after_error;
+            self.config.non_stop = input_state.non_stop;
+            self.config.voice_mode = input_state.voice_mode;
+            self.config.non_stop_expires_at = input_state.non_stop_expires_at;
+            self.config.non_stop_budget = input_state.non_stop_budget;
+            self.pending_non_stop_override = input_state.pending_non_stop_override;
+            self.pending_voice_mode_override = input_state.pending_voice_mode_override;
+            self.pending_deep_request_count = input_state.pending_deep_request_count;
         } else {
             self.agent_turn_running = false;
             self.pending_steers.clear();
@@ -2140,10 +2437,22 @@ impl ChatWidget {
             );
             self.bottom_pane.set_composer_pending_pastes(Vec::new());
             self.queued_user_messages.clear();
+            self.queued_user_message_edit_active = false;
+            self.queued_user_messages_newer.clear();
+            self.delayed_non_stop_messages.clear();
+            self.queued_non_stop_boundary_messages.clear();
+            self.pause_queue_autosend_after_error = false;
+            self.config.voice_mode = false;
+            self.config.non_stop_expires_at = None;
+            self.config.non_stop_budget = None;
+            self.pending_non_stop_override = None;
+            self.pending_voice_mode_override = None;
+            self.pending_deep_request_count = 0;
         }
         self.turn_sleep_inhibitor
             .set_turn_running(self.agent_turn_running);
         self.update_task_running_state();
+        self.release_due_scheduled_non_stop_messages();
         self.refresh_pending_input_preview();
         self.request_redraw();
     }
@@ -3070,6 +3379,13 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
         let current_cwd = Some(config.cwd.clone());
+        let completion_gate = config
+            .completion_gate
+            .as_ref()
+            .map(|gate| CompletionGateInfo {
+                criteria: gate.criteria.clone(),
+                judge_model: gate.judge_model.clone(),
+            });
         let queued_message_edit_binding =
             queued_message_edit_binding_for_terminal(terminal_info().name);
         let mut widget = Self {
@@ -3127,13 +3443,25 @@ impl ChatWidget {
             retry_status_header: None,
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
+            pause_queue_autosend_after_error: false,
             thread_id: None,
             thread_name: None,
             forked_from: None,
+            completion_gate,
+            completion_gate_last_decision: None,
+            completion_gate_last_error: None,
+            completion_gate_last_blocked_stop: None,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
             pending_model_selection: None,
+            pending_non_stop_override: None,
+            pending_voice_mode_override: None,
+            delayed_non_stop_messages: VecDeque::new(),
+            pending_deep_request_count: 0,
+            queued_non_stop_boundary_messages: VecDeque::new(),
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
             suppress_session_configured_redraw: false,
@@ -3252,6 +3580,13 @@ impl ChatWidget {
 
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
         let current_cwd = Some(config.cwd.clone());
+        let completion_gate = config
+            .completion_gate
+            .as_ref()
+            .map(|gate| CompletionGateInfo {
+                criteria: gate.criteria.clone(),
+                judge_model: gate.judge_model.clone(),
+            });
 
         let queued_message_edit_binding =
             queued_message_edit_binding_for_terminal(terminal_info().name);
@@ -3310,17 +3645,29 @@ impl ChatWidget {
             retry_status_header: None,
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
+            pause_queue_autosend_after_error: false,
             thread_id: None,
             thread_name: None,
             forked_from: None,
+            completion_gate,
+            completion_gate_last_decision: None,
+            completion_gate_last_error: None,
+            completion_gate_last_blocked_stop: None,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
             pending_model_selection: None,
+            pending_non_stop_override: None,
+            pending_voice_mode_override: None,
+            delayed_non_stop_messages: VecDeque::new(),
+            pending_deep_request_count: 0,
+            queued_non_stop_boundary_messages: VecDeque::new(),
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
             suppress_session_configured_redraw: false,
@@ -3428,6 +3775,13 @@ impl ChatWidget {
             settings: fallback_default,
         };
 
+        let completion_gate = config
+            .completion_gate
+            .as_ref()
+            .map(|gate| CompletionGateInfo {
+                criteria: gate.criteria.clone(),
+                judge_model: gate.judge_model.clone(),
+            });
         let queued_message_edit_binding =
             queued_message_edit_binding_for_terminal(terminal_info().name);
         let mut widget = Self {
@@ -3485,13 +3839,25 @@ impl ChatWidget {
             retry_status_header: None,
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
+            pause_queue_autosend_after_error: false,
             thread_id: None,
             thread_name: None,
             forked_from: None,
+            completion_gate,
+            completion_gate_last_decision: None,
+            completion_gate_last_error: None,
+            completion_gate_last_blocked_stop: None,
             queued_user_messages: VecDeque::new(),
+            queued_user_message_edit_active: false,
+            queued_user_messages_newer: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queued_message_edit_binding,
             pending_model_selection: None,
+            pending_non_stop_override: None,
+            pending_voice_mode_override: None,
+            delayed_non_stop_messages: VecDeque::new(),
+            pending_deep_request_count: 0,
+            queued_non_stop_boundary_messages: VecDeque::new(),
             show_welcome_banner: false,
             startup_tooltip_override: None,
             suppress_session_configured_redraw: true,
@@ -3622,11 +3988,28 @@ impl ChatWidget {
             && self.queued_message_edit_binding.is_press(key_event)
             && !self.queued_user_messages.is_empty()
         {
+            if self.queued_user_message_edit_active {
+                let existing_message = UserMessage {
+                    text: self.bottom_pane.composer_text(),
+                    text_elements: self.bottom_pane.composer_text_elements(),
+                    local_images: self.bottom_pane.composer_local_images(),
+                    remote_image_urls: self.bottom_pane.remote_image_urls(),
+                    mention_bindings: self.bottom_pane.composer_mention_bindings(),
+                    source: UserMessageSource::Typed,
+                };
+                if !existing_message.text.is_empty()
+                    || !existing_message.local_images.is_empty()
+                    || !existing_message.remote_image_urls.is_empty()
+                {
+                    self.queued_user_messages_newer.push_front(existing_message);
+                }
+            }
             if let Some(user_message) = self.queued_user_messages.pop_back() {
                 self.restore_user_message_to_composer(user_message);
-                self.refresh_pending_input_preview();
-                self.request_redraw();
+                self.queued_user_message_edit_active = true;
             }
+            self.refresh_pending_input_preview();
+            self.request_redraw();
             return;
         }
 
@@ -3658,6 +4041,7 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        source: UserMessageSource::Typed,
                     };
                     if user_message.text.is_empty()
                         && user_message.local_images.is_empty()
@@ -3670,19 +4054,22 @@ impl ChatWidget {
                     else {
                         return;
                     };
-                    let should_submit_now = self.is_session_configured()
-                        && !self.bottom_pane.is_task_running()
-                        && !self.is_review_mode
-                        && !self.is_plan_streaming_in_tui();
-                    if should_submit_now {
+                    if self.should_offer_non_stop_submit_selection() {
+                        self.open_non_stop_submit_selection_for_message(
+                            user_message,
+                            NonStopSubmitMenuDefault::SteerNow,
+                        );
+                    } else if self.should_submit_user_message_now() {
                         // Submitted is emitted when user submits.
                         // Reset any reasoning header only when we are actually submitting a turn.
                         self.reasoning_buffer.clear();
                         self.full_reasoning_buffer.clear();
                         self.set_status_header(String::from("Working"));
-                        self.submit_user_message(user_message);
+                        self.submit_user_message_direct(user_message);
+                        self.finish_queued_user_message_edit();
                     } else {
                         self.queue_user_message(user_message);
+                        self.finish_queued_user_message_edit();
                     }
                 }
                 InputResult::Queued {
@@ -3701,13 +4088,22 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        source: UserMessageSource::Typed,
                     };
                     let Some(user_message) =
                         self.maybe_defer_user_message_for_realtime(user_message)
                     else {
                         return;
                     };
-                    self.queue_user_message(user_message);
+                    if self.should_offer_non_stop_submit_selection() {
+                        self.open_non_stop_submit_selection_for_message(
+                            user_message,
+                            NonStopSubmitMenuDefault::AfterNextNormalStop,
+                        );
+                    } else {
+                        self.queue_user_message(user_message);
+                        self.finish_queued_user_message_edit();
+                    }
                 }
                 InputResult::Command(cmd) => {
                     self.dispatch_command(cmd);
@@ -3827,7 +4223,7 @@ impl ChatWidget {
                     return;
                 }
                 const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
-                self.submit_user_message(INIT_PROMPT.to_string().into());
+                self.submit_user_message_direct(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
@@ -4035,6 +4431,24 @@ impl ChatWidget {
             SlashCommand::Status => {
                 self.add_status_output();
             }
+            SlashCommand::NonStop => {
+                self.show_non_stop_status();
+            }
+            SlashCommand::Voice => {
+                self.show_voice_status();
+            }
+            SlashCommand::VoiceInput => {
+                self.add_error_message("Usage: /voice-input <transcript>".to_string());
+            }
+            SlashCommand::Deep => {
+                self.show_deep_status();
+            }
+            SlashCommand::CompletionCriteria => {
+                self.show_completion_gate_status();
+            }
+            SlashCommand::EnqueueIn => {
+                self.add_error_message("Usage: /enqueue-in <delay> <message>".to_string());
+            }
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
             }
@@ -4136,6 +4550,7 @@ impl ChatWidget {
         let trimmed = args.trim();
         match cmd {
             SlashCommand::Fast => {
+                self.bottom_pane.clear_inline_command_text();
                 if trimmed.is_empty() {
                     self.dispatch_command(cmd);
                     return;
@@ -4156,6 +4571,165 @@ impl ChatWidget {
                         self.add_error_message("Usage: /fast [on|off|status]".to_string());
                     }
                 }
+            }
+            SlashCommand::NonStop => {
+                self.bottom_pane.clear_inline_command_text();
+                if trimmed.is_empty() {
+                    self.show_non_stop_status();
+                    return;
+                }
+                let mut parts = trimmed.split_whitespace();
+                let Some(first) = parts.next() else {
+                    self.show_non_stop_status();
+                    return;
+                };
+                let first_lower = first.to_ascii_lowercase();
+                match first_lower.as_str() {
+                    "status" if parts.next().is_none() => self.show_non_stop_status(),
+                    "off" if parts.next().is_none() => self.set_non_stop_mode(false, None),
+                    "on" => {
+                        let Some(next) = parts.next() else {
+                            self.set_non_stop_mode(true, None);
+                            return;
+                        };
+                        if parts.next().is_some() {
+                            self.add_error_message(
+                                "Usage: /non-stop [on|off|status|<duration>|on <duration>]"
+                                    .to_string(),
+                            );
+                            return;
+                        }
+                        match parse_non_stop_duration(next).and_then(non_stop_expires_at_after) {
+                            Ok(expires_at) => self.set_non_stop_mode(true, Some(expires_at)),
+                            Err(message) => self.add_error_message(message),
+                        }
+                    }
+                    _ if parts.next().is_none() => {
+                        match parse_non_stop_duration(first).and_then(non_stop_expires_at_after) {
+                            Ok(expires_at) => self.set_non_stop_mode(true, Some(expires_at)),
+                            Err(_) => self.add_error_message(
+                                "Usage: /non-stop [on|off|status|<duration>|on <duration>]"
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                    _ => self.add_error_message(
+                        "Usage: /non-stop [on|off|status|<duration>|on <duration>]".to_string(),
+                    ),
+                }
+            }
+            SlashCommand::Voice => {
+                self.bottom_pane.clear_inline_command_text();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+                    self.show_voice_status();
+                    return;
+                }
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "on" => self.set_voice_mode(true),
+                    "off" => self.set_voice_mode(false),
+                    _ => self.add_error_message("Usage: /voice [on|off|status]".to_string()),
+                }
+            }
+            SlashCommand::VoiceInput => {
+                self.bottom_pane.clear_inline_command_text();
+                if trimmed.is_empty() {
+                    self.add_error_message("Usage: /voice-input <transcript>".to_string());
+                    return;
+                }
+                let transcript = trimmed.to_string();
+                if transcript.is_empty() {
+                    self.add_error_message("Usage: /voice-input <transcript>".to_string());
+                    return;
+                }
+                self.submit_voice_transcript(transcript);
+            }
+            SlashCommand::Deep => {
+                self.bottom_pane.clear_inline_command_text();
+                if trimmed.is_empty() {
+                    self.show_deep_status();
+                    return;
+                }
+                match trimmed {
+                    "status" => self.show_deep_status(),
+                    "clear" => {
+                        self.pending_deep_request_count = 0;
+                        self.show_deep_status();
+                    }
+                    _ => match trimmed.parse::<usize>() {
+                        Ok(count) => {
+                            self.pending_deep_request_count = count;
+                            self.show_deep_status();
+                        }
+                        Err(_) => self.add_error_message(
+                            "Usage: /deep <count> | /deep status | /deep clear".to_string(),
+                        ),
+                    },
+                }
+            }
+            SlashCommand::CompletionCriteria => {
+                self.bottom_pane.clear_inline_command_text();
+                if trimmed.is_empty() {
+                    self.show_completion_gate_usage();
+                    return;
+                }
+                match trimmed {
+                    "clear" => self.clear_completion_gate(),
+                    "status" => self.show_completion_gate_status(),
+                    _ => self.set_completion_gate(trimmed.to_string()),
+                }
+            }
+            SlashCommand::EnqueueIn => {
+                if !self.is_non_stop_effective_now() {
+                    self.add_error_message(
+                        "`/enqueue-in` is only available while non-stop mode is currently active."
+                            .to_string(),
+                    );
+                    return;
+                }
+                let Some((prepared_args, prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(true)
+                else {
+                    return;
+                };
+                let (delay, prepared_message_text) = match parse_enqueue_in_args(&prepared_args) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        self.add_error_message(message.to_string());
+                        return;
+                    }
+                };
+                let message_start = prepared_args
+                    .len()
+                    .saturating_sub(prepared_message_text.len());
+                let prepared_message_elements = prepared_elements
+                    .into_iter()
+                    .filter_map(|element| {
+                        if element.byte_range.end <= message_start {
+                            return None;
+                        }
+                        let start = element.byte_range.start.saturating_sub(message_start);
+                        let end = element
+                            .byte_range
+                            .end
+                            .saturating_sub(message_start)
+                            .min(prepared_message_text.len());
+                        (start < end).then_some(element.map_range(|_| (start..end).into()))
+                    })
+                    .collect();
+                let local_images = self
+                    .bottom_pane
+                    .take_recent_submission_images_with_placeholders();
+                let remote_image_urls = self.take_remote_image_urls();
+                let mention_bindings = self.bottom_pane.take_recent_submission_mention_bindings();
+                let user_message = UserMessage {
+                    text: prepared_message_text.to_string(),
+                    local_images,
+                    remote_image_urls,
+                    text_elements: prepared_message_elements,
+                    mention_bindings,
+                    source: UserMessageSource::Typed,
+                };
+                self.schedule_delayed_non_stop_message(user_message, delay);
             }
             SlashCommand::Rename if !trimmed.is_empty() => {
                 self.otel_manager.counter("codex.thread.rename", 1, &[]);
@@ -4195,12 +4769,13 @@ impl ChatWidget {
                     remote_image_urls,
                     text_elements: prepared_elements,
                     mention_bindings: self.bottom_pane.take_recent_submission_mention_bindings(),
+                    source: UserMessageSource::Typed,
                 };
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
                     self.full_reasoning_buffer.clear();
                     self.set_status_header(String::from("Working"));
-                    self.submit_user_message(user_message);
+                    self.submit_user_message_direct(user_message);
                 } else {
                     self.queue_user_message(user_message);
                 }
@@ -4324,11 +4899,113 @@ impl ChatWidget {
             || self.bottom_pane.is_task_running()
             || self.is_review_mode
         {
-            self.queued_user_messages.push_back(user_message);
-            self.refresh_pending_input_preview();
+            self.enqueue_user_message(user_message);
         } else {
-            self.submit_user_message(user_message);
+            self.submit_user_message_direct(user_message);
         }
+    }
+
+    fn enqueue_user_message(&mut self, user_message: UserMessage) {
+        self.queued_user_messages.push_back(user_message);
+        self.refresh_pending_input_preview();
+    }
+
+    fn should_offer_non_stop_submit_selection(&self) -> bool {
+        self.is_non_stop_effective_now()
+            && !self.is_voice_mode_enabled()
+            && self.is_session_configured()
+            && !self.is_review_mode
+            && (self.bottom_pane.is_task_running() || self.is_plan_streaming_in_tui())
+    }
+
+    fn open_non_stop_submit_selection_for_message(
+        &mut self,
+        user_message: UserMessage,
+        default_mode: NonStopSubmitMenuDefault,
+    ) {
+        self.open_non_stop_submit_selection(user_message, default_mode);
+    }
+
+    fn queue_non_stop_boundary_message(&mut self, user_message: UserMessage) {
+        self.queued_non_stop_boundary_messages
+            .push_back(user_message);
+        self.refresh_pending_input_preview();
+        self.add_info_message(
+            "Queued message for the next normal stop boundary.".to_string(),
+            Some(
+                "Codex will inject it the next time `--non-stop` prevents a normal stop."
+                    .to_string(),
+            ),
+        );
+    }
+
+    fn promote_non_stop_boundary_messages_to_front_of_queue(&mut self) {
+        while let Some(user_message) = self.queued_non_stop_boundary_messages.pop_back() {
+            self.queued_user_messages.push_front(user_message);
+        }
+    }
+
+    fn release_next_non_stop_boundary_message(&mut self) {
+        let Some(user_message) = self.queued_non_stop_boundary_messages.pop_front() else {
+            return;
+        };
+        if self.bottom_pane.is_task_running() || self.is_plan_streaming_in_tui() {
+            self.submit_user_message(user_message);
+        } else {
+            self.enqueue_user_message(user_message);
+        }
+        self.refresh_pending_input_preview();
+    }
+
+    fn schedule_delayed_non_stop_message(&mut self, user_message: UserMessage, delay: Duration) {
+        let now = Instant::now();
+        let Some(release_at) = now.checked_add(delay) else {
+            self.add_error_message("Delay is too large.".to_string());
+            return;
+        };
+        let scheduled = ScheduledNonStopMessage {
+            user_message,
+            release_at,
+        };
+        let insert_at = self
+            .delayed_non_stop_messages
+            .iter()
+            .position(|existing| existing.release_at > scheduled.release_at)
+            .unwrap_or(self.delayed_non_stop_messages.len());
+        self.delayed_non_stop_messages.insert(insert_at, scheduled);
+        self.refresh_pending_input_preview();
+
+        let delay_label = crate::status_indicator_widget::fmt_elapsed_compact(delay.as_secs());
+        self.add_info_message(
+            format!("Scheduled non-stop message release in {delay_label}."),
+            Some("Codex will inject it when the delay elapses.".to_string()),
+        );
+
+        let tx = self.app_event_tx.clone();
+        let thread_id = self.thread_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            tx.send(AppEvent::ReleaseDueScheduledNonStopMessages { thread_id });
+        });
+    }
+
+    fn queued_user_messages_is_empty(&self) -> bool {
+        self.queued_user_messages.is_empty() && self.queued_user_messages_newer.is_empty()
+    }
+
+    fn finish_queued_user_message_edit(&mut self) {
+        if !self.queued_user_message_edit_active && self.queued_user_messages_newer.is_empty() {
+            return;
+        }
+        self.queued_user_message_edit_active = false;
+        self.queued_user_messages
+            .extend(self.queued_user_messages_newer.drain(..));
+        self.refresh_pending_input_preview();
+    }
+
+    fn submit_user_message_direct(&mut self, user_message: UserMessage) {
+        self.pause_queue_autosend_after_error = false;
+        self.submit_user_message(user_message);
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
@@ -4350,6 +5027,7 @@ impl ChatWidget {
             remote_image_urls,
             text_elements,
             mention_bindings,
+            source,
         } = user_message;
         if text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
             return;
@@ -4400,9 +5078,15 @@ impl ChatWidget {
             });
         }
 
-        if !text.is_empty() {
+        let submission_text = if source == UserMessageSource::Voice {
+            wrap_voice_transcript(&text)
+        } else {
+            text.clone()
+        };
+
+        if !submission_text.is_empty() {
             items.push(UserInput::Text {
-                text: text.clone(),
+                text: submission_text,
                 text_elements: text_elements.clone(),
             });
         }
@@ -4503,6 +5187,7 @@ impl ChatWidget {
                 remote_image_urls: remote_image_urls.clone(),
                 text_elements: text_elements.clone(),
                 mention_bindings: mention_bindings.clone(),
+                source,
             },
             compare_key: Self::pending_steer_compare_key_from_items(&items),
         });
@@ -4512,6 +5197,7 @@ impl ChatWidget {
             .filter(|_| self.config.features.enabled(Feature::Personality))
             .filter(|_| self.current_model_supports_personality());
         let service_tier = self.config.service_tier.map(Some);
+        let arm_deep_follow_up_budget = render_in_history && self.pending_deep_request_count > 0;
         let op = Op::UserTurn {
             items,
             cwd: self.config.cwd.clone(),
@@ -4526,6 +5212,20 @@ impl ChatWidget {
             personality,
         };
 
+        if arm_deep_follow_up_budget {
+            // PitchAI fork behavior:
+            //
+            // `/deep` only applies to upcoming *new turns*. Immediate steers
+            // into an already-running turn must not consume the counter,
+            // because the whole point is to force extra completion rounds for
+            // the next queued submissions that would otherwise stop too early.
+            if !self.submit_op(Op::SetNextTurnDeepFollowUpBudget {
+                budget: DEEP_FORCE_CONTINUE_ITERATIONS,
+            }) {
+                return;
+            }
+            self.pending_deep_request_count -= 1;
+        }
         if !self.submit_op(op) {
             return;
         }
@@ -4551,6 +5251,26 @@ impl ChatWidget {
             self.pending_steers.push_back(pending_steer);
             self.saw_plan_item_this_turn = false;
             self.refresh_pending_input_preview();
+
+            if source == UserMessageSource::Voice && !text.is_empty() {
+                // Voice transcripts should look inserted immediately even while
+                // they are steering a running turn. Without this optimistic
+                // render, operators only see the raw `/voice-input ...`
+                // command until the backend reaches its next sampling
+                // boundary, which feels like Enter never happened.
+                // Keep the ItemCompleted dedupe above aligned with this.
+                let local_image_paths = local_images
+                    .iter()
+                    .map(|image| image.path.clone())
+                    .collect::<Vec<_>>();
+                let pending_event = UserMessageEvent {
+                    message: wrap_voice_transcript(&text),
+                    images: Some(remote_image_urls.clone()),
+                    local_images: local_image_paths,
+                    text_elements: text_elements.clone(),
+                };
+                self.on_user_message_event(pending_event);
+            }
         }
 
         // Show replayable user content in conversation history.
@@ -4565,12 +5285,14 @@ impl ChatWidget {
                     text_elements.clone(),
                     local_image_paths.clone(),
                     remote_image_urls.clone(),
+                    source,
                 ));
             self.add_to_history(history_cell::new_user_prompt(
                 text,
                 text_elements,
                 local_image_paths,
                 remote_image_urls,
+                source,
             ));
         } else if render_in_history && !remote_image_urls.is_empty() {
             self.last_rendered_user_message_event =
@@ -4579,12 +5301,14 @@ impl ChatWidget {
                     Vec::new(),
                     Vec::new(),
                     remote_image_urls.clone(),
+                    source,
                 ));
             self.add_to_history(history_cell::new_user_prompt(
                 String::new(),
                 Vec::new(),
                 Vec::new(),
                 remote_image_urls,
+                source,
             ));
         }
 
@@ -4630,7 +5354,9 @@ impl ChatWidget {
         for msg in events {
             if matches!(
                 msg,
-                EventMsg::SessionConfigured(_) | EventMsg::ThreadNameUpdated(_)
+                EventMsg::SessionConfigured(_)
+                    | EventMsg::NonStopModeUpdated(_)
+                    | EventMsg::ThreadNameUpdated(_)
             ) {
                 continue;
             }
@@ -4683,7 +5409,14 @@ impl ChatWidget {
         }
 
         match msg {
+            EventMsg::CompletionGateStarted(_) => {}
+            EventMsg::CompletionGateDecision(event) => self.on_completion_gate_decision(event),
+            EventMsg::CompletionGateBlockedStop(event) => {
+                self.on_completion_gate_blocked_stop(event)
+            }
+            EventMsg::CompletionGateError(event) => self.on_completion_gate_error(event),
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
+            EventMsg::NonStopModeUpdated(event) => self.on_non_stop_mode_updated(event),
             EventMsg::ThreadNameUpdated(e) => self.on_thread_name_updated(e),
             EventMsg::AgentMessage(AgentMessageEvent { .. })
                 if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot))
@@ -4719,6 +5452,11 @@ impl ChatWidget {
             EventMsg::TurnComplete(TurnCompleteEvent {
                 last_agent_message, ..
             }) => self.on_task_complete(last_agent_message, from_replay),
+            EventMsg::TurnCompleteDeferredByNonStop(_) => {
+                if !from_replay {
+                    self.release_next_non_stop_boundary_message();
+                }
+            }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
                 self.on_rate_limit_snapshot(ev.rate_limits);
@@ -4886,18 +5624,26 @@ impl ChatWidget {
                     {
                         if let Some(pending) = self.pending_steers.pop_front() {
                             self.refresh_pending_input_preview();
-                            let pending_event = UserMessageEvent {
-                                message: pending.user_message.text,
-                                images: Some(pending.user_message.remote_image_urls),
-                                local_images: pending
-                                    .user_message
-                                    .local_images
-                                    .into_iter()
-                                    .map(|image| image.path)
-                                    .collect(),
-                                text_elements: pending.user_message.text_elements,
-                            };
-                            self.on_user_message_event(pending_event);
+                            if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
+                                let pending_event = UserMessageEvent {
+                                    message: if pending.user_message.source
+                                        == UserMessageSource::Voice
+                                    {
+                                        wrap_voice_transcript(&pending.user_message.text)
+                                    } else {
+                                        pending.user_message.text
+                                    },
+                                    images: Some(pending.user_message.remote_image_urls),
+                                    local_images: pending
+                                        .user_message
+                                        .local_images
+                                        .into_iter()
+                                        .map(|image| image.path)
+                                        .collect(),
+                                    text_elements: pending.user_message.text_elements,
+                                };
+                                self.on_user_message_event(pending_event);
+                            }
                         } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered)
                         {
                             tracing::warn!(
@@ -4980,15 +5726,22 @@ impl ChatWidget {
         self.last_rendered_user_message_event =
             Some(Self::rendered_user_message_event_from_event(&event));
         let remote_image_urls = event.images.unwrap_or_default();
-        if !event.message.trim().is_empty()
+        let (message, source) =
+            if let Some(voice_transcript) = unwrap_voice_transcript(&event.message) {
+                (voice_transcript, UserMessageSource::Voice)
+            } else {
+                (event.message, UserMessageSource::Typed)
+            };
+        if !message.trim().is_empty()
             || !event.text_elements.is_empty()
             || !remote_image_urls.is_empty()
         {
             self.add_to_history(history_cell::new_user_prompt(
-                event.message,
+                message,
                 event.text_elements,
                 event.local_images,
                 remote_image_urls,
+                source,
             ));
         }
 
@@ -5060,7 +5813,15 @@ impl ChatWidget {
         if self.suppress_queue_autosend {
             return;
         }
+        if self.pause_queue_autosend_after_error {
+            self.refresh_pending_input_preview();
+            return;
+        }
         if self.bottom_pane.is_task_running() {
+            return;
+        }
+        if self.queued_user_message_edit_active || !self.queued_user_messages_newer.is_empty() {
+            self.refresh_pending_input_preview();
             return;
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
@@ -5070,12 +5831,60 @@ impl ChatWidget {
         self.refresh_pending_input_preview();
     }
 
+    pub(crate) fn release_due_scheduled_non_stop_messages(&mut self) {
+        self.release_due_scheduled_non_stop_messages_at(Instant::now());
+    }
+
+    fn release_due_scheduled_non_stop_messages_at(&mut self, now: Instant) {
+        if self.delayed_non_stop_messages.is_empty() {
+            return;
+        }
+        while self
+            .delayed_non_stop_messages
+            .front()
+            .is_some_and(|message| message.release_at <= now)
+        {
+            let Some(scheduled) = self.delayed_non_stop_messages.pop_front() else {
+                break;
+            };
+            if self.pause_queue_autosend_after_error {
+                self.enqueue_user_message(scheduled.user_message);
+            } else if self.should_submit_user_message_now() {
+                self.submit_user_message(scheduled.user_message);
+            } else {
+                self.enqueue_user_message(scheduled.user_message);
+            }
+        }
+        self.refresh_pending_input_preview();
+    }
+
+    fn has_pending_auto_follow_ups(&self) -> bool {
+        !self.queued_user_messages_is_empty()
+            || !self.delayed_non_stop_messages.is_empty()
+            || !self.queued_non_stop_boundary_messages.is_empty()
+    }
+
     /// Rebuild and update the bottom-pane pending-input preview.
     fn refresh_pending_input_preview(&mut self) {
         let queued_messages: Vec<String> = self
             .queued_user_messages
             .iter()
+            .chain(self.queued_user_messages_newer.iter())
             .map(|m| m.text.clone())
+            .chain(
+                self.queued_non_stop_boundary_messages
+                    .iter()
+                    .map(|message| format!("[next stop] {}", message.text)),
+            )
+            .chain(self.delayed_non_stop_messages.iter().map(|message| {
+                let remaining = message.release_at.saturating_duration_since(Instant::now());
+                let remaining_secs = remaining.as_secs().max(1);
+                format!(
+                    "[in {}] {}",
+                    crate::status_indicator_widget::fmt_elapsed_compact(remaining_secs),
+                    message.user_message.text
+                )
+            }))
             .collect();
         let pending_steers: Vec<String> = self
             .pending_steers
@@ -5125,6 +5934,10 @@ impl ChatWidget {
             self.model_display_name(),
             collaboration_mode,
             reasoning_effort_override,
+            self.completion_gate.clone(),
+            self.completion_gate_last_decision.clone(),
+            self.completion_gate_last_blocked_stop.clone(),
+            self.completion_gate_last_error.clone(),
         ));
     }
 
@@ -5133,6 +5946,756 @@ impl ChatWidget {
             &self.config,
             self.session_network_proxy.as_ref(),
         ));
+    }
+
+    fn show_completion_gate_usage(&mut self) {
+        self.add_info_message(
+            "Usage: /completion-criteria <text> | /completion-criteria status | /completion-criteria clear"
+                .to_string(),
+            None,
+        );
+    }
+
+    fn show_completion_gate_status(&mut self) {
+        let Some(gate) = self.completion_gate.as_ref() else {
+            self.add_info_message(
+                "Completion gate is disabled. Use /completion-criteria <text> to enable it."
+                    .to_string(),
+                None,
+            );
+            return;
+        };
+
+        let mut lines = vec![
+            vec!["/completion-criteria".magenta()].into(),
+            "".into(),
+            vec!["• ".dim(), "Completion gate".bold(), " is enabled".into()].into(),
+            vec![
+                "  ".into(),
+                "Criterion: ".dim(),
+                gate.criteria.clone().into(),
+            ]
+            .into(),
+        ];
+        if let Some(judge_model) = gate.judge_model.as_ref() {
+            lines.push(
+                vec![
+                    "  ".into(),
+                    "Judge model: ".dim(),
+                    judge_model.clone().into(),
+                ]
+                .into(),
+            );
+        }
+        if let Some(decision) = self.completion_gate_last_decision.as_ref() {
+            let verdict = if decision.allow_stop {
+                "allowed stop"
+            } else {
+                "blocked stop"
+            };
+            lines.push(
+                vec![
+                    "  ".into(),
+                    "Last verdict: ".dim(),
+                    verdict.into(),
+                    " — ".dim(),
+                    decision.reason.clone().into(),
+                ]
+                .into(),
+            );
+        }
+        if let Some(blocked_stop) = self.completion_gate_last_blocked_stop.as_ref() {
+            lines.push(
+                vec![
+                    "  ".into(),
+                    "Continue prompt: ".dim(),
+                    blocked_stop.continue_prompt.clone().into(),
+                ]
+                .into(),
+            );
+        }
+        if let Some(error) = self.completion_gate_last_error.as_ref() {
+            lines.push(
+                vec![
+                    "  ".into(),
+                    "Last error: ".dim(),
+                    error.message.clone().red(),
+                ]
+                .into(),
+            );
+        }
+        self.add_plain_history_lines(lines);
+    }
+
+    fn show_deep_status(&mut self) {
+        if self.pending_deep_request_count == 0 {
+            self.add_info_message(
+                "Deep mode is idle.".to_string(),
+                Some(format!(
+                    "Use `/deep <count>` to arm the next `<count>` new turns. Each targeted turn gets {DEEP_FORCE_CONTINUE_ITERATIONS} extra candidate-stop follow-ups before normal stopping resumes."
+                )),
+            );
+            return;
+        }
+
+        let turns_label = if self.pending_deep_request_count == 1 {
+            "turn"
+        } else {
+            "turns"
+        };
+        self.add_info_message(
+            format!(
+                "Deep mode is armed for the next {} new {turns_label}.",
+                self.pending_deep_request_count
+            ),
+            Some(format!(
+                "Each targeted turn must survive {DEEP_FORCE_CONTINUE_ITERATIONS} extra candidate-stop boundaries before normal stopping resumes. Immediate steers into a running turn do not consume this budget."
+            )),
+        );
+    }
+
+    fn show_voice_status(&mut self) {
+        let status = if self.config.voice_mode {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let hint = if let Some(pending_voice_mode_override) = self.pending_voice_mode_override {
+            Some(format!(
+                "Queued change: voice mode will be {} after the current turn completes and before the next queued message runs.",
+                if pending_voice_mode_override {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ))
+        } else if self.config.voice_mode {
+            Some(
+                "Assistant speech starts streaming to Dispatcher as soon as enough visible text is available. Live voice transcripts submit directly into the running turn while work is active, or start a fresh new turn after Codex has stopped. Add `/non-stop on` separately if you want voice mode to keep auto-continuing."
+                    .to_string(),
+            )
+        } else {
+            Some(
+                "Use `/voice on` to stream assistant speech to Dispatcher during the turn and accept immediate live transcript injection."
+                    .to_string(),
+            )
+        };
+        self.add_info_message(format!("Voice mode is {status}."), hint);
+    }
+
+    fn voice_output_auth_is_configured(&self) -> bool {
+        [
+            "PITCHAI_CODEX_SPEECH_TOKEN",
+            "PITCHAI_DISPATCH_TOKEN",
+            "PITCHAI_CODEX_SPEECH_BASIC_AUTH",
+        ]
+        .into_iter()
+        .any(|key| env::var(key).is_ok_and(|value| !value.trim().is_empty()))
+    }
+
+    fn current_non_stop_mode(&self) -> NonStopModeOverride {
+        NonStopModeOverride {
+            enabled: self.config.non_stop,
+            expires_at: self.config.non_stop_expires_at,
+            budget: self.config.non_stop_budget,
+        }
+    }
+
+    fn is_voice_mode_enabled(&self) -> bool {
+        self.config.voice_mode
+    }
+
+    fn is_non_stop_effective_now(&self) -> bool {
+        let mode = self.current_non_stop_mode();
+        non_stop_is_active(mode.enabled, mode.expires_at, current_unix_timestamp())
+    }
+
+    fn describe_non_stop_mode(&self, mode: NonStopModeOverride) -> String {
+        if !mode.enabled {
+            return "disabled".to_string();
+        }
+        match mode.expires_at {
+            Some(expires_at) => {
+                let now = current_unix_timestamp();
+                if expires_at > now {
+                    let remaining = format!(
+                        "enabled for {} more",
+                        crate::status_indicator_widget::fmt_elapsed_compact(
+                            u64::try_from(expires_at - now).unwrap_or_default()
+                        )
+                    );
+                    match mode.budget {
+                        Some(budget) => format!("{remaining} or {budget} stop attempts"),
+                        None => remaining,
+                    }
+                } else if let Some(budget) = mode.budget {
+                    format!("enabled with an expired timeout and {budget} stop attempts remaining")
+                } else {
+                    "enabled with an expired timeout".to_string()
+                }
+            }
+            None => match mode.budget {
+                Some(budget) => format!("enabled until {budget} stop attempts"),
+                None => "enabled".to_string(),
+            },
+        }
+    }
+
+    fn show_non_stop_status(&mut self) {
+        let current_mode = self.current_non_stop_mode();
+        let status = self.describe_non_stop_mode(current_mode);
+        let hint = if let Some(pending_non_stop_override) = self.pending_non_stop_override {
+            Some(format!(
+                "Queued change: non-stop mode will be {} after the current turn completes and before the next queued message runs.",
+                self.describe_non_stop_mode(pending_non_stop_override)
+            ))
+        } else if self.is_non_stop_effective_now() {
+            Some(
+                "Submitting while a timed or untimed non-stop turn is running opens a mode picker (steer now, next normal stop, or timed release). `/enqueue-in` is also available. Use `/non-stop off` to disable it immediately, or `/non-stop <duration>` to bound it."
+                    .to_string(),
+            )
+        } else if current_mode.enabled {
+            Some(
+                "The timeout has elapsed. Codex will stop at the next normal final answer instead of auto-continuing."
+                    .to_string(),
+            )
+        } else {
+            Some(
+                "Use `/non-stop on` to force continuous follow-up sampling, or `/non-stop 30m` to keep that behavior only until the timeout expires."
+                    .to_string(),
+            )
+        };
+        self.add_info_message(format!("Non-stop mode is {status}."), hint);
+    }
+
+    fn set_voice_mode(&mut self, enabled: bool) {
+        if self.bottom_pane.is_task_running() {
+            if self.pending_voice_mode_override == Some(enabled) {
+                self.show_voice_status();
+                return;
+            }
+            if self.pending_voice_mode_override.is_some() && self.config.voice_mode == enabled {
+                self.pending_voice_mode_override = None;
+                self.add_info_message(
+                    format!(
+                        "Cleared queued voice change. Voice mode will remain {} after the current turn completes.",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                    None,
+                );
+                return;
+            }
+            if self.pending_voice_mode_override.is_none() && self.config.voice_mode == enabled {
+                self.show_voice_status();
+                return;
+            }
+
+            let action = if self.pending_voice_mode_override.is_some() {
+                "Updated queued voice change"
+            } else {
+                "Queued voice change"
+            };
+            self.pending_voice_mode_override = Some(enabled);
+            self.add_info_message(
+                format!(
+                    "{action}. Voice mode will be {} after the current turn completes.",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                Some(
+                    "The current turn keeps its existing speech behavior. The queued setting applies before the next queued message runs."
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+
+        self.apply_voice_mode(enabled, true);
+    }
+
+    fn submit_voice_transcript(&mut self, transcript: String) {
+        let user_message = UserMessage {
+            text: transcript,
+            local_images: Vec::new(),
+            remote_image_urls: Vec::new(),
+            text_elements: Vec::new(),
+            mention_bindings: Vec::new(),
+            source: UserMessageSource::Voice,
+        };
+        let Some(user_message) = self.maybe_defer_user_message_for_realtime(user_message) else {
+            return;
+        };
+        if self.should_submit_user_message_now() {
+            self.reasoning_buffer.clear();
+            self.full_reasoning_buffer.clear();
+            self.set_status_header(String::from("Working"));
+            self.submit_user_message_direct(user_message);
+        } else {
+            self.queue_user_message(user_message);
+        }
+    }
+
+    fn apply_voice_mode(&mut self, enabled: bool, announce: bool) {
+        if self.config.voice_mode == enabled {
+            if announce {
+                self.show_voice_status();
+            }
+            return;
+        }
+        if enabled && !self.voice_output_auth_is_configured() {
+            self.add_error_message(
+                "Voice mode requires Dispatcher speech auth (`PITCHAI_CODEX_SPEECH_TOKEN`, `PITCHAI_DISPATCH_TOKEN`, or `PITCHAI_CODEX_SPEECH_BASIC_AUTH`).".to_string(),
+            );
+            return;
+        }
+
+        self.config.voice_mode = enabled;
+        self.submit_op(Op::SetVoiceMode { enabled });
+        if announce {
+            let message = if enabled {
+                "Voice mode enabled for this session.".to_string()
+            } else {
+                "Voice mode disabled for this session.".to_string()
+            };
+            let hint = if enabled {
+                Some(
+                    "Assistant speech will stream to Dispatcher during the turn. Live transcripts submit directly into a running turn, or start a fresh new turn once Codex has stopped. Enable `/non-stop on` separately if you want voice mode to keep auto-continuing."
+                        .to_string(),
+                )
+            } else if self.config.non_stop {
+                Some(
+                    "Speech output and live transcript steering are disabled. Non-stop mode remains active until you change it separately."
+                        .to_string(),
+                )
+            } else {
+                Some("Speech output and live transcript steering are disabled.".to_string())
+            };
+            self.add_info_message(message, hint);
+        }
+    }
+
+    pub(crate) fn open_non_stop_submit_selection(
+        &mut self,
+        user_message: UserMessage,
+        default_mode: NonStopSubmitMenuDefault,
+    ) {
+        let restore_user_message = user_message.clone();
+        let steer_user_message = user_message.clone();
+        let boundary_user_message = user_message.clone();
+        let timed_user_message = user_message;
+        let initial_selected_idx = match default_mode {
+            NonStopSubmitMenuDefault::SteerNow => Some(0),
+            NonStopSubmitMenuDefault::AfterNextNormalStop => Some(1),
+        };
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(NON_STOP_SUBMIT_SELECTION_VIEW_ID),
+            title: Some("Running non-stop turn".to_string()),
+            subtitle: Some(
+                "Choose how this message should join the active non-stop session.".to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            footer_note: Some(
+                vec![
+                    "Esc".dim(),
+                    " restores the submitted draft to the composer.".into(),
+                ]
+                .into(),
+            ),
+            initial_selected_idx,
+            items: vec![
+                SelectionItem {
+                    name: "Steer now".to_string(),
+                    description: Some(
+                        "Inject immediately into the current running non-stop turn.".to_string(),
+                    ),
+                    selected_description: Some(
+                        "Submit this message as an immediate steer against the active turn."
+                            .to_string(),
+                    ),
+                    is_default: matches!(default_mode, NonStopSubmitMenuDefault::SteerNow),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SubmitNonStopUserMessage {
+                            user_message: steer_user_message.clone(),
+                            mode: NonStopSubmitMode::SteerNow,
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "After next normal stop".to_string(),
+                    description: Some(
+                        "Wait for the next point where Codex would normally stop.".to_string(),
+                    ),
+                    selected_description: Some(
+                        "Queue this message for the next normal-stop boundary while `--non-stop` keeps the turn alive."
+                            .to_string(),
+                    ),
+                    is_default: matches!(
+                        default_mode,
+                        NonStopSubmitMenuDefault::AfterNextNormalStop
+                    ),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SubmitNonStopUserMessage {
+                            user_message: boundary_user_message.clone(),
+                            mode: NonStopSubmitMode::AfterNextNormalStop,
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Timed release…".to_string(),
+                    description: Some(
+                        "Hold the message and inject it after a wall-clock delay.".to_string(),
+                    ),
+                    selected_description: Some(
+                        "Open a delay picker. For arbitrary delays, keep using `/enqueue-in`."
+                            .to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::OpenNonStopTimedSubmitSelection {
+                            user_message: timed_user_message.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            on_cancel: Some(Box::new(move |tx| {
+                tx.send(AppEvent::RestoreSubmittedDraft {
+                    user_message: restore_user_message.clone(),
+                });
+            })),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_non_stop_timed_submit_selection(&mut self, user_message: UserMessage) {
+        let restore_user_message = user_message.clone();
+        let items = [
+            ("30 seconds", Duration::from_secs(30)),
+            ("5 minutes", Duration::from_secs(5 * 60)),
+            ("30 minutes", Duration::from_secs(30 * 60)),
+            ("2 hours", Duration::from_secs(2 * 60 * 60)),
+        ]
+        .into_iter()
+        .map(|(label, delay)| {
+            let submit_user_message = user_message.clone();
+            SelectionItem {
+                name: label.to_string(),
+                description: Some(format!(
+                    "Inject this message after {}.",
+                    crate::status_indicator_widget::fmt_elapsed_compact(delay.as_secs())
+                )),
+                selected_description: Some(
+                    "The timer starts now. When it fires, Codex injects the message using the usual non-stop live-send policy."
+                        .to_string(),
+                ),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SubmitNonStopUserMessage {
+                        user_message: submit_user_message.clone(),
+                        mode: NonStopSubmitMode::Timed(delay),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        })
+        .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(NON_STOP_TIMED_SUBMIT_SELECTION_VIEW_ID),
+            title: Some("Timed non-stop release".to_string()),
+            subtitle: Some("Choose when Codex should inject this message.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            footer_note: Some(
+                vec!["`/enqueue-in`".magenta(), " supports custom delays.".into()].into(),
+            ),
+            initial_selected_idx: Some(1),
+            items,
+            on_cancel: Some(Box::new(move |tx| {
+                tx.send(AppEvent::RestoreSubmittedDraft {
+                    user_message: restore_user_message.clone(),
+                });
+            })),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn submit_non_stop_user_message(
+        &mut self,
+        user_message: UserMessage,
+        mode: NonStopSubmitMode,
+    ) {
+        match mode {
+            NonStopSubmitMode::SteerNow => {
+                self.reasoning_buffer.clear();
+                self.full_reasoning_buffer.clear();
+                self.set_status_header(String::from("Working"));
+                self.submit_user_message_direct(user_message);
+            }
+            NonStopSubmitMode::AfterNextNormalStop => {
+                self.queue_non_stop_boundary_message(user_message);
+            }
+            NonStopSubmitMode::Timed(delay) => {
+                self.schedule_delayed_non_stop_message(user_message, delay);
+            }
+        }
+        self.finish_queued_user_message_edit();
+    }
+
+    pub(crate) fn restore_submitted_draft(&mut self, user_message: UserMessage) {
+        self.restore_user_message_to_composer(user_message);
+        self.request_redraw();
+    }
+
+    fn set_non_stop_mode(&mut self, enabled: bool, expires_at: Option<i64>) {
+        let target_mode = NonStopModeOverride {
+            enabled,
+            expires_at: enabled.then_some(expires_at).flatten(),
+            budget: None,
+        };
+        if self.bottom_pane.is_task_running() {
+            if !enabled && self.current_non_stop_mode() != target_mode {
+                self.pending_non_stop_override = None;
+                self.apply_non_stop_mode(target_mode, true);
+                return;
+            }
+            if self.pending_non_stop_override == Some(target_mode) {
+                self.show_non_stop_status();
+                return;
+            }
+            if self.pending_non_stop_override.is_some()
+                && self.current_non_stop_mode() == target_mode
+            {
+                self.pending_non_stop_override = None;
+                self.add_info_message(
+                    format!(
+                        "Cleared queued non-stop change. Mode will remain {} after the current turn completes.",
+                        self.describe_non_stop_mode(target_mode)
+                    ),
+                    None,
+                );
+                return;
+            }
+            if self.pending_non_stop_override.is_none()
+                && self.current_non_stop_mode() == target_mode
+            {
+                self.show_non_stop_status();
+                return;
+            }
+
+            let action = if self.pending_non_stop_override.is_some() {
+                "Updated queued non-stop change"
+            } else {
+                "Queued non-stop change"
+            };
+            self.pending_non_stop_override = Some(target_mode);
+            self.add_info_message(
+                format!(
+                    "{action}. Non-stop mode will be {} after the current turn completes.",
+                    self.describe_non_stop_mode(target_mode)
+                ),
+                Some(
+                    "The current turn keeps its existing stop policy. The queued setting applies before the next queued message runs."
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+
+        self.apply_non_stop_mode(target_mode, true);
+    }
+
+    fn apply_non_stop_mode(&mut self, mode: NonStopModeOverride, announce: bool) {
+        if self.current_non_stop_mode() == mode {
+            if announce {
+                self.show_non_stop_status();
+            }
+            return;
+        }
+
+        self.config.non_stop = mode.enabled;
+        self.config.non_stop_expires_at = mode.expires_at;
+        self.config.non_stop_budget = mode.budget;
+        self.submit_op(Op::SetNonStopMode {
+            enabled: mode.enabled,
+            expires_at: mode.expires_at,
+        });
+        if announce {
+            let message = if mode.enabled {
+                match mode.expires_at {
+                    Some(expires_at) => {
+                        let now = current_unix_timestamp();
+                        let remaining = expires_at.saturating_sub(now);
+                        format!(
+                            "Timed non-stop mode enabled for {}.",
+                            crate::status_indicator_widget::fmt_elapsed_compact(
+                                u64::try_from(remaining).unwrap_or_default()
+                            )
+                        )
+                    }
+                    None => "Non-stop mode enabled for this session.".to_string(),
+                }
+            } else {
+                "Non-stop mode disabled for this session.".to_string()
+            };
+            let hint = if mode.enabled {
+                Some(
+                    match (mode.expires_at, mode.budget) {
+                        (Some(_), Some(_)) => {
+                            "Codex will keep auto-continuing until the timeout expires or the stop-attempt budget is reached. After that, the next normal final answer may stop the turn."
+                        }
+                        (Some(_), None) => {
+                            "Codex will keep auto-continuing until the timeout expires. After that, the next normal final answer may stop the turn."
+                        }
+                        (None, Some(_)) => {
+                            "Codex will keep auto-continuing until the stop-attempt budget is reached. After that, the next normal final answer may stop the turn."
+                        }
+                        (None, None) => {
+                            "Codex will keep following up until you disable non-stop mode or interrupt the session."
+                        }
+                    }
+                    .to_string(),
+                )
+            } else {
+                Some(
+                    "Normal completion is allowed again. Live user sends queue normally unless another mode changes that."
+                        .to_string(),
+                )
+            };
+            self.add_info_message(message, hint);
+        }
+    }
+
+    fn apply_pending_non_stop_override(&mut self) {
+        let Some(mode) = self.pending_non_stop_override.take() else {
+            return;
+        };
+        self.apply_non_stop_mode(mode, false);
+    }
+
+    fn apply_pending_voice_mode_override(&mut self) {
+        let Some(enabled) = self.pending_voice_mode_override.take() else {
+            return;
+        };
+        self.apply_voice_mode(enabled, false);
+    }
+
+    fn set_completion_gate(&mut self, criteria: String) {
+        let criteria = criteria.trim().to_string();
+        if criteria.is_empty() {
+            self.add_error_message("Completion criteria cannot be empty.".to_string());
+            return;
+        }
+
+        let existing_gate = self.config.completion_gate.clone();
+        let next_gate = codex_core::config::CompletionGateConfig {
+            criteria: criteria.clone(),
+            judge_model: existing_gate
+                .as_ref()
+                .and_then(|gate| gate.judge_model.clone()),
+            judge_base_url: existing_gate
+                .as_ref()
+                .and_then(|gate| gate.judge_base_url.clone()),
+            judge_api_key_env: existing_gate
+                .as_ref()
+                .and_then(|gate| gate.judge_api_key_env.clone()),
+            timeout_ms: existing_gate
+                .as_ref()
+                .map(|gate| gate.timeout_ms)
+                .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_TIMEOUT_MS),
+            max_retries: existing_gate
+                .as_ref()
+                .map(|gate| gate.max_retries)
+                .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_MAX_RETRIES),
+            max_assistant_messages: existing_gate
+                .as_ref()
+                .map(|gate| gate.max_assistant_messages)
+                .unwrap_or(
+                    codex_core::config::CompletionGateConfig::DEFAULT_MAX_ASSISTANT_MESSAGES,
+                ),
+            max_user_messages: existing_gate
+                .as_ref()
+                .map(|gate| gate.max_user_messages)
+                .unwrap_or(codex_core::config::CompletionGateConfig::DEFAULT_MAX_USER_MESSAGES),
+        };
+        self.config.completion_gate = Some(next_gate.clone());
+        self.completion_gate = Some(CompletionGateInfo {
+            criteria,
+            judge_model: next_gate.judge_model.clone(),
+        });
+        self.completion_gate_last_decision = None;
+        self.completion_gate_last_error = None;
+        self.completion_gate_last_blocked_stop = None;
+        self.submit_op(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+            non_stop: None,
+            completion_gate: Some(CompletionGateSettingsUpdate {
+                criteria: Some(Some(next_gate.criteria.clone())),
+                judge_model: None,
+                judge_base_url: None,
+                judge_api_key_env: None,
+                timeout_ms: None,
+                max_retries: None,
+                max_assistant_messages: None,
+                max_user_messages: None,
+            }),
+        });
+        self.add_info_message(
+            format!(
+                "Completion gate enabled. Future candidate stops must satisfy this criterion:\n{}",
+                next_gate.criteria
+            ),
+            None,
+        );
+    }
+
+    fn clear_completion_gate(&mut self) {
+        if self.completion_gate.is_none() {
+            self.add_info_message("Completion gate is already disabled.".to_string(), None);
+            return;
+        }
+
+        self.config.completion_gate = None;
+        self.completion_gate = None;
+        self.completion_gate_last_decision = None;
+        self.completion_gate_last_error = None;
+        self.completion_gate_last_blocked_stop = None;
+        self.submit_op(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+            non_stop: None,
+            completion_gate: Some(CompletionGateSettingsUpdate {
+                criteria: Some(None),
+                judge_model: None,
+                judge_base_url: None,
+                judge_api_key_env: None,
+                timeout_ms: None,
+                max_retries: None,
+                max_assistant_messages: None,
+                max_user_messages: None,
+            }),
+        });
+        self.add_info_message("Completion gate disabled.".to_string(), None);
     }
 
     fn open_status_line_setup(&mut self) {
@@ -5573,6 +7136,8 @@ impl ChatWidget {
                 service_tier: None,
                 collaboration_mode: None,
                 personality: None,
+                non_stop: None,
+                completion_gate: None,
             }));
             tx.send(AppEvent::UpdateModel(switch_model_for_events.clone()));
             tx.send(AppEvent::UpdateReasoningEffort(Some(default_effort)));
@@ -5694,6 +7259,8 @@ impl ChatWidget {
                         collaboration_mode: None,
                         windows_sandbox_level: None,
                         personality: Some(personality),
+                        non_stop: None,
+                        completion_gate: None,
                     }));
                     tx.send(AppEvent::UpdatePersonality(personality));
                     tx.send(AppEvent::PersistPersonalitySelection { personality });
@@ -6161,6 +7728,8 @@ impl ChatWidget {
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            non_stop: None,
+            completion_gate: None,
         });
         self.set_model(&model);
         self.set_reasoning_effort(effort);
@@ -6679,6 +8248,8 @@ impl ChatWidget {
                 service_tier: None,
                 collaboration_mode: None,
                 personality: None,
+                non_stop: None,
+                completion_gate: None,
             }));
             tx.send(AppEvent::UpdateAskForApprovalPolicy(approval));
             tx.send(AppEvent::UpdateSandboxPolicy(sandbox_clone));
@@ -7366,6 +8937,8 @@ impl ChatWidget {
                 service_tier: Some(service_tier),
                 collaboration_mode: None,
                 personality: None,
+                non_stop: None,
+                completion_gate: None,
             }));
         self.app_event_tx
             .send(AppEvent::PersistServiceTierSelection { service_tier });
@@ -8014,6 +9587,30 @@ impl ChatWidget {
         self.plan_stream_controller.is_some()
     }
 
+    /// Decide whether a user "send" action should submit immediately instead of
+    /// entering the follow-up queue.
+    ///
+    /// Normal running turns keep follow-ups queued so they execute after the
+    /// current turn completes. `--non-stop` is the fork-specific exception:
+    /// those turns intentionally refuse normal completion, so queueing a live
+    /// user send would strand the message behind a turn that is expected to keep
+    /// running indefinitely. In that mode, ordinary composer submissions now
+    /// open an explicit mode picker, but once a path is chosen the underlying
+    /// live-send policy is still "submit into the active turn immediately".
+    /// Delayed `/enqueue-in` releases intentionally reuse this same policy at
+    /// release time so timed follow-ups behave like ordinary live sends once
+    /// their timer expires.
+    ///
+    /// Keep explicit queue actions on the queue path; this helper is only for
+    /// normal send actions.
+    fn should_submit_user_message_now(&self) -> bool {
+        if !self.is_session_configured() || self.is_review_mode {
+            return false;
+        }
+        let task_running = self.bottom_pane.is_task_running() || self.is_plan_streaming_in_tui();
+        !task_running || self.is_non_stop_effective_now() || self.is_voice_mode_enabled()
+    }
+
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.bottom_pane.composer_is_empty()
     }
@@ -8037,18 +9634,23 @@ impl ChatWidget {
             return;
         }
         self.set_collaboration_mask(collaboration_mode);
-        let should_queue = self.is_plan_streaming_in_tui() || self.bottom_pane.is_task_running();
         let user_message = UserMessage {
             text,
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            source: UserMessageSource::Typed,
         };
-        if should_queue {
-            self.queue_user_message(user_message);
+        if self.should_offer_non_stop_submit_selection() {
+            self.open_non_stop_submit_selection_for_message(
+                user_message,
+                NonStopSubmitMenuDefault::SteerNow,
+            );
+        } else if self.should_submit_user_message_now() {
+            self.submit_user_message_direct(user_message);
         } else {
-            self.submit_user_message(user_message);
+            self.queue_user_message(user_message);
         }
     }
 
@@ -8091,6 +9693,7 @@ impl ChatWidget {
     pub(crate) fn queued_user_message_texts(&self) -> Vec<String> {
         self.queued_user_messages
             .iter()
+            .chain(self.queued_user_messages_newer.iter())
             .map(|message| message.text.clone())
             .collect()
     }

@@ -2,6 +2,13 @@
 
 Goal: allow Seth to send a Telegram message that triggers an Azure run of Elise (Codex agent). The Telegram message becomes the **prompt** for the next turn, and the final agent response is posted back to the **same Telegram chat**.
 
+Current behavior also supports **reply-to-final-message routing**:
+
+- the stop hook persists the sent Telegram `message_id` together with the originating Codex `conversation_id`
+- when Seth replies to that final Telegram message, the dispatcher resolves the reply target and routes it back to the same Codex session
+- when tmux route metadata is available, the reply is submitted directly into that live tmux-backed Codex session and an `Enter` key is sent automatically
+- otherwise the dispatcher queues a bundle that resumes the same `conversation_id`
+
 Constraints / decisions (per Seth):
 
 - **Reply in the same Telegram chat** where the command was sent.

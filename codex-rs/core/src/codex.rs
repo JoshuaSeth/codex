@@ -86,6 +86,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
@@ -166,6 +167,9 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 #[cfg(test)]
 use crate::exec::StreamOutput;
+use crate::tools::hooks::StopHook;
+use crate::tools::hooks::StopHookEvent;
+use crate::tools::hooks::ToolHook;
 use codex_config::CONFIG_TOML_FILE;
 
 mod rollout_reconstruction;
@@ -208,6 +212,7 @@ fn count_user_turns_in_history(items: &[ResponseItem]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+use crate::completion_gate;
 use crate::exec_policy::ExecPolicyUpdateError;
 use crate::feedback_tags;
 use crate::file_watcher::FileWatcher;
@@ -230,6 +235,8 @@ use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_tool_mentions_from_messages;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
+use crate::non_stop::current_unix_timestamp;
+use crate::non_stop::non_stop_is_active;
 use crate::plugins::PluginsManager;
 use crate::project_doc::get_user_instructions;
 use crate::protocol::AgentMessageContentDeltaEvent;
@@ -238,6 +245,9 @@ use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
 use crate::protocol::BackgroundEventEvent;
 use crate::protocol::CompactedItem;
+use crate::protocol::CompletionGateInfo;
+use crate::protocol::CompletionGateSettingsUpdate;
+use crate::protocol::CompletionGateStartedEvent;
 use crate::protocol::DeprecationNoticeEvent;
 use crate::protocol::ErrorEvent;
 use crate::protocol::Event;
@@ -247,6 +257,7 @@ use crate::protocol::McpServerRefreshConfig;
 use crate::protocol::ModelRerouteEvent;
 use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
+use crate::protocol::NonStopModeUpdatedEvent;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::RateLimitSnapshot;
@@ -267,6 +278,7 @@ use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+use crate::protocol::TurnCompleteDeferredByNonStopEvent;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
@@ -313,6 +325,7 @@ use crate::tools::spec::ToolsConfigParams;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::util::backoff;
+use crate::voice_mode::VoiceOutputClient;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_async_utils::OrCancelExt;
 use codex_otel::OtelManager;
@@ -359,8 +372,11 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 const FORCED_STREAM_MAX_RETRIES: u64 = 30;
+const FORCED_CYBER_STREAM_MAX_RETRIES: u64 = 200;
 const DECODE_RESPONSE_BODY_MATCH: &str = "errordecodingresponsebody";
 const PROCESSING_REQUEST_ERROR_MATCH: &str = "anerroroccurredwhileprocessingyourrequest";
+const POSSIBLE_CYBERSECURITY_RISK_MATCH: &str = "possiblecybersecurityrisk";
+const TRUSTED_ACCESS_FOR_CYBER_MATCH: &str = "trustedaccessforcyber";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -522,6 +538,12 @@ impl Codex {
             dynamic_tools,
             persist_extended_history,
             inherited_shell_snapshot,
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
+            completion_gate: config.completion_gate.clone(),
+            next_turn_deep_follow_up_budget: None,
         };
 
         // Generate a unique ID for the lifetime of this Codex session.
@@ -660,6 +682,7 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
+    voice_output: Option<Arc<VoiceOutputClient>>,
     js_repl: Arc<JsReplHandle>,
     next_internal_sub_id: AtomicU64,
 }
@@ -684,6 +707,21 @@ pub(crate) struct TurnContext {
     pub(crate) sub_id: String,
     pub(crate) trace_id: Option<String>,
     pub(crate) realtime_active: bool,
+    /// Remaining `/deep` forced-follow-up budget assigned when this turn
+    /// started.
+    ///
+    /// PitchAI fork behavior:
+    ///
+    /// `/deep n` is intentionally a per-turn continuation override, not a
+    /// session-wide fallback. The TUI arms the next `n` *new* turns with a
+    /// fixed follow-up budget so each turn must survive a bounded number of
+    /// candidate-stop boundaries before normal completion is allowed again.
+    ///
+    /// If an upstream merge removes this field because the value looks local
+    /// to the sampling loop, the budget can no longer survive the normal
+    /// `new_turn_* -> spawn_task -> run_sampling_request` hand-off and `/deep`
+    /// silently regresses.
+    pub(crate) deep_follow_up_budget: u32,
     pub(crate) config: Arc<Config>,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
@@ -712,6 +750,8 @@ pub(crate) struct TurnContext {
     pub(crate) tools_config: ToolsConfig,
     pub(crate) features: ManagedFeatures,
     pub(crate) ghost_snapshot: GhostSnapshotConfig,
+    pub(crate) tool_hook: Option<ToolHook>,
+    pub(crate) stop_hook: Option<StopHook>,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
     pub(crate) tool_call_gate: Arc<ReadinessFlag>,
@@ -775,6 +815,7 @@ impl TurnContext {
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             realtime_active: self.realtime_active,
+            deep_follow_up_budget: self.deep_follow_up_budget,
             config: Arc::new(config),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
@@ -803,6 +844,8 @@ impl TurnContext {
             tools_config,
             features,
             ghost_snapshot: self.ghost_snapshot.clone(),
+            tool_hook: self.tool_hook.clone(),
+            stop_hook: self.stop_hook.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.clone(),
             tool_call_gate: Arc::new(ReadinessFlag::new()),
@@ -926,6 +969,12 @@ pub(crate) struct SessionConfiguration {
     dynamic_tools: Vec<DynamicToolSpec>,
     persist_extended_history: bool,
     inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+    non_stop: bool,
+    voice_mode: bool,
+    non_stop_expires_at: Option<i64>,
+    non_stop_budget: Option<u32>,
+    completion_gate: Option<crate::config::CompletionGateConfig>,
+    next_turn_deep_follow_up_budget: Option<u32>,
 }
 
 impl SessionConfiguration {
@@ -938,6 +987,10 @@ impl SessionConfiguration {
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.service_tier,
+            non_stop: self.non_stop,
+            voice_mode: self.voice_mode,
+            non_stop_expires_at: self.non_stop_expires_at,
+            non_stop_budget: self.non_stop_budget,
             approval_policy: self.approval_policy.value(),
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
@@ -945,6 +998,13 @@ impl SessionConfiguration {
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
             personality: self.personality,
             session_source: self.session_source.clone(),
+            completion_gate: self
+                .completion_gate
+                .as_ref()
+                .map(|gate| CompletionGateInfo {
+                    criteria: gate.criteria.clone(),
+                    judge_model: gate.judge_model.clone(),
+                }),
         }
     }
 
@@ -977,6 +1037,104 @@ impl SessionConfiguration {
         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
             next_configuration.app_server_client_name = Some(app_server_client_name);
         }
+        if let Some(non_stop) = updates.non_stop {
+            next_configuration.non_stop = non_stop;
+            if !non_stop || updates.non_stop_expires_at.is_none() {
+                next_configuration.non_stop_expires_at = None;
+            }
+            if !non_stop || updates.non_stop_budget.is_none() {
+                next_configuration.non_stop_budget = None;
+            }
+        }
+        if let Some(voice_mode) = updates.voice_mode {
+            next_configuration.voice_mode = voice_mode;
+        }
+        if let Some(non_stop_expires_at) = updates.non_stop_expires_at {
+            next_configuration.non_stop_expires_at = non_stop_expires_at;
+            if non_stop_expires_at.is_some() {
+                next_configuration.non_stop = true;
+            }
+        }
+        if let Some(non_stop_budget) = updates.non_stop_budget {
+            next_configuration.non_stop_budget = non_stop_budget;
+            if non_stop_budget.is_some() {
+                next_configuration.non_stop = true;
+            }
+        }
+        if let Some(completion_gate) = updates.completion_gate.clone() {
+            match completion_gate.criteria {
+                Some(Some(criteria)) => {
+                    let mut next_gate =
+                        next_configuration
+                            .completion_gate
+                            .clone()
+                            .unwrap_or(crate::config::CompletionGateConfig {
+                            criteria: criteria.clone(),
+                            judge_model: None,
+                            judge_base_url: None,
+                            judge_api_key_env: None,
+                            timeout_ms: crate::config::CompletionGateConfig::DEFAULT_TIMEOUT_MS,
+                            max_retries: crate::config::CompletionGateConfig::DEFAULT_MAX_RETRIES,
+                            max_assistant_messages:
+                                crate::config::CompletionGateConfig::DEFAULT_MAX_ASSISTANT_MESSAGES,
+                            max_user_messages:
+                                crate::config::CompletionGateConfig::DEFAULT_MAX_USER_MESSAGES,
+                        });
+                    next_gate.criteria = criteria;
+                    if let Some(judge_model) = completion_gate.judge_model {
+                        next_gate.judge_model = judge_model;
+                    }
+                    if let Some(judge_base_url) = completion_gate.judge_base_url {
+                        next_gate.judge_base_url = judge_base_url;
+                    }
+                    if let Some(judge_api_key_env) = completion_gate.judge_api_key_env {
+                        next_gate.judge_api_key_env = judge_api_key_env;
+                    }
+                    if let Some(timeout_ms) = completion_gate.timeout_ms {
+                        next_gate.timeout_ms = timeout_ms.max(1);
+                    }
+                    if let Some(max_retries) = completion_gate.max_retries {
+                        next_gate.max_retries = max_retries.max(1);
+                    }
+                    if let Some(max_assistant_messages) = completion_gate.max_assistant_messages {
+                        next_gate.max_assistant_messages = max_assistant_messages.max(1);
+                    }
+                    if let Some(max_user_messages) = completion_gate.max_user_messages {
+                        next_gate.max_user_messages = max_user_messages.max(1);
+                    }
+                    next_configuration.completion_gate = Some(next_gate);
+                }
+                Some(None) => {
+                    next_configuration.completion_gate = None;
+                }
+                None => {
+                    if let Some(next_gate) = next_configuration.completion_gate.as_mut() {
+                        if let Some(judge_model) = completion_gate.judge_model {
+                            next_gate.judge_model = judge_model;
+                        }
+                        if let Some(judge_base_url) = completion_gate.judge_base_url {
+                            next_gate.judge_base_url = judge_base_url;
+                        }
+                        if let Some(judge_api_key_env) = completion_gate.judge_api_key_env {
+                            next_gate.judge_api_key_env = judge_api_key_env;
+                        }
+                        if let Some(timeout_ms) = completion_gate.timeout_ms {
+                            next_gate.timeout_ms = timeout_ms.max(1);
+                        }
+                        if let Some(max_retries) = completion_gate.max_retries {
+                            next_gate.max_retries = max_retries.max(1);
+                        }
+                        if let Some(max_assistant_messages) = completion_gate.max_assistant_messages
+                        {
+                            next_gate.max_assistant_messages = max_assistant_messages.max(1);
+                        }
+                        if let Some(max_user_messages) = completion_gate.max_user_messages {
+                            next_gate.max_user_messages = max_user_messages.max(1);
+                        }
+                    }
+                }
+            }
+        }
         Ok(next_configuration)
     }
 }
@@ -993,6 +1151,23 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) final_output_json_schema: Option<Option<Value>>,
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
+    pub(crate) non_stop: Option<bool>,
+    pub(crate) voice_mode: Option<bool>,
+    pub(crate) non_stop_expires_at: Option<Option<i64>>,
+    pub(crate) non_stop_budget: Option<Option<u32>>,
+    pub(crate) completion_gate: Option<CompletionGateSettingsUpdate>,
+}
+
+fn non_stop_mode_updated_event(
+    non_stop: bool,
+    non_stop_expires_at: Option<i64>,
+    non_stop_budget: Option<u32>,
+) -> EventMsg {
+    EventMsg::NonStopModeUpdated(NonStopModeUpdatedEvent {
+        enabled: non_stop,
+        expires_at: non_stop_expires_at,
+        stop_attempt_budget: non_stop_budget,
+    })
 }
 
 impl Session {
@@ -1062,6 +1237,11 @@ impl Session {
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
         per_turn_config.service_tier = session_configuration.service_tier;
         per_turn_config.personality = session_configuration.personality;
+        per_turn_config.non_stop = session_configuration.non_stop;
+        per_turn_config.voice_mode = session_configuration.voice_mode;
+        per_turn_config.non_stop_expires_at = session_configuration.non_stop_expires_at;
+        per_turn_config.non_stop_budget = session_configuration.non_stop_budget;
+        per_turn_config.completion_gate = session_configuration.completion_gate.clone();
         let resolved_web_search_mode = resolve_web_search_mode_for_turn(
             &per_turn_config.web_search_mode,
             session_configuration.sandbox_policy.get(),
@@ -1116,6 +1296,7 @@ impl Session {
         otel_manager: &OtelManager,
         provider: ModelProviderInfo,
         session_configuration: &SessionConfiguration,
+        deep_follow_up_budget: u32,
         per_turn_config: Config,
         model_info: ModelInfo,
         network: Option<NetworkProxy>,
@@ -1163,6 +1344,7 @@ impl Session {
             sub_id,
             trace_id: current_span_trace_id(),
             realtime_active: false,
+            deep_follow_up_budget,
             config: per_turn_config.clone(),
             auth_manager: auth_manager_for_context,
             model_info: model_info.clone(),
@@ -1188,6 +1370,14 @@ impl Session {
             tools_config,
             features: per_turn_config.features.clone(),
             ghost_snapshot: per_turn_config.ghost_snapshot.clone(),
+            tool_hook: per_turn_config
+                .tool_hook_command
+                .clone()
+                .and_then(ToolHook::new),
+            stop_hook: per_turn_config
+                .stop_hook_command
+                .clone()
+                .and_then(StopHook::new),
             final_output_json_schema: None,
             codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
             tool_call_gate: Arc::new(ReadinessFlag::new()),
@@ -1601,6 +1791,7 @@ impl Session {
             config.js_repl_node_path.clone(),
             config.js_repl_node_module_dirs.clone(),
         ));
+        let voice_output = VoiceOutputClient::from_env(config.voice_mode)?.map(Arc::new);
 
         let sess = Arc::new(Session {
             conversation_id,
@@ -1612,6 +1803,7 @@ impl Session {
             conversation: Arc::new(RealtimeConversationManager::new()),
             active_turn: Mutex::new(None),
             services,
+            voice_output,
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
         });
@@ -1640,8 +1832,27 @@ impl Session {
                 initial_messages,
                 network_proxy: session_network_proxy,
                 rollout_path,
+                non_stop: session_configuration.non_stop,
+                completion_gate: session_configuration.completion_gate.as_ref().map(|gate| {
+                    CompletionGateInfo {
+                        criteria: gate.criteria.clone(),
+                        judge_model: gate.judge_model.clone(),
+                    }
+                }),
             }),
         })
+        .chain(
+            (session_configuration.non_stop_expires_at.is_some()
+                || session_configuration.non_stop_budget.is_some())
+            .then(|| Event {
+                id: INITIAL_SUBMIT_ID.to_owned(),
+                msg: non_stop_mode_updated_event(
+                    session_configuration.non_stop,
+                    session_configuration.non_stop_expires_at,
+                    session_configuration.non_stop_budget,
+                ),
+            }),
+        )
         .chain(post_session_configured_events.into_iter());
         for event in events {
             sess.send_event_raw(event).await;
@@ -1772,10 +1983,10 @@ impl Session {
             return;
         }
         let mut turn_state = active_turn.turn_state.lock().await;
-        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut() {
-            if cost_tracking.baseline_prompt_items.is_none() {
-                cost_tracking.set_baseline_prompt_items(baseline_prompt_items);
-            }
+        if let Some(cost_tracking) = turn_state.cost_tracking.as_mut()
+            && cost_tracking.baseline_prompt_items.is_none()
+        {
+            cost_tracking.set_baseline_prompt_items(baseline_prompt_items);
         }
     }
 
@@ -2288,7 +2499,7 @@ impl Session {
                 }
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                if !search_call_ids.remove(call_id) {
+                if !search_call_ids.contains(call_id) {
                     return;
                 }
                 let Some(content) = output.body.to_text() else {
@@ -2310,6 +2521,7 @@ impl Session {
                 else {
                     return;
                 };
+                search_call_ids.remove(call_id);
                 *active_selected_tools = Some(selected_tools);
             }
             _ => {}
@@ -2407,11 +2619,16 @@ impl Session {
 
         match state.session_configuration.apply(&updates) {
             Ok(updated) => {
+                let completion_gate_changed =
+                    state.session_configuration.completion_gate != updated.completion_gate;
                 let previous_cwd = state.session_configuration.cwd.clone();
                 let next_cwd = updated.cwd.clone();
                 let codex_home = updated.codex_home.clone();
                 let session_source = updated.session_source.clone();
                 state.session_configuration = updated;
+                if completion_gate_changed {
+                    state.reset_completion_gate_runtime();
+                }
                 drop(state);
 
                 self.maybe_refresh_shell_snapshot_for_cwd(
@@ -2437,6 +2654,7 @@ impl Session {
     ) -> ConstraintResult<Arc<TurnContext>> {
         let (
             session_configuration,
+            deep_follow_up_budget,
             sandbox_policy_changed,
             previous_cwd,
             codex_home,
@@ -2444,15 +2662,26 @@ impl Session {
         ) = {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(&updates) {
-                Ok(next) => {
+                Ok(mut next) => {
+                    let completion_gate_changed =
+                        state.session_configuration.completion_gate != next.completion_gate;
                     let previous_cwd = state.session_configuration.cwd.clone();
                     let sandbox_policy_changed =
                         state.session_configuration.sandbox_policy != next.sandbox_policy;
                     let codex_home = next.codex_home.clone();
                     let session_source = next.session_source.clone();
+                    let deep_follow_up_budget = next
+                        .next_turn_deep_follow_up_budget
+                        .take()
+                        .unwrap_or_default();
                     state.session_configuration = next.clone();
+                    if completion_gate_changed {
+                        state.reset_completion_gate_runtime();
+                    }
+                    state.session_configuration.next_turn_deep_follow_up_budget = None;
                     (
                         next,
+                        deep_follow_up_budget,
                         sandbox_policy_changed,
                         previous_cwd,
                         codex_home,
@@ -2485,6 +2714,7 @@ impl Session {
             .new_turn_from_configuration(
                 sub_id,
                 session_configuration,
+                deep_follow_up_budget,
                 updates.final_output_json_schema,
                 sandbox_policy_changed,
             )
@@ -2495,6 +2725,7 @@ impl Session {
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
+        deep_follow_up_budget: u32,
         final_output_json_schema: Option<Option<Value>>,
         sandbox_policy_changed: bool,
     ) -> Arc<TurnContext> {
@@ -2545,6 +2776,7 @@ impl Session {
             &self.services.otel_manager,
             session_configuration.provider.clone(),
             &session_configuration,
+            deep_follow_up_budget,
             per_turn_config,
             model_info,
             self.services
@@ -2713,7 +2945,7 @@ impl Session {
             let state = self.state.lock().await;
             state.session_configuration.clone()
         };
-        self.new_turn_from_configuration(sub_id, session_configuration, None, false)
+        self.new_turn_from_configuration(sub_id, session_configuration, 0, None, false)
             .await
     }
 
@@ -2754,6 +2986,7 @@ impl Session {
             .await;
         self.maybe_clear_realtime_handoff_for_event(&legacy_source)
             .await;
+        self.maybe_push_event_text_to_voice(&legacy_source).await;
 
         let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
         for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
@@ -2784,6 +3017,21 @@ impl Session {
             return;
         }
         self.conversation.clear_active_handoff().await;
+    }
+
+    async fn maybe_push_event_text_to_voice(&self, msg: &EventMsg) {
+        let voice_mode_enabled = {
+            let state = self.state.lock().await;
+            state.session_configuration.voice_mode
+        };
+        if !voice_mode_enabled {
+            return;
+        }
+        let Some(voice_output) = self.voice_output.as_ref() else {
+            return;
+        };
+        let conversation_id = self.conversation_id.to_string();
+        voice_output.enqueue_event(conversation_id.as_str(), msg);
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
@@ -3437,6 +3685,70 @@ impl Session {
         );
         if let Some(developer_instructions) = turn_context.developer_instructions.as_deref() {
             developer_sections.push(developer_instructions.to_string());
+        }
+        // PitchAI fork behavior:
+        //
+        // `--non-stop` is a deliberate operator override that says normal completion is never
+        // enough. The model must expect another round even after it thinks it has reached a final
+        // answer, otherwise it tends to emit a polished conclusion every sampling request and then
+        // get forced back in by runtime logic with no explanation.
+        if turn_context.config.voice_mode {
+            developer_sections.push(
+                "Voice mode is enabled for this session. Visible assistant updates may start \
+speaking before the message is fully complete, and live voice input may interrupt the current \
+run immediately. Keep responses concise and ready for interruption. Voice transcripts may arrive \
+wrapped in <voice_transcript> tags; treat the wrapped body as the user's direct spoken request."
+                    .to_string(),
+            );
+        }
+        if non_stop_is_active(
+            turn_context.config.non_stop,
+            turn_context.config.non_stop_expires_at,
+            current_unix_timestamp(),
+        ) {
+            let instructions = match (
+                turn_context.config.non_stop_expires_at,
+                turn_context.config.non_stop_budget,
+            ) {
+                (Some(_), Some(budget)) => format!(
+                    "Timed non-stop mode is enabled for this session with a remaining budget of \
+{budget} normal stop attempts. Until the operator timeout expires or the stop-attempt budget is \
+reached, do not conclude the turn or present a final answer. Keep working, waiting, checking, or \
+otherwise continuing the session; once either bound is reached, the next normal final answer may \
+stop the turn."
+                ),
+                (Some(_), None) => "Timed non-stop mode is enabled for this session. Until the operator timeout \
+expires, do not conclude the turn or present a final answer. Keep working, waiting, checking, or \
+otherwise continuing the session; once that timeout has expired, the next normal final answer may \
+stop the turn."
+                    .to_string(),
+                (None, Some(budget)) => format!(
+                    "Non-stop mode is enabled for this session with a remaining budget of \
+{budget} normal stop attempts. Do not conclude the turn or present a final answer until that \
+stop-attempt budget is reached. Keep working, waiting, checking, or otherwise continuing the \
+session."
+                ),
+                (None, None) => "Non-stop mode is enabled for this session. Never conclude the turn or present a \
+final answer. Keep working, waiting, checking, or otherwise continuing the session until it is \
+externally interrupted or aborted."
+                    .to_string(),
+            };
+            developer_sections.push(instructions);
+        }
+        // PitchAI fork behavior:
+        //
+        // `--persistent` needs both prompt-level and runtime enforcement. These developer
+        // instructions tell the model what the operator expects (keep watching/managing live
+        // terminals instead of wrapping up), while the later completion guard makes that promise
+        // non-optional if the model still tries to stop early.
+        if turn_context.config.persistent {
+            developer_sections.push(
+                "Persistent terminal mode is enabled for this session. If any session terminal is \
+still running, do not end the turn or present a final answer yet. Keep monitoring or managing \
+live terminals until they exit; when you need to wait on a running terminal, prefer \
+`write_stdin` with empty `chars` so you poll it instead of sending input."
+                    .to_string(),
+            );
         }
         // Add developer instructions for memories.
         if turn_context.features.enabled(Feature::MemoryTool)
@@ -4108,6 +4420,8 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     service_tier,
                     collaboration_mode,
                     personality,
+                    non_stop,
+                    completion_gate,
                 } => {
                     let collaboration_mode = if let Some(collab_mode) = collaboration_mode {
                         collab_mode
@@ -4131,10 +4445,57 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                             reasoning_summary: summary,
                             service_tier,
                             personality,
+                            non_stop,
+                            completion_gate,
                             ..Default::default()
                         },
                     )
                     .await;
+                    false
+                }
+                Op::SetNonStopMode {
+                    enabled,
+                    expires_at,
+                } => {
+                    handlers::override_turn_context(
+                        &sess,
+                        sub.id.clone(),
+                        SessionSettingsUpdate {
+                            non_stop: Some(enabled),
+                            non_stop_expires_at: Some(expires_at),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    false
+                }
+                Op::SetVoiceMode { enabled } => {
+                    if enabled && sess.voice_output.is_none() {
+                        sess.send_event_raw(Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: "Voice mode requires Dispatcher speech auth (`PITCHAI_CODEX_SPEECH_TOKEN`, `PITCHAI_DISPATCH_TOKEN`, or `PITCHAI_CODEX_SPEECH_BASIC_AUTH`).".to_string(),
+                                codex_error_info: Some(CodexErrorInfo::BadRequest),
+                            }),
+                        })
+                        .await;
+                    } else {
+                        handlers::override_turn_context(
+                            &sess,
+                            sub.id.clone(),
+                            SessionSettingsUpdate {
+                                voice_mode: Some(enabled),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                    false
+                }
+                Op::SetNextTurnDeepFollowUpBudget { budget } => {
+                    let mut state = sess.state.lock().await;
+                    state.session_configuration.next_turn_deep_follow_up_budget =
+                        (budget > 0).then_some(budget);
                     false
                 }
                 Op::UserInput { .. } | Op::UserTurn { .. } => {
@@ -4371,6 +4732,9 @@ mod handlers {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) {
+        let non_stop_touched = updates.non_stop.is_some()
+            || updates.non_stop_expires_at.is_some()
+            || updates.non_stop_budget.is_some();
         if let Err(err) = sess.update_settings(updates).await {
             sess.send_event_raw(Event {
                 id: sub_id,
@@ -4378,6 +4742,24 @@ mod handlers {
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::BadRequest),
                 }),
+            })
+            .await;
+        } else if non_stop_touched {
+            let (non_stop, non_stop_expires_at, non_stop_budget) = {
+                let state = sess.state.lock().await;
+                (
+                    state.session_configuration.non_stop,
+                    state.session_configuration.non_stop_expires_at,
+                    state.session_configuration.non_stop_budget,
+                )
+            };
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: super::non_stop_mode_updated_event(
+                    non_stop,
+                    non_stop_expires_at,
+                    non_stop_budget,
+                ),
             })
             .await;
         }
@@ -4421,6 +4803,11 @@ mod handlers {
                         final_output_json_schema: Some(final_output_json_schema),
                         personality,
                         app_server_client_name: None,
+                        non_stop: None,
+                        non_stop_expires_at: None,
+                        non_stop_budget: None,
+                        voice_mode: None,
+                        completion_gate: None,
                     },
                 )
             }
@@ -5326,6 +5713,7 @@ async fn spawn_review_thread(
         sub_id: review_turn_id,
         trace_id: current_span_trace_id(),
         realtime_active: parent_turn_context.realtime_active,
+        deep_follow_up_budget: parent_turn_context.deep_follow_up_budget,
         config: per_turn_config,
         auth_manager: auth_manager_for_context,
         model_info: model_info.clone(),
@@ -5337,6 +5725,8 @@ async fn spawn_review_thread(
         tools_config,
         features: parent_turn_context.features.clone(),
         ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
+        tool_hook: parent_turn_context.tool_hook.clone(),
+        stop_hook: parent_turn_context.stop_hook.clone(),
         current_date: parent_turn_context.current_date.clone(),
         timezone: parent_turn_context.timezone.clone(),
         app_server_client_name: parent_turn_context.app_server_client_name.clone(),
@@ -5448,8 +5838,13 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
 ///
 /// - If the model requests a function call, we execute it and send the output
 ///   back to the model in the next sampling request.
-/// - If the model sends only an assistant message, we record it in the
+/// - If the model sends only an assistant message, we usually record it in the
 ///   conversation history and consider the turn complete.
+///
+/// PitchAI fork note: background-terminal workflows, `--persistent`, and
+/// `--non-stop` sessions add explicit exceptions to that rule. Keep the
+/// completion guards in `try_run_sampling_request` aligned before simplifying
+/// this flow.
 ///
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
@@ -5619,6 +6014,30 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
+    // PitchAI fork invariant:
+    //
+    // This tracks a one-shot continuation hint for background terminals that were *waited on*
+    // via empty `write_stdin` polls and are still alive. The tool call itself already causes one
+    // follow-up round, but that is not sufficient: the next model response is often a plain
+    // assistant status update ("still running", "leaving it running", etc.) with no new tool
+    // call. Without carrying this state across the response boundary, core mistakes that
+    // assistant-only update for a terminal answer and ends the turn early.
+    //
+    // If an upstream merge removes this state because it looks redundant next to ordinary
+    // tool-follow-up handling, background-terminal workflows regress immediately and Codex starts
+    // prematurely finalizing turns after status commentary.
+    let mut pending_background_wait_process_ids = HashSet::new();
+    // Separate one-shot guard for the common "tool output -> short/commentary assistant update"
+    // pattern. This is intentionally re-armed only by tool-producing responses so we do not turn
+    // every short final answer into an extra loop.
+    let mut allow_assistant_status_follow_up_after_tool_output = false;
+    // PitchAI fork behavior:
+    //
+    // `/deep n` arms the next `n` *new* turns with a bounded follow-up budget.
+    // We burn one unit only when the current sampling response would otherwise
+    // stop, which gives each targeted turn four extra "think one more step"
+    // rounds without turning the whole session into `--non-stop`.
+    let mut remaining_deep_follow_up_budget = turn_context.deep_follow_up_budget;
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -5681,6 +6100,9 @@ pub(crate) async fn run_turn(
             sampling_request_input,
             &explicitly_enabled_connectors,
             skills_outcome,
+            allow_assistant_status_follow_up_after_tool_output,
+            &pending_background_wait_process_ids,
+            &mut remaining_deep_follow_up_budget,
             &mut server_model_warning_emitted_for_turn,
             cancellation_token.child_token(),
         )
@@ -5690,7 +6112,12 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    last_agent_message_phase: _sampling_request_last_agent_message_phase,
+                    armed_background_wait_process_ids,
+                    saw_tool_call,
                 } = sampling_request_output;
+                pending_background_wait_process_ids = armed_background_wait_process_ids;
+                allow_assistant_status_follow_up_after_tool_output = saw_tool_call;
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -5723,6 +6150,117 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    if let Some(completion_gate_config) =
+                        turn_context.config.completion_gate.as_ref()
+                        && let Some(candidate_response) =
+                            sampling_request_last_agent_message.as_deref()
+                    {
+                        let (boundary_history_len, history) = {
+                            let state = sess.state.lock().await;
+                            (
+                                state.completion_gate_boundary_history_len,
+                                state.history.raw_items().to_vec(),
+                            )
+                        };
+                        let criteria_hash =
+                            completion_gate::criteria_hash(&completion_gate_config.criteria);
+                        let judge_model = completion_gate_config
+                            .judge_model
+                            .clone()
+                            .unwrap_or_else(|| turn_context.model_info.slug.clone());
+                        let boundary_history_len_after_response = history.len();
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::CompletionGateStarted(CompletionGateStartedEvent {
+                                thread_id: sess.conversation_id.to_string(),
+                                turn_id: turn_context.sub_id.clone(),
+                                criteria_hash,
+                                judge_model,
+                            }),
+                        )
+                        .await;
+                        match completion_gate::evaluate_candidate_stop(
+                            &sess.services.auth_manager,
+                            &sess.services.models_manager,
+                            &turn_context,
+                            sess.conversation_id,
+                            history.as_slice(),
+                            boundary_history_len,
+                            completion_gate_config,
+                            candidate_response,
+                        )
+                        .await
+                        {
+                            completion_gate::CompletionGateOutcome::Allow(allow) => {
+                                {
+                                    let mut state = sess.state.lock().await;
+                                    state.completion_gate_boundary_history_len =
+                                        Some(boundary_history_len_after_response);
+                                    state.completion_gate_last_decision = Some(allow.event.clone());
+                                }
+                                sess.send_event(
+                                    &turn_context,
+                                    EventMsg::CompletionGateDecision(allow.event),
+                                )
+                                .await;
+                            }
+                            completion_gate::CompletionGateOutcome::Deny(deny) => {
+                                {
+                                    let mut state = sess.state.lock().await;
+                                    state.completion_gate_boundary_history_len =
+                                        Some(boundary_history_len_after_response);
+                                    state.completion_gate_last_decision =
+                                        Some(deny.decision_event.clone());
+                                }
+                                sess.send_event(
+                                    &turn_context,
+                                    EventMsg::CompletionGateDecision(deny.decision_event),
+                                )
+                                .await;
+                                sess.send_event(
+                                    &turn_context,
+                                    EventMsg::CompletionGateBlockedStop(deny.blocked_event),
+                                )
+                                .await;
+                                if sess
+                                    .inject_response_items(vec![deny.continuation])
+                                    .await
+                                    .is_err()
+                                {
+                                    error_or_panic(
+                                        "completion gate denial could not inject continuation into the active turn".to_string(),
+                                    );
+                                    break;
+                                }
+                                continue;
+                            }
+                            completion_gate::CompletionGateOutcome::Error(failure) => {
+                                {
+                                    let mut state = sess.state.lock().await;
+                                    state.completion_gate_boundary_history_len =
+                                        Some(boundary_history_len_after_response);
+                                    state.completion_gate_last_decision = None;
+                                }
+                                sess.send_event(
+                                    &turn_context,
+                                    EventMsg::CompletionGateError(failure.event),
+                                )
+                                .await;
+                                if sess
+                                    .inject_response_items(vec![failure.continuation])
+                                    .await
+                                    .is_err()
+                                {
+                                    error_or_panic(
+                                        "completion gate failure could not inject fail-closed continuation into the active turn".to_string(),
+                                    );
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     last_agent_message = sampling_request_last_agent_message;
                     let hook_outcomes = sess
                         .hooks()
@@ -5781,6 +6319,22 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                         return None;
+                    }
+                    if let Some(stop_hook) = turn_context.stop_hook.as_ref() {
+                        let response_items = sess.clone_history().await.raw_items().to_vec();
+                        let token_usage = {
+                            let state = sess.state.lock().await;
+                            state.token_info().map(|info| info.last_token_usage)
+                        };
+                        let event = StopHookEvent::new(
+                            sess.conversation_id.to_string(),
+                            turn_context.sub_id.clone(),
+                            turn_context.cwd.display().to_string(),
+                            last_agent_message.clone(),
+                            response_items,
+                            token_usage,
+                        );
+                        stop_hook.emit(event).await;
                     }
                     break;
                 }
@@ -6111,10 +6665,22 @@ fn build_prompt(
 
 fn stream_retry_budget_for_error(turn_context: &TurnContext, err: &CodexErr) -> u64 {
     let configured_max_retries = turn_context.provider.stream_max_retries();
-    if should_force_stream_retry_budget(err) {
+    if should_force_cyber_stream_retry_budget(err) {
+        configured_max_retries.max(FORCED_CYBER_STREAM_MAX_RETRIES)
+    } else if should_force_stream_retry_budget(err) {
         configured_max_retries.max(FORCED_STREAM_MAX_RETRIES)
     } else {
         configured_max_retries
+    }
+}
+
+fn should_force_cyber_stream_retry_budget(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::Stream(message, _) => is_cyber_retry_message(message),
+        CodexErr::UnexpectedStatus(unexpected_response) => {
+            is_cyber_retry_message(&unexpected_response.body)
+        }
+        _ => false,
     }
 }
 
@@ -6133,6 +6699,12 @@ fn should_force_stream_retry_budget(err: &CodexErr) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_cyber_retry_message(message: &str) -> bool {
+    let normalized = normalize_for_retry_matching(message);
+    normalized.contains(POSSIBLE_CYBERSECURITY_RISK_MATCH)
+        || normalized.contains(TRUSTED_ACCESS_FOR_CYBER_MATCH)
 }
 
 fn is_generic_bad_request_body(body: &str) -> bool {
@@ -6184,6 +6756,9 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
+    allow_assistant_status_follow_up_after_tool_output: bool,
+    pending_background_wait_process_ids: &HashSet<String>,
+    remaining_deep_follow_up_budget: &mut u32,
     server_model_warning_emitted_for_turn: &mut bool,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -6216,6 +6791,9 @@ async fn run_sampling_request(
             client_session,
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
+            allow_assistant_status_follow_up_after_tool_output,
+            pending_background_wait_process_ids,
+            remaining_deep_follow_up_budget,
             server_model_warning_emitted_for_turn,
             &prompt,
             cancellation_token.child_token(),
@@ -6382,6 +6960,43 @@ async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    last_agent_message_phase: Option<MessagePhase>,
+    armed_background_wait_process_ids: HashSet<String>,
+    saw_tool_call: bool,
+}
+
+const INTERMEDIARY_ASSISTANT_FALLBACK_MAX_LINES: usize = 5;
+
+fn assistant_message_line_count(message: &str) -> usize {
+    if message.is_empty() {
+        0
+    } else {
+        message.lines().count()
+    }
+}
+
+fn should_treat_assistant_only_response_as_intermediary(
+    phase: Option<&MessagePhase>,
+    message: &str,
+) -> bool {
+    // PitchAI fork behavior:
+    //
+    // The backend can distinguish `commentary` from `final_answer`, but that metadata is not
+    // present for every provider/model. We therefore use `phase` as the primary signal and only
+    // fall back to a short-message heuristic when `phase` is absent.
+    //
+    // We intentionally do *not* rely on line count alone: local March 2026 session history
+    // contains plenty of genuine short final answers, so a blanket "<5 lines means continue"
+    // rule would create loops. The short-message fallback exists only to preserve the old
+    // "intermediary status update" feel for models that omit `phase`.
+    match phase {
+        Some(MessagePhase::Commentary) => true,
+        Some(MessagePhase::FinalAnswer) => false,
+        None => {
+            let line_count = assistant_message_line_count(message);
+            line_count > 0 && line_count < INTERMEDIARY_ASSISTANT_FALLBACK_MAX_LINES
+        }
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -6564,6 +7179,10 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         },
         EventMsg::Error(_)
         | EventMsg::Warning(_)
+        | EventMsg::CompletionGateStarted(_)
+        | EventMsg::CompletionGateDecision(_)
+        | EventMsg::CompletionGateBlockedStop(_)
+        | EventMsg::CompletionGateError(_)
         | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
@@ -6572,6 +7191,8 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
+        | EventMsg::TurnCompleteDeferredByNonStop(_)
+        | EventMsg::NonStopModeUpdated(_)
         | EventMsg::TokenCount(_)
         | EventMsg::UserMessage(_)
         | EventMsg::AgentMessageDelta(_)
@@ -6897,14 +7518,25 @@ async fn handle_assistant_item_done_in_plan_mode(
     false
 }
 
+// Drain queued tool results into history and harvest any background-terminal continuation hints
+// produced by empty `write_stdin` waits. This is intentionally separate from ordinary
+// `needs_follow_up` handling because the regression happens *after* the tool call round already
+// completed successfully.
 async fn drain_in_flight(
-    in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
+    in_flight: &mut FuturesOrdered<
+        BoxFuture<'static, CodexResult<crate::stream_events_utils::InFlightToolResult>>,
+    >,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<HashSet<String>> {
+    let mut armed_background_wait_process_ids = HashSet::new();
     while let Some(res) = in_flight.next().await {
         match res {
-            Ok(response_input) => {
+            Ok(tool_result) => {
+                let response_input = tool_result.response_input;
+                if let Some(process_id) = tool_result.armed_background_wait_process_id {
+                    armed_background_wait_process_ids.insert(process_id);
+                }
                 sess.record_conversation_items(&turn_context, &[response_input.into()])
                     .await;
             }
@@ -6913,7 +7545,7 @@ async fn drain_in_flight(
             }
         }
     }
-    Ok(())
+    Ok(armed_background_wait_process_ids)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6931,6 +7563,9 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
+    allow_assistant_status_follow_up_after_tool_output: bool,
+    pending_background_wait_process_ids: &HashSet<String>,
+    remaining_deep_follow_up_budget: &mut u32,
     server_model_warning_emitted_for_turn: &mut bool,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
@@ -6963,12 +7598,15 @@ async fn try_run_sampling_request(
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
-        FuturesOrdered::new();
+    let mut in_flight: FuturesOrdered<
+        BoxFuture<'static, CodexResult<crate::stream_events_utils::InFlightToolResult>>,
+    > = FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+    let mut last_agent_message_phase: Option<MessagePhase> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
+    let mut saw_tool_call = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
@@ -7048,10 +7686,12 @@ async fn try_run_sampling_request(
                     .instrument(handle_responses)
                     .await?;
                 if let Some(tool_future) = output_result.tool_future {
+                    saw_tool_call = true;
                     in_flight.push_back(tool_future);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
+                    last_agent_message_phase = output_result.last_agent_message_phase;
                 }
                 needs_follow_up |= output_result.needs_follow_up;
             }
@@ -7143,10 +7783,208 @@ async fn try_run_sampling_request(
                 should_emit_turn_diff = true;
 
                 needs_follow_up |= sess.has_pending_input().await;
+                // PitchAI fork behavior:
+                //
+                // If the previous sampling request waited on a background terminal and that
+                // process is still alive, then an assistant-only response here is often merely an
+                // in-between progress report. The old behavior treated "no tool call in *this*
+                // response" as sufficient to stop, which regressed long-running background
+                // terminal tasks by emitting final messages such as "still running" and then
+                // immediately ending the turn.
+                //
+                // We therefore force exactly one more follow-up round in this narrow case. Keep
+                // this logic aligned with `stream_events_utils.rs`, which arms the one-shot
+                // process-id hint only for empty `write_stdin` waits whose process remains alive.
+                if !saw_tool_call
+                    && last_agent_message.is_some()
+                    && !pending_background_wait_process_ids.is_empty()
+                    && sess
+                        .services
+                        .unified_exec_manager
+                        .any_process_alive(pending_background_wait_process_ids)
+                        .await
+                {
+                    debug!(
+                        turn_id = %turn_context.sub_id,
+                        process_ids = ?pending_background_wait_process_ids,
+                        "continuing turn because a waited-on background terminal is still alive"
+                    );
+                    needs_follow_up = true;
+                }
+                // PitchAI fork behavior:
+                //
+                // Local session history shows a strong distinction between backend-declared
+                // `commentary` messages and true final answers. When the backend omits `phase`,
+                // intermediary status messages also skew very short. We use that line-count
+                // heuristic only as a fallback when `phase` is absent.
+                //
+                // This continuation applies only to the response *after* a tool-producing
+                // sampling round. That keeps the behavior focused on "tool output -> brief
+                // assistant status update -> continue" without globally forcing every short final
+                // answer to loop. Removing this reintroduces premature stops after terse
+                // intermediary updates that appear after tool output.
+                if !saw_tool_call
+                    && allow_assistant_status_follow_up_after_tool_output
+                    && let Some(message) = last_agent_message.as_deref()
+                    && should_treat_assistant_only_response_as_intermediary(
+                        last_agent_message_phase.as_ref(),
+                        message,
+                    )
+                {
+                    debug!(
+                        turn_id = %turn_context.sub_id,
+                        lines = assistant_message_line_count(message),
+                        phase = ?last_agent_message_phase,
+                        "continuing turn because the assistant-only response looks intermediary"
+                    );
+                    needs_follow_up = true;
+                }
+                let (runtime_non_stop, runtime_non_stop_budget) = {
+                    let state = sess.state.lock().await;
+                    (
+                        non_stop_is_active(
+                            state.session_configuration.non_stop,
+                            state.session_configuration.non_stop_expires_at,
+                            current_unix_timestamp(),
+                        ),
+                        state.session_configuration.non_stop_budget,
+                    )
+                };
+                // PitchAI fork behavior:
+                //
+                // `/deep n` is intentionally a bounded "push through a few more candidate-stop
+                // boundaries" control for upcoming turns. It should only spend budget when this
+                // response would otherwise stop on its own; if some other policy already requires
+                // follow-up (`--non-stop`, `--persistent`, pending input, tool output, etc.), the
+                // `/deep` budget must remain untouched.
+                //
+                // If an upstream merge removes this because it looks similar to `--non-stop`,
+                // `/deep` silently stops working for queued follow-ups: turns will halt on the
+                // first clean assistant answer instead of surviving the requested extra rounds.
+                if !runtime_non_stop && !needs_follow_up && *remaining_deep_follow_up_budget > 0 {
+                    *remaining_deep_follow_up_budget -= 1;
+                    debug!(
+                        turn_id = %turn_context.sub_id,
+                        remaining_deep_follow_up_budget = *remaining_deep_follow_up_budget,
+                        "continuing turn because /deep armed extra candidate-stop follow-ups"
+                    );
+                    needs_follow_up = true;
+                }
+                // PitchAI fork behavior:
+                //
+                // `--non-stop` is the strongest continuation override in our fork. When enabled
+                // we never allow normal turn completion, regardless of the assistant message,
+                // tool-call structure, or whether any terminals are still alive.
+                //
+                // Keep this check before we return `SamplingRequestResult`; otherwise the outer
+                // turn loop can still observe `needs_follow_up = false` and emit `TurnComplete`.
+                let would_complete_without_non_stop = !needs_follow_up;
+                if runtime_non_stop {
+                    let mut force_non_stop_follow_up = true;
+                    // PitchAI fork behavior:
+                    //
+                    // This event is the authoritative "normal stop boundary" marker for
+                    // `--non-stop`. The TUI uses it to inject queued "after next normal stop"
+                    // messages exactly where the turn would otherwise end, without allowing the
+                    // turn to actually complete.
+                    //
+                    // Do not remove this as "redundant" with `needs_follow_up = true`. The whole
+                    // point is that `--non-stop` erases the normal `TurnComplete` boundary, so the
+                    // UI needs a replacement signal to preserve the fork's queued-follow-up
+                    // workflow during never-ending turns.
+                    if would_complete_without_non_stop {
+                        if runtime_non_stop_budget.is_some_and(|budget| budget <= 1) {
+                            {
+                                let mut state = sess.state.lock().await;
+                                state.session_configuration.non_stop = false;
+                                state.session_configuration.non_stop_expires_at = None;
+                                state.session_configuration.non_stop_budget = None;
+                            }
+                            sess.send_event(
+                                &turn_context,
+                                non_stop_mode_updated_event(false, None, None),
+                            )
+                            .await;
+                            debug!(
+                                turn_id = %turn_context.sub_id,
+                                "allowing turn completion because --non-stop stop-attempt budget was reached"
+                            );
+                            force_non_stop_follow_up = false;
+                        } else {
+                            let non_stop_budget = if runtime_non_stop_budget.is_some() {
+                                let mut state = sess.state.lock().await;
+                                if let Some(budget) =
+                                    state.session_configuration.non_stop_budget.as_mut()
+                                {
+                                    *budget = budget.saturating_sub(1);
+                                }
+                                Some((
+                                    state.session_configuration.non_stop_expires_at,
+                                    state.session_configuration.non_stop_budget,
+                                ))
+                            } else {
+                                None
+                            };
+                            sess.send_event(
+                                &turn_context,
+                                EventMsg::TurnCompleteDeferredByNonStop(
+                                    TurnCompleteDeferredByNonStopEvent {
+                                        turn_id: turn_context.sub_id.clone(),
+                                        last_agent_message: last_agent_message.clone(),
+                                    },
+                                ),
+                            )
+                            .await;
+                            if let Some((expires_at, budget)) = non_stop_budget {
+                                sess.send_event(
+                                    &turn_context,
+                                    non_stop_mode_updated_event(true, expires_at, budget),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    if force_non_stop_follow_up {
+                        debug!(
+                            turn_id = %turn_context.sub_id,
+                            "continuing turn because --non-stop forbids normal completion"
+                        );
+                        needs_follow_up = true;
+                    }
+                }
+                // PitchAI fork behavior:
+                //
+                // `--persistent` is intentionally stronger than the narrower commentary and
+                // background-wait guards above. When enabled, any still-live session terminal is
+                // a hard "do not finish yet" signal for the whole session, even if the model
+                // just emitted a polished assistant-only response.
+                //
+                // This must remain session-wide rather than response-local. Our fork regularly
+                // leaves a background shell alive across multiple sampling rounds, and removing
+                // this check reintroduces exactly the regression the flag exists to prevent:
+                // Codex emits a final message while a terminal from the same session is still
+                // running.
+                if turn_context.config.persistent
+                    && !needs_follow_up
+                    && sess
+                        .services
+                        .unified_exec_manager
+                        .any_terminal_alive()
+                        .await
+                {
+                    debug!(
+                        turn_id = %turn_context.sub_id,
+                        "continuing turn because --persistent forbids completion while a session terminal is still alive"
+                    );
+                    needs_follow_up = true;
+                }
 
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    last_agent_message_phase,
+                    armed_background_wait_process_ids: HashSet::new(),
+                    saw_tool_call,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -7237,7 +8075,8 @@ async fn try_run_sampling_request(
     )
     .await;
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let armed_background_wait_process_ids =
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
 
     if should_emit_turn_diff {
         let unified_diff = {
@@ -7250,7 +8089,10 @@ async fn try_run_sampling_request(
         }
     }
 
-    outcome
+    outcome.map(|mut result| {
+        result.armed_background_wait_process_ids = armed_background_wait_process_ids;
+        result
+    })
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
@@ -7337,7 +8179,7 @@ mod tests {
     use opentelemetry::trace::TraceId;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
-    use std::fs;
+
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -7488,6 +8330,16 @@ mod tests {
             request_id: None,
         });
         assert!(should_force_stream_retry_budget(&err));
+    }
+
+    #[test]
+    fn should_force_cyber_stream_retry_budget_for_flagged_message() {
+        let err = CodexErr::Stream(
+            "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"
+                .to_string(),
+            None,
+        );
+        assert!(should_force_cyber_stream_retry_budget(&err));
     }
 
     #[test]
@@ -8627,6 +9479,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -8645,6 +9502,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         };
 
         let mut state = SessionState::new(session_configuration);
@@ -8722,6 +9580,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -8740,6 +9603,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         };
 
         let mut state = SessionState::new(session_configuration);
@@ -9048,6 +9912,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -9066,6 +9935,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         }
     }
 
@@ -9107,6 +9977,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -9125,6 +10000,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         };
 
         let (tx_event, _rx_event) = async_channel::unbounded();
@@ -9199,6 +10075,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -9217,6 +10098,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         };
         let per_turn_config = Session::build_per_turn_config(&session_configuration);
         let model_info = ModelsManager::construct_model_info_offline_for_tests(
@@ -9301,6 +10183,7 @@ mod tests {
             &otel_manager,
             session_configuration.provider.clone(),
             &session_configuration,
+            0,
             per_turn_config,
             model_info,
             None,
@@ -9316,6 +10199,7 @@ mod tests {
             state: Mutex::new(state),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
+            voice_output: None,
             conversation: Arc::new(RealtimeConversationManager::new()),
             active_turn: Mutex::new(None),
             services,
@@ -9609,6 +10493,11 @@ mod tests {
             user_instructions: config.user_instructions.clone(),
             service_tier: None,
             personality: config.personality,
+            completion_gate: config.completion_gate.clone(),
+            non_stop: config.non_stop,
+            voice_mode: config.voice_mode,
+            non_stop_expires_at: config.non_stop_expires_at,
+            non_stop_budget: config.non_stop_budget,
             base_instructions: config
                 .base_instructions
                 .clone()
@@ -9627,6 +10516,7 @@ mod tests {
             dynamic_tools,
             persist_extended_history: false,
             inherited_shell_snapshot: None,
+            next_turn_deep_follow_up_budget: None,
         };
         let per_turn_config = Session::build_per_turn_config(&session_configuration);
         let model_info = ModelsManager::construct_model_info_offline_for_tests(
@@ -9711,6 +10601,7 @@ mod tests {
             &otel_manager,
             session_configuration.provider.clone(),
             &session_configuration,
+            0,
             per_turn_config,
             model_info,
             None,
@@ -9726,6 +10617,7 @@ mod tests {
             state: Mutex::new(state),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
+            voice_output: None,
             conversation: Arc::new(RealtimeConversationManager::new()),
             active_turn: Mutex::new(None),
             services,

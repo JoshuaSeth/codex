@@ -3020,6 +3020,8 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            non_stop: None,
+            completion_gate: None,
         })
         .await
         .expect("override turn context");

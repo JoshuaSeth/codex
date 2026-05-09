@@ -1024,6 +1024,12 @@ impl BottomPane {
         self.composer.prepare_inline_args_submission(record_history)
     }
 
+    pub(crate) fn clear_inline_command_text(&mut self) {
+        self.composer
+            .clear_visible_text_after_inline_command_dispatch();
+        self.request_redraw();
+    }
+
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
             RenderableItem::Borrowed(view)

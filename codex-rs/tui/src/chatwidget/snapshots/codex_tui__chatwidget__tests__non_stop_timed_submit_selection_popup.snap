@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Timed non-stop release
+  Choose when Codex should inject this message.
+
+  1. 30 seconds  Inject this message after 30s.
+› 2. 5 minutes   The timer starts now. When it fires, Codex injects the
+                 message using the usual non-stop live-send policy.
+  3. 30 minutes  Inject this message after 30m 00s.
+  4. 2 hours     Inject this message after 2h 00m 00s.
+
+  `/enqueue-in` supports custom delays.
+  Press enter to confirm or esc to go back

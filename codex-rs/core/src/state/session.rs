@@ -43,6 +43,9 @@ pub(crate) struct SessionState {
     pub(crate) startup_regular_task: Option<JoinHandle<CodexResult<RegularTask>>>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
+    pub(crate) completion_gate_boundary_history_len: Option<usize>,
+    pub(crate) completion_gate_last_decision:
+        Option<codex_protocol::protocol::CompletionGateDecisionEvent>,
 }
 
 impl SessionState {
@@ -62,6 +65,8 @@ impl SessionState {
             startup_regular_task: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
+            completion_gate_boundary_history_len: None,
+            completion_gate_last_decision: None,
         }
     }
 
@@ -111,6 +116,12 @@ impl SessionState {
         self.history.replace(items);
         self.history
             .set_reference_context_item(reference_context_item);
+        if self
+            .completion_gate_boundary_history_len
+            .is_some_and(|boundary| boundary > self.history.raw_items().len())
+        {
+            self.completion_gate_boundary_history_len = None;
+        }
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -244,6 +255,11 @@ impl SessionState {
 
     pub(crate) fn clear_mcp_tool_selection(&mut self) {
         self.active_mcp_tool_selection = None;
+    }
+
+    pub(crate) fn reset_completion_gate_runtime(&mut self) {
+        self.completion_gate_boundary_history_len = None;
+        self.completion_gate_last_decision = None;
     }
 
     // Adds connector IDs to the active set and returns the merged selection.

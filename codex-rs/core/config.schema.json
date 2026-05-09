@@ -2213,9 +2213,23 @@
       ],
       "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
     },
+    "stop_hook_command": {
+      "description": "Command to run once a turn completes (after the final assistant reply).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
       "type": "boolean"
+    },
+    "tool_hook_command": {
+      "description": "Command to run before/after each tool call.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "tool_output_token_limit": {
       "description": "Token budget applied when storing tool/function outputs in the context manager.",

@@ -53,6 +53,17 @@ class TimelineCard(BaseModel):
 class SessionView(BaseModel):
     meta: SessionMeta
     cards: List[TimelineCard]
+    assistant_messages: List["AssistantMessage"]
+
+
+class AssistantMessage(BaseModel):
+    timestamp: datetime
+    delta_seconds: Optional[float]
+    source_kind: str
+    source_label: str
+    body: str
+    body_html: Optional[str] = None
+    raw: Dict[str, Any]
 
 
 @dataclass

@@ -20,6 +20,8 @@ app = FastAPI(title="Codex Session Viewer")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
+VIEW_MODES = {"combined", "timeline", "assistant-messages"}
+
 
 def _ensure_file(conversation_id: str) -> Path:
     path = find_rollout_by_conversation_id(conversation_id)
@@ -54,15 +56,21 @@ async def home(request: Request, conversation_id: Optional[str] = None):
 
 
 @app.get("/conversations/{conversation_id}", response_class=HTMLResponse)
-async def conversation(request: Request, conversation_id: str):
+async def conversation(
+    request: Request,
+    conversation_id: str,
+    view: Optional[str] = None,
+):
     path = _ensure_file(conversation_id)
     session = parse_session(path)
+    view_mode = view if view in VIEW_MODES else "combined"
     return templates.TemplateResponse(
         "conversation.html",
         {
             "request": request,
             "session": session,
             "config": get_config(),
+            "view_mode": view_mode,
         },
     )
 

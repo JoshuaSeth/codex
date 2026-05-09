@@ -6,7 +6,7 @@ from typing import Optional
 
 from markdown import markdown
 
-from .models import RawEvent, TimelineCard
+from .models import AssistantMessage, RawEvent, TimelineCard
 
 ROLE_ICONS = {
     "user": "user",
@@ -54,21 +54,56 @@ def _render_markdown(value: Optional[str]) -> Optional[str]:
     return markdown(value, extensions=["fenced_code", "tables", "sane_lists"], output_format="html5")
 
 
+def _response_item_message_text(payload: dict) -> str:
+    text_chunks = []
+    for part in payload.get("content", []):
+        if part.get("type") in {"input_text", "output_text"}:
+            text_chunks.append(part.get("text", ""))
+    return "\n".join(text_chunks).strip()
+
+
+def to_assistant_message(event: RawEvent, delta: Optional[float]) -> Optional[AssistantMessage]:
+    payload = event.payload
+    if event.type == "event_msg" and payload.get("type") == "agent_message":
+        text = (payload.get("message") or "").strip()
+        if not text:
+            return None
+        return AssistantMessage(
+            timestamp=event.timestamp,
+            delta_seconds=delta,
+            source_kind="stream",
+            source_label="In-between assistant output",
+            body=text,
+            body_html=_render_markdown(text),
+            raw=event.raw,
+        )
+
+    if event.type == "response_item" and payload.get("type") == "message" and payload.get("role", "assistant") == "assistant":
+        text = _response_item_message_text(payload)
+        if not text:
+            return None
+        return AssistantMessage(
+            timestamp=event.timestamp,
+            delta_seconds=delta,
+            source_kind="final",
+            source_label="Final assistant output",
+            body=text,
+            body_html=_render_markdown(text),
+            raw=event.raw,
+        )
+
+    return None
+
+
 def to_card(event: RawEvent, delta: Optional[float]) -> Optional[TimelineCard]:
     payload = event.payload
     if event.type == "response_item":
         item_type = payload.get("type")
         if item_type == "message":
             role = payload.get("role", "assistant")
-            text_chunks = []
-            for part in payload.get("content", []):
-                if part.get("type") == "input_text":
-                    text_chunks.append(part.get("text", ""))
-                elif part.get("type") == "output_text":
-                    text_chunks.append(part.get("text", ""))
-            text = "\n".join(text_chunks).strip()
+            text = _response_item_message_text(payload)
             icon_class = _icon_class_for_name(ROLE_ICONS.get(role, "message-square"))
-            title = f"{role.title()} message"
+            title = "Final assistant output" if role == "assistant" else f"{role.title()} message"
             presentation = "hidden" if role == "user" else "summary-collapsed"
             return TimelineCard(
                 timestamp=event.timestamp,
@@ -121,7 +156,7 @@ def to_card(event: RawEvent, delta: Optional[float]) -> Optional[TimelineCard]:
                 timestamp=event.timestamp,
                 delta_seconds=delta,
                 kind="assistant_event",
-                title="Assistant",
+                title="Assistant update",
                 body=payload.get("message"),
                 body_html=markdown_body,
                 icon="",

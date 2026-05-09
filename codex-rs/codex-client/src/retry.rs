@@ -6,7 +6,10 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 const FORCED_MAX_ATTEMPTS: u64 = 30;
+const FORCED_CYBER_MAX_ATTEMPTS: u64 = 200;
 const MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
+const POSSIBLE_CYBERSECURITY_RISK_MATCH: &str = "possiblecybersecurityrisk";
+const TRUSTED_ACCESS_FOR_CYBER_MATCH: &str = "trustedaccessforcyber";
 
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -69,13 +72,13 @@ where
         match op(req, attempt).await {
             Ok(resp) => return Ok(resp),
             Err(err) => {
-                if should_force_retry_budget(&err) {
-                    max_attempts = max_attempts.max(FORCED_MAX_ATTEMPTS);
+                let forced_retry_budget = forced_retry_budget(&err);
+                if let Some(forced_retry_budget) = forced_retry_budget {
+                    max_attempts = max_attempts.max(forced_retry_budget);
                 }
 
-                let force_retry = should_force_retry(&err);
                 let should_retry = policy.retry_on.should_retry(&err, attempt, max_attempts)
-                    || (force_retry && attempt < max_attempts);
+                    || (forced_retry_budget.is_some() && attempt < max_attempts);
                 if should_retry {
                     sleep(backoff(policy.base_delay, attempt + 1)).await;
                     attempt += 1;
@@ -88,20 +91,30 @@ where
     }
 }
 
-fn should_force_retry_budget(err: &TransportError) -> bool {
+fn forced_retry_budget(err: &TransportError) -> Option<u64> {
     match err {
-        TransportError::Network(message) => {
-            normalize_for_matching(message).contains("decodingresponsebody")
-        }
+        TransportError::Network(message) => forced_retry_budget_for_message(message),
         TransportError::Http { status, body, .. } if *status == http::StatusCode::BAD_REQUEST => {
-            body.as_deref().is_some_and(is_generic_bad_request_body)
+            body.as_deref().and_then(|body| {
+                forced_retry_budget_for_message(body)
+                    .or_else(|| is_generic_bad_request_body(body).then_some(FORCED_MAX_ATTEMPTS))
+            })
         }
-        _ => false,
+        _ => None,
     }
 }
 
-fn should_force_retry(err: &TransportError) -> bool {
-    should_force_retry_budget(err)
+fn forced_retry_budget_for_message(message: &str) -> Option<u64> {
+    let normalized = normalize_for_matching(message);
+    if normalized.contains(POSSIBLE_CYBERSECURITY_RISK_MATCH)
+        || normalized.contains(TRUSTED_ACCESS_FOR_CYBER_MATCH)
+    {
+        Some(FORCED_CYBER_MAX_ATTEMPTS)
+    } else if normalized.contains("decodingresponsebody") {
+        Some(FORCED_MAX_ATTEMPTS)
+    } else {
+        None
+    }
 }
 
 fn is_generic_bad_request_body(body: &str) -> bool {
@@ -201,6 +214,38 @@ mod tests {
                         headers: Some(HeaderMap::new()),
                         body: Some("{\"detail\": \"Bad Request\"}".to_string()),
                     });
+                }
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_forces_budget_on_cyber_flag_network_error() {
+        let policy = RetryPolicy {
+            max_attempts: 0,
+            base_delay: Duration::from_millis(0),
+            retry_on: RetryOn {
+                retry_429: false,
+                retry_5xx: false,
+                retry_transport: false,
+            },
+        };
+
+        let calls = AtomicUsize::new(0);
+        let result = run_with_retry(
+            policy,
+            || Request::new(http::Method::GET, "/".to_string()),
+            |_req, _attempt| async {
+                let call_num = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call_num < 3 {
+                    return Err(TransportError::Network(
+                        "This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber".to_string(),
+                    ));
                 }
                 Ok(())
             },

@@ -163,6 +163,8 @@ In Azure:
 
 - Secret: `telegram-bot-token` → env `TELEGRAM_BOT_TOKEN`
 - Secret: `telegram-chat-id` → env `TELEGRAM_CHAT_ID`
+- Preferred for the final-updates channel: `PITCHAI_UPDATES_TELEGRAM_CHAT_ID` (or `TELEGRAM_UPDATES_CHAT_ID`)
+- Optional PM DB connectivity (`PITCHAI_PM_DB_URL` or the `PITCHAI_PM_DB_*` / `PITCHAI_DB_*` env set) lets the stop hook persist the sent Telegram `message_id` plus route metadata so replies to that specific final message can be mapped back to the originating Codex session
 
 Stop-hook implementation: `tools/custom_tools/telegram_bot.py` (copied into the image as `/opt/pitchai/telegram_bot.py`).
 

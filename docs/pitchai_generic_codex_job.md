@@ -57,6 +57,12 @@ Auto-continue on usage-limit (broker mode):
 - `PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_MAX_S` — max backoff seconds (default `120`).
 - `PITCHAI_BROKER_AUTO_CONTINUE_PROMPT` — prompt used for resume auto-continue turns (default `continue`).
 
+Cyber-safety reroute retry:
+
+- `PITCHAI_CYBER_RETRY_MAX` — max retries after Codex emits the `chatgpt.com/cyber` / high-risk cyber reroute warning (default `200`).
+- `PITCHAI_CYBER_RETRY_BACKOFF_INITIAL_S` — initial backoff seconds before replaying the original prompt after that reroute (default `2`).
+- `PITCHAI_CYBER_RETRY_BACKOFF_MAX_S` — max backoff seconds for that reroute retry loop (default `30`).
+
 Lease outcome classification sent to broker:
 
 - `usage_limit_reached` — output contains `usage_limit_reached`, `insufficient_quota`, or `429 Too Many Requests`.

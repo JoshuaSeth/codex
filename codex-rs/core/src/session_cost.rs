@@ -544,7 +544,7 @@ mod tests {
 
         let prompt = Prompt {
             input: vec![
-                baseline_item.clone(),
+                baseline_item,
                 local_item.clone(),
                 replayed_model_item.clone(),
             ],
@@ -560,10 +560,10 @@ mod tests {
         let (_tokenizer, estimate) =
             estimate_request_tokens(&prompt, "gpt-5", &tracking).expect("estimate should succeed");
 
-        assert_eq!(estimate.already_in_session_tokens > 0, true);
-        assert_eq!(estimate.new_local_tokens > 0, true);
-        assert_eq!(estimate.replayed_model_output_tokens > 0, true);
-        assert_eq!(estimate.instructions_tokens > 0, true);
+        assert!(estimate.already_in_session_tokens > 0);
+        assert!(estimate.new_local_tokens > 0);
+        assert!(estimate.replayed_model_output_tokens > 0);
+        assert!(estimate.instructions_tokens > 0);
         assert!(estimate.tools_tokens > 0);
         assert_eq!(estimate.unclassified_input_tokens, 0);
         assert_eq!(

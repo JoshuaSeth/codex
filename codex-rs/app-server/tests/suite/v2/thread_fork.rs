@@ -73,7 +73,14 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     )
     .await??;
     let fork_result = fork_resp.result.clone();
-    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+    let ThreadForkResponse {
+        thread,
+        completion_gate,
+        voice_mode,
+        ..
+    } = to_response::<ThreadForkResponse>(fork_resp)?;
+    assert_eq!(completion_gate, None);
+    assert!(!voice_mode);
 
     // Wire contract: thread title field is `name`, serialized as null when unset.
     let thread_json = fork_result
@@ -84,6 +91,16 @@ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
         thread_json.get("name"),
         Some(&Value::Null),
         "forked threads do not inherit a name; expected `name: null`"
+    );
+    assert_eq!(
+        fork_result.get("completionGate"),
+        Some(&Value::Null),
+        "thread/fork should serialize `completionGate: null` when disabled"
+    );
+    assert_eq!(
+        fork_result.get("voiceMode").and_then(Value::as_bool),
+        Some(false),
+        "thread/fork should serialize `voiceMode: false` by default"
     );
 
     let after_contents = std::fs::read_to_string(&original_path)?;

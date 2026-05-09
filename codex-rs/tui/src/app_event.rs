@@ -9,6 +9,7 @@
 //! quits without reaching into the app loop or coupling to shutdown/exit sequencing.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use codex_chatgpt::connectors::AppInfo;
 use codex_file_search::FileMatch;
@@ -20,6 +21,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
+use crate::chatwidget::UserMessage;
 use crate::history_cell::HistoryCell;
 
 use codex_core::features::Feature;
@@ -34,6 +36,19 @@ use codex_protocol::protocol::SandboxPolicy;
 pub(crate) enum RealtimeAudioDeviceKind {
     Microphone,
     Speaker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonStopSubmitMenuDefault {
+    SteerNow,
+    AfterNextNormalStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonStopSubmitMode {
+    SteerNow,
+    AfterNextNormalStop,
+    Timed(Duration),
 }
 
 impl RealtimeAudioDeviceKind {
@@ -177,6 +192,35 @@ pub(crate) enum AppEvent {
 
     /// Submit the next queued user message (if any) when idle.
     MaybeSendNextQueuedInput,
+
+    /// Re-check whether any delayed non-stop messages have become due.
+    ///
+    /// `ChatWidget` owns the actual delayed-message queue. Timer tasks only use this
+    /// event to wake the app loop at or after a requested release deadline.
+    ///
+    /// The optional `thread_id` prevents a timer that was scheduled in one agent thread from
+    /// releasing messages in whichever thread happens to be active when the timer fires.
+    /// Inactive threads still preserve their delayed messages in `ThreadInputState`; those release
+    /// the next time that thread becomes active and restores its input state.
+    ReleaseDueScheduledNonStopMessages {
+        thread_id: Option<ThreadId>,
+    },
+
+    /// Open the non-stop timed-release selector for a just-submitted draft.
+    OpenNonStopTimedSubmitSelection {
+        user_message: UserMessage,
+    },
+
+    /// Apply the chosen submit mode for a running `--non-stop` turn.
+    SubmitNonStopUserMessage {
+        user_message: UserMessage,
+        mode: NonStopSubmitMode,
+    },
+
+    /// Restore a previously submitted draft back into the composer.
+    RestoreSubmittedDraft {
+        user_message: UserMessage,
+    },
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),

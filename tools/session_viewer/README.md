@@ -17,3 +17,9 @@ uvicorn session_viewer.app:app --reload
 ```
 
 Then open <http://localhost:8000>, enter a conversation ID (UUID) from `~/.codex/sessions`, and explore the timeline.
+
+The conversation page now has three view modes:
+
+- `Combined` shows the timeline plus a parsed assistant-message list.
+- `Assistant Messages` shows only parsed assistant outputs, including both streamed/intermediate updates and final assistant outputs.
+- `Timeline` keeps the raw event timeline view.

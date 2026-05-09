@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• Queued voice change. Voice mode will be enabled after the current turn completes. The current turn keeps its existing speech behavior. The queued setting applies before the next queued message runs.

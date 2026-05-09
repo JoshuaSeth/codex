@@ -177,6 +177,25 @@ pub struct Permissions {
     pub macos_seatbelt_profile_extensions: Option<MacOsSeatbeltProfileExtensions>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionGateConfig {
+    pub criteria: String,
+    pub judge_model: Option<String>,
+    pub judge_base_url: Option<String>,
+    pub judge_api_key_env: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retries: u32,
+    pub max_assistant_messages: usize,
+    pub max_user_messages: usize,
+}
+
+impl CompletionGateConfig {
+    pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    pub const DEFAULT_MAX_RETRIES: u32 = 3;
+    pub const DEFAULT_MAX_ASSISTANT_MESSAGES: usize = 10;
+    pub const DEFAULT_MAX_USER_MESSAGES: usize = 3;
+}
+
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -355,6 +374,17 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// When set, Codex will invoke this command before and after every tool call with a JSON payload describing the event.
+    /// Example `~/.codex/config.toml` entry:
+    /// `tool_hook_command = ["python3", "~/capture_tool_calls.py"]`
+    pub tool_hook_command: Option<Vec<String>>,
+
+    /// When set, Codex will invoke this command once per turn right after the final
+    /// assistant response is produced. The hook receives a JSON payload containing
+    /// the conversation/turn identifiers, final message text, response items, and
+    /// latest token usage snapshot.
+    pub stop_hook_command: Option<Vec<String>>,
+
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
     /// Maximum runtime in seconds for agent job workers before they are failed.
@@ -384,6 +414,45 @@ pub struct Config {
 
     /// When true, session is not persisted on disk. Default to `false`
     pub ephemeral: bool,
+
+    /// When true, Codex treats any still-live unified-exec terminal as a hard
+    /// "do not finish yet" signal for the current session. This is CLI-only
+    /// today (`--persistent`) and is intentionally not loaded from config.toml.
+    pub persistent: bool,
+
+    /// When true, Codex never completes a turn on its own. This is stronger
+    /// than `persistent`: even a normal-looking final answer is treated as
+    /// intermediary and another sampling round is forced. This is CLI/runtime-
+    /// only today (`--non-stop` or `/non-stop`) and is intentionally not
+    /// loaded from config.toml.
+    pub non_stop: bool,
+
+    /// When true, Codex enables PitchAI continuous voice mode. This is
+    /// CLI-only today (`--voice`) and is intentionally not loaded from
+    /// config.toml.
+    ///
+    /// Voice mode is an operator-facing runtime that:
+    /// - starts pushing assistant speech once enough visible text has streamed,
+    ///   then still pushes the final completed message if it changed,
+    /// - expects browser-side live STT to inject user speech immediately,
+    /// - does not force non-stop behavior by itself; combine it with
+    ///   `--non-stop` when continuous auto-follow-up sampling is desired.
+    pub voice_mode: bool,
+
+    /// Optional Unix-second deadline for timed non-stop mode. While this
+    /// deadline is in the future, non-stop behavior stays active; once it
+    /// expires, Codex allows the next normal final answer to stop the turn.
+    pub non_stop_expires_at: Option<i64>,
+
+    /// Optional candidate-stop budget for non-stop mode. When set, Codex
+    /// blocks normal completion until this many candidate stop attempts have
+    /// been reached; `None` means unbounded non-stop mode.
+    pub non_stop_budget: Option<u32>,
+
+    /// When set, Codex uses a secondary completion judge at candidate stop
+    /// boundaries. This is CLI/runtime-only today and is intentionally not
+    /// loaded from config.toml.
+    pub completion_gate: Option<CompletionGateConfig>,
 
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
@@ -1129,6 +1198,12 @@ pub struct ConfigToml {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// Command to run before/after each tool call.
+    pub tool_hook_command: Option<Vec<String>>,
+
+    /// Command to run once a turn completes (after the final assistant reply).
+    pub stop_hook_command: Option<Vec<String>>,
+
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: Option<u64>,
@@ -1590,6 +1665,12 @@ pub struct ConfigOverrides {
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
     pub ephemeral: Option<bool>,
+    pub persistent: Option<bool>,
+    pub non_stop: Option<bool>,
+    pub voice_mode: Option<bool>,
+    pub non_stop_expires_at: Option<i64>,
+    pub non_stop_budget: Option<u32>,
+    pub completion_gate: Option<CompletionGateConfig>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
     /// When non-empty, enforce a strict filesystem scope for workspace-write:
@@ -1737,6 +1818,12 @@ impl Config {
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
             ephemeral,
+            persistent,
+            non_stop,
+            voice_mode,
+            non_stop_expires_at,
+            non_stop_budget,
+            completion_gate,
             additional_writable_roots,
             strict_sandbox_roots,
         } = overrides;
@@ -1836,8 +1923,7 @@ impl Config {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "strict sandbox roots require workspace-write sandbox mode; got {}",
-                            other
+                            "strict sandbox roots require workspace-write sandbox mode; got {other}"
                         ),
                     ));
                 }
@@ -2228,6 +2314,14 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            tool_hook_command: config_profile
+                .tool_hook_command
+                .clone()
+                .or_else(|| cfg.tool_hook_command.clone()),
+            stop_hook_command: config_profile
+                .stop_hook_command
+                .clone()
+                .or_else(|| cfg.stop_hook_command.clone()),
             agent_max_threads,
             agent_max_depth,
             agent_roles,
@@ -2239,6 +2333,13 @@ impl Config {
             config_layer_stack,
             history,
             ephemeral: ephemeral.unwrap_or_default(),
+            persistent: persistent.unwrap_or_default(),
+            non_stop: non_stop
+                .unwrap_or(non_stop_expires_at.is_some() || non_stop_budget.is_some()),
+            voice_mode: voice_mode.unwrap_or_default(),
+            non_stop_expires_at,
+            non_stop_budget,
+            completion_gate,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             codex_linux_sandbox_exe,
             main_execve_wrapper_exe,
@@ -3190,6 +3291,60 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn profile_tool_hook_command_overrides_root_value() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.tool_hook_command = Some(vec!["root".to_string()]);
+        cfg.profile = Some("hooks".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "hooks".to_string(),
+            ConfigProfile {
+                tool_hook_command: Some(vec!["profile".to_string()]),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.tool_hook_command, Some(vec!["profile".to_string()]));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_stop_hook_command_overrides_root_value() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let mut cfg = ConfigToml::default();
+        cfg.stop_hook_command = Some(vec!["root".to_string()]);
+        cfg.profile = Some("hooks".to_string());
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(
+            "hooks".to_string(),
+            ConfigProfile {
+                stop_hook_command: Some(vec!["profile".to_string()]),
+                ..ConfigProfile::default()
+            },
+        );
+        cfg.profiles = profiles_map;
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.stop_hook_command, Some(vec!["profile".to_string()]));
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let config = Config::load_from_base_config_with_overrides(
@@ -3293,7 +3448,7 @@ trust_level = "trusted"
                         read_only_access,
                         &ReadOnlyAccess::Restricted {
                             include_platform_defaults: true,
-                            readable_roots: vec![expected_root.clone()],
+                            readable_roots: vec![expected_root],
                         }
                     );
                     assert!(*exclude_tmpdir_env_var);
@@ -5333,6 +5488,8 @@ model_verbosity = "high"
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
+                tool_hook_command: None,
+                stop_hook_command: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
                 agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
                 agent_roles: BTreeMap::new(),
@@ -5345,6 +5502,12 @@ model_verbosity = "high"
                 startup_warnings: Vec::new(),
                 history: History::default(),
                 ephemeral: false,
+                persistent: false,
+                non_stop: false,
+                voice_mode: false,
+                non_stop_expires_at: None,
+                non_stop_budget: None,
+                completion_gate: None,
                 file_opener: UriBasedFileOpener::VsCode,
                 codex_linux_sandbox_exe: None,
                 main_execve_wrapper_exe: None,
@@ -5463,6 +5626,8 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
+            stop_hook_command: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
             agent_roles: BTreeMap::new(),
@@ -5475,6 +5640,12 @@ model_verbosity = "high"
             startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
+            persistent: false,
+            non_stop: false,
+            voice_mode: false,
+            non_stop_expires_at: None,
+            non_stop_budget: None,
+            completion_gate: None,
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             main_execve_wrapper_exe: None,
@@ -5591,6 +5762,8 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
+            stop_hook_command: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
             agent_roles: BTreeMap::new(),
@@ -5603,6 +5776,12 @@ model_verbosity = "high"
             startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
+            persistent: false,
+            non_stop: false,
+            voice_mode: false,
+            non_stop_expires_at: None,
+            non_stop_budget: None,
+            completion_gate: None,
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             main_execve_wrapper_exe: None,
@@ -5705,6 +5884,8 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            tool_hook_command: None,
+            stop_hook_command: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
             agent_roles: BTreeMap::new(),
@@ -5717,6 +5898,12 @@ model_verbosity = "high"
             startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
+            persistent: false,
+            non_stop: false,
+            voice_mode: false,
+            non_stop_expires_at: None,
+            non_stop_budget: None,
+            completion_gate: None,
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
             main_execve_wrapper_exe: None,

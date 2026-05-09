@@ -1,0 +1,6 @@
+{
+  "check": "dispatcher_voice_push_real_tts_backend",
+  "status": "failed_external_dependency",
+  "detail": "audio_push_stream returned 503: tts stream failed: [Errno -2] Name or service not known",
+  "base_url": "http://127.0.0.1:8132"
+}

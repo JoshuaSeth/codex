@@ -1,0 +1,29 @@
+---
+source: tui/src/status/tests.rs
+expression: sanitized
+---
+/status
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.0.0)                                                    │
+│                                                                              │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                │
+│ information on rate limits and credits                                       │
+│                                                                              │
+│  Model:                  gpt-5.1-codex-max (reasoning medium, summaries auto │
+│  Directory: [[workspace]]                                                    │
+│  Permissions:            Custom (read-only, on-request)                      │
+│  Agents.md:              /root/code/worktrees/dft/wt-2/AGENTS.md             │
+│  Thread name:            completion-gate-demo                                │
+│  Collaboration mode:     default                                             │
+│  Completion gate:        enabled                                             │
+│  Gate judge:             gpt-5.1-mini                                        │
+│  Completion criterion:   Stop only after verification passes.                │
+│  Gate verdict:           blocked stop — Verification output is still         │
+│ missing.                                                                     │
+│  Session:                019ce433-3c37-7ad0-a1b3-6bf12eb33ccc                │
+│                                                                              │
+│  Token usage:            1.4K total  (1K input + 400 output)                 │
+│  Context window:         100% left (1.45K used / 272K)                       │
+│  Limits:                 data not available yet                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

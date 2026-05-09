@@ -105,13 +105,86 @@ fn is_pitchai_cli_token(token: &str) -> bool {
     binary.eq_ignore_ascii_case("pitchai")
 }
 
+fn is_deliberate_sleep_command(command: &[String]) -> bool {
+    let Some((program, args)) = command.split_first() else {
+        return false;
+    };
+
+    if is_deliberate_sleep_invocation(program, args) {
+        return true;
+    }
+
+    if args.len() == 2
+        && is_shell_wrapper_program(program)
+        && matches!(args[0].as_str(), "-c" | "-lc")
+    {
+        return is_deliberate_sleep_shell_snippet(&args[1]);
+    }
+
+    false
+}
+
+fn is_sleep_program(program: &str) -> bool {
+    let binary = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    binary.eq_ignore_ascii_case("sleep")
+}
+
+fn is_deliberate_sleep_invocation(program: &str, args: &[String]) -> bool {
+    is_sleep_program(program)
+        && !args.is_empty()
+        && args.iter().all(|arg| is_sleep_duration_arg(arg))
+}
+
+fn is_sleep_duration_arg(arg: &str) -> bool {
+    let normalized = arg.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "inf" | "infinity") {
+        return true;
+    }
+
+    let number = match normalized.chars().last() {
+        Some('s' | 'm' | 'h' | 'd') => &normalized[..normalized.len() - 1],
+        Some(_) => normalized.as_str(),
+        None => return false,
+    };
+
+    !number.is_empty()
+        && number.chars().any(|ch| ch.is_ascii_digit())
+        && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+}
+
+fn is_shell_wrapper_program(program: &str) -> bool {
+    let binary = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    ["sh", "bash", "dash", "zsh", "fish"]
+        .iter()
+        .any(|candidate| binary.eq_ignore_ascii_case(candidate))
+}
+
+fn is_deliberate_sleep_shell_snippet(shell_command: &str) -> bool {
+    let trimmed = shell_command.trim().trim_end_matches(';').trim();
+    let Some(tokens) = shlex::split(trimmed) else {
+        return false;
+    };
+    let tokens = if tokens.first().is_some_and(|token| token == "exec") {
+        &tokens[1..]
+    } else {
+        &tokens[..]
+    };
+    let Some((program, args)) = tokens.split_first() else {
+        return false;
+    };
+
+    is_deliberate_sleep_invocation(program, args)
+}
+
 struct PreparedProcessHandles {
+    process: Arc<UnifiedExecProcess>,
     writer_tx: mpsc::Sender<Vec<u8>>,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
+    call_id: String,
     command: Vec<String>,
     process_id: String,
     tty: bool,
@@ -316,12 +389,14 @@ impl UnifiedExecProcessManager {
         let process_id = request.process_id.to_string();
 
         let PreparedProcessHandles {
+            process,
             writer_tx,
             output_buffer,
             output_notify,
             output_closed,
             output_closed_notify,
             cancellation_token,
+            call_id,
             command: session_command,
             process_id,
             tty,
@@ -367,6 +442,8 @@ impl UnifiedExecProcessManager {
         let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
         let original_token_count = approx_token_count(&text);
         let chunk_id = generate_chunk_id();
+        let observed_exit_code = process.exit_code();
+        let has_exited = process.has_exited() || observed_exit_code.is_some();
 
         // After polling, refresh_process_state tells us whether the PTY is
         // still alive or has exited and been removed from the store; we thread
@@ -383,6 +460,7 @@ impl UnifiedExecProcessManager {
                 let call_id = entry.call_id.clone();
                 (None, exit_code, call_id)
             }
+            ProcessStatus::Unknown if has_exited => (None, observed_exit_code, call_id),
             ProcessStatus::Unknown => {
                 return Err(UnifiedExecError::UnknownProcessId {
                     process_id: request.process_id.to_string(),
@@ -403,6 +481,49 @@ impl UnifiedExecProcessManager {
         };
 
         Ok(response)
+    }
+
+    // Used by the PitchAI background-terminal continuation guard in core. This must stay cheap
+    // and side-effect free because it runs while deciding whether an assistant-only response
+    // should continue the turn or be treated as terminal.
+    pub(crate) async fn is_process_alive(&self, process_id: &str) -> bool {
+        let store = self.process_store.lock().await;
+        store
+            .processes
+            .get(process_id)
+            .is_some_and(|entry| !entry.process.has_exited())
+    }
+
+    // Same guard as above, but batched for the one-shot carry-over set that spans sampling
+    // request boundaries after empty `write_stdin` waits.
+    pub(crate) async fn any_process_alive(&self, process_ids: &HashSet<String>) -> bool {
+        if process_ids.is_empty() {
+            return false;
+        }
+
+        let store = self.process_store.lock().await;
+        process_ids.iter().any(|process_id| {
+            store
+                .processes
+                .get(process_id)
+                .is_some_and(|entry| !entry.process.has_exited())
+        })
+    }
+
+    // PitchAI `--persistent` mode depends on this staying session-wide rather than request-scoped.
+    // It intentionally checks every live TTY-backed unified-exec process in the session, not only
+    // processes referenced by the current sampling response, because the CLI option promises
+    // "do not stop while any terminal is still running".
+    //
+    // If an upstream merge removes or narrows this to only recently touched process ids, the
+    // persistent-session guarantee regresses immediately: Codex starts accepting assistant-only
+    // text as final while an older background shell is still alive.
+    pub(crate) async fn any_terminal_alive(&self) -> bool {
+        let store = self.process_store.lock().await;
+        store
+            .processes
+            .values()
+            .any(|entry| entry.tty && !entry.process.has_exited())
     }
 
     async fn refresh_process_state(&self, process_id: &str) -> ProcessStatus {
@@ -459,12 +580,14 @@ impl UnifiedExecProcessManager {
         } = entry.process.output_handles();
 
         Ok(PreparedProcessHandles {
+            process: Arc::clone(&entry.process),
             writer_tx: entry.process.writer_sender(),
             output_buffer,
             output_notify,
             output_closed,
             output_closed_notify,
             cancellation_token,
+            call_id: entry.call_id.clone(),
             command: entry.command.clone(),
             process_id: entry.process_id.clone(),
             tty: entry.tty,
@@ -504,12 +627,16 @@ impl UnifiedExecProcessManager {
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
-        let (number_processes, pruned_entry) = {
+        let (number_processes, exited_entries, pruned_entry) = {
             let mut store = self.process_store.lock().await;
+            let exited_entries = Self::take_exited_processes(&mut store);
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
             store.processes.insert(process_id.clone(), entry);
-            (store.processes.len(), pruned_entry)
+            (store.processes.len(), exited_entries, pruned_entry)
         };
+        for exited_entry in exited_entries {
+            Self::unregister_network_approval_for_entry(&exited_entry).await;
+        }
         // prune_processes_if_needed runs while holding process_store; do async
         // network-approval cleanup only after dropping that lock.
         if let Some(pruned_entry) = pruned_entry {
@@ -538,6 +665,20 @@ impl UnifiedExecProcessManager {
             transcript,
             started_at,
         );
+    }
+
+    fn take_exited_processes(store: &mut ProcessStore) -> Vec<ProcessEntry> {
+        let exited_process_ids: Vec<String> = store
+            .processes
+            .iter()
+            .filter(|(_, entry)| entry.process.has_exited())
+            .map(|(process_id, _)| process_id.clone())
+            .collect();
+
+        exited_process_ids
+            .into_iter()
+            .filter_map(|process_id| store.remove(&process_id))
+            .collect()
     }
 
     pub(crate) async fn open_session_with_exec_env(
@@ -778,6 +919,10 @@ impl UnifiedExecProcessManager {
     }
 
     fn max_empty_yield_time_ms(&self, session_command: &[String]) -> u64 {
+        if is_deliberate_sleep_command(session_command) {
+            return u64::MAX;
+        }
+
         let hard_cap = if is_pitchai_cli_command(session_command) {
             MAX_EMPTY_YIELD_TIME_MS_PITCHAI_CLI
         } else {
@@ -803,9 +948,67 @@ enum ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context;
+    use crate::exec::ExecExpiration;
+    use crate::exec::SandboxType;
+    use crate::protocol::AskForApproval;
+    use crate::protocol::SandboxPolicy;
+    use crate::sandboxing::ExecRequest;
+    use crate::sandboxing::SandboxPermissions;
+    use crate::unified_exec::NoopSpawnLifecycle;
+    use codex_protocol::config_types::WindowsSandboxLevel;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
+    use std::path::Path;
+    use std::sync::Weak;
     use tokio::time::Duration;
     use tokio::time::Instant;
+
+    async fn test_session_and_turn() -> (Arc<crate::codex::Session>, Arc<crate::codex::TurnContext>)
+    {
+        let (session, mut turn) = make_session_and_context().await;
+        turn.approval_policy
+            .set(AskForApproval::Never)
+            .expect("test setup should allow updating approval policy");
+        turn.sandbox_policy
+            .set(SandboxPolicy::DangerFullAccess)
+            .expect("test setup should allow updating sandbox policy");
+        (Arc::new(session), Arc::new(turn))
+    }
+
+    async fn spawn_process(
+        manager: &UnifiedExecProcessManager,
+        cwd: &Path,
+        command: &str,
+        tty: bool,
+    ) -> anyhow::Result<UnifiedExecProcess> {
+        let bash = which::which("bash")?;
+        manager
+            .open_session_with_exec_env(
+                &ExecRequest {
+                    command: vec![
+                        bash.display().to_string(),
+                        "-lc".to_string(),
+                        command.to_string(),
+                    ],
+                    cwd: cwd.to_path_buf(),
+                    env: apply_unified_exec_env(std::env::vars().collect()),
+                    network: None,
+                    expiration: ExecExpiration::Never,
+                    sandbox: SandboxType::None,
+                    windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    sandbox_policy: SandboxPolicy::DangerFullAccess,
+                    justification: None,
+                    arg0: None,
+                },
+                tty,
+                Box::new(NoopSpawnLifecycle),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+    }
 
     #[test]
     fn unified_exec_env_injects_defaults() {
@@ -905,6 +1108,183 @@ mod tests {
         assert_eq!(candidate, Some(id(1)));
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn take_exited_processes_removes_dead_entries() -> anyhow::Result<()> {
+        let manager = UnifiedExecProcessManager::default();
+        let process = spawn_process(
+            &manager,
+            std::env::current_dir()?.as_path(),
+            "sleep 0.1",
+            true,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(process.has_exited());
+
+        let process_id = "1000".to_string();
+        let mut store = ProcessStore::default();
+        store.reserved_process_ids.insert(process_id.clone());
+        store.processes.insert(
+            process_id.clone(),
+            ProcessEntry {
+                process: Arc::new(process),
+                call_id: "call".to_string(),
+                process_id: process_id.clone(),
+                command: vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "sleep 0.1".to_string(),
+                ],
+                tty: true,
+                network_approval_id: None,
+                session: Weak::new(),
+                last_used: Instant::now(),
+            },
+        );
+
+        let swept = UnifiedExecProcessManager::take_exited_processes(&mut store);
+
+        assert_eq!(swept.len(), 1);
+        assert!(store.processes.is_empty());
+        assert!(store.reserved_process_ids.is_empty());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_process_sweeps_exited_entries_before_warning_count() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let (session, turn) = test_session_and_turn().await;
+        let manager = &session.services.unified_exec_manager;
+
+        let exited_process =
+            Arc::new(spawn_process(manager, tempdir.path(), "sleep 0.1", true).await?);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !exited_process.has_exited() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stale process should exit during test");
+
+        {
+            let mut store = manager.process_store.lock().await;
+            for idx in 0..(WARNING_UNIFIED_EXEC_PROCESSES - 1) {
+                let process_id = format!("stale-{idx}");
+                store.reserved_process_ids.insert(process_id.clone());
+                store.processes.insert(
+                    process_id.clone(),
+                    ProcessEntry {
+                        process: Arc::clone(&exited_process),
+                        call_id: format!("stale-call-{idx}"),
+                        process_id,
+                        command: vec![
+                            "bash".to_string(),
+                            "-lc".to_string(),
+                            "sleep 0.1".to_string(),
+                        ],
+                        tty: true,
+                        network_approval_id: None,
+                        session: Arc::downgrade(&session),
+                        last_used: Instant::now() - Duration::from_secs((idx + 1) as u64),
+                    },
+                );
+            }
+        }
+
+        let live_process =
+            Arc::new(spawn_process(manager, tempdir.path(), "sleep 60", true).await?);
+        let context = UnifiedExecContext::new(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "warning-sweep".to_string(),
+        );
+        let command = vec!["sleep 60".to_string()];
+        manager
+            .store_process(
+                Arc::clone(&live_process),
+                &context,
+                &command,
+                tempdir.path().to_path_buf(),
+                Instant::now(),
+                "live-1000".to_string(),
+                true,
+                None,
+                Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+            )
+            .await;
+
+        let history = session.clone_history().await;
+        assert!(
+            !history.raw_items().iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { content, .. }
+                        if content.iter().any(|part| matches!(
+                            part,
+                            ContentItem::InputText { text }
+                                if text.contains("maximum number of unified exec processes")
+                        ))
+                )
+            }),
+            "swept exited entries should not inflate warning counts"
+        );
+
+        let store = manager.process_store.lock().await;
+        assert_eq!(store.processes.len(), 1);
+        assert!(store.processes.contains_key("live-1000"));
+        assert!(store.reserved_process_ids.is_empty());
+        drop(store);
+
+        manager.terminate_all_processes().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deliberate_sleep_wait_is_not_cut_short_by_manager_cap() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let manager = UnifiedExecProcessManager::new(250);
+        let (session, turn) = test_session_and_turn().await;
+        let context =
+            UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "sleep-wait".into());
+
+        let process = Arc::new(spawn_process(&manager, tempdir.path(), "sleep 0.5", true).await?);
+        manager
+            .store_process(
+                Arc::clone(&process),
+                &context,
+                &[
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "sleep 0.5".to_string(),
+                ],
+                tempdir.path().to_path_buf(),
+                Instant::now(),
+                "sleep-1000".to_string(),
+                true,
+                None,
+                Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default())),
+            )
+            .await;
+
+        let response = manager
+            .write_stdin(WriteStdinRequest {
+                process_id: "sleep-1000",
+                input: "",
+                yield_time_ms: 1_000,
+                max_output_tokens: None,
+            })
+            .await?;
+
+        assert_eq!(response.process_id, None);
+        assert_eq!(response.exit_code, Some(0));
+
+        Ok(())
+    }
+
     #[test]
     fn detects_pitchai_cli_command() {
         assert!(is_pitchai_cli_command(&["pitchai status".to_string()]));
@@ -922,6 +1302,52 @@ mod tests {
     }
 
     #[test]
+    fn detects_deliberate_sleep_command() {
+        assert!(is_deliberate_sleep_command(&[
+            "sleep".to_string(),
+            "4h".to_string(),
+        ]));
+        assert!(is_deliberate_sleep_command(&[
+            "sleep".to_string(),
+            "0.5".to_string(),
+        ]));
+        assert!(is_deliberate_sleep_command(&[
+            "/bin/sleep".to_string(),
+            "3600".to_string(),
+        ]));
+        assert!(is_deliberate_sleep_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 4h".to_string(),
+        ]));
+        assert!(is_deliberate_sleep_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "exec /bin/sleep 4h;".to_string(),
+        ]));
+        assert!(!is_deliberate_sleep_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo sleep 4h".to_string(),
+        ]));
+        assert!(!is_deliberate_sleep_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 4h && echo done".to_string(),
+        ]));
+        assert!(!is_deliberate_sleep_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 4h; echo done".to_string(),
+        ]));
+        assert!(!is_deliberate_sleep_command(&[
+            "python3".to_string(),
+            "-c".to_string(),
+            "import time; time.sleep(3600)".to_string(),
+        ]));
+    }
+
+    #[test]
     fn max_empty_yield_time_uses_pitchai_cap() {
         let manager = UnifiedExecProcessManager::new(12 * 60 * 60 * 1_000);
         assert_eq!(
@@ -931,6 +1357,14 @@ mod tests {
         assert_eq!(
             manager.max_empty_yield_time_ms(&["codex exec".to_string()]),
             MAX_EMPTY_YIELD_TIME_MS
+        );
+        assert_eq!(
+            manager.max_empty_yield_time_ms(&[
+                "bash".to_string(),
+                "-lc".to_string(),
+                "sleep 4h".to_string(),
+            ]),
+            u64::MAX
         );
     }
 }

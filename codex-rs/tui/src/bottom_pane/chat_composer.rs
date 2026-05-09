@@ -2560,7 +2560,17 @@ impl ChatComposer {
         );
         let trimmed_rest = prepared_rest.trim();
         args_elements = Self::trim_text_elements(prepared_rest, trimmed_rest, args_elements);
+        // Inline-arg slash commands are a real submission path, not just a preview. If the
+        // textarea stays populated after dispatch, external automations such as `/voice-input ...`
+        // can leave the raw slash command in the composer, and later Enter presses re-submit the
+        // same transcript over and over. Keep this aligned with the successful bare-command path:
+        // extract args first, then clear the visible textarea while preserving the kill buffer.
+        self.textarea.set_text_clearing_elements("");
         Some((trimmed_rest.to_string(), args_elements))
+    }
+
+    pub(crate) fn clear_visible_text_after_inline_command_dispatch(&mut self) {
+        self.textarea.set_text_clearing_elements("");
     }
 
     fn reject_slash_command_if_unavailable(&self, cmd: SlashCommand) -> bool {
@@ -7195,6 +7205,30 @@ mod tests {
                 (" and ".to_string(), 0),
             ]
         );
+    }
+
+    #[test]
+    fn prepare_inline_args_submission_clears_textarea_after_success() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content_with_mention_bindings(
+            "/deep 2".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let prepared = composer.prepare_inline_args_submission(false);
+        assert_eq!(prepared, Some(("2".to_string(), Vec::new())));
+        assert!(composer.textarea.is_empty(), "composer should be cleared");
     }
 
     /// Behavior: if multiple large pastes share the same placeholder label (same char count),

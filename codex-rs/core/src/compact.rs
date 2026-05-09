@@ -25,6 +25,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::unwrap_voice_transcript;
 use codex_protocol::user_input::UserInput;
 use futures::prelude::*;
 use http::StatusCode;
@@ -292,7 +293,8 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     if pieces.is_empty() {
         None
     } else {
-        Some(pieces.join("\n"))
+        let joined = pieces.join("\n");
+        Some(unwrap_voice_transcript(&joined).unwrap_or(joined))
     }
 }
 
@@ -494,6 +496,7 @@ mod tests {
 
     use super::*;
     use crate::error::UnexpectedResponseError;
+    use codex_protocol::protocol::wrap_voice_transcript;
     use http::StatusCode;
     use pretty_assertions::assert_eq;
 
@@ -544,6 +547,17 @@ mod tests {
         let joined = content_items_to_text(&items);
 
         assert_eq!(None, joined);
+    }
+
+    #[test]
+    fn content_items_to_text_unwraps_voice_transcripts() {
+        let items = vec![ContentItem::InputText {
+            text: wrap_voice_transcript("spoken operator follow-up"),
+        }];
+
+        let joined = content_items_to_text(&items);
+
+        assert_eq!(Some("spoken operator follow-up".to_string()), joined);
     }
 
     #[test]

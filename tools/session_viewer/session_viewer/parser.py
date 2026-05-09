@@ -30,6 +30,7 @@ def iter_raw_events(path: Path) -> Iterator[RawEvent]:
 def parse_session(path: Path) -> SessionView:
     meta: Optional[SessionMeta] = None
     cards = []
+    assistant_messages = []
     prev_ts: Optional[datetime] = None
     for event in iter_raw_events(path):
         if event.type == "session_meta" and meta is None:
@@ -47,6 +48,9 @@ def parse_session(path: Path) -> SessionView:
             continue
         delta = (event.timestamp - prev_ts).total_seconds() if prev_ts else None
         prev_ts = event.timestamp
+        assistant_message = summary.to_assistant_message(event, delta)
+        if assistant_message:
+            assistant_messages.append(assistant_message)
         card = summary.to_card(event, delta)
         if card:
             cards.append(card)
@@ -61,4 +65,4 @@ def parse_session(path: Path) -> SessionView:
             created_at=datetime.fromtimestamp(path.stat().st_mtime),
             file_path=path,
         )
-    return SessionView(meta=meta, cards=cards)
+    return SessionView(meta=meta, cards=cards, assistant_messages=assistant_messages)

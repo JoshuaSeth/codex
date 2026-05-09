@@ -86,6 +86,57 @@ async fn find_locates_rollout_file_by_id() {
 }
 
 #[tokio::test]
+async fn find_ignores_matching_cost_file_by_id() {
+    let home = TempDir::new().unwrap();
+    let id = Uuid::new_v4();
+    let expected = write_minimal_rollout_with_id(home.path(), id);
+    let sessions_root = home.path().join("sessions");
+    std::fs::write(sessions_root.join(format!("cost_{id}.json")), "{}").unwrap();
+
+    let found = find_thread_path_by_id_str(home.path(), &id.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(found, Some(expected));
+}
+
+#[tokio::test]
+async fn find_locates_rollout_file_by_id_beyond_listing_scan_cap() {
+    let home = TempDir::new().unwrap();
+    let id = Uuid::new_v4();
+    let expected = write_minimal_rollout_with_id(home.path(), id);
+    let newer_sessions = home.path().join("sessions/2030/01/01");
+    std::fs::create_dir_all(&newer_sessions).unwrap();
+    for index in 0..10_050 {
+        let newer_id = Uuid::new_v4();
+        std::fs::write(
+            newer_sessions.join(format!("rollout-2030-01-01T00-00-00-{newer_id}.jsonl")),
+            format!("{index}\n"),
+        )
+        .unwrap();
+    }
+
+    let found = find_thread_path_by_id_str(home.path(), &id.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(found, Some(expected));
+}
+
+#[tokio::test]
+async fn find_locates_rollout_file_by_id_with_missing_leading_zeroes() {
+    let home = TempDir::new().unwrap();
+    let id = Uuid::parse_str("019d1f63-7251-7c41-a001-e945ccf4f9a1").expect("expected fixed UUID");
+    let expected = write_minimal_rollout_with_id(home.path(), id);
+
+    let found = find_thread_path_by_id_str(home.path(), "19d1f63-7251-7c41-a001-e945ccf4f9a1")
+        .await
+        .unwrap();
+
+    assert_eq!(found, Some(expected));
+}
+
+#[tokio::test]
 async fn find_handles_gitignore_covering_codex_home_directory() {
     let repo = TempDir::new().unwrap();
     let codex_home = repo.path().join(".codex");

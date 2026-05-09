@@ -10,6 +10,9 @@ mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
 
+use crate::cli::Command as ExecCommand;
+use crate::event_processor::CodexStatus;
+use crate::event_processor::EventProcessor;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
@@ -25,6 +28,7 @@ use codex_core::auth::CODEX_API_KEY_ENV_VAR;
 use codex_core::auth::enforce_login_restrictions;
 use codex_core::auth::is_force_api_key_auth_enabled;
 use codex_core::check_execpolicy_for_warnings;
+use codex_core::config::CompletionGateConfig;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -33,10 +37,16 @@ use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config_loader::ConfigLoadError;
 use codex_core::config_loader::format_config_error_with_source;
+use codex_core::default_client::set_default_client_residency_requirement;
+use codex_core::default_client::set_default_originator;
+use codex_core::find_thread_path_by_id_str;
+use codex_core::find_thread_path_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::RefreshStrategy;
+use codex_core::non_stop_expires_at_after;
+use codex_core::normalize_thread_id_selector_str;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
 use codex_protocol::approvals::ElicitationAction;
@@ -72,15 +82,6 @@ use tracing::info_span;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
-use uuid::Uuid;
-
-use crate::cli::Command as ExecCommand;
-use crate::event_processor::CodexStatus;
-use crate::event_processor::EventProcessor;
-use codex_core::default_client::set_default_client_residency_requirement;
-use codex_core::default_client::set_default_originator;
-use codex_core::find_thread_path_by_id_str;
-use codex_core::find_thread_path_by_name_str;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
@@ -147,6 +148,20 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         add_dir,
         strict_dir,
         ephemeral,
+        persistent,
+        non_stop,
+        voice,
+        non_stop_for,
+        non_stop_budget,
+        completion_criteria,
+        completion_criteria_file,
+        completion_judge_model,
+        completion_judge_base_url,
+        completion_judge_api_key_env,
+        completion_judge_timeout_ms,
+        completion_judge_max_retries,
+        completion_judge_max_assistant_messages,
+        completion_judge_max_user_messages,
         color,
         last_message_file,
         json: json_mode,
@@ -318,6 +333,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Load configuration and determine approval policy
+    let completion_gate = load_completion_gate_config(
+        completion_criteria,
+        completion_criteria_file,
+        completion_judge_model,
+        completion_judge_base_url,
+        completion_judge_api_key_env,
+        completion_judge_timeout_ms,
+        completion_judge_max_retries,
+        completion_judge_max_assistant_messages,
+        completion_judge_max_user_messages,
+    );
     let overrides = ConfigOverrides {
         model,
         review_model: None,
@@ -341,6 +367,18 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
         ephemeral: ephemeral.then_some(true),
+        persistent: persistent.then_some(true),
+        non_stop: non_stop
+            .then_some(true)
+            .or(non_stop_for.map(|_| true))
+            .or(non_stop_budget.map(|_| true)),
+        voice_mode: voice.then_some(true),
+        non_stop_expires_at: non_stop_for
+            .map(non_stop_expires_at_after)
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
+        non_stop_budget,
+        completion_gate,
         additional_writable_roots: add_dir,
         strict_sandbox_roots: strict_dir,
     };
@@ -884,8 +922,9 @@ async fn resolve_resume_path(
             }
         }
     } else if let Some(id_str) = args.session_id.as_deref() {
-        if Uuid::parse_str(id_str).is_ok() {
-            let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
+        if let Some(normalized_thread_id) = normalize_thread_id_selector_str(id_str) {
+            let path =
+                find_thread_path_by_id_str(&config.codex_home, &normalized_thread_id).await?;
             Ok(path)
         } else {
             let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;
@@ -920,6 +959,72 @@ fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
             std::process::exit(1);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_completion_gate_config(
+    criteria: Option<String>,
+    criteria_file: Option<PathBuf>,
+    judge_model: Option<String>,
+    judge_base_url: Option<String>,
+    judge_api_key_env: Option<String>,
+    timeout_ms: Option<u64>,
+    max_retries: Option<u32>,
+    max_assistant_messages: Option<usize>,
+    max_user_messages: Option<usize>,
+) -> Option<CompletionGateConfig> {
+    let criteria = match (criteria, criteria_file) {
+        (Some(criteria), None) => Some(criteria),
+        (None, Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(err) => {
+                eprintln!(
+                    "Failed to read completion criteria file {}: {err}",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap enforces mutual exclusivity"),
+    };
+
+    if criteria.is_none()
+        && (judge_model.is_some()
+            || judge_base_url.is_some()
+            || judge_api_key_env.is_some()
+            || timeout_ms.is_some()
+            || max_retries.is_some()
+            || max_assistant_messages.is_some()
+            || max_user_messages.is_some())
+    {
+        eprintln!(
+            "Completion-judge overrides require `--completion-criteria` or `--completion-criteria-file`."
+        );
+        std::process::exit(1);
+    }
+
+    let criteria = criteria.map(|text| text.trim().to_string());
+    let Some(criteria) = criteria else {
+        return None;
+    };
+    if criteria.is_empty() {
+        eprintln!("Completion criteria cannot be empty.");
+        std::process::exit(1);
+    }
+
+    Some(CompletionGateConfig {
+        criteria,
+        judge_model,
+        judge_base_url,
+        judge_api_key_env,
+        timeout_ms: timeout_ms.unwrap_or(CompletionGateConfig::DEFAULT_TIMEOUT_MS),
+        max_retries: max_retries.unwrap_or(CompletionGateConfig::DEFAULT_MAX_RETRIES),
+        max_assistant_messages: max_assistant_messages
+            .unwrap_or(CompletionGateConfig::DEFAULT_MAX_ASSISTANT_MESSAGES),
+        max_user_messages: max_user_messages
+            .unwrap_or(CompletionGateConfig::DEFAULT_MAX_USER_MESSAGES),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

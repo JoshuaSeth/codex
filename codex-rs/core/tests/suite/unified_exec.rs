@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::DEEP_FORCE_CONTINUE_ITERATIONS;
+use codex_core::current_unix_timestamp;
 use codex_core::features::Feature;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -928,6 +930,715 @@ async fn unified_exec_emits_terminal_interaction_for_write_stdin() -> Result<()>
         .and_then(Value::as_str)
         .expect("stdin chars");
     assert_eq!(delta.stdin, expected_stdin);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assistant_only_response_after_background_wait_triggers_follow_up() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let open_args = json!({
+        "cmd": "sleep 1000",
+        "yield_time_ms": 200,
+        "tty": true,
+    });
+    // Regression guard for the PitchAI fork:
+    //
+    // 1. The model starts a long-running background process.
+    // 2. The model issues empty `write_stdin`, which is a wait/poll on that process.
+    // 3. The process is still alive, so the next model response may be only commentary such as
+    //    "still running".
+    // 4. Core must not treat that assistant-only response as terminal just because this second
+    //    response has no fresh tool call.
+    //
+    // If this test starts failing after an upstream merge, re-check the one-shot background wait
+    // continuation path in `stream_events_utils.rs` and `codex.rs`.
+    let wait_args = json!({
+        "chars": "",
+        "session_id": 1000,
+        "yield_time_ms": 200,
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "uexec-open",
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_function_call(
+                    "uexec-wait",
+                    "write_stdin",
+                    &serde_json::to_string(&wait_args)?,
+                ),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-1", "still running"),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-4"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "wait on the background terminal until it finishes".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    if let Some(message) = turn_complete.last_agent_message.as_deref() {
+        assert_eq!(message, "done");
+    }
+    assert_eq!(request_log.requests().len(), 4);
+
+    codex.submit(Op::CleanBackgroundTerminals).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commentary_message_after_tool_output_triggers_follow_up() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let open_args = json!({
+        "cmd": "printf ready",
+        "yield_time_ms": 200,
+        "tty": true,
+    });
+    let commentary_message = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "msg-1",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "still checking"}]
+        }
+    });
+    let final_message = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "msg-2",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "done"}]
+        }
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "uexec-open",
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                commentary_message,
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                final_message,
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "run a command and keep going until there is a real final answer".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    if let Some(message) = turn_complete.last_agent_message.as_deref() {
+        assert_eq!(message, "done");
+    }
+    assert_eq!(request_log.requests().len(), 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_final_answer_after_tool_output_still_stops() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let open_args = json!({
+        "cmd": "printf ready",
+        "yield_time_ms": 200,
+        "tty": true,
+    });
+    let short_final_message = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "msg-1",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "done"}]
+        }
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "uexec-open",
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                short_final_message,
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "run a command and stop when it is actually done".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some("done"));
+    assert_eq!(request_log.requests().len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_mode_keeps_turn_alive_while_terminal_is_running() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.persistent = true;
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let open_args = json!({
+        "cmd": "bash -i",
+        "yield_time_ms": 200,
+        "tty": true,
+    });
+    let close_args = json!({
+        "chars": "exit\n",
+        "session_id": 1000,
+        "yield_time_ms": 200,
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    "uexec-open",
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "still running"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_function_call(
+                    "uexec-close",
+                    "write_stdin",
+                    &serde_json::to_string(&close_args)?,
+                ),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-4"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "keep going until every background terminal is closed".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some("done"));
+    assert_eq!(request_log.requests().len(), 4);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_stop_mode_forces_follow_up_after_final_answer() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_windows!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config.non_stop = true;
+        config.use_experimental_unified_exec_tool = true;
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = builder.build(&server).await?;
+
+    let open_call_id = "uexec-open-after-final";
+    let open_args = json!({
+        "cmd": "sleep 60",
+        "yield_time_ms": 200,
+        "tty": true,
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_function_call(
+                    open_call_id,
+                    "exec_command",
+                    &serde_json::to_string(&open_args)?,
+                ),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "never stop on your own; keep going until interrupted".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    wait_for_event(&codex, |event| {
+        matches!(
+            event,
+            EventMsg::TurnCompleteDeferredByNonStop(ev)
+                if ev.last_agent_message.as_deref() == Some("done")
+        )
+    })
+    .await;
+    wait_for_event(
+        &codex,
+        |event| matches!(event, EventMsg::ExecCommandBegin(ev) if ev.call_id == open_call_id),
+    )
+    .await;
+    assert_eq!(request_log.requests().len(), 2);
+
+    codex.submit(Op::Interrupt).await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_stop_budget_allows_stop_on_budgeted_attempt() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done 1"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done 2"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = test_codex()
+        .with_config(|config| {
+            config.non_stop = true;
+            config.non_stop_budget = Some(2);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "say done twice".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: session_configured.approval_policy,
+            sandbox_policy: session_configured.sandbox_policy,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    wait_for_event(&codex, |event| {
+        matches!(
+            event,
+            EventMsg::TurnCompleteDeferredByNonStop(ev)
+                if ev.last_agent_message.as_deref() == Some("done 1")
+        )
+    })
+    .await;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some("done 2"));
+    assert_eq!(request_log.requests().len(), 2);
+    let config_snapshot = codex.config_snapshot().await;
+    assert!(!config_snapshot.non_stop);
+    assert_eq!(config_snapshot.non_stop_budget, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_non_stop_mode_allows_stop_after_timeout() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = test_codex()
+        .with_config(|config| {
+            config.non_stop = true;
+            config.non_stop_expires_at = Some(current_unix_timestamp());
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "say done".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: session_configured.approval_policy,
+            sandbox_policy: session_configured.sandbox_policy,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some("done"));
+    assert_eq!(request_log.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_budget_forces_four_extra_candidate_stop_rounds() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done 1"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done 2"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "done 3"),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-4", "done 4"),
+                ev_completed("resp-4"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-5"),
+                ev_assistant_message("msg-5", "done 5"),
+                ev_completed("resp-5"),
+            ]),
+        ],
+    )
+    .await;
+
+    let TestCodex {
+        codex,
+        cwd,
+        session_configured,
+        ..
+    } = test_codex().build(&server).await?;
+
+    codex
+        .submit(Op::SetNextTurnDeepFollowUpBudget {
+            budget: DEEP_FORCE_CONTINUE_ITERATIONS,
+        })
+        .await?;
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "keep thinking a few more times before you stop".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: cwd.path().to_path_buf(),
+            approval_policy: session_configured.approval_policy,
+            sandbox_policy: session_configured.sandbox_policy,
+            model: session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            final_output_json_schema: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    let turn_complete = loop {
+        let msg = wait_for_event(&codex, |_| true).await;
+        if let EventMsg::TurnComplete(ev) = msg {
+            break ev;
+        }
+    };
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some("done 5"));
+    assert_eq!(
+        request_log.requests().len(),
+        usize::try_from(DEEP_FORCE_CONTINUE_ITERATIONS).expect("small test constant") + 1
+    );
     Ok(())
 }
 

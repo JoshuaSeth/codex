@@ -53,6 +53,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let ThreadStartResponse {
         thread,
         model_provider,
+        completion_gate,
+        voice_mode,
         ..
     } = to_response::<ThreadStartResponse>(resp)?;
     assert!(!thread.id.is_empty(), "thread id should not be empty");
@@ -61,6 +63,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         "new threads should start with an empty preview"
     );
     assert_eq!(model_provider, "mock_provider");
+    assert_eq!(completion_gate, None);
+    assert!(!voice_mode);
     assert!(
         thread.created_at > 0,
         "created_at should be a positive UNIX timestamp"
@@ -91,6 +95,16 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         thread_json.get("ephemeral").and_then(Value::as_bool),
         Some(false),
         "new persistent threads should serialize `ephemeral: false`"
+    );
+    assert_eq!(
+        resp_result.get("completionGate"),
+        Some(&Value::Null),
+        "thread/start should serialize `completionGate: null` when disabled"
+    );
+    assert_eq!(
+        resp_result.get("voiceMode").and_then(Value::as_bool),
+        Some(false),
+        "thread/start should serialize `voiceMode: false` by default"
     );
     assert_eq!(thread.name, None);
 

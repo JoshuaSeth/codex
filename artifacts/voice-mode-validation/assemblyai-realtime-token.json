@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "provider": "assemblyai",
+  "token": "REDACTED",
+  "expires_in": 300,
+  "sample_rate": 16000,
+  "encoding": "pcm_s16le",
+  "speech_model": "universal-streaming-english",
+  "ws_url": "wss://streaming.assemblyai.com/v3/ws"
+}

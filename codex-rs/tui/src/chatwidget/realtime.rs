@@ -53,12 +53,14 @@ pub(super) struct RenderedUserMessageEvent {
     pub(super) remote_image_urls: Vec<String>,
     pub(super) local_images: Vec<PathBuf>,
     pub(super) text_elements: Vec<TextElement>,
+    pub(super) source: UserMessageSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PendingSteerCompareKey {
     pub(super) message: String,
     pub(super) image_count: usize,
+    pub(super) source: UserMessageSource,
 }
 
 impl ChatWidget {
@@ -67,23 +69,32 @@ impl ChatWidget {
         text_elements: Vec<TextElement>,
         local_images: Vec<PathBuf>,
         remote_image_urls: Vec<String>,
+        source: UserMessageSource,
     ) -> RenderedUserMessageEvent {
         RenderedUserMessageEvent {
             message,
             remote_image_urls,
             local_images,
             text_elements,
+            source,
         }
     }
 
     pub(super) fn rendered_user_message_event_from_event(
         event: &UserMessageEvent,
     ) -> RenderedUserMessageEvent {
+        let (message, source) =
+            if let Some(voice_transcript) = unwrap_voice_transcript(&event.message) {
+                (voice_transcript, UserMessageSource::Voice)
+            } else {
+                (event.message.clone(), UserMessageSource::Typed)
+            };
         Self::rendered_user_message_event_from_parts(
-            event.message.clone(),
+            message,
             event.text_elements.clone(),
             event.local_images.clone(),
             event.images.clone().unwrap_or_default(),
+            source,
         )
     }
 
@@ -97,10 +108,18 @@ impl ChatWidget {
     ) -> PendingSteerCompareKey {
         let mut message = String::new();
         let mut image_count = 0;
+        let mut source = UserMessageSource::Typed;
 
         for item in items {
             match item {
-                UserInput::Text { text, .. } => message.push_str(text),
+                UserInput::Text { text, .. } => {
+                    if let Some(voice_transcript) = unwrap_voice_transcript(text) {
+                        source = UserMessageSource::Voice;
+                        message.push_str(&voice_transcript);
+                    } else {
+                        message.push_str(text);
+                    }
+                }
                 UserInput::Image { .. } | UserInput::LocalImage { .. } => image_count += 1,
                 UserInput::Skill { .. } | UserInput::Mention { .. } => {}
                 _ => {}
@@ -110,6 +129,7 @@ impl ChatWidget {
         PendingSteerCompareKey {
             message,
             image_count,
+            source,
         }
     }
 
@@ -156,6 +176,7 @@ impl ChatWidget {
             text_elements,
             local_images,
             remote_image_urls,
+            UserMessageSource::Typed,
         )
     }
 

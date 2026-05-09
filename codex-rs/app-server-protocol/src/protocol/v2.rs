@@ -45,6 +45,7 @@ use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
+use codex_protocol::protocol::CompletionGateInfo;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
@@ -76,6 +77,9 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use ts_rs::TS;
+
+#[cfg(test)]
+use codex_protocol::protocol::UserMessageSource as CoreUserMessageSource;
 
 // Macro to declare a camelCased API v2 enum mirroring a core enum which
 // tends to use either snake_case or kebab-case.
@@ -1889,10 +1893,12 @@ pub struct ThreadStartResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub voice_mode: bool,
     pub cwd: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub completion_gate: Option<CompletionGateInfo>,
 }
 
 #[derive(
@@ -1967,10 +1973,12 @@ pub struct ThreadResumeResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub voice_mode: bool,
     pub cwd: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub completion_gate: Option<CompletionGateInfo>,
 }
 
 #[derive(
@@ -2034,10 +2042,12 @@ pub struct ThreadForkResponse {
     pub model: String,
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
+    pub voice_mode: bool,
     pub cwd: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub completion_gate: Option<CompletionGateInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -4705,6 +4715,7 @@ mod tests {
                     path: "app://demo-app".to_string(),
                 },
             ],
+            source: CoreUserMessageSource::Typed,
         });
 
         assert_eq!(

@@ -42,6 +42,7 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
+use codex_core::auth::AuthMode;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -402,8 +403,13 @@ fn should_show_model_migration_prompt(
     target_model: &str,
     seen_migrations: &BTreeMap<String, String>,
     available_models: &[ModelPreset],
+    auth_mode: Option<AuthMode>,
 ) -> bool {
     if target_model == current_model {
+        return false;
+    }
+
+    if matches!(auth_mode, Some(AuthMode::Chatgpt)) && target_model == "gpt-5.4" {
         return false;
     }
 
@@ -530,6 +536,7 @@ async fn handle_model_migration_prompt_if_needed(
     model: &str,
     app_event_tx: &AppEventSender,
     available_models: &[ModelPreset],
+    auth_mode: Option<AuthMode>,
 ) -> Option<AppExitInfo> {
     let upgrade = available_models
         .iter()
@@ -555,6 +562,7 @@ async fn handle_model_migration_prompt_if_needed(
             &target_model,
             &config.notices.model_migrations,
             available_models,
+            auth_mode,
         ) {
             return None;
         }
@@ -1579,6 +1587,7 @@ impl App {
             model.as_str(),
             &app_event_tx,
             &available_models,
+            auth_manager.auth_mode(),
         )
         .await;
         if let Some(exit_info) = exit_info {
@@ -2181,6 +2190,22 @@ impl App {
             AppEvent::MaybeSendNextQueuedInput => {
                 self.chat_widget.maybe_send_next_queued_input();
             }
+            AppEvent::ReleaseDueScheduledNonStopMessages { thread_id } => {
+                if thread_id.is_none() || self.chat_widget.thread_id() == thread_id {
+                    self.chat_widget.release_due_scheduled_non_stop_messages();
+                }
+            }
+            AppEvent::OpenNonStopTimedSubmitSelection { user_message } => {
+                self.chat_widget
+                    .open_non_stop_timed_submit_selection(user_message);
+            }
+            AppEvent::SubmitNonStopUserMessage { user_message, mode } => {
+                self.chat_widget
+                    .submit_non_stop_user_message(user_message, mode);
+            }
+            AppEvent::RestoreSubmittedDraft { user_message } => {
+                self.chat_widget.restore_submitted_draft(user_message);
+            }
             AppEvent::CodexEvent(event) => {
                 self.enqueue_primary_event(event).await?;
             }
@@ -2575,6 +2600,8 @@ impl App {
                                         service_tier: None,
                                         collaboration_mode: None,
                                         personality: None,
+                                        non_stop: None,
+                                        completion_gate: None,
                                     },
                                 ));
                                 self.app_event_tx.send(
@@ -2598,6 +2625,8 @@ impl App {
                                         service_tier: None,
                                         collaboration_mode: None,
                                         personality: None,
+                                        non_stop: None,
+                                        completion_gate: None,
                                     },
                                 ));
                                 self.app_event_tx
@@ -2911,6 +2940,8 @@ impl App {
                                 service_tier: None,
                                 collaboration_mode: None,
                                 personality: None,
+                                non_stop: None,
+                                completion_gate: None,
                             }));
                     }
                 }
@@ -3288,7 +3319,9 @@ impl App {
     fn handle_codex_event_now(&mut self, event: Event) {
         let needs_refresh = matches!(
             event.msg,
-            EventMsg::SessionConfigured(_) | EventMsg::TokenCount(_)
+            EventMsg::SessionConfigured(_)
+                | EventMsg::NonStopModeUpdated(_)
+                | EventMsg::TokenCount(_)
         );
         // This guard is only for intentional thread-switch shutdowns.
         // App-exit shutdowns are tracked by `pending_shutdown_exit_thread_id`
@@ -3393,6 +3426,7 @@ impl App {
                 model: config_snapshot.model,
                 model_provider_id: config_snapshot.model_provider_id,
                 service_tier: config_snapshot.service_tier,
+                non_stop: config_snapshot.non_stop,
                 approval_policy: config_snapshot.approval_policy,
                 sandbox_policy: config_snapshot.sandbox_policy,
                 cwd: config_snapshot.cwd,
@@ -3402,6 +3436,7 @@ impl App {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: thread.rollout_path(),
+                completion_gate: config_snapshot.completion_gate,
             }),
         };
         let channel =
@@ -3718,6 +3753,7 @@ mod tests {
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::protocol::UserMessageSource;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
     use crossterm::event::KeyModifiers;
@@ -3878,6 +3914,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
 
@@ -4050,6 +4088,8 @@ mod tests {
                         initial_messages: None,
                         network_proxy: None,
                         rollout_path: Some(PathBuf::new()),
+                        non_stop: false,
+                        completion_gate: None,
                     }),
                 },
             ),
@@ -4127,6 +4167,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4208,6 +4250,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4288,6 +4332,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4362,6 +4408,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4475,6 +4523,8 @@ mod tests {
                         initial_messages: None,
                         network_proxy: None,
                         rollout_path: Some(PathBuf::new()),
+                        non_stop: false,
+                        completion_gate: None,
                     }),
                 },
             ),
@@ -4544,6 +4594,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4647,6 +4699,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4723,6 +4777,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
         app.chat_widget
@@ -4969,6 +5025,8 @@ mod tests {
                         initial_messages: None,
                         network_proxy: None,
                         rollout_path: Some(PathBuf::from("/tmp/agent-rollout.jsonl")),
+                        non_stop: false,
+                        completion_gate: None,
                     }),
                 },
             ),
@@ -5165,6 +5223,7 @@ mod tests {
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
                 remote_image_urls: Vec::new(),
+                source: UserMessageSource::Typed,
             }) as Arc<dyn HistoryCell>
         };
         let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
@@ -5190,6 +5249,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             };
             Arc::new(new_session_info(
                 app.chat_widget.config_ref(),
@@ -5451,31 +5512,36 @@ mod tests {
             "gpt-5",
             "gpt-5.2-codex",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5-codex",
             "gpt-5.2-codex",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5-codex-mini",
             "gpt-5.2-codex",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
         assert!(should_show_model_migration_prompt(
             "gpt-5.1-codex",
             "gpt-5.2-codex",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
         assert!(!should_show_model_migration_prompt(
             "gpt-5.1-codex",
             "gpt-5.1-codex",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
     }
 
@@ -5601,13 +5667,36 @@ mod tests {
             "gpt-5",
             "gpt-5.1",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
         ));
         assert!(!should_show_model_migration_prompt(
             "gpt-5.1",
             "gpt-5.1",
             &seen,
-            &all_model_presets()
+            &all_model_presets(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn model_migration_prompt_skips_gpt_5_4_for_chatgpt_auth() {
+        let seen = BTreeMap::new();
+        let available = all_model_presets();
+
+        assert!(should_show_model_migration_prompt(
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            &seen,
+            &available,
+            Some(AuthMode::ApiKey),
+        ));
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            &seen,
+            &available,
+            Some(AuthMode::Chatgpt),
         ));
     }
 
@@ -5635,6 +5724,7 @@ mod tests {
             "missing-target",
             &BTreeMap::new(),
             &available,
+            None,
         ));
 
         assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
@@ -5651,6 +5741,7 @@ mod tests {
             "gpt-5.2-codex",
             &BTreeMap::new(),
             &with_hidden_target,
+            None,
         ));
         assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.2-codex").is_none());
     }
@@ -5689,6 +5780,7 @@ mod tests {
                 &upgrade.id,
                 &config.notices.model_migrations,
                 &available_models,
+                None,
             ),
             "expected migration prompt to be eligible for hidden model"
         );
@@ -5814,6 +5906,7 @@ mod tests {
                 text_elements,
                 local_image_paths,
                 remote_image_urls,
+                source: UserMessageSource::Typed,
             }) as Arc<dyn HistoryCell>
         };
         let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
@@ -5840,6 +5933,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             };
             Arc::new(new_session_info(
                 app.chat_widget.config_ref(),
@@ -5899,6 +5994,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         });
 
@@ -5943,6 +6040,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
+            source: UserMessageSource::Typed,
         }) as Arc<dyn HistoryCell>];
         app.chat_widget
             .set_composer_text("stale draft".to_string(), Vec::new(), Vec::new());
@@ -5991,6 +6089,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         });
 
@@ -6000,6 +6100,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: vec![data_image_url.clone()],
+            source: UserMessageSource::Typed,
         }) as Arc<dyn HistoryCell>];
 
         app.apply_backtrack_rollback(BacktrackSelection {
@@ -6076,6 +6177,8 @@ mod tests {
                 ]),
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         });
 
@@ -6149,6 +6252,8 @@ mod tests {
                 ]),
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         });
 
@@ -6198,6 +6303,7 @@ mod tests {
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
                 remote_image_urls: Vec::new(),
+                source: UserMessageSource::Typed,
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(
                 vec![Line::from("after first")],
@@ -6208,6 +6314,7 @@ mod tests {
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
                 remote_image_urls: Vec::new(),
+                source: UserMessageSource::Typed,
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(
                 vec![Line::from("after second")],
@@ -6263,6 +6370,8 @@ mod tests {
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(PathBuf::new()),
+            non_stop: false,
+            completion_gate: None,
         };
 
         app.chat_widget.handle_codex_event(Event {
@@ -6332,6 +6441,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),
+                non_stop: false,
+                completion_gate: None,
             }),
         });
         app.chat_widget
@@ -6341,6 +6452,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
+            source: UserMessageSource::Typed,
         }) as Arc<dyn HistoryCell>];
         app.overlay = Some(Overlay::new_transcript(app.transcript_cells.clone()));
         app.deferred_history_lines = vec![Line::from("stale buffered line")];

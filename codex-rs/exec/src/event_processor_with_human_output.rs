@@ -220,6 +220,46 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             self.finish_progress_line();
         }
         match msg {
+            EventMsg::CompletionGateStarted(event) => {
+                ts_msg!(
+                    self,
+                    "{} judging candidate stop with {}",
+                    "completion gate:".style(self.cyan),
+                    event.judge_model.style(self.dimmed)
+                );
+            }
+            EventMsg::CompletionGateDecision(event) => {
+                if event.allow_stop {
+                    ts_msg!(
+                        self,
+                        "{} stop allowed ({})",
+                        "completion gate:".style(self.green),
+                        event.reason
+                    );
+                }
+            }
+            EventMsg::CompletionGateBlockedStop(event) => {
+                ts_msg!(
+                    self,
+                    "{} stop blocked ({})",
+                    "completion gate:".style(self.yellow).style(self.bold),
+                    event.reason
+                );
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "continuing with:".style(self.dimmed),
+                    event.continue_prompt
+                );
+            }
+            EventMsg::CompletionGateError(event) => {
+                ts_msg!(
+                    self,
+                    "{} failed closed ({})",
+                    "completion gate:".style(self.red).style(self.bold),
+                    event.message
+                );
+            }
             EventMsg::Error(ErrorEvent { message, .. }) => {
                 let prefix = "ERROR:".style(self.red);
                 ts_msg!(self, "{prefix} {message}");
@@ -324,6 +364,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 
                 return CodexStatus::InitiateShutdown;
             }
+            EventMsg::TurnCompleteDeferredByNonStop(_) => {}
             EventMsg::TokenCount(ev) => {
                 self.last_total_token_usage = ev.info;
             }
@@ -616,6 +657,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 ts_msg!(self, "model: {}", model);
                 eprintln!();
             }
+            EventMsg::NonStopModeUpdated(_) => {}
             EventMsg::PlanUpdate(plan_update_event) => {
                 let UpdatePlanArgs { explanation, plan } = plan_update_event;
 
@@ -948,6 +990,8 @@ impl EventProcessorWithHumanOutput {
                 | EventMsg::RequestUserInput(_)
                 | EventMsg::DynamicToolCallRequest(_)
                 | EventMsg::DynamicToolCallResponse(_)
+                | EventMsg::TurnCompleteDeferredByNonStop(_)
+                | EventMsg::NonStopModeUpdated(_)
         )
     }
 

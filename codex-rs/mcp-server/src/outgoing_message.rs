@@ -310,6 +310,8 @@ mod tests {
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
+                non_stop: false,
+                completion_gate: None,
             }),
         };
 
@@ -353,6 +355,8 @@ mod tests {
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
+            non_stop: false,
+            completion_gate: None,
         };
         let event = Event {
             id: "1".to_string(),
@@ -391,6 +395,7 @@ mod tests {
                 "history_log_id": session_configured_event.history_log_id,
                 "history_entry_count": session_configured_event.history_entry_count,
                 "rollout_path": rollout_file.path().to_path_buf(),
+                "non_stop": false,
             }
         });
         assert_eq!(params.unwrap(), expected_params);
@@ -420,6 +425,8 @@ mod tests {
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
+            non_stop: false,
+            completion_gate: None,
         };
         let event = Event {
             id: "1".to_string(),

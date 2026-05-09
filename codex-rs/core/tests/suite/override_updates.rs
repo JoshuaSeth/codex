@@ -1,18 +1,18 @@
 use anyhow::Result;
 use codex_core::config::Constrained;
-use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
-use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -61,8 +61,7 @@ fn rollout_developer_texts(text: &str) -> Vec<String> {
             Ok(rollout) => rollout,
             Err(_) => continue,
         };
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-            rollout.item
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rollout.item
             && role == "developer"
         {
             for item in content {
@@ -86,8 +85,7 @@ fn rollout_environment_texts(text: &str) -> Vec<String> {
             Ok(rollout) => rollout,
             Err(_) => continue,
         };
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-            rollout.item
+        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rollout.item
             && role == "user"
         {
             for item in content {
@@ -103,7 +101,8 @@ fn rollout_environment_texts(text: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_turn_context_without_user_turn_does_not_record_permissions_update() -> Result<()> {
+async fn override_turn_context_without_user_turn_does_not_record_permissions_update() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -124,6 +123,8 @@ async fn override_turn_context_without_user_turn_does_not_record_permissions_upd
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            non_stop: None,
+            completion_gate: None,
         })
         .await?;
 
@@ -146,7 +147,8 @@ async fn override_turn_context_without_user_turn_does_not_record_permissions_upd
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_turn_context_without_user_turn_does_not_record_environment_update() -> Result<()> {
+async fn override_turn_context_without_user_turn_does_not_record_environment_update() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -165,6 +167,8 @@ async fn override_turn_context_without_user_turn_does_not_record_environment_upd
             service_tier: None,
             collaboration_mode: None,
             personality: None,
+            non_stop: None,
+            completion_gate: None,
         })
         .await?;
 
@@ -183,7 +187,8 @@ async fn override_turn_context_without_user_turn_does_not_record_environment_upd
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_turn_context_without_user_turn_does_not_record_collaboration_update() -> Result<()> {
+async fn override_turn_context_without_user_turn_does_not_record_collaboration_update() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -203,6 +208,8 @@ async fn override_turn_context_without_user_turn_does_not_record_collaboration_u
             service_tier: None,
             collaboration_mode: Some(collaboration_mode),
             personality: None,
+            non_stop: None,
+            completion_gate: None,
         })
         .await?;
 
@@ -218,6 +225,117 @@ async fn override_turn_context_without_user_turn_does_not_record_collaboration_u
         .filter(|text| text.as_str() == collab_text.as_str())
         .count();
     assert_eq!(collab_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn override_turn_context_updates_non_stop_runtime_flag() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex().build(&server).await?;
+
+    assert!(!test.codex.config_snapshot().await.non_stop);
+
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+            non_stop: Some(true),
+            completion_gate: None,
+        })
+        .await?;
+    let mut non_stop_enabled = false;
+    for _ in 0..50 {
+        if test.codex.config_snapshot().await.non_stop {
+            non_stop_enabled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(non_stop_enabled);
+
+    test.codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+            non_stop: Some(false),
+            completion_gate: None,
+        })
+        .await?;
+    let mut non_stop_disabled = false;
+    for _ in 0..50 {
+        if !test.codex.config_snapshot().await.non_stop {
+            non_stop_disabled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(non_stop_disabled);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_non_stop_mode_updates_runtime_timeout() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex().build(&server).await?;
+    let expires_at = codex_core::current_unix_timestamp() + 1800;
+
+    test.codex
+        .submit(Op::SetNonStopMode {
+            enabled: true,
+            expires_at: Some(expires_at),
+        })
+        .await?;
+
+    let mut updated = false;
+    for _ in 0..50 {
+        let snapshot = test.codex.config_snapshot().await;
+        if snapshot.non_stop && snapshot.non_stop_expires_at == Some(expires_at) {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(updated);
+
+    test.codex
+        .submit(Op::SetNonStopMode {
+            enabled: false,
+            expires_at: None,
+        })
+        .await?;
+
+    let mut cleared = false;
+    for _ in 0..50 {
+        let snapshot = test.codex.config_snapshot().await;
+        if !snapshot.non_stop && snapshot.non_stop_expires_at.is_none() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cleared);
 
     Ok(())
 }

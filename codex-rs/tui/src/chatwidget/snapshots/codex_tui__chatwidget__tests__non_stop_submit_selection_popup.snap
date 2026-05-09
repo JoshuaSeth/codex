@@ -1,0 +1,16 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Running non-stop turn
+  Choose how this message should join the active non-stop session.
+
+› 1. Steer now (default)     Submit this message as an immediate steer against
+                             the active turn.
+  2. After next normal stop  Wait for the next point where Codex would
+                             normally stop.
+  3. Timed release…          Hold the message and inject it after a wall-clock
+                             delay.
+
+  Esc restores the submitted draft to the composer.
+  Press enter to confirm or esc to go back

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import html
 import json
 import os
 import re
@@ -41,6 +42,12 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for hook environments
             return _FallbackLogger(name)
 
     structlog = _StructlogShim()
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ModuleNotFoundError:  # pragma: no cover - optional in local hook environments
+    psycopg2 = None  # type: ignore[assignment]
 
 logger = structlog.get_logger(__name__)
 
@@ -93,6 +100,305 @@ def _get_env_value(key: str) -> str | None:
     return os.getenv(key)
 
 
+def _first_env_value(*keys: str) -> str | None:
+    for key in keys:
+        value = _get_env_value(key)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _pm_db_dsn() -> str | None:
+    url = _first_env_value("PITCHAI_PM_DB_URL")
+    if url:
+        return url
+
+    host = _first_env_value("PITCHAI_PM_DB_HOST", "PITCHAI_DB_HOST")
+    port = _first_env_value("PITCHAI_PM_DB_PORT", "PITCHAI_DB_PORT")
+    name = _first_env_value("PITCHAI_PM_DB_NAME", "PITCHAI_DB_NAME")
+    user = _first_env_value("PITCHAI_PM_DB_USER", "PITCHAI_DB_USER")
+    password = _first_env_value("PITCHAI_PM_DB_PASS", "PITCHAI_DB_PASS")
+    if not all((host, port, name, user, password)):
+        return None
+    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+
+def _pm_db_connect():
+    if psycopg2 is None:
+        return None
+    dsn = _pm_db_dsn()
+    if not dsn:
+        return None
+    return psycopg2.connect(dsn, connect_timeout=10)
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _project_name_from_cwd(cwd: Any) -> str:
+    text = str(cwd or "(unknown cwd)")
+    try:
+        return Path(text).resolve().name or str(Path(text).resolve())
+    except Exception:  # noqa: BLE001
+        return Path(text).name or text
+
+
+def _workspace_default_socket(cur, workspace_id: str | None) -> str | None:
+    if not workspace_id:
+        return None
+    cur.execute(
+        """
+        select socket_path
+        from pitchai_dispatch.workspace_tmux_servers
+        where workspace_id = %s
+        order by case when label = 'default' then 0 else 1 end, created_at asc
+        limit 1
+        """,
+        (workspace_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    socket_path = row[0] if not isinstance(row, dict) else row.get("socket_path")
+    return str(socket_path).strip() if socket_path else None
+
+
+def _resolve_tmux_socket_path(cur, *, socket_hint: str | None, workspace_id: str | None) -> str | None:
+    if socket_hint:
+        hint = socket_hint.strip()
+        if hint.startswith("/"):
+            return hint
+        if hint.startswith("tmux-"):
+            return f"/host_tmp/{hint}"
+    return _workspace_default_socket(cur, workspace_id)
+
+
+def _route_from_tmux_key(
+    cur,
+    *,
+    tmux_key: str,
+    workspace_id: str | None,
+    ui_title: str | None,
+) -> dict[str, Any] | None:
+    key = tmux_key.strip()
+    if not key:
+        return None
+
+    socket_hint = None
+    tmux_session = key
+    if "|" in key:
+        socket_hint, tmux_session = key.split("|", 1)
+
+    socket_path = _resolve_tmux_socket_path(cur, socket_hint=socket_hint, workspace_id=workspace_id)
+    route = {
+        "workspace_id": workspace_id,
+        "tmux_socket_path": socket_path,
+        "tmux_session": tmux_session.strip() or None,
+        "tmux_window_index": 0,
+        "ui_title": ui_title,
+    }
+    return route if route.get("tmux_session") else None
+
+
+def _lookup_session_route(conversation_id: str | None) -> dict[str, Any] | None:
+    env_tmux_session = _first_env_value("PITCHAI_CODEX_TMUX_SESSION")
+    if env_tmux_session:
+        env_route = {
+            "workspace_id": _first_env_value("PITCHAI_WORKSPACE_ID"),
+            "tmux_socket_path": _first_env_value("PITCHAI_CODEX_TMUX_SOCKET"),
+            "tmux_session": env_tmux_session,
+            "tmux_window_index": _coerce_int(_first_env_value("PITCHAI_CODEX_TMUX_WINDOW")) or 0,
+            "ui_title": _first_env_value("PITCHAI_CODEX_UI_TITLE"),
+            "route_source": "env",
+        }
+        return env_route
+
+    if not conversation_id:
+        return None
+
+    conn = _pm_db_connect()
+    if conn is None:
+        return None
+
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    select
+                      workspace_id::text as workspace_id,
+                      cwd,
+                      repo_full_name,
+                      meta_json
+                    from pitchai_dispatch.project_codex_sessions
+                    where conversation_id = %s
+                    order by updated_at desc nulls last, created_at desc nulls last
+                    limit 1
+                    """,
+                    (conversation_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                workspace_id = row.get("workspace_id")
+                meta_json = row.get("meta_json") if isinstance(row.get("meta_json"), dict) else {}
+                ui_title_map = meta_json.get("ui_title_by_tmux_session")
+                if isinstance(ui_title_map, dict) and ui_title_map:
+                    tmux_key, ui_title = list(ui_title_map.items())[-1]
+                    route = _route_from_tmux_key(
+                        cur,
+                        tmux_key=str(tmux_key),
+                        workspace_id=workspace_id,
+                        ui_title=str(ui_title).strip() if ui_title else None,
+                    )
+                    if route:
+                        route["route_source"] = "project_codex_sessions.ui_title_by_tmux_session"
+                        route["cwd"] = row.get("cwd")
+                        route["repo_full_name"] = row.get("repo_full_name")
+                        return route
+
+                ui_remove_events = meta_json.get("ui_remove_events")
+                if isinstance(ui_remove_events, list) and ui_remove_events:
+                    last_event = ui_remove_events[-1]
+                    if isinstance(last_event, dict):
+                        socket_path = last_event.get("tmux_socket_path")
+                        route = {
+                            "workspace_id": workspace_id,
+                            "tmux_socket_path": str(socket_path).strip() if socket_path else None,
+                            "tmux_session": str(last_event.get("tmux_session") or "").strip() or None,
+                            "tmux_window_index": _coerce_int(last_event.get("tmux_window_index")) or 0,
+                            "ui_title": meta_json.get("ui_title"),
+                            "route_source": "project_codex_sessions.ui_remove_events",
+                            "cwd": row.get("cwd"),
+                            "repo_full_name": row.get("repo_full_name"),
+                        }
+                        if route.get("tmux_session"):
+                            return route
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to look up Codex session route",
+            conversation_id=conversation_id,
+            error=str(exc),
+        )
+        return None
+    finally:
+        conn.close()
+
+    return None
+
+
+def _synthetic_outbound_update_id(chat_id: int, message_id: int) -> int:
+    return -(((abs(chat_id) % 10_000_000_000) * 1_000_000) + abs(message_id))
+
+
+def _persist_sent_final_update(
+    *,
+    payload: dict[str, Any],
+    telegram_result: dict[str, Any],
+    route: dict[str, Any] | None,
+) -> None:
+    conn = _pm_db_connect()
+    if conn is None:
+        return
+
+    result = telegram_result.get("result")
+    if not isinstance(result, dict):
+        return
+
+    chat_id = _coerce_int((result.get("chat") or {}).get("id") if isinstance(result.get("chat"), dict) else None)
+    message_id = _coerce_int(result.get("message_id"))
+    if chat_id is None or message_id is None:
+        return
+
+    conversation_id = str(payload.get("conversation_id") or "").strip() or None
+    bundle = _first_env_value("PITCHAI_DISPATCH_BUNDLE", "PITCHAI_CODEX_BUNDLE")
+    final_message = payload.get("final_message") or _extract_last_assistant_message(payload.get("response_items"))
+    preview = _truncate(str(final_message).strip(), 240) if final_message else ""
+    workspace_id = None
+    if route and isinstance(route.get("workspace_id"), str) and route.get("workspace_id"):
+        workspace_id = route["workspace_id"]
+
+    raw_json = {
+        "kind": "sent_final_update",
+        "payload": {
+            "conversation_id": conversation_id,
+            "turn_id": payload.get("turn_id"),
+            "cwd": payload.get("cwd"),
+            "bundle": bundle,
+        },
+        "route": route or {},
+        "telegram_result": telegram_result,
+    }
+
+    columns = [
+        "update_id",
+        "status",
+        "chat_id",
+        "message_id",
+        "conversation_id",
+        "bundle",
+        "prompt_preview",
+        "raw_json",
+    ]
+    values: list[Any] = [
+        _synthetic_outbound_update_id(chat_id, message_id),
+        "sent_final_update",
+        chat_id,
+        message_id,
+        conversation_id,
+        bundle,
+        preview,
+        json.dumps(raw_json),
+    ]
+    placeholders = ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s::jsonb"]
+    updates = [
+        "updated_at = now()",
+        "status = excluded.status",
+        "chat_id = excluded.chat_id",
+        "message_id = excluded.message_id",
+        "conversation_id = excluded.conversation_id",
+        "bundle = excluded.bundle",
+        "prompt_preview = excluded.prompt_preview",
+        "raw_json = excluded.raw_json",
+    ]
+
+    if workspace_id:
+        columns.append("workspace_id")
+        values.append(workspace_id)
+        placeholders.append("%s::uuid")
+        updates.append("workspace_id = excluded.workspace_id")
+
+    sql = (
+        "insert into pitchai_dispatch.telegram_inbound_updates ("
+        + ", ".join(columns)
+        + ") values ("
+        + ", ".join(placeholders)
+        + ") on conflict (update_id) do update set "
+        + ", ".join(updates)
+    )
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(values))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to persist sent Telegram update route",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            error=str(exc),
+        )
+    finally:
+        conn.close()
+
+
 class TelegramNotifier:
     """Handles Telegram notifications for monitoring alerts."""
 
@@ -103,8 +409,16 @@ class TelegramNotifier:
             bot_token: Telegram bot token (or from TELEGRAM_BOT_TOKEN env)
             chat_id: Telegram chat ID (or from TELEGRAM_CHAT_ID env)
         """
-        env_bot_token = _get_env_value("TELEGRAM_BOT_TOKEN")
-        env_chat_id = _get_env_value("TELEGRAM_CHAT_ID")
+        env_bot_token = _first_env_value(
+            "PITCHAI_UPDATES_TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_UPDATES_BOT_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+        )
+        env_chat_id = _first_env_value(
+            "PITCHAI_UPDATES_TELEGRAM_CHAT_ID",
+            "TELEGRAM_UPDATES_CHAT_ID",
+            "TELEGRAM_CHAT_ID",
+        )
 
         self.bot_token = bot_token or env_bot_token
         self.chat_id = chat_id or env_chat_id
@@ -131,7 +445,7 @@ class TelegramNotifier:
             return False
 
         message = self._format_daily_report(report)
-        return await self._send_message(message)
+        return await self.send_markdown(message)
 
     async def send_critical_alert(self, alert: dict[str, Any]) -> bool:
         """Send critical alert immediately.
@@ -146,7 +460,7 @@ class TelegramNotifier:
             return False
 
         message = self._format_critical_alert(alert)
-        return await self._send_message(message, priority="high")
+        return await self.send_markdown(message, priority="high")
 
     async def send_test_failure_summary(self, failures: list[dict[str, Any]]) -> bool:
         """Send UI test failure summary.
@@ -161,7 +475,7 @@ class TelegramNotifier:
             return False
 
         message = self._format_test_failures(failures)
-        return await self._send_message(message)
+        return await self.send_markdown(message)
 
     def _format_daily_report(self, report: dict[str, Any]) -> str:
         """Format daily report for Telegram."""
@@ -250,19 +564,26 @@ class TelegramNotifier:
 
         return "\n".join(lines)
 
-    async def _send_message(self, message: str, priority: str = "normal") -> bool:
+    async def _send_message(
+        self,
+        message: str,
+        *,
+        priority: str = "normal",
+        parse_mode: str = "Markdown",
+    ) -> dict[str, Any] | None:
         """Send message via Telegram.
 
         Args:
             message: Formatted message to send
             priority: Message priority (normal/high)
+            parse_mode: Telegram parse mode
 
         Returns:
-            True if sent successfully
+            Telegram API response payload, or None on failure
         """
         if not self._is_configured():
             logger.warning("Telegram not configured, skipping notification")
-            return False
+            return None
 
         try:
             # Add priority indicator for high priority
@@ -273,7 +594,7 @@ class TelegramNotifier:
                 {
                     "chat_id": self.chat_id,
                     "text": message,
-                    "parse_mode": "Markdown",
+                    "parse_mode": parse_mode,
                     "disable_web_page_preview": True,
                 }
             ).encode("utf-8")
@@ -282,17 +603,18 @@ class TelegramNotifier:
             request = urllib_request.Request(self.api_url, data=payload, headers=headers)
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: urllib_request.urlopen(request, timeout=15).read())
+            raw = await loop.run_in_executor(None, lambda: urllib_request.urlopen(request, timeout=15).read())
+            decoded = json.loads(raw.decode("utf-8") or "{}")
 
-            logger.info("Telegram notification sent", priority=priority)
-            return True
+            logger.info("Telegram notification sent", priority=priority, parse_mode=parse_mode)
+            return decoded if isinstance(decoded, dict) else {"ok": True}
 
         except urllib_error.URLError as exc:
             logger.error("Failed to send Telegram notification", error=str(exc))
-            return False
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.error("Unexpected error sending Telegram notification", error=str(exc))
-            return False
+            return None
 
     def _is_configured(self) -> bool:
         """Check if Telegram is properly configured."""
@@ -311,12 +633,32 @@ class TelegramNotifier:
             "✅ Telegram notifications are working!"
         )
 
-        return await self._send_message(test_message)
+        return await self.send_markdown(test_message)
 
-    async def send_plain_text(self, message: str, priority: str = "normal") -> bool:
+    async def send_markdown(self, message: str, priority: str = "normal") -> bool:
         """Send an arbitrary Markdown message."""
 
-        return await self._send_message(message, priority=priority)
+        return await self.send_markdown_with_metadata(message, priority=priority) is not None
+
+    async def send_markdown_with_metadata(
+        self,
+        message: str,
+        priority: str = "normal",
+    ) -> dict[str, Any] | None:
+        return await self._send_message(message, priority=priority, parse_mode="Markdown")
+
+    async def send_html(self, message: str, priority: str = "normal") -> bool:
+        return await self.send_html_with_metadata(message, priority=priority) is not None
+
+    async def send_html_with_metadata(
+        self,
+        message: str,
+        priority: str = "normal",
+    ) -> dict[str, Any] | None:
+        return await self._send_message(message, priority=priority, parse_mode="HTML")
+
+    async def send_plain_text(self, message: str, priority: str = "normal") -> bool:
+        return await self.send_markdown(message, priority=priority)
 
 
 def _truncate(text: str, limit: int = 1500) -> str:
@@ -407,41 +749,60 @@ def _stop_hook_should_dedup_skip(
 
     return (False, basis_hash, state_path)
 
-def _format_stop_hook_message(payload: dict[str, Any]) -> str:
-    cwd = payload.get("cwd", "(unknown cwd)")
-    final_message = payload.get("final_message") or _extract_last_assistant_message(
-        payload.get("response_items")
-    )
-    final_message = final_message or "(No final assistant message recorded.)"
-    final_message = final_message.strip()
-    final_message = _truncate(final_message, 1500)
+def _build_stop_hook_context(payload: dict[str, Any]) -> dict[str, Any]:
+    cwd = str(payload.get("cwd") or "(unknown cwd)")
+    final_message = payload.get("final_message") or _extract_last_assistant_message(payload.get("response_items"))
+    final_message = _truncate(str(final_message or "(No final assistant message recorded.)").strip(), 3500)
+    conversation_id = str(payload.get("conversation_id") or "").strip() or None
+    dispatch_bundle = _first_env_value("PITCHAI_DISPATCH_BUNDLE", "PITCHAI_CODEX_BUNDLE")
+    execution_name = _first_env_value("CONTAINER_APP_JOB_EXECUTION_NAME", "PITCHAI_JOB_EXECUTION_NAME")
+    route = _lookup_session_route(conversation_id)
+    return {
+        "cwd": cwd,
+        "project_name": _project_name_from_cwd(cwd),
+        "final_message": final_message,
+        "conversation_id": conversation_id,
+        "dispatch_bundle": dispatch_bundle,
+        "execution_name": execution_name,
+        "sent_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "route": route,
+    }
 
-    project_name = cwd
-    try:
-        project_name = Path(cwd).resolve().name or str(Path(cwd).resolve())
-    except Exception:  # noqa: BLE001
-        project_name = Path(cwd).name or cwd
 
-    utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    execution_name = os.getenv("CONTAINER_APP_JOB_EXECUTION_NAME") or os.getenv("PITCHAI_JOB_EXECUTION_NAME")
-    conversation_id = payload.get("conversation_id")
-    dispatch_bundle = os.getenv("PITCHAI_DISPATCH_BUNDLE") or os.getenv("PITCHAI_CODEX_BUNDLE")
+def _format_stop_hook_message(context: dict[str, Any]) -> str:
+    route = context.get("route") if isinstance(context.get("route"), dict) else None
+    conversation_id = context.get("conversation_id")
+    bundle = context.get("dispatch_bundle")
+    execution_name = context.get("execution_name")
 
-    meta_parts = [utc]
-    if isinstance(execution_name, str) and execution_name.strip():
-        meta_parts.append(execution_name.strip())
-    if isinstance(conversation_id, str) and conversation_id.strip():
-        convo = conversation_id.strip()
-        meta_parts.append(f"convo={convo[:10]}")
-        meta_parts.append(f"cid={convo}")
-    if isinstance(dispatch_bundle, str) and dispatch_bundle.strip():
-        meta_parts.append(f"bundle={dispatch_bundle.strip()}")
-    meta = " | ".join(meta_parts)
+    header_lines = [f"<b>{html.escape(str(context['project_name']))}</b>"]
 
-    project_name = _escape_markdown(project_name)
-    meta = _escape_markdown(meta)
-    final_message = _escape_markdown(final_message)
-    return f"*{project_name}* _{meta}_\n{final_message}"
+    meta_bits = [context["sent_at_utc"]]
+    if execution_name:
+        meta_bits.append(str(execution_name))
+    if conversation_id:
+        meta_bits.append(f"conversation={conversation_id}")
+    if bundle:
+        meta_bits.append(f"bundle={bundle}")
+    header_lines.append(f"<i>{html.escape(' | '.join(meta_bits))}</i>")
+
+    if route:
+        route_bits = []
+        if route.get("ui_title"):
+            route_bits.append(f"title={route['ui_title']}")
+        if route.get("tmux_session"):
+            route_bits.append(f"tmux={route['tmux_session']}")
+        if route.get("tmux_window_index") is not None:
+            route_bits.append(f"window={route['tmux_window_index']}")
+        if route.get("tmux_socket_path"):
+            route_bits.append(f"socket={route['tmux_socket_path']}")
+        if route.get("workspace_id"):
+            route_bits.append(f"workspace={route['workspace_id']}")
+        if route_bits:
+            header_lines.append(f"<code>{html.escape(' | '.join(route_bits))}</code>")
+
+    body = html.escape(str(context["final_message"]))
+    return "\n".join(header_lines + ["", body])
 
 
 def _append_debug_log(payload: dict[str, Any], message: str) -> None:
@@ -460,7 +821,8 @@ def _append_debug_log(payload: dict[str, Any], message: str) -> None:
 
 
 async def handle_stop_hook_event(payload: dict[str, Any], *, dry_run: bool = False) -> bool:
-    message = _format_stop_hook_message(payload)
+    context = _build_stop_hook_context(payload)
+    message = _format_stop_hook_message(context)
     _append_debug_log(payload, message)
     if dry_run:
         print(message)
@@ -485,13 +847,16 @@ async def handle_stop_hook_event(payload: dict[str, Any], *, dry_run: bool = Fal
         conversation_id=payload.get("conversation_id"),
         cwd=payload.get("cwd"),
     )
-    sent = await notifier.send_plain_text(message)
-    if sent and state_path and basis_hash:
+    telegram_result = await notifier.send_html_with_metadata(message)
+    if telegram_result and state_path and basis_hash:
         _write_dedup_state(
             state_path,
             {"last_basis_sha256": basis_hash, "last_sent_epoch": int(datetime.now(timezone.utc).timestamp())},
         )
-    return sent
+    if telegram_result:
+        _persist_sent_final_update(payload=payload, telegram_result=telegram_result, route=context.get("route"))
+        return True
+    return False
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:

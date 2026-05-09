@@ -14,14 +14,17 @@ use crate::function_tool::FunctionCallError;
 use crate::memories::citations::get_thread_id_from_citations;
 use crate::parse_turn_item;
 use crate::state_db;
+use crate::tools::context::ToolPayload;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_utils_stream_parser::strip_proposed_plan_blocks;
 use futures::Future;
+use serde::Deserialize;
 use tracing::debug;
 use tracing::instrument;
 
@@ -105,12 +108,25 @@ async fn record_stage1_output_usage_for_completed_item(
 /// Handle a completed output item from the model stream, recording it and
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
+pub(crate) struct InFlightToolResult {
+    pub response_input: ResponseInputItem,
+    pub armed_background_wait_process_id: Option<String>,
+}
+
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<InFlightToolResult>> + Send + 'f>>;
+
+#[derive(Debug, Deserialize)]
+struct WriteStdinContinuationArgs {
+    session_id: i32,
+    #[serde(default)]
+    chars: String,
+}
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
+    pub last_agent_message_phase: Option<MessagePhase>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightFuture<'static>>,
 }
@@ -142,15 +158,61 @@ pub(crate) async fn handle_output_item_done(
                 payload_preview
             );
 
+            // PitchAI fork invariant:
+            //
+            // An empty `write_stdin` call is not "send input"; it is a wait/poll on an
+            // already-running background terminal. If that poll returns while the process is
+            // still alive, the *next* model response is often only commentary such as
+            // "still running" and may not include a fresh tool call.
+            //
+            // If this process id is not carried forward into the next sampling request, core
+            // later sees an assistant-only response with no new tool call and incorrectly emits
+            // `task_complete`. That exact regression caused premature final messages in our fork
+            // after background-terminal waits. Keep this carry-over behavior in place across
+            // upstream merges.
+            let armed_background_wait_process_id = if call.tool_name == "write_stdin"
+                && let ToolPayload::Function { arguments } = &call.payload
+            {
+                serde_json::from_str::<WriteStdinContinuationArgs>(arguments)
+                    .ok()
+                    .filter(|args| args.chars.is_empty())
+                    .map(|args| args.session_id.to_string())
+            } else {
+                None
+            };
+
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
-            let tool_future: InFlightFuture<'static> = Box::pin(
-                ctx.tool_runtime
-                    .clone()
-                    .handle_tool_call(call, cancellation_token),
-            );
+            let tool_runtime = ctx.tool_runtime.clone();
+            let session = Arc::clone(&ctx.sess);
+            let tool_future: InFlightFuture<'static> = Box::pin(async move {
+                let response_input = tool_runtime
+                    .handle_tool_call(call, cancellation_token)
+                    .await?;
+                // Only arm the continuation hint if the waited-on process is still alive after
+                // the poll completes. If the process already exited, the next assistant-only
+                // message can legitimately be terminal and should not be forced into another
+                // model round.
+                let armed_background_wait_process_id = if let Some(process_id) =
+                    armed_background_wait_process_id
+                    && session
+                        .services
+                        .unified_exec_manager
+                        .is_process_alive(&process_id)
+                        .await
+                {
+                    Some(process_id)
+                } else {
+                    None
+                };
+
+                Ok(InFlightToolResult {
+                    response_input,
+                    armed_background_wait_process_id,
+                })
+            });
 
             output.needs_follow_up = true;
             output.tool_future = Some(tool_future);
@@ -178,8 +240,10 @@ pub(crate) async fn handle_output_item_done(
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
             let last_agent_message = last_assistant_message_from_item(&item, plan_mode);
+            let last_agent_message_phase = assistant_message_phase_from_item(&item);
 
             output.last_agent_message = last_agent_message;
+            output.last_agent_message_phase = last_agent_message_phase;
         }
         // Guardrail: the model issued a LocalShellCall without an id; surface the error back into history.
         Err(FunctionCallError::MissingLocalShellCallId) => {
@@ -238,6 +302,16 @@ pub(crate) async fn handle_output_item_done(
     }
 
     Ok(output)
+}
+
+pub(crate) fn assistant_message_phase_from_item(item: &ResponseItem) -> Option<MessagePhase> {
+    if let ResponseItem::Message { role, phase, .. } = item
+        && role == "assistant"
+    {
+        return phase.clone();
+    }
+
+    None
 }
 
 pub(crate) fn handle_non_tool_response_item(

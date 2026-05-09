@@ -56,6 +56,8 @@ use uuid::Uuid;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 #[cfg(test)]
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
+#[cfg(test)]
+use codex_protocol::protocol::UserMessageSource;
 
 /// Convert persisted [`RolloutItem`] entries into a sequence of [`Turn`] values.
 ///
@@ -1265,6 +1267,7 @@ mod tests {
                 item: CoreTurnItem::UserMessage(CoreUserMessageItem {
                     id: "user-item-id".to_string(),
                     content: Vec::new(),
+                    source: UserMessageSource::Typed,
                 }),
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {

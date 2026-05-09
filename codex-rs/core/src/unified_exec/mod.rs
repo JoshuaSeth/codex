@@ -520,4 +520,72 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_stdin_reports_exit_after_watcher_releases_entry() -> anyhow::Result<()> {
+        skip_if_sandbox!(Ok(()));
+
+        let (session, turn) = test_session_and_turn().await;
+
+        let open_shell = exec_command(&session, &turn, "/bin/cat", 2_500).await?;
+        let process_id = open_shell.process_id.expect("expected process id");
+
+        let exit = write_stdin(&session, &process_id, "\u{0004}", 500).await?;
+        assert!(exit.process_id.is_none());
+        assert_eq!(exit.exit_code, Some(0));
+
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        assert!(store.processes.is_empty());
+        assert!(store.reserved_process_ids.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exited_long_lived_process_is_released_without_follow_up_touch() -> anyhow::Result<()> {
+        skip_if_sandbox!(Ok(()));
+
+        let (session, turn) = test_session_and_turn().await;
+
+        let result = exec_command(&session, &turn, "sleep 1", 250).await?;
+        assert!(
+            result.process_id.is_some(),
+            "expected long-lived command to report a process id"
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let store = session
+                    .services
+                    .unified_exec_manager
+                    .process_store
+                    .lock()
+                    .await;
+                let released = store.processes.is_empty() && store.reserved_process_ids.is_empty();
+                drop(store);
+                if released {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("exit watcher should release long-lived process entry");
+
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        assert!(store.processes.is_empty());
+        assert!(store.reserved_process_ids.is_empty());
+
+        Ok(())
+    }
 }

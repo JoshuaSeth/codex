@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• Queued non-stop change. Non-stop mode will be enabled after the current turn completes. The current turn keeps its existing stop policy. The queued setting applies before the next queued message runs.

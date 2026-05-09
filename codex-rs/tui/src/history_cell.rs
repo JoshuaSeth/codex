@@ -57,6 +57,7 @@ use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::UserMessageSource;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::user_input::TextElement;
@@ -203,6 +204,7 @@ pub(crate) struct UserHistoryCell {
     #[allow(dead_code)]
     pub local_image_paths: Vec<PathBuf>,
     pub remote_image_urls: Vec<String>,
+    pub source: UserMessageSource,
 }
 
 /// Build logical lines for a user message with styled text elements.
@@ -346,6 +348,10 @@ impl HistoryCell for UserHistoryCell {
         }
 
         let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
+
+        if self.source == UserMessageSource::Voice {
+            lines.push(Line::from(vec!["  ".into(), "[voice]".cyan().dim()]));
+        }
 
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
@@ -1130,12 +1136,14 @@ pub(crate) fn new_user_prompt(
     text_elements: Vec<TextElement>,
     local_image_paths: Vec<PathBuf>,
     remote_image_urls: Vec<String>,
+    source: UserMessageSource,
 ) -> UserHistoryCell {
     UserHistoryCell {
         message,
         text_elements,
         local_image_paths,
         remote_image_urls,
+        source,
     }
 }
 
@@ -2526,6 +2534,8 @@ mod tests {
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(PathBuf::new()),
+            non_stop: false,
+            completion_gate: None,
         }
     }
 
@@ -3728,6 +3738,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
+            source: UserMessageSource::Typed,
         };
 
         // Small width to force wrapping more clearly. Effective wrap width is width-2 due to the ▌ prefix and trailing space.
@@ -3745,6 +3756,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: vec!["https://example.com/example.png".to_string()],
+            source: UserMessageSource::Typed,
         };
 
         let rendered = render_lines(&cell.display_lines(80)).join("\n");
@@ -3761,6 +3773,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: vec!["data:image/png;base64,aGVsbG8=".to_string()],
+            source: UserMessageSource::Typed,
         };
 
         let rendered = render_lines(&cell.display_lines(80)).join("\n");
@@ -3779,6 +3792,7 @@ mod tests {
                 "https://example.com/one.png".to_string(),
                 "https://example.com/two.png".to_string(),
             ],
+            source: UserMessageSource::Typed,
         };
 
         let rendered = render_lines(&cell.display_lines(80)).join("\n");
@@ -3798,6 +3812,7 @@ mod tests {
                 "https://example.com/one.png".to_string(),
                 "https://example.com/two.png".to_string(),
             ],
+            source: UserMessageSource::Typed,
         };
 
         let width = 80;
@@ -3817,6 +3832,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: vec!["https://example.com/one.png".to_string()],
+            source: UserMessageSource::Typed,
         };
 
         let rendered = render_lines(&cell.display_lines(80));
@@ -3840,6 +3856,7 @@ mod tests {
             )],
             local_image_paths: Vec::new(),
             remote_image_urls: vec!["https://example.com/one.png".to_string()],
+            source: UserMessageSource::Typed,
         };
 
         let rendered = render_lines(&cell.display_lines(80));
@@ -3860,6 +3877,7 @@ mod tests {
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
             remote_image_urls: Vec::new(),
+            source: UserMessageSource::Typed,
         });
 
         let width: u16 = 52;

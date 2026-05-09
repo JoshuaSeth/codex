@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "allow_stop",
+    "reason",
+    "missing_requirements",
+    "continue_prompt",
+    "evidence"
+  ],
+  "properties": {
+    "allow_stop": { "type": "boolean" },
+    "reason": { "type": "string", "minLength": 1 },
+    "missing_requirements": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "continue_prompt": { "type": "string" },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

@@ -19,6 +19,16 @@ Usage-limit recovery in broker mode:
   - `PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_INITIAL_S` (default: 5)
   - `PITCHAI_BROKER_USAGE_LIMIT_BACKOFF_MAX_S` (default: 120)
   - `PITCHAI_BROKER_AUTO_CONTINUE_PROMPT` (default: "continue")
+
+Cyber-safety reroute recovery:
+- When `codex exec --json` reports the high-risk cyber reroute warning
+  (`chatgpt.com/cyber` / "high-risk cyber activity"), the runner treats that
+  turn as incomplete and replays the original prompt instead of accepting the
+  downgraded result.
+- Retry knobs:
+  - `PITCHAI_CYBER_RETRY_MAX` (default: 200)
+  - `PITCHAI_CYBER_RETRY_BACKOFF_INITIAL_S` (default: 2)
+  - `PITCHAI_CYBER_RETRY_BACKOFF_MAX_S` (default: 30)
 """
 from __future__ import annotations
 
@@ -364,8 +374,24 @@ def _run_codex_json_stream(
 
 def _classify_broker_outcome(lines: list[str], rc: int) -> tuple[str, str | None]:
     combined = "\n".join(lines).strip()
-    if "usage_limit_reached" in combined or "insufficient_quota" in combined or "429 Too Many Requests" in combined:
+    combined_lower = combined.lower()
+    if (
+        "usage_limit_reached" in combined
+        or "insufficient_quota" in combined
+        or "429 too many requests" in combined_lower
+        or "you've hit your usage limit" in combined_lower
+        or "the usage limit has been reached" in combined_lower
+        or "chatgpt.com/codex/settings/usage" in combined_lower
+    ):
         return ("usage_limit_reached", combined[:4000] or None)
+    if (
+        "chatgpt.com/cyber" in combined_lower
+        or "high-risk cyber activity" in combined_lower
+        or "high_risk_cyber_activity" in combined_lower
+        or "highriskcyberactivity" in combined_lower
+        or "codex/concepts/cyber-safety" in combined_lower
+    ):
+        return ("cyber_safety_reroute", combined[:4000] or None)
     if (
         "refresh_token_expired" in combined
         or "refresh_token_reused" in combined
@@ -589,6 +615,9 @@ def _spawn_codex(
       2) acquires a new lease (`/v1/leases`),
       3) rewrites `$CODEX_HOME/auth.json`,
       4) retries by resuming the same thread with a short "continue" prompt.
+    - If the backend reroutes the request because of the high-risk cyber safety
+      gate, the runner retries the original prompt instead of accepting the
+      downgraded result.
     - Non-usage failures are returned immediately to preserve fail-fast behavior.
     """
     cfg.codex_home.mkdir(parents=True, exist_ok=True)
@@ -614,6 +643,24 @@ def _spawn_codex(
         usage_backoff_max_s = 120.0
     usage_backoff_max_s = max(usage_backoff_initial_s, min(usage_backoff_max_s, 7200.0))
 
+    try:
+        max_cyber_retries = int(os.getenv("PITCHAI_CYBER_RETRY_MAX", "200") or "200")
+    except ValueError:
+        max_cyber_retries = 200
+    max_cyber_retries = max(0, min(max_cyber_retries, 1000))
+
+    try:
+        cyber_backoff_initial_s = float(os.getenv("PITCHAI_CYBER_RETRY_BACKOFF_INITIAL_S", "2") or "2")
+    except ValueError:
+        cyber_backoff_initial_s = 2.0
+    cyber_backoff_initial_s = max(0.0, min(cyber_backoff_initial_s, 300.0))
+
+    try:
+        cyber_backoff_max_s = float(os.getenv("PITCHAI_CYBER_RETRY_BACKOFF_MAX_S", "30") or "30")
+    except ValueError:
+        cyber_backoff_max_s = 30.0
+    cyber_backoff_max_s = max(cyber_backoff_initial_s, min(cyber_backoff_max_s, 1800.0))
+
     continue_prompt = (os.getenv("PITCHAI_BROKER_AUTO_CONTINUE_PROMPT") or "").strip() or "continue"
 
     model_args, config_overrides = _model_args()
@@ -638,9 +685,11 @@ def _spawn_codex(
     captured_thread_id: Optional[str] = None
     resume_for_attempt = resume_id
     usage_continue_attempts = 0
+    cyber_retry_attempts = 0
     final_rc = 1
     fork_applied = False
     attempt_number = 0
+    replay_original_prompt = False
     while True:
         attempt_number += 1
         cmd = list(base_cmd)
@@ -650,8 +699,13 @@ def _spawn_codex(
                 cmd.append("--fork")
                 fork_applied = True
 
-        prompt_path = cfg.prompt_path if (attempt_number == 1 or not resume_for_attempt) else None
+        prompt_path = (
+            cfg.prompt_path
+            if (attempt_number == 1 or replay_original_prompt or not resume_for_attempt)
+            else None
+        )
         inline_prompt = None if prompt_path is not None else continue_prompt
+        replay_original_prompt = False
         rc, output_lines, attempt_thread_id = _run_codex_json_stream(
             cmd,
             child_env=child_env,
@@ -670,7 +724,7 @@ def _spawn_codex(
                 _report_broker_lease(
                     broker_cfg,
                     broker_lease,
-                    outcome=outcome,
+                    outcome="runner_error" if outcome == "cyber_safety_reroute" else outcome,
                     updated_auth_bytes=_materialized_auth_bytes(cfg.codex_home),
                     detail=detail,
                 )
@@ -680,6 +734,41 @@ def _spawn_codex(
                     file=sys.stderr,
                     flush=True,
                 )
+
+        if outcome == "cyber_safety_reroute":
+            if cyber_retry_attempts >= max_cyber_retries:
+                print(
+                    f"[runner] high-risk cyber reroute repeated; retry budget exhausted ({cyber_retry_attempts}/{max_cyber_retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                final_rc = rc if rc != 0 else 1
+                break
+
+            cyber_retry_attempts += 1
+            replay_original_prompt = True
+            if resume_for_attempt:
+                print(
+                    f"[runner] high-risk cyber reroute detected; replaying original prompt on {resume_for_attempt} ({cyber_retry_attempts}/{max_cyber_retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[runner] high-risk cyber reroute detected before thread id was observed; retrying original prompt ({cyber_retry_attempts}/{max_cyber_retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            delay_s = min(cyber_backoff_max_s, cyber_backoff_initial_s * (2 ** (cyber_retry_attempts - 1)))
+            if delay_s > 0:
+                print(
+                    f"[runner] sleeping {delay_s:.1f}s before cyber reroute retry",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay_s)
+            continue
 
         if rc == 0:
             break

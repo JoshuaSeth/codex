@@ -22,6 +22,12 @@ try:
 except Exception:  # noqa: BLE001
     DefaultAzureCredential = None  # type: ignore[misc,assignment]
 
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:  # noqa: BLE001
+    psycopg2 = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -76,6 +82,30 @@ def _require_env(name: str) -> str:
 def _optional_env(name: str) -> Optional[str]:
     value = os.getenv(name, "").strip()
     return value or None
+
+
+def _db_dsn() -> Optional[str]:
+    url = _optional_env("PITCHAI_PM_DB_URL")
+    if url:
+        return url
+
+    host = _optional_env("PITCHAI_PM_DB_HOST") or _optional_env("PITCHAI_DB_HOST")
+    port = _optional_env("PITCHAI_PM_DB_PORT") or _optional_env("PITCHAI_DB_PORT")
+    name = _optional_env("PITCHAI_PM_DB_NAME") or _optional_env("PITCHAI_DB_NAME")
+    user = _optional_env("PITCHAI_PM_DB_USER") or _optional_env("PITCHAI_DB_USER")
+    password = _optional_env("PITCHAI_PM_DB_PASS") or _optional_env("PITCHAI_DB_PASS")
+    if not all((host, port, name, user, password)):
+        return None
+    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+
+def _db_connect():
+    if psycopg2 is None:
+        return None
+    dsn = _db_dsn()
+    if not dsn:
+        return None
+    return psycopg2.connect(dsn, connect_timeout=10)
 
 
 def _now_utc() -> str:
@@ -177,6 +207,219 @@ def _write_prompt_file(
     except FileExistsError:
         return (path, False)
     return (path, True)
+
+
+def _write_reply_bundle(
+    settings: Settings,
+    *,
+    update_id: int,
+    chat_id: str,
+    from_user_id: str,
+    from_username: str,
+    text: str,
+    conversation_id: str,
+    reply_to_message_id: int,
+    bundle: Optional[str],
+    workspace_id: Optional[str],
+    route: Optional[dict[str, Any]],
+) -> Path:
+    ts = _now_utc_compact()
+    rid = uuid4().hex[:12]
+    settings.prompt_queue_dir.mkdir(parents=True, exist_ok=True)
+    bundle_dir = settings.prompt_queue_dir / f"{ts}_reply_{rid}"
+    bundle_dir.mkdir(parents=False, exist_ok=False)
+
+    (bundle_dir / "prompt.md").write_text(text.rstrip() + "\n", encoding="utf-8")
+    meta = {
+        "ts_utc": _now_utc(),
+        "source": "telegram_reply",
+        "update_id": update_id,
+        "chat_id": chat_id,
+        "from_user_id": from_user_id,
+        "from_username": from_username,
+        "conversation_id": conversation_id,
+        "reply_to_message_id": reply_to_message_id,
+        "bundle": bundle,
+        "workspace_id": workspace_id,
+        "tmux_route": route or {},
+    }
+    (bundle_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return bundle_dir
+
+
+def _tmux_args(route: dict[str, Any]) -> list[str]:
+    socket_path = route.get("tmux_socket_path")
+    if isinstance(socket_path, str) and socket_path.strip():
+        return ["tmux", "-S", socket_path.strip()]
+    return ["tmux"]
+
+
+def _submit_reply_to_tmux(route: dict[str, Any], text: str) -> None:
+    tmux_session = route.get("tmux_session")
+    if not isinstance(tmux_session, str) or not tmux_session.strip():
+        raise RuntimeError("tmux_session missing from route")
+
+    window_index = route.get("tmux_window_index")
+    try:
+        window_part = int(window_index) if window_index is not None else 0
+    except (TypeError, ValueError):
+        window_part = 0
+
+    target = f"{tmux_session.strip()}:{window_part}"
+    base_cmd = _tmux_args(route)
+
+    subprocess.run(
+        [*base_cmd, "has-session", "-t", tmux_session.strip()],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    subprocess.run(
+        [*base_cmd, "load-buffer", "-"],
+        input=text,
+        check=True,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        [*base_cmd, "paste-buffer", "-d", "-t", target],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    subprocess.run(
+        [*base_cmd, "send-keys", "-t", target, "Enter"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _lookup_reply_mapping(chat_id: str, reply_to_message_id: int) -> Optional[dict[str, Any]]:
+    conn = _db_connect()
+    if conn is None:
+        return None
+
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    select
+                      conversation_id,
+                      bundle,
+                      workspace_id::text as workspace_id,
+                      raw_json
+                    from pitchai_dispatch.telegram_inbound_updates
+                    where chat_id = %s
+                      and message_id = %s
+                      and status = 'sent_final_update'
+                    order by created_at desc
+                    limit 1
+                    """,
+                    (int(chat_id), reply_to_message_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+
+                raw_json = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
+                route = raw_json.get("route") if isinstance(raw_json.get("route"), dict) else {}
+                return {
+                    "conversation_id": row.get("conversation_id"),
+                    "bundle": row.get("bundle"),
+                    "workspace_id": row.get("workspace_id"),
+                    "route": route,
+                }
+    finally:
+        conn.close()
+
+
+def _record_telegram_update(
+    *,
+    update_id: int,
+    status: str,
+    chat_id: Optional[str],
+    from_user_id: Optional[str],
+    message_id: Optional[int],
+    reply_to_message_id: Optional[int],
+    conversation_id: Optional[str],
+    bundle: Optional[str],
+    prompt_preview: str,
+    error: Optional[str],
+    raw_json: dict[str, Any],
+    workspace_id: Optional[str],
+) -> None:
+    conn = _db_connect()
+    if conn is None:
+        return
+
+    columns = [
+        "update_id",
+        "status",
+        "chat_id",
+        "from_user_id",
+        "message_id",
+        "reply_to_message_id",
+        "conversation_id",
+        "bundle",
+        "prompt_preview",
+        "error",
+        "raw_json",
+    ]
+    values: list[Any] = [
+        update_id,
+        status,
+        int(chat_id) if chat_id else None,
+        int(from_user_id) if from_user_id else None,
+        message_id,
+        reply_to_message_id,
+        conversation_id,
+        bundle,
+        prompt_preview,
+        error,
+        json.dumps(raw_json),
+    ]
+    placeholders = ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s::jsonb"]
+    updates = [
+        "updated_at = now()",
+        "status = excluded.status",
+        "chat_id = excluded.chat_id",
+        "from_user_id = excluded.from_user_id",
+        "message_id = excluded.message_id",
+        "reply_to_message_id = excluded.reply_to_message_id",
+        "conversation_id = excluded.conversation_id",
+        "bundle = excluded.bundle",
+        "prompt_preview = excluded.prompt_preview",
+        "error = excluded.error",
+        "raw_json = excluded.raw_json",
+    ]
+
+    if workspace_id:
+        columns.append("workspace_id")
+        values.append(workspace_id)
+        placeholders.append("%s::uuid")
+        updates.append("workspace_id = excluded.workspace_id")
+
+    sql = (
+        "insert into pitchai_dispatch.telegram_inbound_updates ("
+        + ", ".join(columns)
+        + ") values ("
+        + ", ".join(placeholders)
+        + ") on conflict (update_id) do update set "
+        + ", ".join(updates)
+    )
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(values))
+    finally:
+        conn.close()
 
 
 def _parse_dispatch_request(payload: Any) -> DispatchRequest:
@@ -352,6 +595,26 @@ def _local_dispatch(settings: Settings) -> None:
     subprocess.Popen(cmd, shell=True, stdout=sys.stderr, stderr=sys.stderr)
 
 
+def _maybe_start_default_dispatch(settings: Settings) -> None:
+    if settings.dispatch_mode == "noop":
+        return
+    if settings.dispatch_mode == "local":
+        _local_dispatch(settings)
+        return
+
+    if not (settings.aca_subscription_id and settings.aca_resource_group and settings.aca_job_name):
+        raise RuntimeError("ACA_* env vars not configured")
+
+    try:
+        if _aca_has_running_execution(settings):
+            return
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dispatch] failed checking running executions: {exc}", file=sys.stderr, flush=True)
+        return
+
+    _aca_start_job(settings)
+
+
 app = FastAPI()
 SETTINGS = load_settings()
 
@@ -464,6 +727,129 @@ async def telegram_webhook(
     text = message.get("text")
     if not isinstance(text, str) or not text.strip():
         return "ignored"
+    prompt_preview = text.strip().replace("\n", " ")[:240]
+    incoming_message_id = message.get("message_id") if isinstance(message.get("message_id"), int) else None
+    reply_to = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
+    reply_to_message_id = reply_to.get("message_id") if isinstance(reply_to.get("message_id"), int) else None
+
+    if reply_to_message_id is not None:
+        mapping = _lookup_reply_mapping(chat_id, reply_to_message_id)
+        if mapping is None:
+            _record_telegram_update(
+                update_id=update_id,
+                status="reply_mapping_missing",
+                chat_id=chat_id,
+                from_user_id=from_user_id,
+                message_id=incoming_message_id,
+                reply_to_message_id=reply_to_message_id,
+                conversation_id=None,
+                bundle=None,
+                prompt_preview=prompt_preview,
+                error="No sent_final_update mapping found for reply target",
+                raw_json={"update": update},
+                workspace_id=None,
+            )
+            try:
+                _telegram_send_message(
+                    SETTINGS.telegram_bot_token,
+                    chat_id,
+                    "Reply received, but I could not resolve the originating Codex session for that message.",
+                )
+            except Exception:
+                pass
+            return "ok"
+
+        mapped_conversation_id = str(mapping.get("conversation_id") or "").strip() or None
+        mapped_bundle = str(mapping.get("bundle") or "").strip() or None
+        mapped_workspace_id = str(mapping.get("workspace_id") or "").strip() or None
+        route = mapping.get("route") if isinstance(mapping.get("route"), dict) else {}
+
+        status = "reply_unroutable"
+        error = None
+        bundle_name = mapped_bundle
+        raw_json: dict[str, Any] = {
+            "update": update,
+            "reply_mapping": mapping,
+        }
+        try:
+            if route.get("tmux_session"):
+                _submit_reply_to_tmux(route, text)
+                status = "submitted_to_tmux"
+                raw_json["delivery"] = {"mode": "tmux"}
+            elif mapped_conversation_id:
+                queued_bundle = _write_reply_bundle(
+                    SETTINGS,
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    from_user_id=from_user_id,
+                    from_username=from_username,
+                    text=text,
+                    conversation_id=mapped_conversation_id,
+                    reply_to_message_id=reply_to_message_id,
+                    bundle=mapped_bundle,
+                    workspace_id=mapped_workspace_id,
+                    route=route,
+                )
+                bundle_name = queued_bundle.name
+                status = "queued_reply_resume"
+                raw_json["delivery"] = {"mode": "queued_resume", "bundle_dir": queued_bundle.name}
+                _maybe_start_default_dispatch(SETTINGS)
+            else:
+                error = "Resolved reply target has neither tmux route nor conversation_id"
+        except Exception as exc:  # noqa: BLE001
+            if mapped_conversation_id:
+                try:
+                    queued_bundle = _write_reply_bundle(
+                        SETTINGS,
+                        update_id=update_id,
+                        chat_id=chat_id,
+                        from_user_id=from_user_id,
+                        from_username=from_username,
+                        text=text,
+                        conversation_id=mapped_conversation_id,
+                        reply_to_message_id=reply_to_message_id,
+                        bundle=mapped_bundle,
+                        workspace_id=mapped_workspace_id,
+                        route=route,
+                    )
+                    bundle_name = queued_bundle.name
+                    status = "queued_reply_resume"
+                    error = f"tmux submit failed: {exc}"
+                    raw_json["delivery"] = {
+                        "mode": "queued_resume_after_tmux_failure",
+                        "bundle_dir": queued_bundle.name,
+                        "tmux_error": str(exc),
+                    }
+                    _maybe_start_default_dispatch(SETTINGS)
+                except Exception as queued_exc:  # noqa: BLE001
+                    error = f"tmux submit failed: {exc}; queueing failed: {queued_exc}"
+            else:
+                error = str(exc)
+
+        _record_telegram_update(
+            update_id=update_id,
+            status=status,
+            chat_id=chat_id,
+            from_user_id=from_user_id,
+            message_id=incoming_message_id,
+            reply_to_message_id=reply_to_message_id,
+            conversation_id=mapped_conversation_id,
+            bundle=bundle_name,
+            prompt_preview=prompt_preview,
+            error=error,
+            raw_json=raw_json,
+            workspace_id=mapped_workspace_id,
+        )
+        if status == "reply_unroutable":
+            try:
+                _telegram_send_message(
+                    SETTINGS.telegram_bot_token,
+                    chat_id,
+                    "Reply received, but the originating Codex session could not be routed automatically.",
+                )
+            except Exception:
+                pass
+        return "ok"
 
     prompt_path, created = _write_prompt_file(
         SETTINGS,
@@ -474,39 +860,33 @@ async def telegram_webhook(
         text=text,
     )
 
+    _record_telegram_update(
+        update_id=update_id,
+        status="queued_new_prompt" if created else "duplicate_update",
+        chat_id=chat_id,
+        from_user_id=from_user_id,
+        message_id=incoming_message_id,
+        reply_to_message_id=None,
+        conversation_id=None,
+        bundle=prompt_path.name,
+        prompt_preview=prompt_preview,
+        error=None,
+        raw_json={"update": update, "delivery": {"mode": "prompt_file", "created": created}},
+        workspace_id=None,
+    )
+
     if created:
         try:
             _telegram_send_message(SETTINGS.telegram_bot_token, chat_id, f"Queued for Elise: {prompt_path.name}")
         except Exception:
             pass
 
-    if SETTINGS.dispatch_mode == "noop":
-        return "ok"
-
-    if SETTINGS.dispatch_mode == "local":
-        _local_dispatch(SETTINGS)
-        return "ok"
-
-    # Azure: best-effort start, but avoid starting a duplicate execution if one is already running.
-    if not (SETTINGS.aca_subscription_id and SETTINGS.aca_resource_group and SETTINGS.aca_job_name):
-        raise HTTPException(status_code=500, detail="ACA_* env vars not configured")
-
-    # If this is a duplicate webhook delivery, don't start a new execution. The prompt is already queued.
-    if not created:
-        return "ok"
-
-    try:
-        if _aca_has_running_execution(SETTINGS):
-            return "ok"
-    except Exception as exc:  # noqa: BLE001
-        # Safety: if we can't check running state, do not attempt to start a new execution.
-        # The prompt remains queued and will be picked up by the scheduled run.
-        print(f"[dispatch] failed checking running executions: {exc}", file=sys.stderr, flush=True)
-        return "ok"
-
-    try:
-        _aca_start_job(SETTINGS)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"failed to start job: {exc}") from exc
+    if created:
+        try:
+            _maybe_start_default_dispatch(SETTINGS)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"failed to start job: {exc}") from exc
 
     return "ok"

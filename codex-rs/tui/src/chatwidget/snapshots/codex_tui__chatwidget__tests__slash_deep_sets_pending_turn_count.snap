@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: rendered
+---
+• Deep mode is armed for the next 2 new turns. Each targeted turn must survive 4 extra candidate-stop boundaries before normal stopping resumes. Immediate steers into a running turn do not consume this budget.
