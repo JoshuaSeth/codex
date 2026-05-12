@@ -823,6 +823,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     }
     event_processor.print_final_output();
+    auth_manager.shutdown().await;
     if error_seen {
         std::process::exit(1);
     }

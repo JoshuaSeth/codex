@@ -35,6 +35,7 @@ use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -62,14 +63,21 @@ use dunce::canonicalize as normalize_path;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::env;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
+use tokio::time::timeout;
 use uuid::Uuid;
 use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::Request;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::body_string_contains;
+use wiremock::matchers::header;
 use wiremock::matchers::header_regex;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -140,6 +148,69 @@ fn write_auth_json(
     .unwrap();
 
     fake_jwt
+}
+
+#[expect(clippy::unwrap_used)]
+fn auth_json_value(
+    email: &str,
+    access_token: &str,
+    refresh_token: &str,
+    account_id: &str,
+) -> serde_json::Value {
+    use base64::Engine as _;
+
+    let header = json!({ "alg": "none", "typ": "JWT" });
+    let payload = json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_account_id": account_id
+        }
+    });
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let id_token = format!(
+        "{}.{}.{}",
+        b64(&serde_json::to_vec(&header).unwrap()),
+        b64(&serde_json::to_vec(&payload).unwrap()),
+        b64(b"sig")
+    );
+
+    json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id,
+        },
+        "last_refresh": chrono::Utc::now(),
+    })
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = env::var_os(key);
+        unsafe {
+            env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.original {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2123,6 +2194,199 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         error_event.message
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(auth_broker)]
+async fn usage_limit_error_rotates_broker_auth_and_retries_same_turn() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    use base64::Engine as _;
+
+    let server = MockServer::start().await;
+
+    let leased_auth = auth_json_value(
+        "broker@example.com",
+        "broker-access",
+        "broker-refresh",
+        "broker-account",
+    );
+    let leased_auth_b64 = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&leased_auth).expect("serialize leased auth"));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/leases"))
+        .and(header("authorization", "Bearer broker-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "lease_id": "lease-1",
+            "account_id": "broker-account",
+            "auth_json_b64": leased_auth_b64,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/leases/lease-1/report"))
+        .and(body_string_contains("\"outcome\":\"success\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response_attempts = Arc::new(AtomicUsize::new(0));
+    let response_attempts_for_mock = Arc::clone(&response_attempts);
+    let success_sse = sse(vec![
+        ev_response_created("resp-broker"),
+        ev_completed_with_tokens("resp-broker", 321),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |_: &Request| {
+            if response_attempts_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(429)
+                    .insert_header("x-codex-primary-used-percent", "100.0")
+                    .insert_header("x-codex-secondary-used-percent", "80.0")
+                    .insert_header("x-codex-primary-window-minutes", "15")
+                    .insert_header("x-codex-secondary-window-minutes", "60")
+                    .set_body_json(json!({
+                        "error": {
+                            "type": "usage_limit_reached",
+                            "message": "limit reached",
+                            "resets_at": 1704067242,
+                            "plan_type": "pro"
+                        }
+                    }))
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(success_sse.clone(), "text/event-stream")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_auth_json(&home, None, "pro", "local-access", Some("local-account"));
+    let _broker_url = EnvVarGuard::set("CODEX_AUTH_BROKER_URL", &server.uri());
+    let _broker_token = EnvVarGuard::set("CODEX_AUTH_BROKER_TOKEN", "broker-token");
+
+    let auth_manager = Arc::new(codex_core::AuthManager::new(
+        home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    ));
+    let provider = ModelProviderInfo {
+        base_url: Some(format!("{}/v1", server.uri())),
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        ..built_in_model_providers()["openai"].clone()
+    };
+    let thread_manager = codex_core::test_support::thread_manager_with_models_provider_and_home(
+        CodexAuth::from_api_key("dummy"),
+        provider.clone(),
+        home.path().to_path_buf(),
+    );
+
+    let mut config = load_default_config_for_test(&home).await;
+    config.model_provider = provider;
+    let cwd = TempDir::new().unwrap();
+    config.cwd = cwd.path().to_path_buf();
+
+    let new_thread = thread_manager
+        .resume_thread_with_history(config, InitialHistory::New, auth_manager.clone(), false)
+        .await?;
+    let codex = new_thread.thread;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+
+    let mut saw_warning = false;
+    let mut saw_turn_complete = false;
+    for _ in 0..64 {
+        let event = timeout(Duration::from_secs(5), codex.next_event())
+            .await
+            .expect("timeout waiting for event")?;
+        match event.msg {
+            EventMsg::Warning(warning) => {
+                if warning
+                    .message
+                    .contains("Switched to broker account broker@example.com")
+                {
+                    saw_warning = true;
+                }
+            }
+            EventMsg::Error(err) => {
+                panic!("unexpected error after broker rotation: {}", err.message);
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_warning, "expected broker rotation warning");
+    assert!(
+        saw_turn_complete,
+        "expected turn to complete after broker rotation"
+    );
+
+    let all_requests = server
+        .received_requests()
+        .await
+        .expect("requests should be captured");
+    let response_requests: Vec<_> = all_requests
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/responses"
+        })
+        .collect();
+    assert_eq!(response_requests.len(), 2);
+    assert_eq!(
+        response_requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer local-access")
+    );
+    assert_eq!(
+        response_requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer broker-access")
+    );
+
+    let stored_auth =
+        codex_core::auth::load_auth_dot_json(home.path(), AuthCredentialsStoreMode::File)?
+            .expect("stored auth should exist");
+    assert_eq!(
+        stored_auth
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.account_id.as_deref()),
+        Some("broker-account")
+    );
+    assert_eq!(
+        stored_auth
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.access_token.as_str()),
+        Some("broker-access")
+    );
+
+    auth_manager.shutdown().await;
+    server.verify().await;
     Ok(())
 }
 

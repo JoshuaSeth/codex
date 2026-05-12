@@ -7,13 +7,18 @@ use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fmt::Debug;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_otel::TelemetryAuthMode;
@@ -23,6 +28,7 @@ pub use crate::auth::storage::AuthCredentialsStoreMode;
 pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
+use crate::auth_broker::AuthBrokerClient;
 use crate::config::Config;
 use crate::error::RefreshTokenFailedError;
 use crate::error::RefreshTokenFailedReason;
@@ -552,6 +558,25 @@ fn logout_all_stores(
     Ok(removed_ephemeral || removed_managed)
 }
 
+fn broker_affinity_key(codex_home: &Path) -> String {
+    for key in ["PITCHAI_STATE_KEY", "PITCHAI_CODEX_STATE_KEY"] {
+        if let Some(value) = env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return value;
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    codex_home.hash(&mut hasher);
+    if let Ok(cwd) = env::current_dir() {
+        cwd.hash(&mut hasher);
+    }
+    format!("codex-dev:{:016x}", hasher.finish())
+}
+
 fn load_auth(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
@@ -813,6 +838,37 @@ impl AuthDotJson {
     }
 }
 
+const BROKER_SUCCESS_OUTCOME: &str = "success";
+const BROKER_LOGOUT_OUTCOME: &str = "logout";
+pub(crate) const BROKER_USAGE_LIMIT_OUTCOME: &str = "usage_limit_reached";
+pub(crate) const BROKER_RATE_LIMITED_OUTCOME: &str = "rate_limited";
+pub(crate) const BROKER_AUTH_INVALID_OUTCOME: &str = "auth_invalid";
+pub(crate) const BROKER_REFRESH_TOKEN_INVALID_OUTCOME: &str = "refresh_token_invalid";
+pub(crate) const BROKER_UNAUTHORIZED_OUTCOME: &str = "unauthorized";
+const BROKER_INTERNAL_ERROR_OUTCOME: &str = "internal_error";
+
+struct ActiveBrokerLease {
+    lease_id: String,
+    account_id: String,
+    heartbeat_shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl Debug for ActiveBrokerLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveBrokerLease")
+            .field("lease_id", &self.lease_id)
+            .field("account_id", &self.account_id)
+            .field("heartbeat_active", &self.heartbeat_shutdown.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AuthBrokerRecovery {
+    pub(crate) account_id: String,
+    pub(crate) account_email: Option<String>,
+}
+
 /// Internal cached auth state.
 #[derive(Clone)]
 struct CachedAuth {
@@ -978,6 +1034,10 @@ pub struct AuthManager {
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: RwLock<Option<String>>,
+    broker_client: Option<AuthBrokerClient>,
+    broker_affinity_key: String,
+    broker_lease: Mutex<Option<ActiveBrokerLease>>,
+    broker_recovery_lock: AsyncMutex<()>,
 }
 
 impl AuthManager {
@@ -997,7 +1057,17 @@ impl AuthManager {
         )
         .ok()
         .flatten();
+        let broker_client = match AuthBrokerClient::from_env() {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::error!("Failed to configure auth broker client: {err}");
+                None
+            }
+        };
         Self {
+            broker_affinity_key: broker_affinity_key(&codex_home),
+            broker_client,
+            broker_lease: Mutex::new(None),
             codex_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
@@ -1006,6 +1076,7 @@ impl AuthManager {
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            broker_recovery_lock: AsyncMutex::new(()),
         }
     }
 
@@ -1017,11 +1088,15 @@ impl AuthManager {
         };
 
         Arc::new(Self {
+            broker_client: None,
+            broker_affinity_key: String::new(),
+            broker_lease: Mutex::new(None),
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            broker_recovery_lock: AsyncMutex::new(()),
         })
     }
 
@@ -1035,11 +1110,15 @@ impl AuthManager {
             external_refresher: None,
         };
         Arc::new(Self {
+            broker_client: None,
+            broker_affinity_key: String::new(),
+            broker_lease: Mutex::new(None),
             codex_home,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            broker_recovery_lock: AsyncMutex::new(()),
         })
     }
 
@@ -1054,6 +1133,19 @@ impl AuthManager {
         let auth = self.auth_cached()?;
         if let Err(err) = self.refresh_if_stale(&auth).await {
             tracing::error!("Failed to refresh token: {}", err);
+            let detail = format!("Stale token refresh failed: {err}");
+            match self
+                .recover_from_broker(BROKER_REFRESH_TOKEN_INVALID_OUTCOME, Some(&detail))
+                .await
+            {
+                Ok(Some(_)) => return self.auth_cached(),
+                Ok(None) => {}
+                Err(recovery_err) => {
+                    tracing::warn!(
+                        "Auth broker recovery after stale refresh failed: {recovery_err}"
+                    );
+                }
+            }
             return Some(auth);
         }
         self.auth_cached()
@@ -1125,7 +1217,7 @@ impl AuthManager {
     fn load_auth_from_storage(&self) -> Option<CodexAuth> {
         load_auth(
             &self.codex_home,
-            self.enable_codex_api_key_env,
+            self.enable_codex_api_key_env && !self.has_active_broker_lease(),
             self.auth_credentials_store_mode,
         )
         .ok()
@@ -1141,6 +1233,76 @@ impl AuthManager {
             changed
         } else {
             false
+        }
+    }
+
+    fn has_active_broker_lease(&self) -> bool {
+        self.broker_lease
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|_| ()))
+            .is_some()
+    }
+
+    fn take_active_broker_lease(&self) -> Option<ActiveBrokerLease> {
+        self.broker_lease
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    fn current_auth_snapshot(&self) -> std::io::Result<Option<AuthDotJson>> {
+        load_auth_dot_json(&self.codex_home, self.auth_credentials_store_mode)
+    }
+
+    fn install_broker_lease(&self, lease_id: String, account_id: String) {
+        let Some(broker) = self.broker_client.clone() else {
+            return;
+        };
+
+        let mut heartbeat_shutdown = None;
+        let interval = broker.heartbeat_interval();
+        if !interval.is_zero() {
+            let lease_id_for_task = lease_id.clone();
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+            heartbeat_shutdown = Some(shutdown_tx);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        _ = ticker.tick() => {
+                            match broker.heartbeat(&lease_id_for_task).await {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    tracing::warn!(
+                                        lease_id = lease_id_for_task,
+                                        "Auth broker heartbeat failed: {err}"
+                                    );
+                                    if matches!(
+                                        err,
+                                        crate::auth_broker::AuthBrokerError::Broker {
+                                            status: StatusCode::NOT_FOUND,
+                                            ..
+                                        }
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Ok(mut guard) = self.broker_lease.lock() {
+            *guard = Some(ActiveBrokerLease {
+                lease_id,
+                account_id,
+                heartbeat_shutdown,
+            });
         }
     }
 
@@ -1194,6 +1356,159 @@ impl AuthManager {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
 
+    pub fn broker_enabled(&self) -> bool {
+        self.broker_client.is_some()
+    }
+
+    pub(crate) async fn recover_from_broker(
+        &self,
+        exhausted_outcome: &str,
+        detail: Option<&str>,
+    ) -> std::io::Result<Option<AuthBrokerRecovery>> {
+        let Some(broker) = self.broker_client.clone() else {
+            return Ok(None);
+        };
+
+        if !self
+            .auth_cached()
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth)
+            && !self.has_active_broker_lease()
+        {
+            return Ok(None);
+        }
+
+        let _guard = self.broker_recovery_lock.lock().await;
+        let auth_before_rotation = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(exhausted_outcome, detail, auth_before_rotation.as_ref())
+            .await
+        {
+            tracing::warn!("Failed to report exhausted auth broker lease: {err}");
+        }
+
+        let lease = broker
+            .acquire_lease(&self.broker_affinity_key)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        if let Err(err) = save_auth(
+            &self.codex_home,
+            &lease.auth,
+            self.auth_credentials_store_mode,
+        ) {
+            let detail = format!("Failed to persist broker lease auth.json: {err}");
+            tracing::error!("{detail}");
+            if let Err(report_err) = broker
+                .report_lease(
+                    &lease.lease_id,
+                    BROKER_INTERNAL_ERROR_OUTCOME,
+                    Some(&lease.auth),
+                    Some(&detail),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to release broker lease after persistence error: {report_err}"
+                );
+            }
+            return Err(err);
+        }
+
+        let auth = load_auth(&self.codex_home, false, self.auth_credentials_store_mode)?
+            .ok_or_else(|| {
+                std::io::Error::other("Broker lease auth.json was not readable after save.")
+            })?;
+        self.set_cached_auth(Some(auth));
+        self.install_broker_lease(lease.lease_id, lease.account_id.clone());
+
+        Ok(Some(AuthBrokerRecovery {
+            account_email: lease
+                .auth
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.id_token.email.clone()),
+            account_id: lease.account_id,
+        }))
+    }
+
+    pub async fn shutdown(&self) {
+        let auth_snapshot = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(
+                BROKER_SUCCESS_OUTCOME,
+                Some("Codex process shutdown."),
+                auth_snapshot.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!("Failed to report auth broker lease during shutdown: {err}");
+        }
+    }
+
+    pub async fn logout_and_clear(&self) -> std::io::Result<bool> {
+        let auth_snapshot = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(
+                BROKER_LOGOUT_OUTCOME,
+                Some("User requested logout."),
+                auth_snapshot.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!("Failed to report auth broker lease during logout: {err}");
+        }
+
+        let removed = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
+        self.reload();
+        Ok(removed)
+    }
+
+    async fn report_active_broker_lease(
+        &self,
+        outcome: &str,
+        detail: Option<&str>,
+        updated_auth: Option<&AuthDotJson>,
+    ) -> std::io::Result<()> {
+        let Some(mut lease) = self.take_active_broker_lease() else {
+            return Ok(());
+        };
+
+        if let Some(shutdown_tx) = lease.heartbeat_shutdown.take() {
+            let _ = shutdown_tx.send(());
+        }
+
+        let Some(broker) = self.broker_client.clone() else {
+            return Ok(());
+        };
+
+        broker
+            .report_lease(&lease.lease_id, outcome, updated_auth, detail)
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    async fn sync_active_broker_lease(&self, updated_auth: &AuthDotJson) {
+        let lease_id = self
+            .broker_lease
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|lease| lease.lease_id.clone()));
+        let Some(lease_id) = lease_id else {
+            return;
+        };
+        let Some(broker) = self.broker_client.clone() else {
+            return;
+        };
+
+        if let Err(err) = broker.sync_lease(&lease_id, updated_auth).await {
+            tracing::warn!(
+                lease_id,
+                "Failed to sync auth broker lease auth.json: {err}"
+            );
+        }
+    }
+
     /// Attempt to refresh the token by first performing a guarded reload. Auth
     /// is reloaded from storage only when the account id matches the currently
     /// cached account id. If the persisted token differs from the cached token, we
@@ -1242,9 +1557,32 @@ impl AuthManager {
                         "Token data is not available.",
                     ))
                 })?;
-                self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
-                    .await?;
-                Ok(())
+                match self
+                    .refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(err) if self.broker_enabled() => {
+                        let detail = format!("Token refresh failed: {err}");
+                        match self
+                            .recover_from_broker(
+                                BROKER_REFRESH_TOKEN_INVALID_OUTCOME,
+                                Some(&detail),
+                            )
+                            .await
+                        {
+                            Ok(Some(_)) => Ok(()),
+                            Ok(None) => Err(err),
+                            Err(recovery_err) => {
+                                tracing::warn!(
+                                    "Auth broker recovery after token refresh failure failed: {recovery_err}"
+                                );
+                                Err(err)
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
             CodexAuth::ApiKey(_) => Ok(()),
         }
@@ -1356,13 +1694,14 @@ impl AuthManager {
     ) -> Result<(), RefreshTokenError> {
         let refresh_response = request_chatgpt_token_refresh(refresh_token, auth.client()).await?;
 
-        persist_tokens(
+        let updated_auth = persist_tokens(
             auth.storage(),
             refresh_response.id_token,
             refresh_response.access_token,
             refresh_response.refresh_token,
         )
         .map_err(RefreshTokenError::from)?;
+        self.sync_active_broker_lease(&updated_auth).await;
         self.reload();
 
         Ok(())

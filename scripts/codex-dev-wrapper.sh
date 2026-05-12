@@ -143,10 +143,274 @@ pick_dispatch_state_sidecar_script() {
   return 1
 }
 
+read_auth_token_server_env_value() {
+  local key="${1:-}"
+  local file="${2:-}"
+  local line value
+  if [[ -z "$key" || -z "$file" || ! -r "$file" ]]; then
+    return 1
+  fi
+  line="$(grep -m1 "^${key}=" "$file" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  value="${line#*=}"
+  value="${value%$'\r'}"
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value="${value#\"}"
+    value="${value%\"}"
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value="${value#\'}"
+    value="${value%\'}"
+  fi
+  printf '%s\n' "$value"
+}
+
+codex_dev_is_login_command() {
+  local saw_login=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      login)
+        saw_login=1
+        ;;
+      status|-h|--help)
+        return 1
+        ;;
+    esac
+  done
+  [[ "$saw_login" == "1" ]]
+}
+
+configure_codex_auth_broker() {
+  if [[ "${CODEX_DEV_AUTH_BROKER_DISABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local env_file="${CODEX_DEV_AUTH_BROKER_ENV_FILE:-/etc/auth-token-server/auth-token-server.env}"
+  local default_url="${CODEX_DEV_AUTH_BROKER_URL:-http://127.0.0.1:38188}"
+  local client_token="${AUTH_TOKEN_SERVER_CLIENT_TOKEN:-}"
+  local admin_token="${AUTH_TOKEN_SERVER_ADMIN_TOKEN:-}"
+
+  if [[ -z "$client_token" ]]; then
+    client_token="$(read_auth_token_server_env_value AUTH_TOKEN_SERVER_CLIENT_TOKEN "$env_file" || true)"
+  fi
+  if [[ -z "$admin_token" ]]; then
+    admin_token="$(read_auth_token_server_env_value AUTH_TOKEN_SERVER_ADMIN_TOKEN "$env_file" || true)"
+  fi
+
+  if [[ -z "${CODEX_AUTH_BROKER_TOKEN:-}" && -n "$client_token" ]]; then
+    export CODEX_AUTH_BROKER_TOKEN="$client_token"
+  fi
+  if [[ -z "${CODEX_AUTH_BROKER_URL:-}" && -n "${CODEX_AUTH_BROKER_TOKEN:-}" ]]; then
+    export CODEX_AUTH_BROKER_URL="$default_url"
+  fi
+  if [[ -n "${CODEX_AUTH_BROKER_URL:-}" && -n "${CODEX_AUTH_BROKER_TOKEN:-}" ]]; then
+    export CODEX_AUTH_BROKER_CLIENT_NAME="${CODEX_AUTH_BROKER_CLIENT_NAME:-codex-dev}"
+    export CODEX_AUTH_BROKER_LEASE_REASON="${CODEX_AUTH_BROKER_LEASE_REASON:-codex-dev}"
+    export CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS="${CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS:-64}"
+  fi
+
+  if codex_dev_is_login_command "$@"; then
+    if [[ -z "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" && -n "$admin_token" ]]; then
+      export CODEX_AUTH_BROKER_ADMIN_TOKEN="$admin_token"
+    fi
+    if [[ -z "${CODEX_AUTH_BROKER_ADMIN_URL:-}" && -n "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" ]]; then
+      export CODEX_AUTH_BROKER_ADMIN_URL="${CODEX_AUTH_BROKER_URL:-$default_url}"
+    fi
+    export CODEX_AUTH_BROKER_IMPORT_ON_LOGIN="${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-1}"
+  fi
+}
+
+codex_dev_import_login_auth_to_broker() {
+  if [[ "${CODEX_DEV_AUTH_BROKER_DISABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${CODEX_AUTH_BROKER_ADMIN_URL:-}" || -z "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" ]]; then
+    echo "codex-dev: auth broker login import skipped; admin broker env is not configured." >&2
+    return 1
+  fi
+
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local auth_path="$codex_home/auth.json"
+  if [[ ! -r "$auth_path" ]]; then
+    echo "codex-dev: auth broker login import failed; auth.json not readable at $auth_path" >&2
+    return 1
+  fi
+
+  python3 - "$auth_path" <<'PY'
+import base64
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        parsed = json.loads(decoded)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+auth_path = pathlib.Path(sys.argv[1])
+auth_json = json.loads(auth_path.read_text(encoding="utf-8"))
+tokens = auth_json.get("tokens") if isinstance(auth_json, dict) else None
+if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
+    raise SystemExit(f"codex-dev: {auth_path} does not contain ChatGPT refresh tokens")
+
+claims = _decode_jwt_payload(str(tokens.get("id_token") or ""))
+profile_claims = claims.get("https://api.openai.com/profile")
+auth_claims = claims.get("https://api.openai.com/auth")
+email = claims.get("email")
+if not email and isinstance(profile_claims, dict):
+    email = profile_claims.get("email")
+account_id = tokens.get("account_id")
+if isinstance(auth_claims, dict) and auth_claims.get("chatgpt_account_id"):
+    account_id = auth_claims["chatgpt_account_id"]
+
+label = os.environ.get("CODEX_AUTH_BROKER_IMPORT_LABEL") or email or "codex-dev-login"
+priority = int(os.environ.get("CODEX_AUTH_BROKER_IMPORT_PRIORITY") or "100")
+url = os.environ["CODEX_AUTH_BROKER_ADMIN_URL"].rstrip("/") + "/v1/admin/accounts/import"
+body = json.dumps(
+    {
+        "auth_json": auth_json,
+        "label": label,
+        "priority": priority,
+        "enabled": True,
+    }
+).encode("utf-8")
+request = urllib.request.Request(
+    url,
+    data=body,
+    method="POST",
+    headers={
+        "Authorization": f"Bearer {os.environ['CODEX_AUTH_BROKER_ADMIN_TOKEN']}",
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", errors="replace")
+    raise SystemExit(f"codex-dev: auth broker login import failed: HTTP {exc.code}: {detail}") from exc
+
+imported_account_id = (
+    payload.get("metadata", {}).get("account_id") if isinstance(payload, dict) else None
+)
+print(
+    "codex-dev: imported login auth into auth broker"
+    f" (account_id={imported_account_id or account_id or 'unknown'}).",
+    file=sys.stderr,
+)
+PY
+}
+
+codex_dev_auth_file_fingerprint() {
+  local auth_path="${1:-}"
+  if [[ -z "$auth_path" || ! -r "$auth_path" ]]; then
+    return 1
+  fi
+  python3 - "$auth_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+codex_dev_auth_has_chatgpt_refresh_token() {
+  local auth_path="${1:-}"
+  if [[ -z "$auth_path" || ! -r "$auth_path" ]]; then
+    return 1
+  fi
+  python3 - "$auth_path" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    auth_json = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+tokens = auth_json.get("tokens") if isinstance(auth_json, dict) else None
+if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
+    raise SystemExit(1)
+PY
+}
+
+codex_dev_wait_for_login_auth() {
+  local auth_path="${1:-}"
+  local before_fingerprint="${2:-}"
+  local allow_unchanged="${3:-0}"
+  local wait_seconds="${CODEX_DEV_LOGIN_IMPORT_WAIT_SECONDS:-30}"
+  local deadline
+  local after_fingerprint
+  deadline=$((SECONDS + wait_seconds))
+  while (( SECONDS <= deadline )); do
+    if codex_dev_auth_has_chatgpt_refresh_token "$auth_path"; then
+      after_fingerprint="$(codex_dev_auth_file_fingerprint "$auth_path" || true)"
+      if [[ "$allow_unchanged" == "1" || -z "$before_fingerprint" || "$after_fingerprint" != "$before_fingerprint" ]]; then
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+codex_dev_run_login_command() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local auth_path="$codex_home/auth.json"
+  local before_fingerprint
+  local login_status
+  local allow_unchanged=0
+
+  before_fingerprint="$(codex_dev_auth_file_fingerprint "$auth_path" || true)"
+
+  set +e
+  "$bin" "$@"
+  login_status=$?
+  set -e
+
+  if [[ "$login_status" == "0" ]]; then
+    allow_unchanged=1
+  fi
+
+  if codex_dev_wait_for_login_auth "$auth_path" "$before_fingerprint" "$allow_unchanged"; then
+    if codex_dev_import_login_auth_to_broker; then
+      exit 0
+    fi
+    if [[ "$login_status" == "0" ]]; then
+      exit 1
+    fi
+    exit "$login_status"
+  fi
+
+  if [[ "$login_status" == "0" && "${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-0}" == "1" ]]; then
+    echo "codex-dev: login completed but no ChatGPT refresh token was available for auth broker import at $auth_path" >&2
+    exit 1
+  fi
+  exit "$login_status"
+}
+
 if [[ "$use_speech" == "1" && "$voice_mode" == "1" ]]; then
   echo "codex-dev: --use-speech ignored because --voice uses the streaming local voice web path." >&2
   use_speech=0
 fi
+
+configure_codex_auth_broker "$@"
 
 if [[ "$use_speech" == "1" ]]; then
   if has_config_override notify "$@"; then
@@ -596,6 +860,10 @@ if [[ -n "${PITCHAI_CODEX_STATE_TMUX_SESSION:-}" ]] && [[ "${PITCHAI_CODEX_STATE
     ) &
     disown "$!" 2>/dev/null || true
   fi
+fi
+
+if codex_dev_is_login_command "$@"; then
+  codex_dev_run_login_command "$@"
 fi
 
 exec "$bin" "$@"
