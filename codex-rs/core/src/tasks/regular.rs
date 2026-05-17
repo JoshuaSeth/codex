@@ -37,13 +37,15 @@ impl RegularTask {
         turn_metadata_header: Option<String>,
     ) -> CodexResult<Self> {
         let mut client_session = model_client.new_session();
+        let (reasoning_effort, reasoning_summary) =
+            turn_context.reasoning_for_assistant_response(0);
         client_session
             .prewarm_websocket(
                 &prompt,
                 &turn_context.model_info,
                 &turn_context.otel_manager,
-                turn_context.reasoning_effort,
-                turn_context.reasoning_summary,
+                reasoning_effort,
+                reasoning_summary,
                 turn_context.config.service_tier,
                 turn_metadata_header.as_deref(),
             )

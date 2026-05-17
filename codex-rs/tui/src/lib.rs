@@ -417,6 +417,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
             .or(cli.non_stop_for.map(|_| true))
             .or(cli.non_stop_budget.map(|_| true)),
         voice_mode: cli.voice.then_some(true),
+        disable_reasoning_on_first_response: cli.no_thinking_first_response.then_some(true),
         non_stop_expires_at: cli
             .non_stop_for
             .map(non_stop_expires_at_after)

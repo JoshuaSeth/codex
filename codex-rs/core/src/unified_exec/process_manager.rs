@@ -1130,7 +1130,7 @@ mod tests {
             ProcessEntry {
                 process: Arc::new(process),
                 call_id: "call".to_string(),
-                process_id: process_id.clone(),
+                process_id: process_id,
                 command: vec![
                     "bash".to_string(),
                     "-lc".to_string(),

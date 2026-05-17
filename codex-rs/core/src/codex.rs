@@ -762,6 +762,20 @@ pub(crate) struct TurnContext {
     pub(crate) turn_skills: TurnSkillsContext,
 }
 impl TurnContext {
+    pub(crate) fn reasoning_for_assistant_response(
+        &self,
+        assistant_response_index: usize,
+    ) -> (Option<ReasoningEffortConfig>, ReasoningSummaryConfig) {
+        if self.config.disable_reasoning_on_first_response && assistant_response_index == 0 {
+            return (
+                Some(ReasoningEffortConfig::None),
+                ReasoningSummaryConfig::None,
+            );
+        }
+
+        (self.reasoning_effort, self.reasoning_summary)
+    }
+
     pub(crate) fn model_context_window(&self) -> Option<i64> {
         let effective_context_window_percent = self.model_info.effective_context_window_percent;
         self.model_info.context_window.map(|context_window| {
@@ -6038,6 +6052,7 @@ pub(crate) async fn run_turn(
     // stop, which gives each targeted turn four extra "think one more step"
     // rounds without turning the whole session into `--non-stop`.
     let mut remaining_deep_follow_up_budget = turn_context.deep_follow_up_budget;
+    let mut assistant_response_count = 0usize;
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
@@ -6055,9 +6070,11 @@ pub(crate) async fn run_turn(
             .map(ResponseItem::from)
             .collect::<Vec<ResponseItem>>();
 
+        let mut pending_user_message_seen = false;
         if !pending_response_items.is_empty() {
             for response_item in pending_response_items {
                 if let Some(TurnItem::UserMessage(user_message)) = parse_turn_item(&response_item) {
+                    pending_user_message_seen = true;
                     // todo(aibrahim): move pending input to be UserInput only to keep TextElements. context: https://github.com/openai/codex/pull/10656#discussion_r2765522480
                     sess.record_user_prompt_and_emit_turn_item(
                         turn_context.as_ref(),
@@ -6073,6 +6090,9 @@ pub(crate) async fn run_turn(
                     .await;
                 }
             }
+        }
+        if pending_user_message_seen {
+            assistant_response_count = 0;
         }
 
         // Construct the input that we will send to the model.
@@ -6091,6 +6111,8 @@ pub(crate) async fn run_turn(
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
         let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+        let (reasoning_effort, reasoning_summary) =
+            turn_context.reasoning_for_assistant_response(assistant_response_count);
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -6104,6 +6126,8 @@ pub(crate) async fn run_turn(
             &pending_background_wait_process_ids,
             &mut remaining_deep_follow_up_budget,
             &mut server_model_warning_emitted_for_turn,
+            reasoning_effort,
+            reasoning_summary,
             cancellation_token.child_token(),
         )
         .await
@@ -6116,6 +6140,7 @@ pub(crate) async fn run_turn(
                     armed_background_wait_process_ids,
                     saw_tool_call,
                 } = sampling_request_output;
+                assistant_response_count = assistant_response_count.saturating_add(1);
                 pending_background_wait_process_ids = armed_background_wait_process_ids;
                 allow_assistant_status_follow_up_after_tool_output = saw_tool_call;
                 let total_usage_tokens = sess.get_total_token_usage().await;
@@ -6760,6 +6785,8 @@ async fn run_sampling_request(
     pending_background_wait_process_ids: &HashSet<String>,
     remaining_deep_follow_up_budget: &mut u32,
     server_model_warning_emitted_for_turn: &mut bool,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+    reasoning_summary: ReasoningSummaryConfig,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(
@@ -6802,6 +6829,8 @@ async fn run_sampling_request(
             pending_background_wait_process_ids,
             remaining_deep_follow_up_budget,
             server_model_warning_emitted_for_turn,
+            reasoning_effort,
+            reasoning_summary,
             &prompt,
             cancellation_token.child_token(),
         )
@@ -7689,6 +7718,8 @@ async fn try_run_sampling_request(
     pending_background_wait_process_ids: &HashSet<String>,
     remaining_deep_follow_up_budget: &mut u32,
     server_model_warning_emitted_for_turn: &mut bool,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+    reasoning_summary: ReasoningSummaryConfig,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -7696,7 +7727,7 @@ async fn try_run_sampling_request(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = turn_context.sandbox_policy.get(),
-        effort = turn_context.reasoning_effort,
+        effort = reasoning_effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
@@ -7705,8 +7736,8 @@ async fn try_run_sampling_request(
             prompt,
             &turn_context.model_info,
             &turn_context.otel_manager,
-            turn_context.reasoning_effort,
-            turn_context.reasoning_summary,
+            reasoning_effort,
+            reasoning_summary,
             turn_context.config.service_tier,
             turn_metadata_header,
         )

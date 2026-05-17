@@ -439,6 +439,11 @@ pub struct Config {
     ///   `--non-stop` when continuous auto-follow-up sampling is desired.
     pub voice_mode: bool,
 
+    /// When true, the first model response after each user turn is requested
+    /// with reasoning effort and summary set to `none`; follow-up responses use
+    /// the configured reasoning settings again. This is CLI-only today.
+    pub disable_reasoning_on_first_response: bool,
+
     /// Optional Unix-second deadline for timed non-stop mode. While this
     /// deadline is in the future, non-stop behavior stays active; once it
     /// expires, Codex allows the next normal final answer to stop the turn.
@@ -1668,6 +1673,7 @@ pub struct ConfigOverrides {
     pub persistent: Option<bool>,
     pub non_stop: Option<bool>,
     pub voice_mode: Option<bool>,
+    pub disable_reasoning_on_first_response: Option<bool>,
     pub non_stop_expires_at: Option<i64>,
     pub non_stop_budget: Option<u32>,
     pub completion_gate: Option<CompletionGateConfig>,
@@ -1821,6 +1827,7 @@ impl Config {
             persistent,
             non_stop,
             voice_mode,
+            disable_reasoning_on_first_response,
             non_stop_expires_at,
             non_stop_budget,
             completion_gate,
@@ -2337,6 +2344,8 @@ impl Config {
             non_stop: non_stop
                 .unwrap_or(non_stop_expires_at.is_some() || non_stop_budget.is_some()),
             voice_mode: voice_mode.unwrap_or_default(),
+            disable_reasoning_on_first_response: disable_reasoning_on_first_response
+                .unwrap_or_default(),
             non_stop_expires_at,
             non_stop_budget,
             completion_gate,
@@ -5505,6 +5514,7 @@ model_verbosity = "high"
                 persistent: false,
                 non_stop: false,
                 voice_mode: false,
+                disable_reasoning_on_first_response: false,
                 non_stop_expires_at: None,
                 non_stop_budget: None,
                 completion_gate: None,
@@ -5643,6 +5653,7 @@ model_verbosity = "high"
             persistent: false,
             non_stop: false,
             voice_mode: false,
+            disable_reasoning_on_first_response: false,
             non_stop_expires_at: None,
             non_stop_budget: None,
             completion_gate: None,
@@ -5779,6 +5790,7 @@ model_verbosity = "high"
             persistent: false,
             non_stop: false,
             voice_mode: false,
+            disable_reasoning_on_first_response: false,
             non_stop_expires_at: None,
             non_stop_budget: None,
             completion_gate: None,
@@ -5901,6 +5913,7 @@ model_verbosity = "high"
             persistent: false,
             non_stop: false,
             voice_mode: false,
+            disable_reasoning_on_first_response: false,
             non_stop_expires_at: None,
             non_stop_budget: None,
             completion_gate: None,

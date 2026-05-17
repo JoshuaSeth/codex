@@ -11,7 +11,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    after_long_help = "PitchAI auth policy:\n  - Default: managed shared auth in $CODEX_HOME/auth.json (typically broker-issued).\n  - `CODEX_API_KEY` is never used as implicit fallback.\n  - API-key mode is explicit-only (`CODEX_FORCE_API_KEY_AUTH=1`).\n\nPitchAI automation/broker notes:\n  - Runners can lease auth from auth-token-server via `CODEX_AUTH_BROKER_URL` + `CODEX_AUTH_BROKER_TOKEN`.\n  - On usage/rate limits, the runner can report lease outcome, fetch fresh auth, and auto-continue the same thread.\n\nPersistent terminal mode:\n  - Use `--persistent` to keep the turn alive while any session terminal is still running.\n  - Codex will not accept an assistant-only response as terminal until those terminals exit.\n  - This is opt-in because intentionally leaving a shell open keeps the turn running.\n\nNon-stop mode:\n  - Use `--non-stop` to forbid normal turn completion entirely.\n  - Use `--non-stop-for <DURATION>` to keep that behavior only until the timeout expires; after that, the next normal final answer may stop.\n  - Use `--non-stop-budget <COUNT>` to keep that behavior only until COUNT normal stop attempts have been reached.\n  - Codex keeps sampling until it is externally interrupted, aborted, otherwise forced to stop, or the configured budget is exhausted.\n  - This is stronger than `--persistent` and can intentionally run forever.\n\nCompletion gate:\n  - Use `--completion-criteria <TEXT>` to require a secondary judge call before Codex may stop.\n  - The judge sees real session history, returns strict JSON-schema output, and can block stop.\n  - Denied stops inject a continuation prompt. Judge failures fail closed and keep the turn alive.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies workspace-write sandbox and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Commands continue to run normally; approval policy still governs escalation."
+    after_long_help = "PitchAI auth policy:\n  - Default: managed shared auth in $CODEX_HOME/auth.json (typically broker-issued).\n  - `CODEX_API_KEY` is never used as implicit fallback.\n  - API-key mode is explicit-only (`CODEX_FORCE_API_KEY_AUTH=1`).\n\nPitchAI automation/broker notes:\n  - Runners can lease auth from auth-token-server via `CODEX_AUTH_BROKER_URL` + `CODEX_AUTH_BROKER_TOKEN`.\n  - On usage/rate limits, the runner can report lease outcome, fetch fresh auth, and auto-continue the same thread.\n\nPersistent terminal mode:\n  - Use `--persistent` to keep the turn alive while any session terminal is still running.\n  - Codex will not accept an assistant-only response as terminal until those terminals exit.\n  - This is opt-in because intentionally leaving a shell open keeps the turn running.\n\nNon-stop mode:\n  - Use `--non-stop` to forbid normal turn completion entirely.\n  - Use `--non-stop-for <DURATION>` to keep that behavior only until the timeout expires; after that, the next normal final answer may stop.\n  - Use `--non-stop-budget <COUNT>` to keep that behavior only until COUNT normal stop attempts have been reached.\n  - Codex keeps sampling until it is externally interrupted, aborted, otherwise forced to stop, or the configured budget is exhausted.\n  - This is stronger than `--persistent` and can intentionally run forever.\n\nFirst-response no-thinking mode:\n  - Use `--no-thinking-first-response` to request reasoning effort and summaries as `none` for the first assistant response after each user turn.\n  - Follow-up sampling responses in the same turn use the configured reasoning effort and summary again.\n\nCompletion gate:\n  - Use `--completion-criteria <TEXT>` to require a secondary judge call before Codex may stop.\n  - The judge sees real session history, returns strict JSON-schema output, and can block stop.\n  - Denied stops inject a continuation prompt. Judge failures fail closed and keep the turn alive.\n\nStrict filesystem scoping:\n  - Use `--strict-dir <DIR>` (repeatable) to restrict reads+writes to explicit roots.\n  - `--strict-dir` implies workspace-write sandbox and disables default writable temp roots (`/tmp`, `$TMPDIR`).\n  - Commands continue to run normally; approval policy still governs escalation."
 )]
 pub struct Cli {
     /// Action to perform. If omitted, runs a new non-interactive session.
@@ -145,6 +145,15 @@ pub struct Cli {
         value_parser = parse_non_stop_budget
     )]
     pub non_stop_budget: Option<u32>,
+
+    /// Disable reasoning effort and summaries only for the first assistant response after each user turn.
+    #[arg(
+        long = "no-thinking-first-response",
+        alias = "disable-reasoning-on-first-response",
+        global = true,
+        default_value_t = false
+    )]
+    pub no_thinking_first_response: bool,
 
     /// Require a secondary completion judge before Codex may stop.
     #[arg(long = "completion-criteria", global = true)]
@@ -444,6 +453,17 @@ mod tests {
     fn resume_parses_non_stop_budget_flag() {
         let cli = Cli::parse_from(["codex-exec", "resume", "--non-stop-budget", "300", "prompt"]);
         assert_eq!(cli.non_stop_budget, Some(300));
+    }
+
+    #[test]
+    fn resume_parses_no_thinking_first_response_flag() {
+        let cli = Cli::parse_from([
+            "codex-exec",
+            "resume",
+            "--no-thinking-first-response",
+            "prompt",
+        ]);
+        assert!(cli.no_thinking_first_response);
     }
 
     #[test]

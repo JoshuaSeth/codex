@@ -153,6 +153,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         voice,
         non_stop_for,
         non_stop_budget,
+        no_thinking_first_response,
         completion_criteria,
         completion_criteria_file,
         completion_judge_model,
@@ -373,6 +374,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .or(non_stop_for.map(|_| true))
             .or(non_stop_budget.map(|_| true)),
         voice_mode: voice.then_some(true),
+        disable_reasoning_on_first_response: no_thinking_first_response.then_some(true),
         non_stop_expires_at: non_stop_for
             .map(non_stop_expires_at_after)
             .transpose()
