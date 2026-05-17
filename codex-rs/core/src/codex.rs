@@ -6781,7 +6781,8 @@ async fn run_sampling_request(
         base_instructions,
     );
     let mut retries = 0;
-    let mut broker_rotations = 0usize;
+    let mut broker_rotation_attempts = 0usize;
+    let mut last_broker_rotation_failure: Option<String> = None;
     let max_broker_rotations = std::env::var("CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -6891,8 +6892,9 @@ async fn run_sampling_request(
         };
 
         if let Some((outcome, reason)) = broker_outcome
-            && broker_rotations < max_broker_rotations
+            && broker_rotation_attempts < max_broker_rotations
         {
+            broker_rotation_attempts += 1;
             let detail = format!("{err:#}");
             match sess
                 .services
@@ -6901,7 +6903,7 @@ async fn run_sampling_request(
                 .await
             {
                 Ok(Some(recovery)) => {
-                    broker_rotations += 1;
+                    last_broker_rotation_failure = None;
                     client_session.reset_after_auth_rotation();
                     let account = recovery
                         .account_email
@@ -6921,15 +6923,18 @@ async fn run_sampling_request(
                 }
                 Ok(None) => {}
                 Err(recovery_err) => {
-                    sess.send_event(
-                        &turn_context,
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "{reason} and auth broker rotation failed: {recovery_err}"
-                            ),
-                        }),
-                    )
-                    .await;
+                    let message =
+                        format!("{reason} and auth broker rotation failed: {recovery_err}");
+                    if last_broker_rotation_failure.as_deref() != Some(message.as_str()) {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: message.clone(),
+                            }),
+                        )
+                        .await;
+                    }
+                    last_broker_rotation_failure = Some(message);
                 }
             }
         }

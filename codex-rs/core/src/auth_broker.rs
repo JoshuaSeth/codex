@@ -285,10 +285,7 @@ async fn read_broker_error(response: reqwest::Response) -> AuthBrokerError {
             status,
             detail: payload
                 .detail
-                .map(|detail| match detail {
-                    Value::String(text) => text,
-                    other => other.to_string(),
-                })
+                .map(format_broker_detail)
                 .unwrap_or_else(|| status.to_string()),
         };
     }
@@ -301,5 +298,186 @@ async fn read_broker_error(response: reqwest::Response) -> AuthBrokerError {
         } else {
             truncate_detail(detail)
         },
+    }
+}
+
+fn format_broker_detail(detail: Value) -> String {
+    let formatted = match detail {
+        Value::String(text) => return truncate_detail(&text),
+        Value::Object(object) => format_availability_diagnostics(&object)
+            .unwrap_or_else(|| Value::Object(object).to_string()),
+        other => other.to_string(),
+    };
+    truncate_detail(&formatted)
+}
+
+fn format_availability_diagnostics(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let message = object.get("message")?.as_str()?;
+    let summary = object.get("summary")?.as_object()?;
+    let selectable = summary_count(summary, "selectable_accounts");
+    let leased = summary_count(summary, "leased_accounts");
+    let rate_limited = summary_count(summary, "rate_limited_accounts");
+    let auth_invalid = summary_count(summary, "auth_invalid_accounts");
+    let disabled = summary_count(summary, "disabled_accounts");
+
+    let mut lines = vec![format!(
+        "{message} ({selectable} selectable, {leased} leased, {rate_limited} rate-limited, {auth_invalid} auth-invalid, {disabled} disabled)."
+    )];
+    if let Some(next_lease) = object_string(summary, "next_lease_expires_at") {
+        lines.push(format!("Next leased account frees at {next_lease}."));
+    }
+    if let Some(next_cooldown) = object_string(summary, "next_cooldown_until") {
+        lines.push(format!(
+            "Next rate-limited account cools down at {next_cooldown}."
+        ));
+    }
+
+    let accounts = object.get("accounts").and_then(Value::as_array)?;
+    if !accounts.is_empty() {
+        lines.push("Accounts:".to_string());
+    }
+    for account in accounts.iter().take(8) {
+        let Some(account) = account.as_object() else {
+            continue;
+        };
+        let account_id = object_string(account, "account_id").unwrap_or("unknown");
+        let label = object_string(account, "label")
+            .filter(|label| !label.is_empty())
+            .unwrap_or(account_id);
+        let availability = object_string(account, "availability").unwrap_or("unknown");
+        let mut fragments = vec![format!("- {label} ({account_id}): {availability}")];
+        if let Some(reasons) = skip_reasons(account) {
+            fragments.push(reasons);
+        }
+        if let Some(usage) = usage_summary(account.get("usage")) {
+            fragments.push(usage);
+        }
+        lines.push(fragments.join("; "));
+    }
+    if accounts.len() > 8 {
+        let remaining = accounts.len() - 8;
+        lines.push(format!("- ... {remaining} more accounts"));
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn summary_count(object: &serde_json::Map<String, Value>, key: &str) -> u64 {
+    object.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn object_string<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+    object.get(key).and_then(Value::as_str)
+}
+
+fn skip_reasons(account: &serde_json::Map<String, Value>) -> Option<String> {
+    let reasons = account
+        .get("skip_reasons")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+fn usage_summary(usage: Option<&Value>) -> Option<String> {
+    let usage = usage?.as_object()?;
+    let mut parts = Vec::new();
+    if let Some(percent) = usage
+        .get("primary_window")
+        .and_then(|window| window.get("used_percent"))
+        .and_then(format_percent)
+    {
+        parts.push(format!("5h {percent}% used"));
+    }
+    if let Some(percent) = usage
+        .get("secondary_window")
+        .and_then(|window| window.get("used_percent"))
+        .and_then(format_percent)
+    {
+        parts.push(format!("weekly {percent}% used"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn format_percent(value: &Value) -> Option<String> {
+    if let Some(percent) = value.as_i64() {
+        return Some(percent.to_string());
+    }
+    value.as_f64().map(|percent| {
+        if percent.fract() == 0.0 {
+            format!("{percent:.0}")
+        } else {
+            format!("{percent:.1}")
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::format_broker_detail;
+
+    #[test]
+    fn broker_diagnostics_detail_is_human_readable() {
+        let detail = format_broker_detail(json!({
+            "message": "No enabled account is currently available",
+            "summary": {
+                "selectable_accounts": 0,
+                "leased_accounts": 1,
+                "rate_limited_accounts": 1,
+                "auth_invalid_accounts": 1,
+                "disabled_accounts": 0,
+                "next_lease_expires_at": "2026-05-16T15:53:05+00:00",
+                "next_cooldown_until": "2026-05-16T18:22:48+00:00"
+            },
+            "accounts": [
+                {
+                    "account_id": "acc-a",
+                    "label": "root-codex",
+                    "availability": "available",
+                    "skip_reasons": ["leased until 2026-05-16T15:53:05+00:00"],
+                    "usage": {
+                        "primary_window": {"used_percent": 0},
+                        "secondary_window": {"used_percent": 21}
+                    }
+                },
+                {
+                    "account_id": "acc-b",
+                    "label": "privaterelay-codex",
+                    "availability": "rate_limited",
+                    "skip_reasons": [
+                        "cooling down until 2026-05-16T18:22:48+00:00",
+                        "rate_limited: no credits remaining (balance 0)"
+                    ],
+                    "usage": {
+                        "primary_window": {"used_percent": 100},
+                        "secondary_window": {"used_percent": 100}
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(
+            detail,
+            "No enabled account is currently available (0 selectable, 1 leased, 1 rate-limited, 1 auth-invalid, 0 disabled).\n\
+             Next leased account frees at 2026-05-16T15:53:05+00:00.\n\
+             Next rate-limited account cools down at 2026-05-16T18:22:48+00:00.\n\
+             Accounts:\n\
+             - root-codex (acc-a): available; leased until 2026-05-16T15:53:05+00:00; 5h 0% used, weekly 21% used\n\
+             - privaterelay-codex (acc-b): rate_limited; cooling down until 2026-05-16T18:22:48+00:00; rate_limited: no credits remaining (balance 0); 5h 100% used, weekly 100% used"
+        );
     }
 }
