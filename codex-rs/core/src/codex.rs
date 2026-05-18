@@ -6206,6 +6206,13 @@ async fn run_sampling_request(
         base_instructions,
     );
     let mut retries = 0;
+    let mut broker_rotation_attempts = 0usize;
+    let mut last_broker_rotation_failure: Option<String> = None;
+    let max_broker_rotations = std::env::var("CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 256);
     loop {
         sess.record_turn_request_estimate(turn_context.as_ref(), &prompt)
             .await;
@@ -6234,10 +6241,125 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                return Err(CodexErr::UsageLimitReached(e));
+                CodexErr::UsageLimitReached(e)
             }
             Err(err) => err,
         };
+
+        let broker_outcome = match &err {
+            CodexErr::UsageLimitReached(_) => Some((
+                crate::auth::BROKER_USAGE_LIMIT_OUTCOME,
+                "Rate limit reached",
+            )),
+            CodexErr::QuotaExceeded => {
+                Some((crate::auth::BROKER_RATE_LIMITED_OUTCOME, "Quota exceeded"))
+            }
+            CodexErr::UsageNotIncluded => Some((
+                crate::auth::BROKER_AUTH_INVALID_OUTCOME,
+                "Current account cannot use Codex",
+            )),
+            CodexErr::RefreshTokenFailed(_) => Some((
+                crate::auth::BROKER_REFRESH_TOKEN_INVALID_OUTCOME,
+                "Token refresh failed",
+            )),
+            CodexErr::RetryLimit(retry) if retry.status.as_u16() == 429 => Some((
+                crate::auth::BROKER_RATE_LIMITED_OUTCOME,
+                "Rate limit reached",
+            )),
+            CodexErr::UnexpectedStatus(unexpected) if unexpected.status.as_u16() == 401 => {
+                Some((crate::auth::BROKER_UNAUTHORIZED_OUTCOME, "Unauthorized"))
+            }
+            CodexErr::UnexpectedStatus(unexpected) if unexpected.status.as_u16() == 429 => Some((
+                crate::auth::BROKER_RATE_LIMITED_OUTCOME,
+                "Rate limit reached",
+            )),
+            CodexErr::UnexpectedStatus(unexpected) if unexpected.status.as_u16() == 403 => {
+                let normalized = unexpected.body.to_ascii_lowercase();
+                if normalized.contains("rate limit")
+                    || normalized.contains("usage limit")
+                    || normalized.contains("quota")
+                    || normalized.contains("too many requests")
+                {
+                    Some((
+                        crate::auth::BROKER_RATE_LIMITED_OUTCOME,
+                        "Rate limit reached",
+                    ))
+                } else if normalized.contains("auth")
+                    || normalized.contains("token")
+                    || normalized.contains("unauthorized")
+                    || normalized.contains("forbidden")
+                {
+                    Some((
+                        crate::auth::BROKER_AUTH_INVALID_OUTCOME,
+                        "Authentication failed",
+                    ))
+                } else {
+                    None
+                }
+            }
+            CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_)
+                if matches!(err.http_status_code_value(), Some(401)) =>
+            {
+                Some((crate::auth::BROKER_UNAUTHORIZED_OUTCOME, "Unauthorized"))
+            }
+            CodexErr::ConnectionFailed(_) | CodexErr::ResponseStreamFailed(_)
+                if matches!(err.http_status_code_value(), Some(429)) =>
+            {
+                Some((
+                    crate::auth::BROKER_RATE_LIMITED_OUTCOME,
+                    "Rate limit reached",
+                ))
+            }
+            _ => None,
+        };
+
+        if let Some((outcome, reason)) = broker_outcome
+            && broker_rotation_attempts < max_broker_rotations
+        {
+            broker_rotation_attempts += 1;
+            let detail = format!("{err:#}");
+            match sess
+                .services
+                .auth_manager
+                .recover_from_broker(outcome, Some(&detail))
+                .await
+            {
+                Ok(Some(recovery)) => {
+                    last_broker_rotation_failure = None;
+                    client_session.reset_after_auth_rotation();
+                    let account = recovery
+                        .account_email
+                        .as_deref()
+                        .unwrap_or(recovery.account_id.as_str());
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "{reason}. Switched to broker account {account} and retrying."
+                            ),
+                        }),
+                    )
+                    .await;
+                    retries = 0;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(recovery_err) => {
+                    let message =
+                        format!("{reason} and auth broker rotation failed: {recovery_err}");
+                    if last_broker_rotation_failure.as_deref() != Some(message.as_str()) {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: message.clone(),
+                            }),
+                        )
+                        .await;
+                    }
+                    last_broker_rotation_failure = Some(message);
+                }
+            }
+        }
 
         if !should_retry_sampling_error(&err) {
             return Err(err);

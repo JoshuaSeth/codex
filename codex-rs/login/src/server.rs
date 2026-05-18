@@ -1,6 +1,7 @@
 //! Local OAuth callback server for CLI login.
 //!
 //! This module runs the short-lived localhost server used by interactive sign-in.
+use std::env;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -25,6 +26,7 @@ use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
 use codex_core::token_data::parse_chatgpt_jwt_claims;
 use rand::RngCore;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
 use tiny_http::Request;
@@ -34,6 +36,12 @@ use tiny_http::StatusCode;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
+const CODEX_AUTH_BROKER_IMPORT_ON_LOGIN_ENV_VAR: &str = "CODEX_AUTH_BROKER_IMPORT_ON_LOGIN";
+const CODEX_AUTH_BROKER_ADMIN_URL_ENV_VAR: &str = "CODEX_AUTH_BROKER_ADMIN_URL";
+const CODEX_AUTH_BROKER_ADMIN_TOKEN_ENV_VAR: &str = "CODEX_AUTH_BROKER_ADMIN_TOKEN";
+const CODEX_AUTH_BROKER_URL_ENV_VAR: &str = "CODEX_AUTH_BROKER_URL";
+const CODEX_AUTH_BROKER_IMPORT_LABEL_ENV_VAR: &str = "CODEX_AUTH_BROKER_IMPORT_LABEL";
+const CODEX_AUTH_BROKER_IMPORT_PRIORITY_ENV_VAR: &str = "CODEX_AUTH_BROKER_IMPORT_PRIORITY";
 
 /// Options for launching the local login callback server.
 #[derive(Debug, Clone)]
@@ -591,7 +599,7 @@ pub(crate) async fn persist_tokens_async(
 ) -> io::Result<()> {
     // Reuse existing synchronous logic but run it off the async runtime.
     let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let auth = tokio::task::spawn_blocking(move || {
         let mut tokens = TokenData {
             id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
             access_token,
@@ -610,10 +618,93 @@ pub(crate) async fn persist_tokens_async(
             tokens: Some(tokens),
             last_refresh: Some(Utc::now()),
         };
-        save_auth(&codex_home, &auth, auth_credentials_store_mode)
+        save_auth(&codex_home, &auth, auth_credentials_store_mode)?;
+        Ok::<AuthDotJson, io::Error>(auth)
     })
     .await
-    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))??;
+    import_login_auth_to_broker(&auth).await?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BrokerImportAccountRequest<'a> {
+    auth_json: &'a AuthDotJson,
+    label: String,
+    priority: u16,
+    enabled: bool,
+}
+
+async fn import_login_auth_to_broker(auth: &AuthDotJson) -> io::Result<()> {
+    let Some((url, token)) = broker_admin_import_config()? else {
+        return Ok(());
+    };
+    let label = read_env(CODEX_AUTH_BROKER_IMPORT_LABEL_ENV_VAR).unwrap_or_else(|| {
+        auth.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.id_token.email.clone())
+            .unwrap_or_else(|| "codex-dev-login".to_string())
+    });
+    let priority = read_env(CODEX_AUTH_BROKER_IMPORT_PRIORITY_ENV_VAR)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(100);
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/admin/accounts/import"))
+        .bearer_auth(token)
+        .json(&BrokerImportAccountRequest {
+            auth_json: auth,
+            label,
+            priority,
+            enabled: true,
+        })
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    Err(io::Error::other(format!(
+        "auth broker import returned status {status}: {body}"
+    )))
+}
+
+fn broker_admin_import_config() -> io::Result<Option<(String, String)>> {
+    if !env_flag(CODEX_AUTH_BROKER_IMPORT_ON_LOGIN_ENV_VAR) {
+        return Ok(None);
+    }
+    let url = read_env(CODEX_AUTH_BROKER_ADMIN_URL_ENV_VAR)
+        .or_else(|| read_env(CODEX_AUTH_BROKER_URL_ENV_VAR));
+    let token = read_env(CODEX_AUTH_BROKER_ADMIN_TOKEN_ENV_VAR);
+    match (url, token) {
+        (Some(url), Some(token)) => Ok(Some((url.trim_end_matches('/').to_string(), token))),
+        (None, Some(_)) => Err(io::Error::other(format!(
+            "{CODEX_AUTH_BROKER_IMPORT_ON_LOGIN_ENV_VAR}=1 requires {CODEX_AUTH_BROKER_ADMIN_URL_ENV_VAR} or {CODEX_AUTH_BROKER_URL_ENV_VAR}"
+        ))),
+        (Some(_), None) | (None, None) => Err(io::Error::other(format!(
+            "{CODEX_AUTH_BROKER_IMPORT_ON_LOGIN_ENV_VAR}=1 requires {CODEX_AUTH_BROKER_ADMIN_TOKEN_ENV_VAR}"
+        ))),
+    }
+}
+
+fn read_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_flag(name: &str) -> bool {
+    read_env(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &str) -> String {
@@ -876,4 +967,94 @@ pub(crate) async fn obtain_api_key(
     }
     let body: ExchangeResp = resp.json().await.map_err(io::Error::other)?;
     Ok(body.access_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_string_contains;
+    use wiremock::matchers::header;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn make_jwt(payload: serde_json::Value) -> String {
+        let header = json!({ "alg": "none", "typ": "JWT" });
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        format!(
+            "{}.{}.{}",
+            b64(&serde_json::to_vec(&header).unwrap()),
+            b64(&serde_json::to_vec(&payload).unwrap()),
+            b64(b"sig")
+        )
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_imports_auth_to_broker_when_enabled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/admin/accounts/import"))
+            .and(header("authorization", "Bearer admin-token"))
+            .and(body_string_contains("access-token-123"))
+            .and(body_string_contains("acct_321"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _import_on_login = EnvVarGuard::set(CODEX_AUTH_BROKER_IMPORT_ON_LOGIN_ENV_VAR, "1");
+        let _admin_url = EnvVarGuard::set(CODEX_AUTH_BROKER_ADMIN_URL_ENV_VAR, &server.uri());
+        let _admin_token = EnvVarGuard::set(CODEX_AUTH_BROKER_ADMIN_TOKEN_ENV_VAR, "admin-token");
+
+        let codex_home = tempdir().unwrap();
+        let id_token = make_jwt(json!({
+            "email": "broker-import@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_321"
+            }
+        }));
+
+        persist_tokens_async(
+            codex_home.path(),
+            None,
+            id_token,
+            "access-token-123".to_string(),
+            "refresh-token-123".to_string(),
+            AuthCredentialsStoreMode::File,
+        )
+        .await
+        .expect("persist should import auth to broker");
+
+        server.verify().await;
+    }
 }

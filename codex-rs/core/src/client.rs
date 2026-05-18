@@ -482,6 +482,11 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn reset_after_auth_rotation(&mut self) {
+        self.websocket_session = WebsocketSession::default();
+        self.turn_state = Arc::new(OnceLock::new());
+    }
+
     fn activate_http_fallback(&self, websocket_enabled: bool) -> bool {
         websocket_enabled
             && !self

@@ -17,6 +17,7 @@ use crate::AuthManager;
 use crate::CodexAuth;
 use crate::ModelProviderInfo;
 use crate::ThreadManager;
+use crate::auth::AuthCredentialsStoreMode;
 use crate::config::Config;
 use crate::models_manager::collaboration_mode_presets;
 use crate::models_manager::manager::ModelsManager;
@@ -47,6 +48,20 @@ pub fn auth_manager_from_auth(auth: CodexAuth) -> Arc<AuthManager> {
 
 pub fn auth_manager_from_auth_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<AuthManager> {
     AuthManager::from_auth_for_testing_with_home(auth, codex_home)
+}
+
+pub fn auth_manager_with_broker(
+    codex_home: PathBuf,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    broker_url: String,
+    broker_token: String,
+) -> Arc<AuthManager> {
+    AuthManager::with_broker_for_testing(
+        codex_home,
+        auth_credentials_store_mode,
+        broker_url,
+        broker_token,
+    )
 }
 
 pub fn thread_manager_with_models_provider(

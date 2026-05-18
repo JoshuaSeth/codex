@@ -942,7 +942,7 @@ async fn run_ratatui_app(
 
     let app_result = App::run(
         &mut tui,
-        auth_manager,
+        auth_manager.clone(),
         config,
         cli_kv_overrides.clone(),
         overrides.clone(),
@@ -955,6 +955,7 @@ async fn run_ratatui_app(
         should_prompt_windows_sandbox_nux_at_startup,
     )
     .await;
+    auth_manager.shutdown().await;
 
     restore();
     // Mark the end of the recorded session.

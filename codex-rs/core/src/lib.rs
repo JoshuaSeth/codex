@@ -10,6 +10,7 @@ pub mod api_bridge;
 mod apply_patch;
 mod apps;
 pub mod auth;
+mod auth_broker;
 mod client;
 mod client_common;
 pub mod codex;
