@@ -22,6 +22,8 @@ fi
 use_speech=0
 voice_mode=0
 forward_args=()
+codex_dev_auth_broker_admin_url=""
+codex_dev_auth_broker_admin_token=""
 while [[ $# -gt 0 ]]; do
   arg="$1"
   shift
@@ -211,37 +213,35 @@ configure_codex_auth_broker() {
     export CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS="${CODEX_AUTH_BROKER_ROTATION_MAX_ATTEMPTS:-64}"
   fi
 
-  if codex_dev_is_login_command "$@"; then
-    if [[ -z "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" && -n "$admin_token" ]]; then
-      export CODEX_AUTH_BROKER_ADMIN_TOKEN="$admin_token"
-    fi
-    if [[ -z "${CODEX_AUTH_BROKER_ADMIN_URL:-}" && -n "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" ]]; then
-      export CODEX_AUTH_BROKER_ADMIN_URL="${CODEX_AUTH_BROKER_URL:-$default_url}"
-    fi
+  codex_dev_auth_broker_admin_token="${CODEX_AUTH_BROKER_ADMIN_TOKEN:-$admin_token}"
+  if [[ -n "$codex_dev_auth_broker_admin_token" ]]; then
+    codex_dev_auth_broker_admin_url="${CODEX_AUTH_BROKER_ADMIN_URL:-${CODEX_AUTH_BROKER_URL:-$default_url}}"
+    export CODEX_AUTH_BROKER_ADMIN_TOKEN="${CODEX_AUTH_BROKER_ADMIN_TOKEN:-$codex_dev_auth_broker_admin_token}"
+    export CODEX_AUTH_BROKER_ADMIN_URL="${CODEX_AUTH_BROKER_ADMIN_URL:-$codex_dev_auth_broker_admin_url}"
     export CODEX_AUTH_BROKER_IMPORT_ON_LOGIN="${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-1}"
   fi
 }
 
-codex_dev_import_login_auth_to_broker() {
+codex_dev_import_auth_to_broker() {
+  local auth_path="${1:-}"
+  local import_mode="${2:-login}"
+  local quiet="${3:-0}"
+
   if [[ "${CODEX_DEV_AUTH_BROKER_DISABLED:-0}" == "1" ]]; then
     return 0
   fi
-  if [[ "${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-0}" != "1" ]]; then
-    return 0
-  fi
   if [[ -z "${CODEX_AUTH_BROKER_ADMIN_URL:-}" || -z "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" ]]; then
-    echo "codex-dev: auth broker login import skipped; admin broker env is not configured." >&2
+    echo "codex-dev: auth broker ${import_mode} import skipped; admin broker env is not configured." >&2
     return 1
   fi
-
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  local auth_path="$codex_home/auth.json"
   if [[ ! -r "$auth_path" ]]; then
-    echo "codex-dev: auth broker login import failed; auth.json not readable at $auth_path" >&2
+    echo "codex-dev: auth broker ${import_mode} import failed; auth.json not readable at $auth_path" >&2
     return 1
   fi
 
-  python3 - "$auth_path" <<'PY'
+  CODEX_AUTH_BROKER_IMPORT_MODE="$import_mode" \
+    CODEX_AUTH_BROKER_IMPORT_QUIET="$quiet" \
+    python3 - "$auth_path" <<'PY'
 import base64
 import json
 import os
@@ -249,6 +249,7 @@ import pathlib
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -280,7 +281,8 @@ if isinstance(auth_claims, dict) and auth_claims.get("chatgpt_account_id"):
 
 label = os.environ.get("CODEX_AUTH_BROKER_IMPORT_LABEL") or email or "codex-dev-login"
 priority = int(os.environ.get("CODEX_AUTH_BROKER_IMPORT_PRIORITY") or "100")
-url = os.environ["CODEX_AUTH_BROKER_ADMIN_URL"].rstrip("/") + "/v1/admin/accounts/import"
+base_url = os.environ["CODEX_AUTH_BROKER_ADMIN_URL"].rstrip("/")
+url = base_url + "/v1/admin/accounts/import"
 body = json.dumps(
     {
         "auth_json": auth_json,
@@ -303,17 +305,58 @@ try:
         payload = json.loads(response.read().decode("utf-8"))
 except urllib.error.HTTPError as exc:
     detail = exc.read().decode("utf-8", errors="replace")
-    raise SystemExit(f"codex-dev: auth broker login import failed: HTTP {exc.code}: {detail}") from exc
+    mode = os.environ.get("CODEX_AUTH_BROKER_IMPORT_MODE") or "login"
+    raise SystemExit(f"codex-dev: auth broker {mode} import failed: HTTP {exc.code}: {detail}") from exc
 
 imported_account_id = (
     payload.get("metadata", {}).get("account_id") if isinstance(payload, dict) else None
 )
-print(
-    "codex-dev: imported login auth into auth broker"
-    f" (account_id={imported_account_id or account_id or 'unknown'}).",
-    file=sys.stderr,
-)
+resolved_account_id = imported_account_id or account_id
+if resolved_account_id:
+    probe_request = urllib.request.Request(
+        base_url + f"/v1/admin/accounts/{quote(str(resolved_account_id), safe='')}/probe",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {os.environ['CODEX_AUTH_BROKER_ADMIN_TOKEN']}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(probe_request, timeout=30) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(
+            "codex-dev: auth broker import succeeded but usage probe failed"
+            f" for account_id={resolved_account_id}: HTTP {exc.code}: {detail}",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        print(
+            "codex-dev: auth broker import succeeded but usage probe failed"
+            f" for account_id={resolved_account_id}: {exc}",
+            file=sys.stderr,
+        )
+
+if os.environ.get("CODEX_AUTH_BROKER_IMPORT_QUIET") != "1":
+    mode = os.environ.get("CODEX_AUTH_BROKER_IMPORT_MODE") or "login"
+    print(
+        f"codex-dev: imported {mode} auth into auth broker"
+        f" (account_id={resolved_account_id or 'unknown'}).",
+        file=sys.stderr,
+    )
 PY
+}
+
+codex_dev_import_login_auth_to_broker() {
+  if [[ "${CODEX_AUTH_BROKER_IMPORT_ON_LOGIN:-0}" != "1" ]]; then
+    return 0
+  fi
+
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local auth_path="$codex_home/auth.json"
+  codex_dev_import_auth_to_broker "$auth_path" "login" "0"
 }
 
 codex_dev_auth_file_fingerprint() {
@@ -348,6 +391,26 @@ tokens = auth_json.get("tokens") if isinstance(auth_json, dict) else None
 if not isinstance(tokens, dict) or not tokens.get("refresh_token"):
     raise SystemExit(1)
 PY
+}
+
+codex_dev_import_existing_auth_to_broker() {
+  case "$(printf '%s' "${CODEX_AUTH_BROKER_IMPORT_EXISTING_ON_STARTUP:-1}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off)
+      return 0
+      ;;
+  esac
+  if [[ -z "${CODEX_AUTH_BROKER_ADMIN_URL:-}" || -z "${CODEX_AUTH_BROKER_ADMIN_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local auth_path="$codex_home/auth.json"
+  if ! codex_dev_auth_has_chatgpt_refresh_token "$auth_path"; then
+    return 0
+  fi
+  if ! codex_dev_import_auth_to_broker "$auth_path" "startup" "1"; then
+    echo "codex-dev: auth broker startup import failed; continuing without blocking launch." >&2
+  fi
 }
 
 codex_dev_wait_for_login_auth() {
@@ -865,5 +928,7 @@ fi
 if codex_dev_is_login_command "$@"; then
   codex_dev_run_login_command "$@"
 fi
+
+codex_dev_import_existing_auth_to_broker
 
 exec "$bin" "$@"

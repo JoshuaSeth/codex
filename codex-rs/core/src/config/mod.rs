@@ -1256,6 +1256,11 @@ pub struct ConfigToml {
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: Option<bool>,
 
+    /// When set to `true`, disables reasoning only for the first assistant
+    /// response after a user message. Follow-up assistant responses restore the
+    /// configured reasoning settings.
+    pub disable_reasoning_on_first_response: Option<bool>,
+
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
@@ -2345,6 +2350,7 @@ impl Config {
                 .unwrap_or(non_stop_expires_at.is_some() || non_stop_budget.is_some()),
             voice_mode: voice_mode.unwrap_or_default(),
             disable_reasoning_on_first_response: disable_reasoning_on_first_response
+                .or(cfg.disable_reasoning_on_first_response)
                 .unwrap_or_default(),
             non_stop_expires_at,
             non_stop_budget,
@@ -6490,6 +6496,27 @@ allow_login_shell = false
         )?;
 
         assert!(!config.permissions.allow_login_shell);
+        Ok(())
+    }
+
+    #[test]
+    fn config_loads_disable_reasoning_on_first_response_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+model = "gpt-5.1"
+disable_reasoning_on_first_response = true
+"#,
+        )
+        .expect("TOML deserialization should succeed for first-response reasoning config");
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert!(config.disable_reasoning_on_first_response);
         Ok(())
     }
 

@@ -26,6 +26,7 @@ use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
 use codex_core::token_data::parse_chatgpt_jwt_claims;
 use rand::RngCore;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
@@ -635,6 +636,16 @@ struct BrokerImportAccountRequest<'a> {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+struct BrokerImportAccountResponse {
+    metadata: BrokerImportAccountMetadata,
+}
+
+#[derive(Deserialize)]
+struct BrokerImportAccountMetadata {
+    account_id: String,
+}
+
 async fn import_login_auth_to_broker(auth: &AuthDotJson) -> io::Result<()> {
     let Some((url, token)) = broker_admin_import_config()? else {
         return Ok(());
@@ -648,9 +659,10 @@ async fn import_login_auth_to_broker(auth: &AuthDotJson) -> io::Result<()> {
     let priority = read_env(CODEX_AUTH_BROKER_IMPORT_PRIORITY_ENV_VAR)
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(100);
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = client
         .post(format!("{url}/v1/admin/accounts/import"))
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .json(&BrokerImportAccountRequest {
             auth_json: auth,
             label,
@@ -662,7 +674,27 @@ async fn import_login_auth_to_broker(auth: &AuthDotJson) -> io::Result<()> {
         .map_err(io::Error::other)?;
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        let body = response.bytes().await.map_err(io::Error::other)?;
+        let payload: BrokerImportAccountResponse =
+            serde_json::from_slice(&body).map_err(io::Error::other)?;
+        let probe_response = client
+            .post(format!(
+                "{url}/v1/admin/accounts/{}/probe",
+                payload.metadata.account_id
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(io::Error::other)?;
+        let probe_status = probe_response.status();
+        if probe_status.is_success() {
+            return Ok(());
+        }
+        let probe_body = probe_response.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "auth broker usage probe returned status {probe_status}: {probe_body}"
+        )));
     }
 
     let body = response.text().await.unwrap_or_default();
@@ -1027,6 +1059,17 @@ mod tests {
             .and(header("authorization", "Bearer admin-token"))
             .and(body_string_contains("access-token-123"))
             .and(body_string_contains("acct_321"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "metadata": {
+                    "account_id": "broker-account-321"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/admin/accounts/broker-account-321/probe"))
+            .and(header("authorization", "Bearer admin-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .expect(1)
             .mount(&server)
