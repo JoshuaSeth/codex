@@ -1,0 +1,22 @@
+[Unit]
+Description=PitchAI Codex Gateway
+After=network-online.target auth-token-server.service
+Wants=network-online.target
+Requires=auth-token-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/codex-gateway
+EnvironmentFile=/etc/auth-token-server/auth-token-server.env
+EnvironmentFile=/etc/codex-gateway/codex-gateway.env
+Environment=PYTHONPATH=/opt/codex-gateway
+ExecStart=/opt/afasask-host/app/.venv/bin/python -m uvicorn codex_gateway:app --host 127.0.0.1 --port 38288
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+StandardOutput=append:/var/log/codex-gateway.log
+StandardError=append:/var/log/codex-gateway.log
+
+[Install]
+WantedBy=multi-user.target
