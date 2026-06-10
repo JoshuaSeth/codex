@@ -1274,7 +1274,16 @@ impl AuthManager {
                         _ = &mut shutdown_rx => break,
                         _ = ticker.tick() => {
                             match broker.heartbeat(&lease_id_for_task).await {
-                                Ok(()) => {}
+                                Ok(Some(freeze)) => {
+                                    let message = freeze.display_message();
+                                    tracing::error!(
+                                        lease_id = lease_id_for_task,
+                                        "Auth broker freeze active: {message}"
+                                    );
+                                    eprintln!("Codex auth broker freeze active: {message}");
+                                    std::process::exit(75);
+                                }
+                                Ok(None) => {}
                                 Err(err) => {
                                     tracing::warn!(
                                         lease_id = lease_id_for_task,
