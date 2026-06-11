@@ -1465,6 +1465,24 @@
         }
       ]
     },
+    "TurnStartSubmissionStatus": {
+      "oneOf": [
+        {
+          "description": "The submitted turn was accepted while the thread was idle and should start immediately.",
+          "enum": [
+            "started"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The submitted turn was accepted behind in-flight work for the thread.",
+          "enum": [
+            "queued"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "TurnStatus": {
       "enum": [
         "completed",
@@ -1719,11 +1737,22 @@
     }
   },
   "properties": {
+    "queuedBehindTurnId": {
+      "description": "The active turn that this accepted submission was queued behind.\n\nPresent only when `submissionStatus` is `queued` and the app-server could identify the active turn at submission time.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "submissionStatus": {
+      "$ref": "#/definitions/TurnStartSubmissionStatus"
+    },
     "turn": {
       "$ref": "#/definitions/Turn"
     }
   },
   "required": [
+    "submissionStatus",
     "turn"
   ],
   "title": "TurnStartResponse",

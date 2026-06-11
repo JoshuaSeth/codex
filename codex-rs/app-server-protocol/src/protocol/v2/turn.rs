@@ -149,6 +149,25 @@ pub struct TurnStartParams {
 #[ts(export_to = "v2/")]
 pub struct TurnStartResponse {
     pub turn: Turn,
+    pub submission_status: TurnStartSubmissionStatus,
+    /// The active turn that this accepted submission was queued behind.
+    ///
+    /// Present only when `submissionStatus` is `queued` and the app-server
+    /// could identify the active turn at submission time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub queued_behind_turn_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum TurnStartSubmissionStatus {
+    /// The submitted turn was accepted while the thread was idle and should
+    /// start immediately.
+    Started,
+    /// The submitted turn was accepted behind in-flight work for the thread.
+    Queued,
 }
 
 #[derive(
@@ -187,12 +206,32 @@ pub struct TurnSteerResponse {
 pub struct TurnInterruptParams {
     pub thread_id: String,
     pub turn_id: String,
+    /// When true, respond as soon as the interrupt request is accepted.
+    /// The client must still wait for `turn/completed` to observe final cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub respond_immediately: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct TurnInterruptResponse {}
+pub struct TurnInterruptResponse {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub status: TurnInterruptResponseStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum TurnInterruptResponseStatus {
+    /// The interrupt request was accepted and cancellation has been requested.
+    Requested,
+    /// The interrupted turn has emitted `turn/completed` with `interrupted` status.
+    Interrupted,
+    /// The target turn finished before the interrupt completed.
+    Finished,
+}
 
 // User input types
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

@@ -16679,6 +16679,10 @@
     "TurnInterruptParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "respondImmediately": {
+          "description": "When true, respond as soon as the interrupt request is accepted. The client must still wait for `turn/completed` to observe final cleanup.",
+          "type": "boolean"
+        },
         "threadId": {
           "type": "string"
         },
@@ -16695,8 +16699,49 @@
     },
     "TurnInterruptResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/TurnInterruptResponseStatus"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "threadId",
+        "turnId"
+      ],
       "title": "TurnInterruptResponse",
       "type": "object"
+    },
+    "TurnInterruptResponseStatus": {
+      "oneOf": [
+        {
+          "description": "The interrupt request was accepted and cancellation has been requested.",
+          "enum": [
+            "requested"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The interrupted turn has emitted `turn/completed` with `interrupted` status.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The target turn finished before the interrupt completed.",
+          "enum": [
+            "finished"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "TurnItemsView": {
       "oneOf": [
@@ -16914,15 +16959,44 @@
     "TurnStartResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "queuedBehindTurnId": {
+          "description": "The active turn that this accepted submission was queued behind.\n\nPresent only when `submissionStatus` is `queued` and the app-server could identify the active turn at submission time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "submissionStatus": {
+          "$ref": "#/definitions/TurnStartSubmissionStatus"
+        },
         "turn": {
           "$ref": "#/definitions/Turn"
         }
       },
       "required": [
+        "submissionStatus",
         "turn"
       ],
       "title": "TurnStartResponse",
       "type": "object"
+    },
+    "TurnStartSubmissionStatus": {
+      "oneOf": [
+        {
+          "description": "The submitted turn was accepted while the thread was idle and should start immediately.",
+          "enum": [
+            "started"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The submitted turn was accepted behind in-flight work for the thread.",
+          "enum": [
+            "queued"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "TurnStartedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",

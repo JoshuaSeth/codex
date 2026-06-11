@@ -74,6 +74,7 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnDiffUpdatedNotification;
 use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptResponse;
+use codex_app_server_protocol::TurnInterruptResponseStatus;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnModerationMetadataNotification;
 use codex_app_server_protocol::TurnPlanStep;
@@ -183,7 +184,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            respond_to_pending_interrupts(&thread_state, &outgoing).await;
+            respond_to_pending_interrupts(
+                &thread_state,
+                &outgoing,
+                TurnInterruptResponseStatus::Finished,
+            )
+            .await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -1145,7 +1151,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            respond_to_pending_interrupts(&thread_state, &outgoing).await;
+            respond_to_pending_interrupts(
+                &thread_state,
+                &outgoing,
+                TurnInterruptResponseStatus::Interrupted,
+            )
+            .await;
 
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
@@ -1590,15 +1601,23 @@ fn thread_rollback_response_from_stored_thread(
 async fn respond_to_pending_interrupts(
     thread_state: &Arc<Mutex<ThreadState>>,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    status: TurnInterruptResponseStatus,
 ) {
     let pending = {
         let mut state = thread_state.lock().await;
         std::mem::take(&mut state.pending_interrupts)
     };
 
-    for request_id in pending {
+    for pending_interrupt in pending {
         outgoing
-            .send_response(request_id, TurnInterruptResponse {})
+            .send_response(
+                pending_interrupt.request_id,
+                TurnInterruptResponse {
+                    thread_id: pending_interrupt.thread_id,
+                    turn_id: pending_interrupt.turn_id,
+                    status,
+                },
+            )
             .await;
     }
 }

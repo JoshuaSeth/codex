@@ -273,7 +273,7 @@ async fn turn_start_settings_override_emits_thread_settings_updated() -> Result<
         mcp.read_stream_until_response_message(RequestId::Integer(turn_request_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response(turn_response)?;
+    let TurnStartResponse { turn, .. } = to_response(turn_response)?;
     assert!(!turn.id.is_empty());
 
     let updated = read_thread_settings_updated(&mut mcp).await?;
@@ -318,7 +318,7 @@ async fn start_text_turn(mcp: &mut TestAppServer, thread_id: String) -> Result<(
         mcp.read_stream_until_response_message(RequestId::Integer(turn_request_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response(turn_response)?;
+    let TurnStartResponse { turn, .. } = to_response(turn_response)?;
     assert!(!turn.id.is_empty());
     Ok(())
 }

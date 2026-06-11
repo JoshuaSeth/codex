@@ -402,6 +402,21 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(&request_id, error, /*error_type*/ None);
                 })?;
+        let queued_behind_turn_id = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            thread_state
+                .lock()
+                .await
+                .active_turn_snapshot()
+                .map(|turn| turn.id)
+        };
+        let submission_status = if queued_behind_turn_id.is_some()
+            || matches!(thread.agent_status().await, AgentStatus::Running)
+        {
+            TurnStartSubmissionStatus::Queued
+        } else {
+            TurnStartSubmissionStatus::Started
+        };
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
@@ -504,7 +519,11 @@ impl TurnRequestProcessor {
             duration_ms: None,
         };
 
-        Ok(TurnStartResponse { turn })
+        Ok(TurnStartResponse {
+            turn,
+            submission_status,
+            queued_behind_turn_id,
+        })
     }
 
     async fn build_environment_override(
@@ -1244,7 +1263,11 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
     ) -> Result<Option<TurnInterruptResponse>, JSONRPCErrorError> {
-        let TurnInterruptParams { thread_id, turn_id } = params;
+        let TurnInterruptParams {
+            thread_id,
+            turn_id,
+            respond_immediately,
+        } = params;
         let is_startup_interrupt = turn_id.is_empty();
 
         let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
@@ -1266,9 +1289,19 @@ impl TurnRequestProcessor {
                 } else if thread_state.last_terminal_turn_id.as_deref() == Some(turn_id.as_str())
                     || !is_running
                 {
-                    return Err(invalid_request("no active turn to interrupt"));
+                    return Ok(Some(TurnInterruptResponse {
+                        thread_id,
+                        turn_id,
+                        status: TurnInterruptResponseStatus::Finished,
+                    }));
                 }
-                thread_state.pending_interrupts.push(request_id.clone());
+                if !respond_immediately {
+                    thread_state.pending_interrupts.push(PendingInterrupt {
+                        request_id: request_id.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    });
+                }
             }
 
             self.outgoing
@@ -1282,15 +1315,21 @@ impl TurnRequestProcessor {
             .submit_core_op(request_id, thread.as_ref(), Op::Interrupt)
             .await
         {
-            Ok(_) if is_startup_interrupt => Ok(Some(TurnInterruptResponse {})),
+            Ok(_) if is_startup_interrupt || respond_immediately => {
+                Ok(Some(TurnInterruptResponse {
+                    thread_id,
+                    turn_id,
+                    status: TurnInterruptResponseStatus::Requested,
+                }))
+            }
             Ok(_) => Ok(None),
             Err(err) => {
-                if !is_startup_interrupt {
+                if !is_startup_interrupt && !respond_immediately {
                     let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
                     let mut thread_state = thread_state.lock().await;
                     thread_state
                         .pending_interrupts
-                        .retain(|pending_request_id| pending_request_id != request_id);
+                        .retain(|pending| pending.request_id != *request_id);
                 }
                 let interrupt_target = if is_startup_interrupt {
                     "startup"

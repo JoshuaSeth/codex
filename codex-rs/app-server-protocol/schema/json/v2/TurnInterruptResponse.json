@@ -1,5 +1,48 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "TurnInterruptResponseStatus": {
+      "oneOf": [
+        {
+          "description": "The interrupt request was accepted and cancellation has been requested.",
+          "enum": [
+            "requested"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The interrupted turn has emitted `turn/completed` with `interrupted` status.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The target turn finished before the interrupt completed.",
+          "enum": [
+            "finished"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "status": {
+      "$ref": "#/definitions/TurnInterruptResponseStatus"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "threadId",
+    "turnId"
+  ],
   "title": "TurnInterruptResponse",
   "type": "object"
 }

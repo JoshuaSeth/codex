@@ -4050,6 +4050,10 @@
     },
     "TurnInterruptParams": {
       "properties": {
+        "respondImmediately": {
+          "description": "When true, respond as soon as the interrupt request is accepted. The client must still wait for `turn/completed` to observe final cleanup.",
+          "type": "boolean"
+        },
         "threadId": {
           "type": "string"
         },

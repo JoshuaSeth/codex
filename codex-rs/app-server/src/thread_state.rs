@@ -25,7 +25,14 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tracing::error;
 
-type PendingInterruptQueue = Vec<ConnectionRequestId>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingInterrupt {
+    pub(crate) request_id: ConnectionRequestId,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+}
+
+type PendingInterruptQueue = Vec<PendingInterrupt>;
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,

@@ -413,7 +413,7 @@ async fn send_turn_and_wait(
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
     wait_for_turn_completed(mcp, &turn.id).await?;
     Ok(turn.id)
 }

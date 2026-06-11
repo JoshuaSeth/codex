@@ -57,6 +57,7 @@ use codex_app_server_protocol::TurnEnvironmentParams;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStartSubmissionStatus;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
@@ -163,8 +164,14 @@ async fn run_local_image_turn(detail: Option<ImageDetail>) -> Result<Vec<Value>>
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse {
+        turn,
+        submission_status,
+        queued_behind_turn_id,
+    } = to_response::<TurnStartResponse>(turn_resp)?;
     assert!(!turn.id.is_empty());
+    assert_eq!(submission_status, TurnStartSubmissionStatus::Started);
+    assert_eq!(queued_behind_turn_id, None);
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -255,7 +262,7 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
     assert!(!turn.id.is_empty());
 
     let started_notif: JSONRPCNotification = timeout(
@@ -900,7 +907,7 @@ async fn turn_start_tracks_turn_event_analytics() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1126,7 +1133,7 @@ async fn turn_start_accepts_text_at_limit_with_mention_item() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
     assert_eq!(turn.status, TurnStatus::InProgress);
 
     timeout(
@@ -1406,7 +1413,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
     assert!(!turn.id.is_empty());
 
     // Expect a turn/started notification.
@@ -1460,7 +1467,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req2)),
     )
     .await??;
-    let TurnStartResponse { turn: turn2 } = to_response::<TurnStartResponse>(turn_resp2)?;
+    let TurnStartResponse { turn: turn2, .. } = to_response::<TurnStartResponse>(turn_resp2)?;
     assert!(!turn2.id.is_empty());
     // Ensure the second turn has a different id than the first.
     assert_ne!(turn.id, turn2.id);
@@ -2195,7 +2202,7 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -2699,7 +2706,7 @@ async fn run_environment_selection_case(
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_notification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -2813,7 +2820,7 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_file_change = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -3142,7 +3149,7 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let mut streamed_content = String::new();
     while streamed_content != "live line\n" {
@@ -3810,7 +3817,7 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
         mcp.read_stream_until_response_message(RequestId::Integer(turn_1_req)),
     )
     .await??;
-    let TurnStartResponse { turn: turn_1 } = to_response::<TurnStartResponse>(turn_1_resp)?;
+    let TurnStartResponse { turn: turn_1, .. } = to_response::<TurnStartResponse>(turn_1_resp)?;
 
     let started_file_change_1 = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -3982,7 +3989,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_file_change = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -4128,7 +4135,7 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn: _turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn: _turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_command = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {

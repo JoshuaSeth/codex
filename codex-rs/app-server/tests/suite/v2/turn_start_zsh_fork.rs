@@ -136,7 +136,7 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let started_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -551,7 +551,7 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let mut approved_subcommand_strings = Vec::new();
     let mut approved_subcommand_ids = Vec::new();

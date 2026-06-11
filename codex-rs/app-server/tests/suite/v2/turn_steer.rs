@@ -169,7 +169,7 @@ async fn turn_steer_rejects_oversized_text_input() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let _task_started: JSONRPCNotification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -283,7 +283,7 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
 
     let _task_started: JSONRPCNotification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -420,7 +420,7 @@ async fn turn_steer_rejects_context_only_input_without_merging_context() -> Resu
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn, .. } = to_response::<TurnStartResponse>(turn_resp)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/started"),

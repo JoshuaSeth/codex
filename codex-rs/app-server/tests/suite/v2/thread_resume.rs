@@ -2430,8 +2430,9 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
         primary.read_stream_until_response_message(RequestId::Integer(running_turn_request_id)),
     )
     .await??;
-    let TurnStartResponse { turn: running_turn } =
-        to_response::<TurnStartResponse>(running_turn_resp)?;
+    let TurnStartResponse {
+        turn: running_turn, ..
+    } = to_response::<TurnStartResponse>(running_turn_resp)?;
     assert_eq!(running_turn.items_view, TurnItemsView::NotLoaded);
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -2548,8 +2549,9 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
         primary.read_stream_until_response_message(RequestId::Integer(running_turn_request_id)),
     )
     .await??;
-    let TurnStartResponse { turn: running_turn } =
-        to_response::<TurnStartResponse>(running_turn_resp)?;
+    let TurnStartResponse {
+        turn: running_turn, ..
+    } = to_response::<TurnStartResponse>(running_turn_resp)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/started"),
@@ -2715,8 +2717,9 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
         primary.read_stream_until_response_message(RequestId::Integer(running_turn_id)),
     )
     .await??;
-    let TurnStartResponse { turn: running_turn } =
-        to_response::<TurnStartResponse>(running_turn_resp)?;
+    let TurnStartResponse {
+        turn: running_turn, ..
+    } = to_response::<TurnStartResponse>(running_turn_resp)?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         primary.read_stream_until_notification_message("turn/started"),

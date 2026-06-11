@@ -317,6 +317,8 @@ fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload {
             completed_at: None,
             duration_ms: None,
         },
+        submission_status: codex_app_server_protocol::TurnStartSubmissionStatus::Started,
+        queued_behind_turn_id: None,
     })
 }
 

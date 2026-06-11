@@ -799,6 +799,7 @@ impl AppServerSession {
                 params: TurnInterruptParams {
                     thread_id: thread_id.to_string(),
                     turn_id,
+                    respond_immediately: false,
                 },
             })
             .await?;
