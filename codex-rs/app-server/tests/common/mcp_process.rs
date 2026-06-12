@@ -533,6 +533,7 @@ impl McpProcess {
             .send_turn_interrupt_request(TurnInterruptParams {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
+                respond_immediately: false,
             })
             .await?;
         match tokio::time::timeout(

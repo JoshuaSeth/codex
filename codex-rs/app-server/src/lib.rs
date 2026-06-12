@@ -28,6 +28,8 @@ use crate::transport::OutboundConnectionState;
 use crate::transport::TransportEvent;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_stdio_connection;
+#[cfg(unix)]
+use crate::transport::start_unix_websocket_acceptor;
 use crate::transport::start_websocket_acceptor;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigWarningNotification;
@@ -357,7 +359,7 @@ pub async fn run_main_with_transport(
     }
 
     let mut stdio_handles = Vec::<JoinHandle<()>>::new();
-    let transport_runtime = match transport {
+    let transport_runtime = match &transport {
         AppServerTransport::Stdio => {
             start_stdio_connection(transport_event_tx.clone(), &mut stdio_handles).await?;
             TransportRuntime::Stdio
@@ -365,7 +367,7 @@ pub async fn run_main_with_transport(
         AppServerTransport::WebSocket { bind_address } => {
             let shutdown_token = CancellationToken::new();
             let accept_handle = start_websocket_acceptor(
-                bind_address,
+                *bind_address,
                 transport_event_tx.clone(),
                 shutdown_token.clone(),
             )
@@ -373,6 +375,30 @@ pub async fn run_main_with_transport(
             TransportRuntime::WebSocket {
                 accept_handle,
                 shutdown_token,
+            }
+        }
+        AppServerTransport::UnixSocket { path } => {
+            #[cfg(unix)]
+            {
+                let shutdown_token = CancellationToken::new();
+                let accept_handle = start_unix_websocket_acceptor(
+                    path.clone(),
+                    transport_event_tx.clone(),
+                    shutdown_token.clone(),
+                )
+                .await?;
+                TransportRuntime::WebSocket {
+                    accept_handle,
+                    shutdown_token,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(std::io::Error::new(
+                    ErrorKind::Unsupported,
+                    "unix:// listen URLs are only supported on Unix",
+                ));
             }
         }
     };
@@ -714,7 +740,7 @@ pub async fn run_main_with_transport(
                                             .process_request(
                                                 connection_id,
                                                 request,
-                                                transport,
+                                                transport.clone(),
                                                 &mut connection_state.session,
                                                 &connection_state.outbound_initialized,
                                             )

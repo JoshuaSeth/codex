@@ -20,6 +20,8 @@ use tokio::sync::oneshot;
 type PendingInterruptQueue = Vec<(
     ConnectionRequestId,
     crate::codex_message_processor::ApiVersion,
+    String,
+    String,
 )>;
 
 pub(crate) struct PendingThreadResumeRequest {

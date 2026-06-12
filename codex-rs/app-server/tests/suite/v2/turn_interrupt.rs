@@ -3,6 +3,7 @@
 use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::create_mock_responses_server_sequence;
+use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCNotification;
@@ -15,6 +16,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
+use codex_app_server_protocol::TurnInterruptResponseStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -96,7 +98,8 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
     let interrupt_id = mcp
         .send_turn_interrupt_request(TurnInterruptParams {
             thread_id: thread_id.clone(),
-            turn_id: turn.id,
+            turn_id: turn.id.clone(),
+            respond_immediately: false,
         })
         .await?;
     let interrupt_resp: JSONRPCResponse = timeout(
@@ -104,7 +107,15 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(interrupt_id)),
     )
     .await??;
-    let _resp: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_resp)?;
+    let resp: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_resp)?;
+    assert_eq!(
+        resp,
+        TurnInterruptResponse {
+            thread_id: thread_id.clone(),
+            turn_id: turn.id,
+            status: TurnInterruptResponseStatus::Interrupted,
+        }
+    );
 
     let completed_notif: JSONRPCNotification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -117,6 +128,107 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
             .expect("turn/completed params must be present"),
     )?;
     assert_eq!(completed.thread_id, thread_id);
+    assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_interrupt_can_acknowledge_request_immediately() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let shell_command = vec![
+        "powershell".to_string(),
+        "-Command".to_string(),
+        "Start-Sleep -Seconds 10".to_string(),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let shell_command = vec!["sleep".to_string(), "10".to_string()];
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let working_directory = tmp.path().join("workdir");
+    std::fs::create_dir(&working_directory)?;
+
+    let server =
+        create_mock_responses_server_sequence_unchecked(vec![create_shell_command_sse_response(
+            shell_command.clone(),
+            Some(&working_directory),
+            Some(10_000),
+            "call_sleep_immediate_ack",
+        )?])
+        .await;
+    create_config_toml(&codex_home, &server.uri(), "never")?;
+
+    let mut mcp = McpProcess::new(&codex_home).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![V2UserInput::Text {
+                text: "run sleep".to_string(),
+                text_elements: Vec::new(),
+            }],
+            cwd: Some(working_directory.clone()),
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let interrupt_id = mcp
+        .send_turn_interrupt_request(TurnInterruptParams {
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            respond_immediately: true,
+        })
+        .await?;
+    let interrupt_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(interrupt_id)),
+    )
+    .await??;
+    let resp: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_resp)?;
+    assert_eq!(
+        resp,
+        TurnInterruptResponse {
+            thread_id: thread.id.clone(),
+            turn_id: turn.id,
+            status: TurnInterruptResponseStatus::Requested,
+        }
+    );
+
+    let completed_notif: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notif
+            .params
+            .expect("turn/completed params must be present"),
+    )?;
+    assert_eq!(completed.thread_id, thread.id);
     assert_eq!(completed.turn.status, TurnStatus::Interrupted);
 
     Ok(())
@@ -198,6 +310,7 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
         .send_turn_interrupt_request(TurnInterruptParams {
             thread_id: thread.id.clone(),
             turn_id: turn.id.clone(),
+            respond_immediately: false,
         })
         .await?;
     let interrupt_resp: JSONRPCResponse = timeout(
@@ -205,7 +318,15 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
         mcp.read_stream_until_response_message(RequestId::Integer(interrupt_id)),
     )
     .await??;
-    let _resp: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_resp)?;
+    let resp: TurnInterruptResponse = to_response::<TurnInterruptResponse>(interrupt_resp)?;
+    assert_eq!(
+        resp,
+        TurnInterruptResponse {
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            status: TurnInterruptResponseStatus::Interrupted,
+        }
+    );
 
     let resolved_notification = timeout(
         DEFAULT_READ_TIMEOUT,

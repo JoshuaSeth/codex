@@ -2339,6 +2339,10 @@ pub struct ThreadReadParams {
     /// When true, include turns and their items from rollout history.
     #[serde(default)]
     pub include_turns: bool,
+    /// Optional cap on the number of most recent turns returned when
+    /// `includeTurns` is true. Omit to return all persisted turns.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -3090,12 +3094,32 @@ pub struct TurnSteerResponse {
 pub struct TurnInterruptParams {
     pub thread_id: String,
     pub turn_id: String,
+    /// When true, respond as soon as the interrupt request is accepted.
+    /// The client must still wait for `turn/completed` to observe final cleanup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub respond_immediately: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct TurnInterruptResponse {}
+pub struct TurnInterruptResponse {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub status: TurnInterruptResponseStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum TurnInterruptResponseStatus {
+    /// The interrupt request was accepted and cancellation has been requested.
+    Requested,
+    /// The interrupted turn has emitted `turn/completed` with `interrupted` status.
+    Interrupted,
+    /// The target turn finished before the interrupt completed.
+    Finished,
+}
 
 // User input types
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

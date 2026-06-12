@@ -14496,6 +14496,15 @@
             "description": "When true, include turns and their items from rollout history.",
             "type": "boolean"
           },
+          "limit": {
+            "description": "Optional cap on the number of most recent turns returned when `includeTurns` is true. Omit to return all persisted turns.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "threadId": {
             "type": "string"
           }
@@ -15471,6 +15480,10 @@
       "TurnInterruptParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "respondImmediately": {
+            "description": "When true, respond as soon as the interrupt request is accepted. The client must still wait for `turn/completed` to observe final cleanup.",
+            "type": "boolean"
+          },
           "threadId": {
             "type": "string"
           },
@@ -15487,8 +15500,49 @@
       },
       "TurnInterruptResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/v2/TurnInterruptResponseStatus"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "threadId",
+          "turnId"
+        ],
         "title": "TurnInterruptResponse",
         "type": "object"
+      },
+      "TurnInterruptResponseStatus": {
+        "oneOf": [
+          {
+            "description": "The interrupt request was accepted and cancellation has been requested.",
+            "enum": [
+              "requested"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The interrupted turn has emitted `turn/completed` with `interrupted` status.",
+            "enum": [
+              "interrupted"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "The target turn finished before the interrupt completed.",
+            "enum": [
+              "finished"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "TurnPlanStep": {
         "properties": {

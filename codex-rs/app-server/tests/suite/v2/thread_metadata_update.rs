@@ -101,6 +101,7 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
         .send_thread_read_request(ThreadReadParams {
             thread_id: thread.id,
             include_turns: false,
+            limit: None,
         })
         .await?;
     let read_resp: JSONRPCResponse = timeout(
@@ -413,6 +414,7 @@ async fn thread_metadata_update_can_clear_stored_git_fields() -> Result<()> {
         .send_thread_read_request(ThreadReadParams {
             thread_id,
             include_turns: false,
+            limit: None,
         })
         .await?;
     let read_resp: JSONRPCResponse = timeout(

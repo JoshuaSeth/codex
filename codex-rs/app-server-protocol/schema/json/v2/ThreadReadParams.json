@@ -6,6 +6,15 @@
       "description": "When true, include turns and their items from rollout history.",
       "type": "boolean"
     },
+    "limit": {
+      "description": "Optional cap on the number of most recent turns returned when `includeTurns` is true. Omit to return all persisted turns.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "threadId": {
       "type": "string"
     }

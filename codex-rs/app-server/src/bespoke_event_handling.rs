@@ -85,6 +85,7 @@ use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnDiffUpdatedNotification;
 use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptResponse;
+use codex_app_server_protocol::TurnInterruptResponseStatus;
 use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
@@ -113,6 +114,7 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
@@ -218,6 +220,28 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(_ev) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
+            let pending_interrupts = {
+                let mut state = thread_state.lock().await;
+                std::mem::take(&mut state.pending_interrupts)
+            };
+            for (rid, ver, thread_id, turn_id) in pending_interrupts {
+                match ver {
+                    ApiVersion::V1 => {
+                        let response = InterruptConversationResponse {
+                            abort_reason: TurnAbortReason::Interrupted,
+                        };
+                        outgoing.send_response(rid, response).await;
+                    }
+                    ApiVersion::V2 => {
+                        let response = TurnInterruptResponse {
+                            thread_id,
+                            turn_id,
+                            status: TurnInterruptResponseStatus::Finished,
+                        };
+                        outgoing.send_response(rid, response).await;
+                    }
+                }
+            }
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -1461,7 +1485,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 std::mem::take(&mut state.pending_interrupts)
             };
             if !pending.is_empty() {
-                for (rid, ver) in pending {
+                for (rid, ver, thread_id, turn_id) in pending {
                     match ver {
                         ApiVersion::V1 => {
                             let response = InterruptConversationResponse {
@@ -1470,7 +1494,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                             outgoing.send_response(rid, response).await;
                         }
                         ApiVersion::V2 => {
-                            let response = TurnInterruptResponse {};
+                            let response = TurnInterruptResponse {
+                                thread_id,
+                                turn_id,
+                                status: TurnInterruptResponseStatus::Interrupted,
+                            };
                             outgoing.send_response(rid, response).await;
                         }
                     }

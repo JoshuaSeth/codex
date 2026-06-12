@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -24,13 +25,17 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::{self};
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async_with_config;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -69,16 +74,27 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::print_stderr)]
+fn print_unix_startup_banner(path: &std::path::Path) {
+    let title = colorize("codex app-server (Unix socket)", Style::new().bold().cyan());
+    let listening_label = colorize("listening on:", Style::new().dimmed());
+    let listen_url = colorize(&format!("unix://{}", path.display()), Style::new().green());
+    eprintln!("{title}");
+    eprintln!("  {listening_label} {listen_url}");
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppServerTransport {
     Stdio,
     WebSocket { bind_address: SocketAddr },
+    UnixSocket { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AppServerTransportParseError {
     UnsupportedListenUrl(String),
     InvalidWebSocketListenUrl(String),
+    InvalidUnixSocketListenUrl(String),
 }
 
 impl std::fmt::Display for AppServerTransportParseError {
@@ -86,11 +102,15 @@ impl std::fmt::Display for AppServerTransportParseError {
         match self {
             AppServerTransportParseError::UnsupportedListenUrl(listen_url) => write!(
                 f,
-                "unsupported --listen URL `{listen_url}`; expected `stdio://` or `ws://IP:PORT`"
+                "unsupported --listen URL `{listen_url}`; expected `stdio://`, `ws://IP:PORT`, or `unix://PATH`"
             ),
             AppServerTransportParseError::InvalidWebSocketListenUrl(listen_url) => write!(
                 f,
                 "invalid websocket --listen URL `{listen_url}`; expected `ws://IP:PORT`"
+            ),
+            AppServerTransportParseError::InvalidUnixSocketListenUrl(listen_url) => write!(
+                f,
+                "invalid unix socket --listen URL `{listen_url}`; expected `unix://PATH`"
             ),
         }
     }
@@ -111,6 +131,17 @@ impl AppServerTransport {
                 AppServerTransportParseError::InvalidWebSocketListenUrl(listen_url.to_string())
             })?;
             return Ok(Self::WebSocket { bind_address });
+        }
+
+        if let Some(path) = listen_url.strip_prefix("unix://") {
+            if path.is_empty() {
+                return Err(AppServerTransportParseError::InvalidUnixSocketListenUrl(
+                    listen_url.to_string(),
+                ));
+            }
+            return Ok(Self::UnixSocket {
+                path: PathBuf::from(path),
+            });
         }
 
         Err(AppServerTransportParseError::UnsupportedListenUrl(
@@ -313,9 +344,78 @@ pub(crate) async fn start_websocket_acceptor(
     }))
 }
 
+#[cfg(unix)]
+pub(crate) async fn start_unix_websocket_acceptor(
+    path: PathBuf,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+    shutdown_token: CancellationToken,
+) -> IoResult<JoinHandle<()>> {
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+
+            if !metadata.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("refusing to replace non-socket file at {}", path.display()),
+                ));
+            }
+            tokio::fs::remove_file(&path).await?;
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let listener = UnixListener::bind(&path)?;
+    print_unix_startup_banner(&path);
+    info!(
+        "app-server websocket listening on unix://{}",
+        path.display()
+    );
+
+    let connection_counter = Arc::new(AtomicU64::new(1));
+    Ok(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    info!("unix socket acceptor shutting down");
+                    break;
+                }
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _peer_addr)) => {
+                            info!("unix socket websocket client connected");
+                            let connection_id =
+                                ConnectionId(connection_counter.fetch_add(1, Ordering::Relaxed));
+                            let transport_event_tx_for_connection = transport_event_tx.clone();
+                            tokio::spawn(async move {
+                                run_websocket_connection(
+                                    connection_id,
+                                    stream,
+                                    transport_event_tx_for_connection,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(err) => {
+                            error!("failed to accept unix socket connection: {err}");
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Err(err) = tokio::fs::remove_file(&path).await
+            && err.kind() != ErrorKind::NotFound
+        {
+            warn!("failed to remove unix socket at {}: {err}", path.display());
+        }
+    }))
+}
+
 async fn run_websocket_connection(
     connection_id: ConnectionId,
-    stream: TcpStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     transport_event_tx: mpsc::Sender<TransportEvent>,
 ) {
     let websocket_stream =
@@ -376,15 +476,14 @@ async fn run_websocket_connection(
         .await;
 }
 
-async fn run_websocket_outbound_loop(
-    mut websocket_writer: futures::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-        WebSocketMessage,
-    >,
+async fn run_websocket_outbound_loop<S>(
+    mut websocket_writer: futures::stream::SplitSink<WebSocketStream<S>, WebSocketMessage>,
     mut writer_rx: mpsc::Receiver<OutgoingMessage>,
     mut writer_control_rx: mpsc::Receiver<WebSocketMessage>,
     disconnect_token: CancellationToken,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
             _ = disconnect_token.cancelled() => {
@@ -413,16 +512,16 @@ async fn run_websocket_outbound_loop(
     }
 }
 
-async fn run_websocket_inbound_loop(
-    mut websocket_reader: futures::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-    >,
+async fn run_websocket_inbound_loop<S>(
+    mut websocket_reader: futures::stream::SplitStream<WebSocketStream<S>>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     writer_tx_for_reader: mpsc::Sender<OutgoingMessage>,
     writer_control_tx: mpsc::Sender<WebSocketMessage>,
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
             _ = disconnect_token.cancelled() => {
@@ -702,6 +801,28 @@ mod tests {
     }
 
     #[test]
+    fn app_server_transport_parses_unix_socket_listen_url() {
+        let transport = AppServerTransport::from_listen_url("unix:///tmp/codex-app.sock")
+            .expect("unix listen URL should parse");
+        assert_eq!(
+            transport,
+            AppServerTransport::UnixSocket {
+                path: PathBuf::from("/tmp/codex-app.sock"),
+            }
+        );
+    }
+
+    #[test]
+    fn app_server_transport_rejects_empty_unix_socket_listen_url() {
+        let err = AppServerTransport::from_listen_url("unix://")
+            .expect_err("empty unix socket path should be rejected");
+        assert_eq!(
+            err.to_string(),
+            "invalid unix socket --listen URL `unix://`; expected `unix://PATH`"
+        );
+    }
+
+    #[test]
     fn app_server_transport_rejects_invalid_websocket_listen_url() {
         let err = AppServerTransport::from_listen_url("ws://localhost:1234")
             .expect_err("hostname bind address should be rejected");
@@ -717,7 +838,7 @@ mod tests {
             .expect_err("unsupported scheme should fail");
         assert_eq!(
             err.to_string(),
-            "unsupported --listen URL `http://127.0.0.1:1234`; expected `stdio://` or `ws://IP:PORT`"
+            "unsupported --listen URL `http://127.0.0.1:1234`; expected `stdio://`, `ws://IP:PORT`, or `unix://PATH`"
         );
     }
 

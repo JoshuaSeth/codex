@@ -232,6 +232,7 @@ export type { TurnDiffUpdatedNotification } from "./TurnDiffUpdatedNotification"
 export type { TurnError } from "./TurnError";
 export type { TurnInterruptParams } from "./TurnInterruptParams";
 export type { TurnInterruptResponse } from "./TurnInterruptResponse";
+export type { TurnInterruptResponseStatus } from "./TurnInterruptResponseStatus";
 export type { TurnPlanStep } from "./TurnPlanStep";
 export type { TurnPlanStepStatus } from "./TurnPlanStepStatus";
 export type { TurnPlanUpdatedNotification } from "./TurnPlanUpdatedNotification";

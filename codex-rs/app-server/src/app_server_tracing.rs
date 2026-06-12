@@ -69,6 +69,7 @@ fn transport_name(transport: AppServerTransport) -> &'static str {
     match transport {
         AppServerTransport::Stdio => "stdio",
         AppServerTransport::WebSocket { .. } => "websocket",
+        AppServerTransport::UnixSocket { .. } => "unix-socket",
     }
 }
 

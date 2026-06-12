@@ -145,6 +145,7 @@ use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnInterruptParams;
+use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
@@ -2692,6 +2693,7 @@ impl CodexMessageProcessor {
         let ThreadReadParams {
             thread_id,
             include_turns,
+            limit,
         } = params;
 
         let thread_uuid = match ThreadId::from_string(&thread_id) {
@@ -2792,6 +2794,11 @@ impl CodexMessageProcessor {
             match read_rollout_items_from_rollout(rollout_path).await {
                 Ok(items) => {
                     thread.turns = build_turns_from_rollout_items(&items);
+                    if let Some(limit) = limit {
+                        let limit = limit as usize;
+                        let start = thread.turns.len().saturating_sub(limit);
+                        thread.turns = thread.turns.split_off(start);
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     self.send_invalid_request_error(
@@ -5673,7 +5680,11 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: TurnInterruptParams,
     ) {
-        let TurnInterruptParams { thread_id, .. } = params;
+        let TurnInterruptParams {
+            thread_id,
+            turn_id,
+            respond_immediately,
+        } = params;
 
         let (thread_uuid, thread) = match self.load_thread(&thread_id).await {
             Ok(v) => v,
@@ -5685,17 +5696,40 @@ impl CodexMessageProcessor {
 
         let request = request_id.clone();
 
-        // Record the pending interrupt so we can reply when TurnAborted arrives.
-        {
+        if !respond_immediately {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let mut thread_state = thread_state.lock().await;
-            thread_state
-                .pending_interrupts
-                .push((request, ApiVersion::V2));
+            thread_state.pending_interrupts.push((
+                request.clone(),
+                ApiVersion::V2,
+                thread_id.clone(),
+                turn_id.clone(),
+            ));
         }
 
-        // Submit the interrupt; we'll respond upon TurnAborted.
-        let _ = thread.submit(Op::Interrupt).await;
+        match thread.submit(Op::Interrupt).await {
+            Ok(_) => {
+                if respond_immediately {
+                    let response = TurnInterruptResponse {
+                        thread_id,
+                        turn_id,
+                        status: codex_app_server_protocol::TurnInterruptResponseStatus::Requested,
+                    };
+                    self.outgoing.send_response(request_id, response).await;
+                }
+            }
+            Err(err) => {
+                if !respond_immediately {
+                    let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
+                    let mut thread_state = thread_state.lock().await;
+                    thread_state
+                        .pending_interrupts
+                        .retain(|(pending_request, _, _, _)| pending_request != &request);
+                }
+                self.send_internal_error(request_id, format!("failed to interrupt turn: {err}"))
+                    .await;
+            }
+        }
     }
 
     async fn ensure_conversation_listener(
