@@ -2575,9 +2575,10 @@ impl ThreadRequestProcessor {
                 .await
                 .map(|thread_history| (thread_history, None))
         } else if let Some(stored_thread) = stored_thread_from_running_probe {
-            self.stored_thread_to_initial_history(&stored_thread)
+            let stored_thread = *stored_thread;
+            self.resume_history_from_stored_thread_rollout(&stored_thread)
                 .await
-                .map(|thread_history| (thread_history, Some(*stored_thread)))
+                .map(|thread_history| (thread_history, Some(stored_thread)))
         } else {
             self.resume_thread_from_rollout(&thread_id, path.as_ref())
                 .await
@@ -2842,20 +2843,24 @@ impl ThreadRequestProcessor {
         } else if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
             && let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await
         {
+            let include_history =
+                !params.exclude_turns || params.initial_turns_page.as_ref().is_some();
             let source_thread = self
                 .read_stored_thread_for_resume(
                     &params.thread_id,
                     /*path*/ None,
-                    /*include_history*/ true,
+                    include_history,
                 )
                 .await?;
             Some((existing_thread_id, existing_thread, source_thread))
         } else {
+            let include_history =
+                !params.exclude_turns || params.initial_turns_page.as_ref().is_some();
             let source_thread = self
                 .read_stored_thread_for_resume(
                     &params.thread_id,
                     params.path.as_ref(),
-                    /*include_history*/ true,
+                    include_history,
                 )
                 .await?;
             let existing_thread_id = source_thread.thread_id;
@@ -2933,11 +2938,7 @@ impl ThreadRequestProcessor {
                 .history
                 .as_ref()
                 .map(|history| history.items.clone())
-                .ok_or_else(|| {
-                    internal_error(format!(
-                        "thread {existing_thread_id} did not include persisted history"
-                    ))
-                })?;
+                .unwrap_or_default();
 
             let thread_state = self
                 .thread_state_manager
@@ -3029,12 +3030,44 @@ impl ThreadRequestProcessor {
         path: Option<&PathBuf>,
     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
         let stored_thread = self
-            .read_stored_thread_for_resume(thread_id, path, /*include_history*/ true)
+            .read_stored_thread_for_resume(thread_id, path, /*include_history*/ false)
             .await?;
         let history = self
-            .stored_thread_to_initial_history(&stored_thread)
+            .resume_history_from_stored_thread_rollout(&stored_thread)
             .await?;
         Ok((history, stored_thread))
+    }
+
+    async fn resume_history_from_stored_thread_rollout(
+        &self,
+        stored_thread: &StoredThread,
+    ) -> Result<InitialHistory, JSONRPCErrorError> {
+        let rollout_path = stored_thread.rollout_path.as_ref().ok_or_else(|| {
+            internal_error(format!(
+                "rollout path missing for thread {}",
+                stored_thread.thread_id
+            ))
+        })?;
+        let history =
+            codex_rollout::RolloutRecorder::get_rollout_resume_history(rollout_path.as_path())
+                .await
+                .map_err(|err| {
+                    internal_error(format!(
+                        "failed to load rollout `{}`: {err}",
+                        rollout_path.display()
+                    ))
+                })?;
+        if let InitialHistory::Resumed(resumed) = &history
+            && resumed.conversation_id != stored_thread.thread_id
+        {
+            return Err(invalid_request(format!(
+                "rollout `{}` belongs to thread {}, not {}",
+                rollout_path.display(),
+                resumed.conversation_id,
+                stored_thread.thread_id
+            )));
+        }
+        Ok(history)
     }
 
     async fn read_stored_thread_for_resume(
@@ -3075,28 +3108,6 @@ impl ThreadRequestProcessor {
         }
 
         Ok(stored_thread)
-    }
-
-    #[tracing::instrument(level = "trace", skip_all)]
-    async fn stored_thread_to_initial_history(
-        &self,
-        stored_thread: &StoredThread,
-    ) -> Result<InitialHistory, JSONRPCErrorError> {
-        let thread_id = stored_thread.thread_id;
-        let history = stored_thread
-            .history
-            .as_ref()
-            .map(|history| history.items.clone())
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "thread {thread_id} did not include persisted history"
-                ))
-            })?;
-        Ok(InitialHistory::Resumed(ResumedHistory {
-            conversation_id: thread_id,
-            history,
-            rollout_path: stored_thread.rollout_path.clone(),
-        }))
     }
 
     fn stored_thread_to_api_thread(

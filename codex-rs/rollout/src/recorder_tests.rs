@@ -362,6 +362,295 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
 }
 
 #[tokio::test]
+async fn load_rollout_items_for_resume_reads_latest_compaction_tail() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "old pre-checkpoint prompt",
+                "kind": "plain",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "compacted",
+            "payload": {
+                "message": "older compaction",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "older base"}],
+                    }
+                ],
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "between checkpoints",
+                "kind": "plain",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "compacted",
+            "payload": {
+                "message": "latest compaction",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "latest base"}],
+                    }
+                ],
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "tail prompt",
+                "kind": "plain",
+            },
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_for_resume(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    assert!(matches!(items[0], RolloutItem::SessionMeta(_)));
+    let RolloutItem::Compacted(compacted) = &items[1] else {
+        panic!("expected latest compaction checkpoint");
+    };
+    assert_eq!(compacted.message, "latest compaction");
+    let RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) = &items[2] else {
+        panic!("expected tail user message");
+    };
+    assert_eq!(user_message.message, "tail prompt");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_for_resume_reads_latest_compaction_tail_after_large_prefix()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "old pre-checkpoint prompt",
+                "kind": "plain",
+            },
+        })
+    )?;
+
+    let old_line = serde_json::json!({
+        "timestamp": ts,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "old assistant filler"}],
+        },
+    })
+    .to_string();
+    while file.metadata()?.len() < RESUME_REVERSE_CHUNK_BYTES.saturating_mul(2) {
+        writeln!(file, "{old_line}")?;
+    }
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "compacted",
+            "payload": {
+                "message": "latest compaction",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "latest base"}],
+                    }
+                ],
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "tail prompt",
+                "kind": "plain",
+            },
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_for_resume(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    let RolloutItem::Compacted(compacted) = &items[1] else {
+        panic!("expected latest compaction");
+    };
+    assert_eq!(compacted.message, "latest compaction");
+    let RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) = &items[2] else {
+        panic!("expected tail user message");
+    };
+    assert_eq!(user_message.message, "tail prompt");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_for_resume_without_checkpoint_falls_back_to_full_history()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "compacted",
+            "payload": {
+                "message": "legacy compaction without replacement history"
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "kept by fallback",
+                "kind": "plain",
+            },
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_for_resume(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    let RolloutItem::Compacted(compacted) = &items[1] else {
+        panic!("expected legacy compaction from full fallback");
+    };
+    assert_eq!(compacted.replacement_history, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

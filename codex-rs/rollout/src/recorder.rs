@@ -3,7 +3,12 @@
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader as StdBufReader;
 use std::io::Error as IoError;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -208,6 +213,9 @@ enum ThreadListRepairMode {
     ScanAndRepair,
     StateDbOnly,
 }
+
+const RESUME_REVERSE_CHUNK_BYTES: u64 = 1024 * 1024;
+const RESUME_SESSION_META_SCAN_LINE_LIMIT: usize = 128;
 
 impl RolloutRecorder {
     /// List threads (rollout files) under the provided Codex home directory.
@@ -857,23 +865,8 @@ impl RolloutRecorder {
                 continue;
             }
             saw_non_empty_line = true;
-            let mut v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("failed to parse line as JSON: {line:?}, error: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
-                    continue;
-                }
-            };
-            if strip_legacy_ghost_snapshot_rollout_line(&mut v) {
-                trace!("skipping legacy ghost_snapshot rollout line");
-                continue;
-            }
-
-            // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v.clone()) {
-                Ok(rollout_line) => {
-                    let item = rollout_line.item;
+            match rollout_item_from_json_line(&line) {
+                Ok(Some(item)) => {
                     // Use the FIRST SessionMeta encountered in the file as the canonical
                     // thread id and main session information. Keep all items intact.
                     if thread_id.is_none()
@@ -883,11 +876,14 @@ impl RolloutRecorder {
                     }
                     items.push(item);
                 }
+                Ok(None) => {
+                    trace!("skipping legacy ghost_snapshot rollout line");
+                }
                 Err(e) => {
-                    trace!("failed to parse rollout line: {e}");
+                    warn!("failed to parse rollout line: {line:?}, error: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                 }
-            }
+            };
         }
         if !saw_non_empty_line {
             return Err(IoError::other("empty session file"));
@@ -902,6 +898,57 @@ impl RolloutRecorder {
         Ok((items, thread_id, parse_errors))
     }
 
+    /// Load only the rollout prefix and suffix needed to resume a thread.
+    ///
+    /// Modern compaction records contain `replacement_history`, which is a complete
+    /// replay base. For app-server cold resume we can read the first `session_meta`,
+    /// find the newest such compaction by scanning from the end, and parse only that
+    /// checkpoint plus the tail after it. Full history APIs still use
+    /// [`RolloutRecorder::load_rollout_items`].
+    pub async fn load_rollout_items_for_resume(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let Some(resolved_path) = compression::existing_rollout_path(path).await else {
+            return Self::load_rollout_items(path).await;
+        };
+        let plain_path = compression::plain_rollout_path(resolved_path.as_path());
+        if plain_path != resolved_path {
+            return Self::load_rollout_items(path).await;
+        }
+
+        let Some(checkpoint_offset) = latest_resume_checkpoint_offset(plain_path.as_path())? else {
+            return Self::load_rollout_items(path).await;
+        };
+        let Some((session_meta_item, thread_id, head_parse_errors)) =
+            first_session_meta_for_resume(plain_path.as_path())?
+        else {
+            return Self::load_rollout_items(path).await;
+        };
+
+        let (mut tail_items, tail_thread_id, tail_parse_errors) =
+            load_plain_rollout_items_from_offset(plain_path.as_path(), checkpoint_offset)?;
+        let thread_id = thread_id.or(tail_thread_id);
+        let mut items = Vec::with_capacity(tail_items.len().saturating_add(1));
+        items.push(session_meta_item);
+        items.extend(
+            tail_items
+                .drain(..)
+                .filter(|item| !matches!(item, RolloutItem::SessionMeta(_))),
+        );
+
+        tracing::debug!(
+            "Fast-resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
+            items.len(),
+            thread_id,
+            head_parse_errors.saturating_add(tail_parse_errors),
+        );
+        Ok((
+            items,
+            thread_id,
+            head_parse_errors.saturating_add(tail_parse_errors),
+        ))
+    }
+
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
         let (items, thread_id, _parse_errors) = Self::load_rollout_items(path).await?;
         let conversation_id = thread_id
@@ -912,6 +959,23 @@ impl RolloutRecorder {
         }
 
         info!("Resumed rollout successfully from {path:?}");
+        Ok(InitialHistory::Resumed(ResumedHistory {
+            conversation_id,
+            history: items,
+            rollout_path: Some(compression::plain_rollout_path(path)),
+        }))
+    }
+
+    pub async fn get_rollout_resume_history(path: &Path) -> std::io::Result<InitialHistory> {
+        let (items, thread_id, _parse_errors) = Self::load_rollout_items_for_resume(path).await?;
+        let conversation_id = thread_id
+            .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
+
+        if items.is_empty() {
+            return Ok(InitialHistory::New);
+        }
+
+        info!("Fast-resumed rollout successfully from {path:?}");
         Ok(InitialHistory::Resumed(ResumedHistory {
             conversation_id,
             history: items,
@@ -945,6 +1009,163 @@ impl RolloutRecorder {
         };
         Ok(())
     }
+}
+
+fn rollout_item_from_json_line(line: &str) -> Result<Option<RolloutItem>, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(line)?;
+    if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+        return Ok(None);
+    }
+    serde_json::from_value::<RolloutLine>(value).map(|line| Some(line.item))
+}
+
+fn latest_resume_checkpoint_offset(path: &Path) -> std::io::Result<Option<u64>> {
+    let mut file = File::open(path)?;
+    let mut end = file.seek(SeekFrom::End(0))?;
+    let mut suffix = Vec::new();
+
+    while end > 0 {
+        let chunk_len_u64 = end.min(RESUME_REVERSE_CHUNK_BYTES);
+        let chunk_len =
+            usize::try_from(chunk_len_u64).map_err(|err| IoError::other(err.to_string()))?;
+        let start = end.saturating_sub(chunk_len_u64);
+        file.seek(SeekFrom::Start(start))?;
+        let mut buffer = vec![0_u8; chunk_len];
+        file.read_exact(&mut buffer)?;
+        buffer.extend_from_slice(&suffix);
+
+        let (complete_start, next_suffix) = if start == 0 {
+            (0_usize, Vec::new())
+        } else if let Some(first_newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            (
+                first_newline.saturating_add(1),
+                buffer[..first_newline].to_vec(),
+            )
+        } else {
+            suffix = buffer;
+            end = start;
+            continue;
+        };
+        suffix = next_suffix;
+
+        if let Some(offset) =
+            find_resume_checkpoint_in_complete_region(start, complete_start, &buffer)?
+        {
+            return Ok(Some(offset));
+        }
+        end = start;
+    }
+
+    Ok(None)
+}
+
+fn find_resume_checkpoint_in_complete_region(
+    chunk_start_offset: u64,
+    complete_start: usize,
+    buffer: &[u8],
+) -> std::io::Result<Option<u64>> {
+    let complete = &buffer[complete_start..];
+    let mut line_end = complete.len();
+    while line_end > 0 {
+        while line_end > 0 && matches!(complete[line_end - 1], b'\n' | b'\r') {
+            line_end -= 1;
+        }
+        if line_end == 0 {
+            break;
+        }
+        let line_start = complete[..line_end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index.saturating_add(1));
+        let line = std::str::from_utf8(&complete[line_start..line_end])
+            .map_err(|err| IoError::new(std::io::ErrorKind::InvalidData, err))?;
+        let line_offset = chunk_start_offset.saturating_add(
+            u64::try_from(complete_start.saturating_add(line_start)).unwrap_or(u64::MAX),
+        );
+        if line_is_resume_checkpoint(line) {
+            return Ok(Some(line_offset));
+        }
+        if line_start == 0 {
+            break;
+        }
+        line_end = line_start.saturating_sub(1);
+    }
+    Ok(None)
+}
+
+fn line_is_resume_checkpoint(line: &str) -> bool {
+    matches!(
+        rollout_item_from_json_line(line.trim()),
+        Ok(Some(RolloutItem::Compacted(compacted))) if compacted.replacement_history.is_some()
+    )
+}
+
+fn first_session_meta_for_resume(
+    path: &Path,
+) -> std::io::Result<Option<(RolloutItem, Option<ThreadId>, usize)>> {
+    let file = File::open(path)?;
+    let mut parse_errors = 0usize;
+    for line in StdBufReader::new(file)
+        .lines()
+        .take(RESUME_SESSION_META_SCAN_LINE_LIMIT)
+    {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match rollout_item_from_json_line(&line) {
+            Ok(Some(item @ RolloutItem::SessionMeta(_))) => {
+                let thread_id = match &item {
+                    RolloutItem::SessionMeta(session_meta_line) => Some(session_meta_line.meta.id),
+                    _ => None,
+                };
+                return Ok(Some((item, thread_id, parse_errors)));
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(err) => {
+                trace!("failed to parse rollout header line: {err}");
+                parse_errors = parse_errors.saturating_add(1);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn load_plain_rollout_items_from_offset(
+    path: &Path,
+    offset: u64,
+) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut items = Vec::new();
+    let mut thread_id = None;
+    let mut parse_errors = 0usize;
+
+    for line in StdBufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match rollout_item_from_json_line(&line) {
+            Ok(Some(item)) => {
+                if thread_id.is_none()
+                    && let RolloutItem::SessionMeta(session_meta_line) = &item
+                {
+                    thread_id = Some(session_meta_line.meta.id);
+                }
+                items.push(item);
+            }
+            Ok(None) => {
+                trace!("skipping legacy ghost_snapshot rollout line");
+            }
+            Err(err) => {
+                trace!("failed to parse rollout tail line: {err}");
+                parse_errors = parse_errors.saturating_add(1);
+            }
+        }
+    }
+
+    Ok((items, thread_id, parse_errors))
 }
 
 fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
