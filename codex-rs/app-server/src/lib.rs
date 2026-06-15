@@ -129,6 +129,8 @@ enum LogFormat {
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
+const OUTGOING_ENVELOPE_CHANNEL_CAPACITY: usize = 32 * 1024;
+
 fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoader> {
     match config.experimental_thread_config_endpoint.as_deref() {
         Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
@@ -439,7 +441,8 @@ pub async fn run_main_with_transport_options(
 ) -> IoResult<()> {
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
+    let (outgoing_tx, mut outgoing_rx) =
+        mpsc::channel::<OutgoingEnvelope>(OUTGOING_ENVELOPE_CHANNEL_CAPACITY);
     let (outbound_control_tx, mut outbound_control_rx) =
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
 
