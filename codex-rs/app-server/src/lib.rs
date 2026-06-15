@@ -1040,30 +1040,39 @@ pub async fn run_main_with_transport_options(
                                                 std::sync::atomic::Ordering::Release,
                                             );
                                         if !was_initialized && is_initialized {
-                                            processor
-                                                .send_initialize_notifications_to_connection(
-                                                    connection_id,
-                                                )
-                                                .await;
-                                            initialize_notification_sender
-                                                .send_server_notification_to_connections(
-                                                    &[connection_id],
-                                                    ServerNotification::RemoteControlStatusChanged(
-                                                        remote_control_status.clone(),
-                                                    ),
-                                                )
-                                                .await;
-                                            processor
-                                                .connection_initialized(
-                                                    connection_id,
-                                                    connection_state
-                                                        .session
-                                                        .request_attestation(),
-                                                )
-                                                .await;
-                                            connection_state
-                                                .outbound_initialized
-                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            let processor = Arc::clone(&processor);
+                                            let initialize_notification_sender =
+                                                initialize_notification_sender.clone();
+                                            let remote_control_status = remote_control_status.clone();
+                                            let request_attestation =
+                                                connection_state.session.request_attestation();
+                                            let outbound_initialized =
+                                                Arc::clone(&connection_state.outbound_initialized);
+                                            tokio::spawn(async move {
+                                                processor
+                                                    .send_initialize_notifications_to_connection(
+                                                        connection_id,
+                                                    )
+                                                    .await;
+                                                initialize_notification_sender
+                                                    .send_server_notification_to_connections(
+                                                        &[connection_id],
+                                                        ServerNotification::RemoteControlStatusChanged(
+                                                            remote_control_status,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                processor
+                                                    .connection_initialized(
+                                                        connection_id,
+                                                        request_attestation,
+                                                    )
+                                                    .await;
+                                                outbound_initialized.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                            });
                                         }
                                     }
                                     JSONRPCMessage::Response(response) => {
