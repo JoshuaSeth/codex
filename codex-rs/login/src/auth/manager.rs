@@ -4,9 +4,12 @@ use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fmt::Debug;
 use std::future::Future;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,6 +19,7 @@ use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use codex_agent_identity::decode_agent_identity_jwt;
@@ -27,6 +31,7 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 
 use super::access_token::CodexAccessToken;
 use super::access_token::classify_codex_access_token;
+use super::broker::AuthBrokerClient;
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
@@ -110,6 +115,36 @@ pub(super) const REVOKE_TOKEN_URL: &str = "https://auth.openai.com/oauth/revoke"
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
 static NEXT_DUMMY_AUTH_ID: AtomicU64 = AtomicU64::new(1);
+
+const BROKER_LOGOUT_OUTCOME: &str = "logout";
+pub const BROKER_USAGE_LIMIT_OUTCOME: &str = "usage_limit_reached";
+pub const BROKER_RATE_LIMITED_OUTCOME: &str = "rate_limited";
+pub const BROKER_AUTH_INVALID_OUTCOME: &str = "auth_invalid";
+pub const BROKER_REFRESH_TOKEN_INVALID_OUTCOME: &str = "refresh_token_invalid";
+pub const BROKER_UNAUTHORIZED_OUTCOME: &str = "unauthorized";
+const BROKER_INTERNAL_ERROR_OUTCOME: &str = "internal_error";
+
+struct ActiveBrokerLease {
+    lease_id: String,
+    account_id: String,
+    heartbeat_shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl Debug for ActiveBrokerLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveBrokerLease")
+            .field("lease_id", &self.lease_id)
+            .field("account_id", &self.account_id)
+            .field("heartbeat_active", &self.heartbeat_shutdown.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthBrokerRecovery {
+    pub account_id: String,
+    pub account_email: Option<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -753,6 +788,25 @@ pub fn load_auth_dot_json(
         keyring_backend_kind,
     );
     storage.load()
+}
+
+fn broker_affinity_key(codex_home: &Path) -> String {
+    for key in ["PITCHAI_STATE_KEY", "PITCHAI_CODEX_STATE_KEY"] {
+        if let Some(value) = env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return value;
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    codex_home.hash(&mut hasher);
+    if let Ok(cwd) = env::current_dir() {
+        cwd.hash(&mut hasher);
+    }
+    format!("codex-dev:{:016x}", hasher.finish())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1481,6 +1535,10 @@ pub struct AuthManager {
     chatgpt_base_url: Option<String>,
     refresh_lock: Semaphore,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
+    broker_client: Option<AuthBrokerClient>,
+    broker_affinity_key: String,
+    broker_lease: Mutex<Option<ActiveBrokerLease>>,
+    broker_recovery_lock: Semaphore,
 }
 
 /// Configuration view required to construct a shared [`AuthManager`].
@@ -1523,6 +1581,7 @@ impl Debug for AuthManager {
             )
             .field("chatgpt_base_url", &self.chatgpt_base_url)
             .field("has_external_auth", &self.has_external_auth())
+            .field("broker_enabled", &self.broker_enabled())
             .finish_non_exhaustive()
     }
 }
@@ -1570,7 +1629,15 @@ impl AuthManager {
         .ok()
         .flatten();
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
+        let broker_client = match AuthBrokerClient::from_env() {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::error!("Failed to configure auth broker client: {err}");
+                None
+            }
+        };
         Self {
+            broker_affinity_key: broker_affinity_key(&codex_home),
             codex_home,
             inner: RwLock::new(CachedAuth {
                 auth: managed_auth,
@@ -1584,6 +1651,9 @@ impl AuthManager {
             chatgpt_base_url,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            broker_client,
+            broker_lease: Mutex::new(None),
+            broker_recovery_lock: Semaphore::new(/*permits*/ 1),
         }
     }
 
@@ -1606,6 +1676,10 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            broker_client: None,
+            broker_affinity_key: String::new(),
+            broker_lease: Mutex::new(None),
+            broker_recovery_lock: Semaphore::new(/*permits*/ 1),
         })
     }
 
@@ -1627,6 +1701,10 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            broker_client: None,
+            broker_affinity_key: String::new(),
+            broker_lease: Mutex::new(None),
+            broker_recovery_lock: Semaphore::new(/*permits*/ 1),
         })
     }
 
@@ -1648,6 +1726,10 @@ impl AuthManager {
             external_auth: RwLock::new(Some(
                 Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>
             )),
+            broker_client: None,
+            broker_affinity_key: String::new(),
+            broker_lease: Mutex::new(None),
+            broker_recovery_lock: Semaphore::new(/*permits*/ 1),
         })
     }
 
@@ -1684,6 +1766,21 @@ impl AuthManager {
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
+            if self.broker_enabled() {
+                let detail = format!("Proactive token refresh failed: {err}");
+                match self
+                    .recover_from_broker(BROKER_REFRESH_TOKEN_INVALID_OUTCOME, Some(&detail))
+                    .await
+                {
+                    Ok(Some(_)) => return self.auth_cached(),
+                    Ok(None) => {}
+                    Err(recovery_err) => {
+                        tracing::warn!(
+                            "Auth broker recovery after proactive token refresh failed: {recovery_err}"
+                        );
+                    }
+                }
+            }
             return Some(auth);
         }
         self.auth_cached()
@@ -1900,6 +1997,213 @@ impl AuthManager {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
 
+    pub fn broker_enabled(&self) -> bool {
+        self.broker_client.is_some()
+    }
+
+    fn has_active_broker_lease(&self) -> bool {
+        self.broker_lease
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|_| ()))
+            .is_some()
+    }
+
+    fn take_active_broker_lease(&self) -> Option<ActiveBrokerLease> {
+        self.broker_lease
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    fn current_auth_snapshot(&self) -> std::io::Result<Option<AuthDotJson>> {
+        load_auth_dot_json(
+            &self.codex_home,
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        )
+    }
+
+    fn install_broker_lease(&self, lease_id: String, account_id: String) {
+        let Some(broker) = self.broker_client.clone() else {
+            return;
+        };
+
+        let mut heartbeat_shutdown = None;
+        let interval = broker.heartbeat_interval();
+        if !interval.is_zero() {
+            let lease_id_for_task = lease_id.clone();
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+            heartbeat_shutdown = Some(shutdown_tx);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        _ = ticker.tick() => {
+                            match broker.heartbeat(&lease_id_for_task).await {
+                                Ok(Some(freeze)) => {
+                                    let message = freeze.display_message();
+                                    tracing::error!(
+                                        lease_id = lease_id_for_task,
+                                        "Auth broker freeze active: {message}"
+                                    );
+                                    std::process::exit(75);
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    tracing::warn!(
+                                        lease_id = lease_id_for_task,
+                                        "Auth broker heartbeat failed: {err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Ok(mut guard) = self.broker_lease.lock() {
+            *guard = Some(ActiveBrokerLease {
+                lease_id,
+                account_id,
+                heartbeat_shutdown,
+            });
+        }
+    }
+
+    pub async fn recover_from_broker(
+        &self,
+        exhausted_outcome: &str,
+        detail: Option<&str>,
+    ) -> std::io::Result<Option<AuthBrokerRecovery>> {
+        let Some(broker) = self.broker_client.clone() else {
+            return Ok(None);
+        };
+
+        if !self
+            .auth_cached()
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth)
+            && !self.has_active_broker_lease()
+        {
+            return Ok(None);
+        }
+
+        let _guard = self
+            .broker_recovery_lock
+            .acquire()
+            .await
+            .map_err(std::io::Error::other)?;
+        let auth_before_rotation = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(exhausted_outcome, detail, auth_before_rotation.as_ref())
+            .await
+        {
+            tracing::warn!("Failed to report exhausted auth broker lease: {err}");
+        }
+
+        let lease = broker
+            .acquire_lease(&self.broker_affinity_key)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        if let Err(err) = save_auth(
+            &self.codex_home,
+            &lease.auth,
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        ) {
+            let detail = format!("Failed to persist broker lease auth.json: {err}");
+            tracing::error!("{detail}");
+            if let Err(report_err) = broker
+                .report_lease(
+                    &lease.lease_id,
+                    BROKER_INTERNAL_ERROR_OUTCOME,
+                    Some(&lease.auth),
+                    Some(&detail),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to release broker lease after persistence error: {report_err}"
+                );
+            }
+            return Err(err);
+        }
+
+        let auth = load_auth(
+            &self.codex_home,
+            false,
+            self.auth_credentials_store_mode,
+            self.forced_chatgpt_workspace_id().as_deref(),
+            self.chatgpt_base_url.as_deref(),
+            self.keyring_backend_kind,
+        )
+        .await?
+        .ok_or_else(|| {
+            std::io::Error::other("Broker lease auth.json was not readable after save.")
+        })?;
+        self.set_cached_auth(Some(auth));
+        self.install_broker_lease(lease.lease_id, lease.account_id.clone());
+
+        Ok(Some(AuthBrokerRecovery {
+            account_email: lease
+                .auth
+                .tokens
+                .as_ref()
+                .and_then(|tokens| tokens.id_token.email.clone()),
+            account_id: lease.account_id,
+        }))
+    }
+
+    async fn report_active_broker_lease(
+        &self,
+        outcome: &str,
+        detail: Option<&str>,
+        updated_auth: Option<&AuthDotJson>,
+    ) -> std::io::Result<()> {
+        let Some(mut lease) = self.take_active_broker_lease() else {
+            return Ok(());
+        };
+
+        if let Some(shutdown_tx) = lease.heartbeat_shutdown.take() {
+            let _ = shutdown_tx.send(());
+        }
+
+        let Some(broker) = self.broker_client.clone() else {
+            return Ok(());
+        };
+
+        broker
+            .report_lease(&lease.lease_id, outcome, updated_auth, detail)
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    async fn sync_active_broker_lease(&self, updated_auth: &AuthDotJson) {
+        let lease_id = self
+            .broker_lease
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|lease| lease.lease_id.clone()));
+        let Some(lease_id) = lease_id else {
+            return;
+        };
+        let Some(broker) = self.broker_client.clone() else {
+            return;
+        };
+
+        if let Err(err) = broker.sync_lease(&lease_id, updated_auth).await {
+            tracing::warn!(
+                lease_id,
+                "Failed to sync auth broker lease auth.json: {err}"
+            );
+        }
+    }
+
     fn external_auth(&self) -> Option<Arc<dyn ExternalAuth>> {
         self.external_auth
             .read()
@@ -2028,9 +2332,20 @@ impl AuthManager {
 
     /// Log out by deleting the on‑disk auth.json (if present). Returns Ok(true)
     /// if a file was removed, Ok(false) if no auth file existed. On success,
-    /// reloads the in‑memory auth cache so callers immediately observe the
+    /// reloads the in-memory auth cache so callers immediately observe the
     /// unauthenticated state.
     pub async fn logout(&self) -> std::io::Result<bool> {
+        let auth_snapshot = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(
+                BROKER_LOGOUT_OUTCOME,
+                Some("User requested logout."),
+                auth_snapshot.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!("Failed to report auth broker lease during logout: {err}");
+        }
         let removed = logout_all_stores(
             &self.codex_home,
             self.auth_credentials_store_mode,
@@ -2042,6 +2357,17 @@ impl AuthManager {
     }
 
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
+        let auth_snapshot = self.current_auth_snapshot().ok().flatten();
+        if let Err(err) = self
+            .report_active_broker_lease(
+                BROKER_LOGOUT_OUTCOME,
+                Some("User requested logout."),
+                auth_snapshot.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!("Failed to report auth broker lease during logout: {err}");
+        }
         let auth_dot_json = self
             .auth_cached()
             .and_then(|auth| auth.get_current_auth_json());
@@ -2151,6 +2477,7 @@ impl AuthManager {
             AuthKeyringBackendKind::default(),
         )
         .map_err(RefreshTokenError::Transient)?;
+        self.sync_active_broker_lease(&auth_dot_json).await;
         self.reload().await;
         Ok(())
     }
@@ -2171,6 +2498,9 @@ impl AuthManager {
             refresh_response.refresh_token,
         )
         .map_err(RefreshTokenError::from)?;
+        if let Ok(Some(updated_auth)) = auth.storage().load() {
+            self.sync_active_broker_lease(&updated_auth).await;
+        }
         self.reload().await;
 
         Ok(())

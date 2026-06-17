@@ -17,11 +17,17 @@ pub use server::ServerOptions;
 pub use server::ShutdownHandle;
 pub use server::run_login_server;
 
+pub use auth::AuthBrokerRecovery;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
 pub use auth::AuthKeyringBackendKind;
 pub use auth::AuthManager;
 pub use auth::AuthManagerConfig;
+pub use auth::BROKER_AUTH_INVALID_OUTCOME;
+pub use auth::BROKER_RATE_LIMITED_OUTCOME;
+pub use auth::BROKER_REFRESH_TOKEN_INVALID_OUTCOME;
+pub use auth::BROKER_UNAUTHORIZED_OUTCOME;
+pub use auth::BROKER_USAGE_LIMIT_OUTCOME;
 pub use auth::CLIENT_ID;
 pub use auth::CODEX_ACCESS_TOKEN_ENV_VAR;
 pub use auth::CODEX_API_KEY_ENV_VAR;
