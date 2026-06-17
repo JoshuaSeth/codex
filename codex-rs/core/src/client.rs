@@ -96,6 +96,7 @@ use crate::error::Result;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
+use crate::privacy_filter::PrivacyFilter;
 use crate::tools::spec::create_tools_json_for_responses_api;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
@@ -131,6 +132,7 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    privacy_filter: Option<Arc<StdMutex<PrivacyFilter>>>,
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -237,6 +239,8 @@ impl ModelClient {
                 beta_features_header,
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                privacy_filter: PrivacyFilter::from_env_if_enabled()
+                    .map(|filter| Arc::new(StdMutex::new(filter))),
             }),
         }
     }
@@ -506,7 +510,13 @@ impl ModelClientSession {
         service_tier: Option<ServiceTier>,
     ) -> Result<ResponsesApiRequest> {
         let instructions = &prompt.base_instructions.text;
-        let input = prompt.get_formatted_input();
+        let mut input = prompt.get_formatted_input();
+        if let Some(privacy_filter) = &self.client.state.privacy_filter {
+            privacy_filter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .anonymize_response_items(&mut input)?;
+        }
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let default_reasoning_effort = model_info.default_reasoning_level;
         let reasoning = if model_info.supports_reasoning_summaries {
@@ -773,7 +783,11 @@ impl ModelClientSession {
                 self.client.state.provider.stream_idle_timeout(),
             )
             .map_err(map_api_error)?;
-            let (stream, _last_request_rx) = map_response_stream(stream, otel_manager.clone());
+            let (stream, _last_request_rx) = map_response_stream(
+                stream,
+                otel_manager.clone(),
+                self.client.state.privacy_filter.clone(),
+            );
             return Ok(stream);
         }
 
@@ -806,7 +820,11 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
-                    let (stream, _) = map_response_stream(stream, otel_manager.clone());
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        otel_manager.clone(),
+                        self.client.state.privacy_filter.clone(),
+                    );
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
@@ -898,8 +916,11 @@ impl ModelClientSession {
                 .stream_request(ws_request)
                 .await
                 .map_err(map_api_error)?;
-            let (stream, last_request_rx) =
-                map_response_stream(stream_result, otel_manager.clone());
+            let (stream, last_request_rx) = map_response_stream(
+                stream_result,
+                otel_manager.clone(),
+                self.client.state.privacy_filter.clone(),
+            );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
         }
@@ -1106,6 +1127,7 @@ fn build_responses_headers(
 fn map_response_stream<S>(
     api_stream: S,
     otel_manager: OtelManager,
+    privacy_filter: Option<Arc<StdMutex<PrivacyFilter>>>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1125,8 +1147,15 @@ where
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
+                    let mut downstream_item = item;
+                    if let Some(privacy_filter) = &privacy_filter {
+                        privacy_filter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .deanonymize_response_item(&mut downstream_item);
+                    }
                     if tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .send(Ok(ResponseEvent::OutputItemDone(downstream_item)))
                         .await
                         .is_err()
                     {
@@ -1266,13 +1295,22 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::ModelClient;
+    use crate::client_common::Prompt;
+    use crate::client_common::ResponseEvent;
+    use crate::privacy_filter::PrivacyFilter;
     use codex_otel::OtelManager;
     use codex_protocol::ThreadId;
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
+    use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn test_model_client(session_source: SessionSource) -> ModelClient {
         let provider = crate::model_provider_info::create_oss_provider_with_base_url(
@@ -1337,6 +1375,37 @@ mod tests {
         )
     }
 
+    fn user_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn test_privacy_filter(text: &str) -> PrivacyFilter {
+        let alice_start = text.find("Alice Smith").expect("Alice span");
+        let email_start = text.find("alice.smith@example.com").expect("email span");
+        PrivacyFilter::with_static_spans_for_tests(vec![
+            (
+                alice_start,
+                alice_start + "Alice Smith".len(),
+                "private_person",
+                "Alice Smith",
+            ),
+            (
+                email_start,
+                email_start + "alice.smith@example.com".len(),
+                "private_email",
+                "alice.smith@example.com",
+            ),
+        ])
+    }
+
     #[test]
     fn build_subagent_headers_sets_other_subagent_label() {
         let client = test_model_client(SessionSource::SubAgent(SubAgentSource::Other(
@@ -1360,5 +1429,88 @@ mod tests {
             .await
             .expect("empty summarize request should succeed");
         assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn privacy_filter_anonymizes_responses_request_input_before_send() {
+        let text = "Ask Alice Smith at alice.smith@example.com about the contract.";
+        let mut client = test_model_client(SessionSource::Cli);
+        let privacy_filter = Arc::new(Mutex::new(test_privacy_filter(text)));
+        Arc::get_mut(&mut client.state)
+            .expect("test client state should be unique")
+            .privacy_filter = Some(Arc::clone(&privacy_filter));
+        let session = client.new_session();
+        let model_info = test_model_info();
+        let prompt = Prompt {
+            input: vec![user_message(text)],
+            ..Prompt::default()
+        };
+
+        let request = session
+            .build_responses_request(
+                &client
+                    .state
+                    .provider
+                    .to_api_provider(None)
+                    .expect("provider"),
+                &prompt,
+                &model_info,
+                None,
+                ReasoningSummary::None,
+                None,
+            )
+            .expect("request");
+        let serialized = serde_json::to_string(&request.input).expect("serialize input");
+
+        assert!(!serialized.contains("Alice Smith"));
+        assert!(!serialized.contains("alice.smith@example.com"));
+        assert!(serialized.contains("@example.com"));
+        assert!(!serialized.contains("by_real"));
+        assert!(!serialized.contains("by_fake"));
+    }
+
+    #[tokio::test]
+    async fn privacy_filter_restores_response_stream_items_before_downstream_display() {
+        let text = "Contact Alice Smith at alice.smith@example.com.";
+        let privacy_filter = Arc::new(Mutex::new(test_privacy_filter(text)));
+        let mut outbound = vec![user_message(text)];
+        privacy_filter
+            .lock()
+            .expect("privacy filter lock")
+            .anonymize_response_items(&mut outbound)
+            .expect("anonymize");
+        let fake_text = match &outbound[0] {
+            ResponseItem::Message { content, .. } => match &content[0] {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => text.clone(),
+                ContentItem::InputImage { .. } => panic!("expected text"),
+            },
+            _ => panic!("expected message"),
+        };
+        assert!(!fake_text.contains("Alice Smith"));
+
+        let api_stream = futures::stream::iter([
+            Ok(ResponseEvent::OutputItemDone(user_message(&fake_text))),
+            Ok(ResponseEvent::Completed {
+                response_id: "resp-1".to_string(),
+                token_usage: None,
+            }),
+        ]);
+        let (mut stream, _) =
+            super::map_response_stream(api_stream, test_otel_manager(), Some(privacy_filter));
+
+        let observed = stream
+            .next()
+            .await
+            .expect("stream event")
+            .expect("ok event");
+        let ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) = observed else {
+            panic!("expected output item");
+        };
+        let (ContentItem::InputText { text } | ContentItem::OutputText { text }) = &content[0]
+        else {
+            panic!("expected text");
+        };
+        assert!(text.contains("Alice Smith"));
+        assert!(text.contains("alice.smith@example.com"));
     }
 }
