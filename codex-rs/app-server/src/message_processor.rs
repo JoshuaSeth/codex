@@ -1180,6 +1180,12 @@ impl MessageProcessor {
             ClientRequest::ThreadLoadedList { params, .. } => {
                 self.thread_processor.thread_loaded_list(params).await
             }
+            ClientRequest::ThreadStatusRead { params, .. } => {
+                self.thread_processor.thread_status_read(params).await
+            }
+            ClientRequest::ThreadStatusList { params, .. } => {
+                self.thread_processor.thread_status_list(params).await
+            }
             ClientRequest::ThreadRead { params, .. } => {
                 self.thread_processor.thread_read(params).await
             }

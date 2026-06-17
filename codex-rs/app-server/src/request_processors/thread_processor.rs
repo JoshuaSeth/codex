@@ -629,6 +629,24 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn thread_status_read(
+        &self,
+        params: ThreadStatusReadParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_status_read_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_status_list(
+        &self,
+        params: ThreadStatusListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_status_list_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
     pub(crate) async fn thread_read(
         &self,
         params: ThreadReadParams,
@@ -2119,6 +2137,36 @@ impl ThreadRequestProcessor {
             data: page,
             next_cursor,
         })
+    }
+
+    async fn thread_status_read_response_inner(
+        &self,
+        params: ThreadStatusReadParams,
+    ) -> Result<ThreadStatusReadResponse, JSONRPCErrorError> {
+        let ThreadStatusReadParams { thread_id } = params;
+        ThreadId::from_string(&thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let status = self
+            .thread_watch_manager
+            .loaded_status_for_thread(&thread_id)
+            .await;
+        Ok(ThreadStatusReadResponse { status })
+    }
+
+    async fn thread_status_list_response_inner(
+        &self,
+        params: ThreadStatusListParams,
+    ) -> Result<ThreadStatusListResponse, JSONRPCErrorError> {
+        let ThreadStatusListParams { thread_ids } = params;
+        for thread_id in &thread_ids {
+            ThreadId::from_string(thread_id)
+                .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        }
+        let statuses = self
+            .thread_watch_manager
+            .loaded_statuses_for_threads(thread_ids)
+            .await;
+        Ok(ThreadStatusListResponse { statuses })
     }
 
     async fn thread_read_response_inner(
