@@ -20,8 +20,9 @@ from dataclasses import dataclass
 
 DETECTOR_CMD = os.environ.get(
     "PITCHAI_CODEX_PRIVACY_FILTER_CMD",
-    f"{sys.executable} scripts/privacy_filter_gliner.py",
+    f"{sys.executable} scripts/privacy_filter_openai.py",
 )
+DETECTOR_KIND = "openai/privacy-filter"
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,8 @@ def main() -> int:
     ]
     result = {
         "detector_cmd": DETECTOR_CMD,
+        "detector_kind": DETECTOR_KIND,
+        "detector_source": "https://huggingface.co/openai/privacy-filter",
         "original_local_input": original,
         "anonymized_outbound_payload": outbound,
         "backend_like_fake_response": backend_response,
