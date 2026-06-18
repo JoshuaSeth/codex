@@ -11,6 +11,8 @@ use std::process::Command;
 
 const ENABLE_ENV: &str = "PITCHAI_CODEX_PRIVACY_MIDDLEWARE";
 const DETECTOR_CMD_ENV: &str = "PITCHAI_CODEX_PRIVACY_FILTER_CMD";
+const DEFAULT_OPENAI_DETECTOR: &str =
+    "python3 /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py";
 
 #[derive(Debug)]
 pub(crate) struct PrivacyFilter {
@@ -19,6 +21,7 @@ pub(crate) struct PrivacyFilter {
     secret: String,
     real_to_fake: HashMap<String, String>,
     fake_to_real: HashMap<String, String>,
+    inbound_pending: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,10 +50,12 @@ impl PrivacyFilter {
             enabled,
             detector_cmd: std::env::var(DETECTOR_CMD_ENV)
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| enabled.then(|| DEFAULT_OPENAI_DETECTOR.to_string())),
             secret: random_secret(),
             real_to_fake: HashMap::new(),
             fake_to_real: HashMap::new(),
+            inbound_pending: String::new(),
         }
     }
 
@@ -62,6 +67,7 @@ impl PrivacyFilter {
             secret: random_secret(),
             real_to_fake: HashMap::new(),
             fake_to_real: HashMap::new(),
+            inbound_pending: String::new(),
         }
     }
 
@@ -73,6 +79,7 @@ impl PrivacyFilter {
             secret: "test-secret".to_string(),
             real_to_fake: HashMap::new(),
             fake_to_real: HashMap::new(),
+            inbound_pending: String::new(),
         }
     }
 
@@ -86,13 +93,13 @@ impl PrivacyFilter {
         Ok(())
     }
 
-    pub(crate) fn de_anonymize_event(&self, event: &mut codex_api::ResponseEvent) {
+    pub(crate) fn de_anonymize_event(&mut self, event: &mut codex_api::ResponseEvent) {
         if !self.enabled {
             return;
         }
         match event {
             codex_api::ResponseEvent::OutputTextDelta(delta) => {
-                *delta = self.de_anonymize_text(delta);
+                *delta = self.de_anonymize_stream_delta(delta);
             }
             codex_api::ResponseEvent::OutputItemDone(item)
             | codex_api::ResponseEvent::OutputItemAdded(item) => {
@@ -111,6 +118,14 @@ impl PrivacyFilter {
             | codex_api::ResponseEvent::RateLimits(_)
             | codex_api::ResponseEvent::ModelsEtag(_) => {}
         }
+    }
+
+    pub(crate) fn take_pending_de_anonymized_delta(&mut self) -> Option<String> {
+        if self.inbound_pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.inbound_pending);
+        Some(self.de_anonymize_text(&pending))
     }
 
     fn anonymize_response_item(&mut self, item: &mut ResponseItem) -> anyhow::Result<()> {
@@ -228,6 +243,33 @@ impl PrivacyFilter {
             }
         }
         restored
+    }
+
+    fn de_anonymize_stream_delta(&mut self, delta: &str) -> String {
+        let combined = format!("{}{}", self.inbound_pending, delta);
+        let restored = self.de_anonymize_text(&combined);
+        let hold_len = self.longest_fake_prefix_suffix(&restored);
+        let split_at = restored.len().saturating_sub(hold_len);
+        self.inbound_pending = restored[split_at..].to_string();
+        restored[..split_at].to_string()
+    }
+
+    fn longest_fake_prefix_suffix(&self, text: &str) -> usize {
+        let mut longest = 0;
+        for boundary in text.char_indices().map(|(idx, _)| idx).chain([text.len()]) {
+            let suffix = &text[boundary..];
+            if suffix.is_empty() {
+                continue;
+            }
+            if self
+                .fake_to_real
+                .keys()
+                .any(|fake| fake.starts_with(suffix) && fake.len() > suffix.len())
+            {
+                longest = longest.max(suffix.len());
+            }
+        }
+        longest
     }
 
     fn detect(&self, text: &str) -> anyhow::Result<Vec<DetectedSpan>> {
@@ -450,6 +492,7 @@ print(json.dumps({{"spans": spans}}))
             secret: "test".to_string(),
             real_to_fake: HashMap::new(),
             fake_to_real: HashMap::new(),
+            inbound_pending: String::new(),
         };
         assert_eq!(filter.anonymize_text("Jane Smith").unwrap(), "Jane Smith");
         assert_eq!(filter.de_anonymize_text("Jane Smith"), "Jane Smith");
@@ -467,6 +510,65 @@ print(json.dumps({{"spans": spans}}))
             panic!("expected output text delta");
         };
         assert_eq!(delta, "Hello Jane Smith");
+    }
+
+    #[test]
+    fn de_anonymizes_fake_values_split_across_streaming_chunks() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let fake = filter.anonymize_text("Jane Smith").unwrap();
+        let split = fake.find(' ').unwrap_or(fake.len() / 2) + 1;
+        let mut first = codex_api::ResponseEvent::OutputTextDelta(fake[..split].to_string());
+        filter.de_anonymize_event(&mut first);
+        let codex_api::ResponseEvent::OutputTextDelta(first_delta) = first else {
+            panic!("expected first text delta");
+        };
+        assert_eq!(first_delta, "");
+
+        let mut second = codex_api::ResponseEvent::OutputTextDelta(fake[split..].to_string());
+        filter.de_anonymize_event(&mut second);
+        let codex_api::ResponseEvent::OutputTextDelta(second_delta) = second else {
+            panic!("expected second text delta");
+        };
+        assert_eq!(second_delta, "Jane Smith");
+        assert_eq!(filter.take_pending_de_anonymized_delta(), None);
+    }
+
+    #[test]
+    fn overlap_filter_keeps_outer_span_and_drops_inner_overlap() {
+        let spans = remove_overlaps(vec![
+            DetectedSpan {
+                start: 0,
+                end: 10,
+                kind: "private_person".to_string(),
+            },
+            DetectedSpan {
+                start: 5,
+                end: 10,
+                kind: "private_person".to_string(),
+            },
+            DetectedSpan {
+                start: 20,
+                end: 30,
+                kind: "private_address".to_string(),
+            },
+        ]);
+        assert_eq!(
+            spans,
+            vec![
+                DetectedSpan {
+                    start: 0,
+                    end: 10,
+                    kind: "private_person".to_string(),
+                },
+                DetectedSpan {
+                    start: 20,
+                    end: 30,
+                    kind: "private_address".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

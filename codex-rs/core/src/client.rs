@@ -1759,14 +1759,31 @@ where
                 break;
             };
             let event = event.map(|mut event| {
-                privacy_filter
+                let mut privacy_filter = privacy_filter
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .de_anonymize_event(&mut event);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                privacy_filter.de_anonymize_event(&mut event);
                 event
             });
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
+                    let pending_delta = privacy_filter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_pending_de_anonymized_delta();
+                    if let Some(delta) = pending_delta
+                        && tx_event
+                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                            .await
+                            .is_err()
+                    {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
                     items_added.push(item.clone());
                     if tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(item)))
@@ -1786,6 +1803,18 @@ where
                     token_usage,
                     end_turn,
                 }) => {
+                    let pending_delta = privacy_filter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_pending_de_anonymized_delta();
+                    if let Some(delta) = pending_delta
+                        && tx_event
+                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(

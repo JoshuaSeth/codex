@@ -21,6 +21,8 @@ from transformers import pipeline
 
 
 MODEL_ID = "openai/privacy-filter"
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
 
 
 @cache
@@ -60,11 +62,41 @@ def merge_adjacent_spans(
     return spans
 
 
+def chunk_offsets(text: str) -> list[tuple[int, str]]:
+    if len(text) <= CHUNK_SIZE:
+        return [(0, text)]
+
+    chunks: list[tuple[int, str]] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + CHUNK_SIZE)
+        if end < len(text):
+            split = max(text.rfind("\n", start, end), text.rfind(" ", start, end))
+            if split > start + (CHUNK_SIZE // 2):
+                end = split + 1
+        chunks.append((start, text[start:end]))
+        if end == len(text):
+            break
+        start = max(end - CHUNK_OVERLAP, start + 1)
+    return chunks
+
+
+def detect(text: str) -> list[dict[str, int | str]]:
+    entities: list[dict[str, Any]] = []
+    model = classifier()
+    for offset, chunk in chunk_offsets(text):
+        for entity in model(chunk):
+            shifted = dict(entity)
+            shifted["start"] = int(shifted["start"]) + offset
+            shifted["end"] = int(shifted["end"]) + offset
+            entities.append(shifted)
+    return merge_adjacent_spans(text, entities)
+
+
 def main() -> int:
     payload = json.load(sys.stdin)
     text = payload["text"]
-    entities = classifier()(text)
-    print(json.dumps({"spans": merge_adjacent_spans(text, entities)}, separators=(",", ":")))
+    print(json.dumps({"spans": detect(text)}, separators=(",", ":")))
     return 0
 
 
