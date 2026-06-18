@@ -26,7 +26,12 @@ def main() -> int:
                 break
             spans.append({"start": index, "end": index + len(value), "kind": kind})
             start = index + len(value)
-    print(json.dumps({"spans": sorted(spans, key=lambda span: span["start"])}, separators=(",", ":")))
+    print(
+        json.dumps(
+            {"spans": sorted(spans, key=lambda span: span["start"])},
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 

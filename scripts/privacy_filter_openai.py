@@ -46,8 +46,12 @@ def merge_adjacent_spans(
     text: str, entities: list[dict[str, Any]]
 ) -> list[dict[str, int | str]]:
     spans: list[dict[str, int | str]] = []
-    for entity in sorted(entities, key=lambda item: (int(item["start"]), int(item["end"]))):
-        kind = str(entity.get("entity_group") or entity.get("entity") or "private_unknown")
+    for entity in sorted(
+        entities, key=lambda item: (int(item["start"]), int(item["end"]))
+    ):
+        kind = str(
+            entity.get("entity_group") or entity.get("entity") or "private_unknown"
+        )
         start, end = trim_span(text, int(entity["start"]), int(entity["end"]))
         if start >= end:
             continue

@@ -90,7 +90,10 @@ printf 'Installed codex-privacy to %s/bin/codex-privacy\\n' "${PREFIX}"
         tar.add(package_dir, arcname=package_name)
 
     archive_sha = sha256(archive)
-    release_url = args.release_url or f"https://github.com/JoshuaSeth/codex/releases/download/{version}/{archive.name}"
+    release_url = (
+        args.release_url
+        or f"https://github.com/JoshuaSeth/codex/releases/download/{version}/{archive.name}"
+    )
 
     formula_dir = args.out_dir / "homebrew"
     formula_dir.mkdir(exist_ok=True)
@@ -152,13 +155,17 @@ process.exit(result.status ?? 1);
         )
         + "\n"
     )
-    npm_pack = subprocess.run(
-        ["npm", "pack", "--pack-destination", str(args.out_dir.resolve())],
-        cwd=npm_dir / "package",
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    ).stdout.strip().splitlines()[-1]
+    npm_pack = (
+        subprocess.run(
+            ["npm", "pack", "--pack-destination", str(args.out_dir.resolve())],
+            cwd=npm_dir / "package",
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        .stdout.strip()
+        .splitlines()[-1]
+    )
 
     manifest = {
         "version": version,
@@ -179,7 +186,9 @@ process.exit(result.status ?? 1);
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--codex-bin", type=Path, default=ROOT / "codex-rs/target/debug/codex")
+    parser.add_argument(
+        "--codex-bin", type=Path, default=ROOT / "codex-rs/target/debug/codex"
+    )
     parser.add_argument("--version", default="v0.0.0-privacy.20260618")
     parser.add_argument("--target", default="linux-x86_64")
     parser.add_argument("--out-dir", type=Path, default=DIST / "privacy-release")

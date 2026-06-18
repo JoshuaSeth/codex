@@ -114,8 +114,16 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
-    codex = (root / args.codex).resolve() if not Path(args.codex).is_absolute() else Path(args.codex)
-    out = (root / args.out).resolve() if not Path(args.out).is_absolute() else Path(args.out)
+    codex = (
+        (root / args.codex).resolve()
+        if not Path(args.codex).is_absolute()
+        else Path(args.codex)
+    )
+    out = (
+        (root / args.out).resolve()
+        if not Path(args.out).is_absolute()
+        else Path(args.out)
+    )
     detector_cmd = args.detector_cmd or (
         "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate "
         f"python {root / 'scripts/privacy_filter_openai.py'}"
@@ -210,7 +218,9 @@ def main() -> int:
     if proc.returncode != 0:
         raise RuntimeError(f"codex exited {proc.returncode}; see {out}")
     if real_in_request:
-        raise RuntimeError(f"real values leaked into outbound request: {real_in_request}; see {out}")
+        raise RuntimeError(
+            f"real values leaked into outbound request: {real_in_request}; see {out}"
+        )
     if len(real_restored_stdout) < len(REAL_VALUES):
         raise RuntimeError(f"stdout did not restore all real values; see {out}")
 

@@ -127,7 +127,9 @@ def main() -> int:
     stable = session.anonymize("Jane Smith")
     backend_response = f"Drafted the note for {stable} using {outbound}."
     restored = session.restore(backend_response)
-    disabled = PrivacySession(enabled=False, detector_cmd=DETECTOR_CMD).anonymize(original)
+    disabled = PrivacySession(enabled=False, detector_cmd=DETECTOR_CMD).anonymize(
+        original
+    )
 
     leaked_real_values = [
         value
