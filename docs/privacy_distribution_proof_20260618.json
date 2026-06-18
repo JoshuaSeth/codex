@@ -2,7 +2,7 @@
   "version": "v0.0.0-privacy.20260618",
   "release_url": "https://github.com/JoshuaSeth/codex/releases/tag/v0.0.0-privacy.20260618",
   "linux_x86_64_asset": "https://github.com/JoshuaSeth/codex/releases/download/v0.0.0-privacy.20260618/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz",
-  "linux_x86_64_sha256": "4214278a6375c67c5fd139e3e4d70dd2056b33e86128410835f8ff9cdbc664b1",
+  "linux_x86_64_sha256": "997707160f4fe66ea5c57ba5972bb154ef3be3937f32ee11072b504da40747f5",
   "local_artifacts": {
     "tarball": "dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz",
     "manifest": "dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.manifest.json",
