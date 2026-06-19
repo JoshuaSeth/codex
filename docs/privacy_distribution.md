@@ -6,6 +6,10 @@ Use GitHub Release assets as the internal source of truth, then expose the same
 asset through Homebrew for macOS/Linux developers. Keep npm as a convenience
 wrapper for Node-oriented environments, not the canonical binary store.
 
+For the exact current-artifact contents, target-machine requirements,
+release-build caveat, and upstream OpenAI Codex distribution comparison, see
+`docs/privacy_packaging_clarity_20260619.md`.
+
 - Linux servers: install the GitHub Release tarball with `install.sh`.
 - macOS developers: install from a PitchAI Homebrew tap formula that downloads
   the GitHub Release tarball and verifies SHA-256.
@@ -18,8 +22,8 @@ This keeps one binary artifact per target and avoids divergent Brew/npm builds.
 ## Build
 
 ```bash
-cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
-python3 scripts/build_privacy_distribution.py --codex-bin codex-rs/target/debug/codex
+cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex --release
+python3 scripts/build_privacy_distribution.py --codex-bin codex-rs/target/release/codex
 ```
 
 The builder emits:
@@ -43,10 +47,10 @@ Linux x86_64 tarball:
 https://github.com/JoshuaSeth/codex/releases/download/v0.0.0-privacy.20260618/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz
 ```
 
-The validated artifact in this worktree is built from a debug-profile Codex
-binary because the full release ThinLTO build was CPU-active for an extended
-period. The distribution path itself is release-compatible: pass a release-built
-`--codex-bin` to the same builder when CI or a release host produces one.
+Updated 2026-06-19: the validated artifact in this worktree is built from a
+release-profile GNU Linux Codex binary at `codex-rs/target/release/codex`. The
+remaining production-hardening gap is to move to upstream-style musl package
+artifacts with checksums/signing for fleet distribution.
 
 ## Install From Tarball
 
