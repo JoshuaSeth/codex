@@ -10,7 +10,6 @@ import os
 import shutil
 import stat
 import subprocess
-import tarfile
 from pathlib import Path
 
 
@@ -81,13 +80,29 @@ PREFIX="${1:-${PREFIX:-$HOME/.local}}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${PREFIX}/bin" "${PREFIX}/lib/pitchai-codex-privacy"
 cp -R "${ROOT}/bin" "${ROOT}/privacy" "${ROOT}/README.md" "${PREFIX}/lib/pitchai-codex-privacy/"
-ln -sf "${PREFIX}/lib/pitchai-codex-privacy/bin/codex-privacy" "${PREFIX}/bin/codex-privacy"
+cat > "${PREFIX}/bin/codex-privacy" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${PREFIX}/lib/pitchai-codex-privacy/bin/codex-privacy" "\\$@"
+EOF
+chmod +x "${PREFIX}/bin/codex-privacy"
 printf 'Installed codex-privacy to %s/bin/codex-privacy\\n' "${PREFIX}"
 """,
     )
 
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(package_dir, arcname=package_name)
+    subprocess.run(
+        [
+            "tar",
+            "-C",
+            str(args.out_dir.resolve()),
+            "-I",
+            "gzip -1",
+            "-cf",
+            str(archive),
+            package_name,
+        ],
+        check=True,
+    )
 
     archive_sha = sha256(archive)
     release_url = (
@@ -111,7 +126,11 @@ printf 'Installed codex-privacy to %s/bin/codex-privacy\\n' "${PREFIX}"
 
   def install
     libexec.install Dir["*"]
-    bin.install_symlink libexec/"bin/codex-privacy" => "codex-privacy"
+    (bin/"codex-privacy").write <<~EOS
+      #!/usr/bin/env bash
+      set -euo pipefail
+      exec "#{{libexec}}/bin/codex-privacy" "$@"
+    EOS
   end
 
   test do
@@ -121,13 +140,15 @@ end
 '''
     )
 
-    npm_dir.mkdir()
-    (npm_dir / "package").mkdir()
-    shutil.copytree(package_dir, npm_dir / "package" / "vendor")
-    (npm_dir / "package" / "bin").mkdir()
-    write_executable(
-        npm_dir / "package" / "bin" / "codex-privacy.js",
-        """#!/usr/bin/env node
+    npm_package: str | None = None
+    if not args.skip_npm:
+        npm_dir.mkdir()
+        (npm_dir / "package").mkdir()
+        shutil.copytree(package_dir, npm_dir / "package" / "vendor")
+        (npm_dir / "package" / "bin").mkdir()
+        write_executable(
+            npm_dir / "package" / "bin" / "codex-privacy.js",
+            """#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,35 +158,36 @@ const executable = resolve(here, "..", "vendor", "bin", "codex-privacy");
 const result = spawnSync(executable, process.argv.slice(2), { stdio: "inherit" });
 process.exit(result.status ?? 1);
 """,
-    )
-    (npm_dir / "package" / "package.json").write_text(
-        json.dumps(
-            {
-                "name": "@pitchai/codex-privacy",
-                "version": version.lstrip("v"),
-                "description": "PitchAI Codex privacy-mode wrapper with bundled runtime artifact.",
-                "license": "UNLICENSED",
-                "private": True,
-                "type": "module",
-                "bin": {"codex-privacy": "bin/codex-privacy.js"},
-                "files": ["bin", "vendor"],
-                "engines": {"node": ">=18"},
-            },
-            indent=2,
         )
-        + "\n"
-    )
-    npm_pack = (
-        subprocess.run(
-            ["npm", "pack", "--pack-destination", str(args.out_dir.resolve())],
-            cwd=npm_dir / "package",
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
+        (npm_dir / "package" / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "@pitchai/codex-privacy",
+                    "version": version.lstrip("v"),
+                    "description": "PitchAI Codex privacy-mode wrapper with bundled runtime artifact.",
+                    "license": "UNLICENSED",
+                    "private": True,
+                    "type": "module",
+                    "bin": {"codex-privacy": "bin/codex-privacy.js"},
+                    "files": ["bin", "vendor"],
+                    "engines": {"node": ">=18"},
+                },
+                indent=2,
+            )
+            + "\n"
         )
-        .stdout.strip()
-        .splitlines()[-1]
-    )
+        npm_pack = (
+            subprocess.run(
+                ["npm", "pack", "--pack-destination", str(args.out_dir.resolve())],
+                cwd=npm_dir / "package",
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            .stdout.strip()
+            .splitlines()[-1]
+        )
+        npm_package = str(args.out_dir / npm_pack)
 
     manifest = {
         "version": version,
@@ -174,7 +196,7 @@ process.exit(result.status ?? 1);
         "archive_sha256": archive_sha,
         "release_url": release_url,
         "homebrew_formula": str(formula),
-        "npm_package": str(args.out_dir / npm_pack),
+        "npm_package": npm_package,
         "codex_binary": str(codex_bin),
         "primary_detector": "openai/privacy-filter",
     }
@@ -193,6 +215,7 @@ def main() -> int:
     parser.add_argument("--target", default="linux-x86_64")
     parser.add_argument("--out-dir", type=Path, default=DIST / "privacy-release")
     parser.add_argument("--release-url")
+    parser.add_argument("--skip-npm", action="store_true")
     return build(parser.parse_args())
 
 
