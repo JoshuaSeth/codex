@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -245,6 +246,7 @@ def version_for_platform(version: str, platform: dict[str, str]) -> str:
 
 
 def pack(stage_dir: Path, out_dir: Path) -> Path:
+    npm = resolve_npm()
     with tempfile.TemporaryDirectory(prefix="pitchai-codex-privacy-npm-") as tmp:
         cache = Path(tmp) / "cache"
         logs = Path(tmp) / "logs"
@@ -254,7 +256,7 @@ def pack(stage_dir: Path, out_dir: Path) -> Path:
         env["NPM_CONFIG_CACHE"] = str(cache)
         env["NPM_CONFIG_LOGS_DIR"] = str(logs)
         output = subprocess.check_output(
-            ["npm", "pack", "--json", "--pack-destination", str(out_dir)],
+            [npm, "pack", "--json", "--pack-destination", str(out_dir)],
             cwd=stage_dir,
             env=env,
             text=True,
@@ -266,6 +268,15 @@ def pack(stage_dir: Path, out_dir: Path) -> Path:
     if not path.exists():
         raise RuntimeError(f"npm pack output missing: {path}")
     return path
+
+
+def resolve_npm() -> str:
+    candidates = ["npm.cmd", "npm"] if sys.platform == "win32" else ["npm"]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved is not None:
+            return resolved
+    raise RuntimeError("npm was not found on PATH")
 
 
 def package_manifest(
