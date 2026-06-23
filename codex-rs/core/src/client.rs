@@ -110,6 +110,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::feedback_tags;
+use crate::privacy::PrivacyFilter;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -180,6 +181,7 @@ struct ModelClientState {
     beta_features_header: Option<String>,
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
+    privacy_filter: Arc<StdMutex<PrivacyFilter>>,
     disable_websockets: AtomicBool,
     cached_websocket_session: StdMutex<WebsocketSession>,
 }
@@ -346,6 +348,7 @@ impl ModelClient {
                 beta_features_header,
                 include_attestation,
                 attestation_provider,
+                privacy_filter: Arc::new(StdMutex::new(PrivacyFilter::from_env())),
                 disable_websockets: AtomicBool::new(false),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
@@ -728,7 +731,13 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let instructions = &prompt.base_instructions.text;
-        let input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+        self.state
+            .privacy_filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .anonymize_items(&mut input)
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
         let reasoning = Self::build_reasoning(model_info, effort, summary);
         let include = if reasoning.is_some() {
@@ -1263,6 +1272,7 @@ impl ModelClientSession {
                 Ok(stream) => {
                     let (stream, _) = map_response_stream(
                         stream,
+                        Arc::clone(&self.client.state.privacy_filter),
                         session_telemetry.clone(),
                         inference_trace_attempt,
                     );
@@ -1451,6 +1461,7 @@ impl ModelClientSession {
                 })?;
             let (stream, last_request_rx) = map_response_stream(
                 stream_result,
+                Arc::clone(&self.client.state.privacy_filter),
                 session_telemetry.clone(),
                 inference_trace_attempt,
             );
@@ -1683,6 +1694,7 @@ const STREAM_DROPPED_REASON: &str = "response stream dropped before provider ter
 
 fn map_response_stream(
     api_stream: codex_api::ResponseStream,
+    privacy_filter: Arc<StdMutex<PrivacyFilter>>,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
@@ -1697,6 +1709,7 @@ fn map_response_stream(
     map_response_events(
         upstream_request_id,
         api_stream,
+        privacy_filter,
         session_telemetry,
         inference_trace_attempt,
     )
@@ -1705,6 +1718,7 @@ fn map_response_stream(
 fn map_response_events<S>(
     upstream_request_id: Option<String>,
     api_stream: S,
+    privacy_filter: Arc<StdMutex<PrivacyFilter>>,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
@@ -1744,8 +1758,32 @@ where
             let Some(event) = event else {
                 break;
             };
+            let event = event.map(|mut event| {
+                let mut privacy_filter = privacy_filter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                privacy_filter.de_anonymize_event(&mut event);
+                event
+            });
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
+                    let pending_delta = privacy_filter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_pending_de_anonymized_delta();
+                    if let Some(delta) = pending_delta
+                        && tx_event
+                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                            .await
+                            .is_err()
+                    {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
                     items_added.push(item.clone());
                     if tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(item)))
@@ -1765,6 +1803,18 @@ where
                     token_usage,
                     end_turn,
                 }) => {
+                    let pending_delta = privacy_filter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_pending_de_anonymized_delta();
+                    if let Some(delta) = pending_delta
+                        && tx_event
+                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
                     feedback_tags!(last_model_response_id = &response_id);
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(

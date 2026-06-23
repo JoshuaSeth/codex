@@ -1,13 +1,12 @@
 use super::*;
 
-pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
-
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pub(super) thread_residency_manager: ThreadResidencyManager,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) fallback_model_provider: String,
@@ -16,7 +15,8 @@ pub(super) struct ListenerTaskContext {
 }
 
 struct UnloadingState {
-    delay: Duration,
+    residency_manager: ThreadResidencyManager,
+    thread_id: ThreadId,
     has_subscribers_rx: watch::Receiver<bool>,
     has_subscribers: (bool, Instant),
     thread_status_rx: watch::Receiver<ThreadStatus>,
@@ -24,11 +24,7 @@ struct UnloadingState {
 }
 
 impl UnloadingState {
-    async fn new(
-        listener_task_context: &ListenerTaskContext,
-        thread_id: ThreadId,
-        delay: Duration,
-    ) -> Option<Self> {
+    async fn new(listener_task_context: &ListenerTaskContext, thread_id: ThreadId) -> Option<Self> {
         let has_subscribers_rx = listener_task_context
             .thread_state_manager
             .subscribe_to_has_connections(thread_id)
@@ -42,8 +38,13 @@ impl UnloadingState {
             matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
             Instant::now(),
         );
+        listener_task_context
+            .thread_residency_manager
+            .note_observed(thread_id, has_subscribers.0, is_active.0)
+            .await;
         Some(Self {
-            delay,
+            residency_manager: listener_task_context.thread_residency_manager.clone(),
+            thread_id,
             has_subscribers_rx,
             has_subscribers,
             thread_status_rx,
@@ -51,11 +52,12 @@ impl UnloadingState {
         })
     }
 
-    fn unloading_target(&self) -> Option<Instant> {
+    fn polling_target(&self) -> Option<Instant> {
         match (self.has_subscribers, self.is_active) {
-            ((false, has_no_subscribers_since), (false, is_inactive_since)) => {
-                Some(std::cmp::max(has_no_subscribers_since, is_inactive_since) + self.delay)
-            }
+            ((false, has_no_subscribers_since), (false, is_inactive_since)) => Some(
+                std::cmp::max(has_no_subscribers_since, is_inactive_since)
+                    + self.residency_manager.eviction_poll(),
+            ),
             _ => None,
         }
     }
@@ -72,10 +74,11 @@ impl UnloadingState {
         }
     }
 
-    fn should_unload_now(&mut self) -> bool {
+    async fn unload_decision(&mut self) -> crate::thread_residency::ThreadResidencyDecision {
         self.sync_receiver_values();
-        self.unloading_target()
-            .is_some_and(|target| target <= Instant::now())
+        self.residency_manager
+            .unload_decision(self.thread_id, self.has_subscribers.0, self.is_active.0)
+            .await
     }
 
     fn note_thread_activity_observed(&mut self) {
@@ -87,14 +90,17 @@ impl UnloadingState {
     async fn wait_for_unloading_trigger(&mut self) -> bool {
         loop {
             self.sync_receiver_values();
-            let unloading_target = self.unloading_target();
-            if let Some(target) = unloading_target
+            self.residency_manager
+                .note_observed(self.thread_id, self.has_subscribers.0, self.is_active.0)
+                .await;
+            let polling_target = self.polling_target();
+            if let Some(target) = polling_target
                 && target <= Instant::now()
             {
                 return true;
             }
             let unloading_sleep = async {
-                if let Some(target) = unloading_target {
+                if let Some(target) = polling_target {
                     tokio::time::sleep_until(target.into()).await;
                 } else {
                     futures::future::pending::<()>().await;
@@ -216,12 +222,8 @@ pub(super) async fn ensure_listener_task_running(
     thread_state: Arc<Mutex<ThreadState>>,
 ) -> Result<(), JSONRPCErrorError> {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    let Some(mut unloading_state) = UnloadingState::new(
-        &listener_task_context,
-        conversation_id,
-        THREAD_UNLOADING_DELAY,
-    )
-    .await
+    let Some(mut unloading_state) =
+        UnloadingState::new(&listener_task_context, conversation_id).await
     else {
         return Err(invalid_request(format!(
             "thread {conversation_id} is closing; retry after the thread is closed"
@@ -266,6 +268,7 @@ pub(super) async fn ensure_listener_task_running(
         thread_manager,
         thread_state_manager,
         pending_thread_unloads,
+        thread_residency_manager,
         thread_watch_manager,
         thread_list_state_permit,
         fallback_model_provider,
@@ -344,6 +347,7 @@ pub(super) async fn ensure_listener_task_running(
                         thread_manager.clone(),
                         thread_outgoing,
                         thread_state.clone(),
+                        thread_residency_manager.clone(),
                         thread_watch_manager.clone(),
                         thread_list_state_permit.clone(),
                         fallback_model_provider.clone(),
@@ -354,7 +358,8 @@ pub(super) async fn ensure_listener_task_running(
                     if !unloading_watchers_open {
                         break;
                     }
-                    if !unloading_state.should_unload_now() {
+                    let unload_decision = unloading_state.unload_decision().await;
+                    if !unload_decision.should_unload {
                         continue;
                     }
                     if matches!(conversation.agent_status().await, AgentStatus::Running) {
@@ -366,9 +371,14 @@ pub(super) async fn ensure_listener_task_running(
                         if pending_thread_unloads.contains(&conversation_id) {
                             continue;
                         }
-                        if !unloading_state.should_unload_now() {
+                        let unload_decision = unloading_state.unload_decision().await;
+                        if !unload_decision.should_unload {
                             continue;
                         }
+                        info!(
+                            "thread {conversation_id} selected for memory-aware residency unload: {}",
+                            unload_decision.reason
+                        );
                         pending_thread_unloads.insert(conversation_id);
                     }
                     unload_thread_without_subscribers(
@@ -376,6 +386,7 @@ pub(super) async fn ensure_listener_task_running(
                         outgoing_for_task.clone(),
                         pending_thread_unloads.clone(),
                         thread_state_manager.clone(),
+                        thread_residency_manager.clone(),
                         thread_watch_manager.clone(),
                         conversation_id,
                         conversation.clone(),
@@ -408,6 +419,7 @@ pub(super) async fn unload_thread_without_subscribers(
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
@@ -429,12 +441,14 @@ pub(super) async fn unload_thread_without_subscribers(
                     thread_watch_manager
                         .remove_thread(&thread_id.to_string())
                         .await;
+                    thread_residency_manager.note_removed(thread_id).await;
                     pending_thread_unloads.lock().await.remove(&thread_id);
                     return;
                 }
                 thread_watch_manager
                     .remove_thread(&thread_id.to_string())
                     .await;
+                thread_residency_manager.note_removed(thread_id).await;
                 let notification = ThreadClosedNotification {
                     thread_id: thread_id.to_string(),
                 };

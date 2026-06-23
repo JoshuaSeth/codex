@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export PITCHAI_CODEX_PRIVACY_MIDDLEWARE="${PITCHAI_CODEX_PRIVACY_MIDDLEWARE:-1}"
+export PITCHAI_CODEX_PRIVACY_FILTER_CMD="${PITCHAI_CODEX_PRIVACY_FILTER_CMD:-uv run --python 3.12 --with transformers>=4.53.0 --with torch --with accelerate python ${HERE}/privacy_filter_openai.py}"
+
+exec "${HERE}/codex" "$@"

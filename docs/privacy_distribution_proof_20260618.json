@@ -1,0 +1,37 @@
+{
+  "version": "v0.0.0-privacy.20260618",
+  "release_url": "https://github.com/JoshuaSeth/codex/releases/tag/v0.0.0-privacy.20260618",
+  "linux_x86_64_asset": "https://github.com/JoshuaSeth/codex/releases/download/v0.0.0-privacy.20260618/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz",
+  "linux_x86_64_sha256": "5b3885bb0a7399a1568a27b2436f9bc4780199a736805bac11f1f93b7e486f61",
+  "local_artifacts": {
+    "tarball": "dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz",
+    "manifest": "dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.manifest.json",
+    "homebrew_formula": "dist/privacy-release/homebrew/pitchai-codex-privacy.rb",
+    "npm_package": "dist/privacy-release/pitchai-codex-privacy-0.0.0-privacy.20260618.tgz"
+  },
+  "validation": {
+    "release_download_sha256_verified": true,
+    "tarball_clean_install_probe": {
+      "leaks": [],
+      "restored": [
+        "Jane Smith",
+        "14 Pearl St",
+        "jane.smith@example.com",
+        "(415) 555-1212"
+      ]
+    },
+    "npm_install_version_check": "codex-cli 0.0.0",
+    "clean_container_probe": {
+      "image": "python:3.12-slim",
+      "leaks": [],
+      "restored": [
+        "Jane Smith",
+        "14 Pearl St",
+        "jane.smith@example.com",
+        "(415) 555-1212"
+      ]
+    }
+  },
+  "primary_detector": "openai/privacy-filter",
+  "release_grade_note": "Updated 2026-06-19: the local release-profile GNU Linux Codex build completed successfully and the prerelease tarball now uses codex-rs/target/release/codex. A final fleet artifact should still follow upstream's musl package/signing/checksum release shape."
+}

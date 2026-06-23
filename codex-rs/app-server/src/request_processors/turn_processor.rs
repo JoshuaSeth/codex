@@ -20,6 +20,7 @@ pub(crate) struct TurnRequestProcessor {
     config_manager: ConfigManager,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<Semaphore>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -76,6 +77,7 @@ impl TurnRequestProcessor {
         config_manager: ConfigManager,
         pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
         thread_state_manager: ThreadStateManager,
+        thread_residency_manager: ThreadResidencyManager,
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
@@ -90,6 +92,7 @@ impl TurnRequestProcessor {
             config_manager,
             pending_thread_unloads,
             thread_state_manager,
+            thread_residency_manager,
             thread_watch_manager,
             thread_list_state_permit,
             skills_watcher,
@@ -403,6 +406,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(&request_id, error, /*error_type*/ None);
                 })?;
+        self.thread_residency_manager.note_accessed(thread_id).await;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
         if let Err(error) = Self::validate_v2_input_limit(&params.input) {
@@ -1315,6 +1319,7 @@ impl TurnRequestProcessor {
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_residency_manager: self.thread_residency_manager.clone(),
             thread_watch_manager: self.thread_watch_manager.clone(),
             thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),

@@ -42,6 +42,7 @@ use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
+use crate::thread_residency::ThreadResidencyManager;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
@@ -375,6 +376,7 @@ impl MessageProcessor {
         let skills_watcher = SkillsWatcher::new(thread_manager.skills_manager(), outgoing.clone());
 
         let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let thread_residency_manager = ThreadResidencyManager::new();
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
@@ -458,6 +460,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             thread_state_manager.clone(),
+            thread_residency_manager.clone(),
             state_db.clone(),
             Arc::clone(&goal_service),
         );
@@ -471,6 +474,7 @@ impl MessageProcessor {
             Arc::clone(&thread_store),
             Arc::clone(&pending_thread_unloads),
             thread_state_manager.clone(),
+            thread_residency_manager.clone(),
             thread_watch_manager.clone(),
             Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
@@ -488,6 +492,7 @@ impl MessageProcessor {
             config_manager.clone(),
             pending_thread_unloads,
             thread_state_manager,
+            thread_residency_manager,
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
