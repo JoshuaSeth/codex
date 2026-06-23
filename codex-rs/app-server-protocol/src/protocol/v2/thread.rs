@@ -1196,6 +1196,38 @@ pub struct ThreadLoadedListResponse {
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.
     pub next_cursor: Option<String>,
+    /// Current app-server thread residency policy and loaded-thread diagnostics.
+    pub residency: ThreadResidencyDiagnostics,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadResidencyDiagnostics {
+    pub soft_cap_bytes: u64,
+    pub hard_cap_bytes: u64,
+    pub idle_min_ttl_secs: u64,
+    pub eviction_poll_secs: u64,
+    #[ts(optional = nullable)]
+    pub rss_bytes: Option<u64>,
+    pub loaded_threads: usize,
+    pub resident_estimated_bytes: u64,
+    pub records: Vec<ThreadResidencyRecord>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadResidencyRecord {
+    pub thread_id: String,
+    pub loaded_for_secs: u64,
+    pub idle_for_secs: u64,
+    #[ts(optional = nullable)]
+    pub estimated_bytes: Option<u64>,
+    #[ts(optional = nullable)]
+    pub resume_source: Option<String>,
+    #[ts(optional = nullable)]
+    pub resume_duration_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

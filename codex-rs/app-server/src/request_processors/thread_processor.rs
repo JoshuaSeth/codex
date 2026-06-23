@@ -323,6 +323,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_store: Arc<dyn ThreadStore>,
     pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pub(super) thread_state_manager: ThreadStateManager,
+    pub(super) thread_residency_manager: ThreadResidencyManager,
     pub(super) thread_watch_manager: ThreadWatchManager,
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
@@ -355,6 +356,7 @@ impl ThreadRequestProcessor {
         thread_store: Arc<dyn ThreadStore>,
         pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
         thread_state_manager: ThreadStateManager,
+        thread_residency_manager: ThreadResidencyManager,
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
         thread_goal_processor: ThreadGoalRequestProcessor,
@@ -372,6 +374,7 @@ impl ThreadRequestProcessor {
             thread_store,
             pending_thread_unloads,
             thread_state_manager,
+            thread_residency_manager,
             thread_watch_manager,
             thread_list_state_permit,
             thread_goal_processor,
@@ -792,6 +795,7 @@ impl ThreadRequestProcessor {
                 }
             }
         }
+        self.thread_residency_manager.note_removed(thread_id).await;
         self.finalize_thread_teardown(thread_id).await;
     }
 
@@ -801,6 +805,7 @@ impl ThreadRequestProcessor {
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_residency_manager: self.thread_residency_manager.clone(),
             thread_watch_manager: self.thread_watch_manager.clone(),
             thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
@@ -898,6 +903,7 @@ impl ThreadRequestProcessor {
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_residency_manager: self.thread_residency_manager.clone(),
             thread_watch_manager: self.thread_watch_manager.clone(),
             thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
@@ -1179,6 +1185,10 @@ impl ThreadRequestProcessor {
             "thread",
         );
 
+        listener_task_context
+            .thread_residency_manager
+            .note_loaded(thread_id, session_configured.rollout_path.as_deref())
+            .await;
         listener_task_context
             .thread_watch_manager
             .upsert_thread_silently(thread.clone())
@@ -2088,9 +2098,11 @@ impl ThreadRequestProcessor {
             .collect();
 
         if data.is_empty() {
+            let residency = self.thread_residency_diagnostics().await;
             return Ok(ThreadLoadedListResponse {
                 data,
                 next_cursor: None,
+                residency,
             });
         }
 
@@ -2118,7 +2130,35 @@ impl ThreadRequestProcessor {
         Ok(ThreadLoadedListResponse {
             data: page,
             next_cursor,
+            residency: self.thread_residency_diagnostics().await,
         })
+    }
+
+    async fn thread_residency_diagnostics(
+        &self,
+    ) -> codex_app_server_protocol::ThreadResidencyDiagnostics {
+        let diagnostics = self.thread_residency_manager.diagnostics().await;
+        codex_app_server_protocol::ThreadResidencyDiagnostics {
+            soft_cap_bytes: diagnostics.soft_cap_bytes,
+            hard_cap_bytes: diagnostics.hard_cap_bytes,
+            idle_min_ttl_secs: diagnostics.idle_min_ttl_secs,
+            eviction_poll_secs: diagnostics.eviction_poll_secs,
+            rss_bytes: diagnostics.rss_bytes,
+            loaded_threads: diagnostics.loaded_threads,
+            resident_estimated_bytes: diagnostics.resident_estimated_bytes,
+            records: diagnostics
+                .records
+                .into_iter()
+                .map(|record| codex_app_server_protocol::ThreadResidencyRecord {
+                    thread_id: record.thread_id,
+                    loaded_for_secs: record.loaded_for_secs,
+                    idle_for_secs: record.idle_for_secs,
+                    estimated_bytes: record.estimated_bytes,
+                    resume_source: record.resume_source,
+                    resume_duration_ms: record.resume_duration_ms,
+                })
+                .collect(),
+        }
     }
 
     async fn thread_read_response_inner(
@@ -2137,6 +2177,9 @@ impl ThreadRequestProcessor {
             .read_thread_view(thread_uuid, include_turns)
             .await
             .map_err(thread_read_view_error)?;
+        self.thread_residency_manager
+            .note_accessed(thread_uuid)
+            .await;
         Ok(ThreadReadResponse { thread })
     }
 
@@ -2494,6 +2537,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
+        let resume_started_at = std::time::Instant::now();
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -2665,6 +2709,14 @@ impl ThreadRequestProcessor {
                     self.outgoing.send_error(request_id, error).await;
                     return Ok(());
                 };
+                self.thread_residency_manager
+                    .note_resume(
+                        thread_id,
+                        Some(rollout_path.as_path()),
+                        "rollout",
+                        resume_started_at.elapsed(),
+                    )
+                    .await;
                 // Auto-attach a thread listener when resuming a thread.
                 log_listener_attach_result(
                     self.ensure_conversation_listener(
@@ -3461,6 +3513,9 @@ impl ThreadRequestProcessor {
             .thread_source
             .map(Into::into);
 
+        self.thread_residency_manager
+            .note_loaded(thread_id, session_configured.rollout_path.as_deref())
+            .await;
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())
             .await;

@@ -6,6 +6,7 @@ use crate::request_processors::populate_thread_turns_from_history;
 use crate::request_processors::thread_from_stored_thread;
 use crate::request_processors::thread_settings_from_core_snapshot;
 use crate::server_request_error::is_turn_transition_server_request_error;
+use crate::thread_residency::ThreadResidencyManager;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
 use crate::thread_state::resolve_server_request_on_thread_listener;
@@ -141,6 +142,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_manager: Arc<ThreadManager>,
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
+    thread_residency_manager: ThreadResidencyManager,
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     fallback_model_provider: String,
@@ -153,6 +155,9 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnStarted(payload) => {
             // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
             outgoing.abort_pending_server_requests().await;
+            thread_residency_manager
+                .note_accessed(conversation_id)
+                .await;
             thread_watch_manager
                 .note_turn_started(&conversation_id.to_string())
                 .await;
@@ -183,6 +188,9 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
+            thread_residency_manager
+                .note_accessed(conversation_id)
+                .await;
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
@@ -2337,6 +2345,7 @@ mod tests {
         outgoing: ThreadScopedOutgoingMessageSender,
         thread_state: Arc<Mutex<ThreadState>>,
         thread_watch_manager: ThreadWatchManager,
+        thread_residency_manager: ThreadResidencyManager,
     }
 
     impl GuardianAssessmentTestContext {
@@ -2352,6 +2361,7 @@ mod tests {
                 self.thread_manager.clone(),
                 self.outgoing.clone(),
                 self.thread_state.clone(),
+                self.thread_residency_manager.clone(),
                 self.thread_watch_manager.clone(),
                 Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
                 "test-provider".to_string(),
@@ -2691,6 +2701,7 @@ mod tests {
             outgoing: outgoing.clone(),
             thread_state: thread_state.clone(),
             thread_watch_manager: thread_watch_manager.clone(),
+            thread_residency_manager: ThreadResidencyManager::new(),
         };
 
         guardian_context
@@ -3303,6 +3314,7 @@ mod tests {
             thread_manager,
             outgoing,
             thread_state,
+            ThreadResidencyManager::new(),
             thread_watch_manager,
             Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
@@ -3373,6 +3385,7 @@ mod tests {
             thread_manager,
             outgoing,
             new_thread_state(),
+            ThreadResidencyManager::new(),
             thread_watch_manager.clone(),
             Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),

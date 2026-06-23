@@ -11,6 +11,7 @@ pub(crate) struct ThreadGoalRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
     state_db: Option<StateDbHandle>,
     goal_service: Arc<GoalService>,
 }
@@ -21,6 +22,7 @@ impl ThreadGoalRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         thread_state_manager: ThreadStateManager,
+        thread_residency_manager: ThreadResidencyManager,
         state_db: Option<StateDbHandle>,
         goal_service: Arc<GoalService>,
     ) -> Self {
@@ -29,6 +31,7 @@ impl ThreadGoalRequestProcessor {
             outgoing,
             config,
             thread_state_manager,
+            thread_residency_manager,
             state_db,
             goal_service,
         }
@@ -104,6 +107,7 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        self.thread_residency_manager.note_accessed(thread_id).await;
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
