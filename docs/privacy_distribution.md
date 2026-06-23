@@ -85,15 +85,41 @@ packaging/homebrew/pitchai-codex-privacy.rb
 
 ## npm
 
-The local npm tarball can be installed directly:
+The current npm packaging follows the upstream Codex split-package model:
+
+- `@pitchai/codex-privacy`: small launcher package.
+- `@pitchai/codex-privacy-<platform>`: platform-specific native package with
+  the canonical `codex-package.json`, `bin/`, `codex-resources/`, and
+  `codex-path/` layout plus the privacy filter adapters under
+  `codex-resources/privacy/`.
+
+Before a private npm registry publish exists, install the platform tarball
+directly. Example for the Linux x64 local package build:
 
 ```bash
-npm install -g ./dist/privacy-release/pitchai-codex-privacy-0.0.0-privacy.20260618.tgz
+python3 scripts/build_privacy_npm_packages.py \
+  --version 0.0.0-privacy.20260623 \
+  --package-dir dist/privacy-npm-local/package-linux-x64 \
+  --out-dir dist/privacy-npm-local/npm \
+  --pack \
+  --force
+
+npm install -g ./dist/privacy-npm-local/npm/pitchai-codex-privacy-linux-x64-0.0.0-privacy.20260623-linux-x64.tgz
+codex-privacy --version
 codex-privacy exec "Jane Smith lives at 14 Pearl St."
 ```
 
-For normal npm distribution, publish the package to a private registry after the
-binary artifact is produced for the target platform.
+For normal npm distribution, publish the small main package and the matching
+platform packages to a private registry. The main package depends on the
+platform packages as optional dependencies, matching the upstream OpenAI Codex
+npm install shape.
+
+The npm launcher requires `uv` on the target machine. It enables
+`PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1` and points
+`PITCHAI_CODEX_PRIVACY_FILTER_CMD` at the bundled `privacy_filter_openai.py`
+adapter, which runs the real `openai/privacy-filter` model through
+Transformers. The npm package must not include model weights; `uv` resolves the
+Python/model dependencies on first privacy-filter execution.
 
 ## Validation
 
