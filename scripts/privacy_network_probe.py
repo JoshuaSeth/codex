@@ -21,7 +21,6 @@ REAL_VALUES = [
     "(415) 555-1212",
 ]
 
-
 PROMPT = (
     "Please summarize this contact twice: Jane Smith lives at 14 Pearl St, "
     "email jane.smith@example.com, phone (415) 555-1212. Jane Smith needs a follow-up."
@@ -78,8 +77,32 @@ def _text_values(value: Any) -> list[str]:
     return []
 
 
+def _request_user_texts(request_json: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+    for item in request_json.get("input", []):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if (
+                isinstance(content_item, dict)
+                and content_item.get("type") == "input_text"
+                and isinstance(content_item.get("text"), str)
+            ):
+                texts.append(content_item["text"])
+    return texts
+
+
+def _candidate_fake_texts(texts: list[str]) -> list[str]:
+    markers = ("@example.", " St", "555")
+    return [text for text in texts if any(marker in text for marker in markers)]
+
+
 class ProbeState:
     request_json: dict[str, Any] | None = None
+    backend_text: str | None = None
 
 
 def make_handler(state: ProbeState) -> type[BaseHTTPRequestHandler]:
@@ -89,9 +112,9 @@ def make_handler(state: ProbeState) -> type[BaseHTTPRequestHandler]:
             body = self.rfile.read(length)
             state.request_json = json.loads(body)
 
-            request_text = "\n".join(_text_values(state.request_json))
-            backend_text = f"Backend saw this anonymized prompt: {request_text}"
-            response = _sse_response(backend_text)
+            request_text = "\n".join(_request_user_texts(state.request_json))
+            state.backend_text = f"Backend saw this anonymized prompt: {request_text}"
+            response = _sse_response(state.backend_text)
 
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -108,9 +131,9 @@ def make_handler(state: ProbeState) -> type[BaseHTTPRequestHandler]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--codex", default="codex-rs/target/release/codex")
-    parser.add_argument("--out", default="docs/privacy_network_probe_20260618.json")
+    parser.add_argument("--out", default="docs/privacy_network_probe_20260623.json")
     parser.add_argument("--detector-cmd")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -191,26 +214,29 @@ def main() -> int:
 
     request_blob = json.dumps(state.request_json, sort_keys=True)
     stdout = proc.stdout
-    stderr = proc.stderr
+    outbound_user_texts = _request_user_texts(state.request_json)
     real_in_request = [value for value in REAL_VALUES if value in request_blob]
-    real_restored_stdout = [value for value in REAL_VALUES if value in stdout]
-    fake_request_values = [
-        text
-        for text in _text_values(state.request_json)
-        if any(marker in text for marker in ["@example.", " St", "555"])
+    real_in_relevant_user_texts = [
+        value for value in REAL_VALUES if any(value in text for text in outbound_user_texts)
     ]
+    real_restored_stdout = [value for value in REAL_VALUES if value in stdout]
+    fake_request_values = _candidate_fake_texts(outbound_user_texts)
 
     proof = {
         "detector": "openai/privacy-filter via scripts/privacy_filter_openai.py",
         "binary": str(codex),
+        "privacy_enabled_env": "PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1",
         "prompt": PROMPT,
         "exit_code": proc.returncode,
         "captured_request_contains_real_values": real_in_request,
-        "stdout_restored_real_values": real_restored_stdout,
+        "captured_relevant_user_texts_contains_real_values": real_in_relevant_user_texts,
         "captured_request_candidate_fake_texts": fake_request_values,
-        "captured_request": state.request_json,
+        "backend_like_fake_response": state.backend_text,
+        "stdout_restored_real_values": real_restored_stdout,
         "stdout": stdout,
-        "stderr": stderr,
+        "stderr_tail": proc.stderr[-4000:],
+        "secrets_logged": False,
+        "full_request_logged": False,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(proof, indent=2, sort_keys=True) + "\n")
@@ -218,9 +244,9 @@ def main() -> int:
     if proc.returncode != 0:
         raise RuntimeError(f"codex exited {proc.returncode}; see {out}")
     if real_in_request:
-        raise RuntimeError(
-            f"real values leaked into outbound request: {real_in_request}; see {out}"
-        )
+        raise RuntimeError(f"real values leaked into outbound request: {real_in_request}; see {out}")
+    if len(fake_request_values) == 0:
+        raise RuntimeError(f"captured request did not include fake PII values; see {out}")
     if len(real_restored_stdout) < len(REAL_VALUES):
         raise RuntimeError(f"stdout did not restore all real values; see {out}")
 
