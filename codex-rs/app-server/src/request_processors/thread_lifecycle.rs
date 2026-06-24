@@ -14,117 +14,6 @@ pub(super) struct ListenerTaskContext {
     pub(super) skills_watcher: Arc<SkillsWatcher>,
 }
 
-struct UnloadingState {
-    residency_manager: ThreadResidencyManager,
-    thread_id: ThreadId,
-    has_subscribers_rx: watch::Receiver<bool>,
-    has_subscribers: (bool, Instant),
-    thread_status_rx: watch::Receiver<ThreadStatus>,
-    is_active: (bool, Instant),
-}
-
-impl UnloadingState {
-    async fn new(listener_task_context: &ListenerTaskContext, thread_id: ThreadId) -> Option<Self> {
-        let has_subscribers_rx = listener_task_context
-            .thread_state_manager
-            .subscribe_to_has_connections(thread_id)
-            .await?;
-        let thread_status_rx = listener_task_context
-            .thread_watch_manager
-            .subscribe(thread_id)
-            .await?;
-        let has_subscribers = (*has_subscribers_rx.borrow(), Instant::now());
-        let is_active = (
-            matches!(*thread_status_rx.borrow(), ThreadStatus::Active { .. }),
-            Instant::now(),
-        );
-        listener_task_context
-            .thread_residency_manager
-            .note_observed(thread_id, has_subscribers.0, is_active.0)
-            .await;
-        Some(Self {
-            residency_manager: listener_task_context.thread_residency_manager.clone(),
-            thread_id,
-            has_subscribers_rx,
-            has_subscribers,
-            thread_status_rx,
-            is_active,
-        })
-    }
-
-    fn polling_target(&self) -> Option<Instant> {
-        match (self.has_subscribers, self.is_active) {
-            ((false, has_no_subscribers_since), (false, is_inactive_since)) => Some(
-                std::cmp::max(has_no_subscribers_since, is_inactive_since)
-                    + self.residency_manager.eviction_poll(),
-            ),
-            _ => None,
-        }
-    }
-
-    fn sync_receiver_values(&mut self) {
-        let has_subscribers = *self.has_subscribers_rx.borrow();
-        if self.has_subscribers.0 != has_subscribers {
-            self.has_subscribers = (has_subscribers, Instant::now());
-        }
-
-        let is_active = matches!(*self.thread_status_rx.borrow(), ThreadStatus::Active { .. });
-        if self.is_active.0 != is_active {
-            self.is_active = (is_active, Instant::now());
-        }
-    }
-
-    async fn unload_decision(&mut self) -> crate::thread_residency::ThreadResidencyDecision {
-        self.sync_receiver_values();
-        self.residency_manager
-            .unload_decision(self.thread_id, self.has_subscribers.0, self.is_active.0)
-            .await
-    }
-
-    fn note_thread_activity_observed(&mut self) {
-        if !self.is_active.0 {
-            self.is_active = (false, Instant::now());
-        }
-    }
-
-    async fn wait_for_unloading_trigger(&mut self) -> bool {
-        loop {
-            self.sync_receiver_values();
-            self.residency_manager
-                .note_observed(self.thread_id, self.has_subscribers.0, self.is_active.0)
-                .await;
-            let polling_target = self.polling_target();
-            if let Some(target) = polling_target
-                && target <= Instant::now()
-            {
-                return true;
-            }
-            let unloading_sleep = async {
-                if let Some(target) = polling_target {
-                    tokio::time::sleep_until(target.into()).await;
-                } else {
-                    futures::future::pending::<()>().await;
-                }
-            };
-            tokio::select! {
-                _ = unloading_sleep => return true,
-                changed = self.has_subscribers_rx.changed() => {
-                    if changed.is_err() {
-                        return false;
-                    }
-                    self.sync_receiver_values();
-                },
-                changed = self.thread_status_rx.changed() => {
-                    if changed.is_err() {
-                        return false;
-                    }
-                    self.sync_receiver_values();
-                },
-            }
-        }
-    }
-}
-
 pub(super) enum ThreadShutdownResult {
     Complete,
     SubmitFailed,
@@ -172,6 +61,18 @@ pub(super) async fn ensure_conversation_listener(
         else {
             return Ok(EnsureConversationListenerResult::ConnectionClosed);
         };
+        let loaded_status = listener_task_context
+            .thread_watch_manager
+            .loaded_status_for_thread(&conversation_id.to_string())
+            .await;
+        listener_task_context
+            .thread_residency_manager
+            .note_observed(
+                conversation_id,
+                /*has_subscribers*/ true,
+                matches!(loaded_status, ThreadStatus::Active { .. }),
+            )
+            .await;
         thread_state
     };
     if let Err(error) = ensure_listener_task_running(
@@ -215,6 +116,155 @@ pub(super) fn log_listener_attach_result(
     }
 }
 
+pub(super) fn spawn_thread_residency_reaper(
+    thread_manager: Arc<ThreadManager>,
+    outgoing: Arc<OutgoingMessageSender>,
+    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
+    thread_watch_manager: ThreadWatchManager,
+    shutdown_token: CancellationToken,
+) {
+    let eviction_poll = std::cmp::max(
+        thread_residency_manager.eviction_poll(),
+        Duration::from_secs(1),
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = tokio::time::sleep(eviction_poll) => {}
+            }
+            reap_thread_residency_once(
+                thread_manager.clone(),
+                outgoing.clone(),
+                pending_thread_unloads.clone(),
+                thread_state_manager.clone(),
+                thread_residency_manager.clone(),
+                thread_watch_manager.clone(),
+            )
+            .await;
+        }
+    });
+}
+
+async fn reap_thread_residency_once(
+    thread_manager: Arc<ThreadManager>,
+    outgoing: Arc<OutgoingMessageSender>,
+    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
+    thread_watch_manager: ThreadWatchManager,
+) {
+    for thread_id in thread_manager.list_thread_ids().await {
+        refresh_thread_residency_observation(
+            thread_id,
+            &thread_state_manager,
+            &thread_residency_manager,
+            &thread_watch_manager,
+        )
+        .await;
+    }
+
+    let candidates = thread_residency_manager.eviction_candidates().await;
+    for thread_id in candidates.thread_ids {
+        maybe_unload_residency_candidate(
+            thread_id,
+            &candidates.reason,
+            thread_manager.clone(),
+            outgoing.clone(),
+            pending_thread_unloads.clone(),
+            thread_state_manager.clone(),
+            thread_residency_manager.clone(),
+            thread_watch_manager.clone(),
+        )
+        .await;
+    }
+}
+
+async fn refresh_thread_residency_observation(
+    thread_id: ThreadId,
+    thread_state_manager: &ThreadStateManager,
+    thread_residency_manager: &ThreadResidencyManager,
+    thread_watch_manager: &ThreadWatchManager,
+) {
+    let has_subscribers = thread_state_manager.has_subscribers(thread_id).await;
+    let loaded_status = thread_watch_manager
+        .loaded_status_for_thread(&thread_id.to_string())
+        .await;
+    thread_residency_manager
+        .note_observed(
+            thread_id,
+            has_subscribers,
+            matches!(loaded_status, ThreadStatus::Active { .. }),
+        )
+        .await;
+}
+
+async fn maybe_unload_residency_candidate(
+    thread_id: ThreadId,
+    reason: &str,
+    thread_manager: Arc<ThreadManager>,
+    outgoing: Arc<OutgoingMessageSender>,
+    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    thread_state_manager: ThreadStateManager,
+    thread_residency_manager: ThreadResidencyManager,
+    thread_watch_manager: ThreadWatchManager,
+) {
+    let thread = match thread_manager.get_thread(thread_id).await {
+        Ok(thread) => thread,
+        Err(_) => {
+            thread_residency_manager.note_removed(thread_id).await;
+            return;
+        }
+    };
+    let has_subscribers = thread_state_manager.has_subscribers(thread_id).await;
+    let loaded_status = thread_watch_manager
+        .loaded_status_for_thread(&thread_id.to_string())
+        .await;
+    let agent_status = thread.agent_status().await;
+    let is_active = matches!(loaded_status, ThreadStatus::Active { .. })
+        || matches!(agent_status, AgentStatus::Running);
+    let is_protected =
+        residency_candidate_is_protected(has_subscribers, &loaded_status, &agent_status);
+    thread_residency_manager
+        .note_observed(thread_id, has_subscribers, is_active)
+        .await;
+    if is_protected {
+        return;
+    }
+
+    {
+        let mut pending_thread_unloads = pending_thread_unloads.lock().await;
+        if pending_thread_unloads.contains(&thread_id) {
+            return;
+        }
+        info!("thread {thread_id} selected for memory-aware residency unload: {reason}");
+        pending_thread_unloads.insert(thread_id);
+    }
+    unload_thread_without_subscribers(
+        thread_manager,
+        outgoing,
+        pending_thread_unloads,
+        thread_state_manager,
+        thread_residency_manager,
+        thread_watch_manager,
+        thread_id,
+        thread,
+    )
+    .await;
+}
+
+fn residency_candidate_is_protected(
+    has_subscribers: bool,
+    loaded_status: &ThreadStatus,
+    agent_status: &AgentStatus,
+) -> bool {
+    has_subscribers
+        || matches!(loaded_status, ThreadStatus::Active { .. })
+        || matches!(agent_status, AgentStatus::Running)
+}
+
 pub(super) async fn ensure_listener_task_running(
     listener_task_context: ListenerTaskContext,
     conversation_id: ThreadId,
@@ -222,13 +272,6 @@ pub(super) async fn ensure_listener_task_running(
     thread_state: Arc<Mutex<ThreadState>>,
 ) -> Result<(), JSONRPCErrorError> {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    let Some(mut unloading_state) =
-        UnloadingState::new(&listener_task_context, conversation_id).await
-    else {
-        return Err(invalid_request(format!(
-            "thread {conversation_id} is closing; retry after the thread is closed"
-        )));
-    };
     let config = conversation.config().await;
     let environments = conversation.environment_selections().await;
     let watch_registration = listener_task_context
@@ -354,46 +397,6 @@ pub(super) async fn ensure_listener_task_running(
                     )
                     .await;
                 }
-                unloading_watchers_open = unloading_state.wait_for_unloading_trigger() => {
-                    if !unloading_watchers_open {
-                        break;
-                    }
-                    let unload_decision = unloading_state.unload_decision().await;
-                    if !unload_decision.should_unload {
-                        continue;
-                    }
-                    if matches!(conversation.agent_status().await, AgentStatus::Running) {
-                        unloading_state.note_thread_activity_observed();
-                        continue;
-                    }
-                    {
-                        let mut pending_thread_unloads = pending_thread_unloads.lock().await;
-                        if pending_thread_unloads.contains(&conversation_id) {
-                            continue;
-                        }
-                        let unload_decision = unloading_state.unload_decision().await;
-                        if !unload_decision.should_unload {
-                            continue;
-                        }
-                        info!(
-                            "thread {conversation_id} selected for memory-aware residency unload: {}",
-                            unload_decision.reason
-                        );
-                        pending_thread_unloads.insert(conversation_id);
-                    }
-                    unload_thread_without_subscribers(
-                        thread_manager.clone(),
-                        outgoing_for_task.clone(),
-                        pending_thread_unloads.clone(),
-                        thread_state_manager.clone(),
-                        thread_residency_manager.clone(),
-                        thread_watch_manager.clone(),
-                        conversation_id,
-                        conversation.clone(),
-                    )
-                    .await;
-                    break;
-                }
             }
         }
 
@@ -404,6 +407,45 @@ pub(super) async fn ensure_listener_task_running(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residency_candidate_final_guard_protects_subscribed_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ true,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_threads_that_became_active() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Active {
+                active_flags: Vec::new(),
+            },
+            &AgentStatus::Completed(None),
+        ));
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Running,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
+        assert!(!residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
 }
 
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
