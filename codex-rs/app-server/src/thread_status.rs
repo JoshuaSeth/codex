@@ -8,6 +8,7 @@ use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadActiveFlag;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+#[cfg(test)]
 use codex_protocol::ThreadId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -243,6 +244,7 @@ impl ThreadWatchManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn subscribe(
         &self,
         thread_id: ThreadId,
@@ -368,6 +370,7 @@ impl ThreadWatchState {
             .unwrap_or(ThreadStatus::NotLoaded)
     }
 
+    #[cfg(test)]
     fn subscribe(&mut self, thread_id: String) -> watch::Receiver<ThreadStatus> {
         let status = self.loaded_status_for_thread(&thread_id);
         let sender = self

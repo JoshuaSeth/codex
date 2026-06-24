@@ -48,8 +48,8 @@ struct ThreadResidencyRecord {
     is_active: bool,
 }
 
-pub(crate) struct ThreadResidencyDecision {
-    pub(crate) should_unload: bool,
+pub(crate) struct ThreadResidencyEvictionCandidates {
+    pub(crate) thread_ids: Vec<ThreadId>,
     pub(crate) reason: String,
 }
 
@@ -191,60 +191,62 @@ impl ThreadResidencyManager {
         self.state.lock().await.records.remove(&thread_id);
     }
 
-    pub(crate) async fn unload_decision(
-        &self,
-        thread_id: ThreadId,
-        has_subscribers: bool,
-        is_active: bool,
-    ) -> ThreadResidencyDecision {
-        if has_subscribers {
-            return keep("thread has subscribers");
-        }
-        if is_active {
-            return keep("thread is active");
-        }
+    pub(crate) async fn eviction_candidates(&self) -> ThreadResidencyEvictionCandidates {
+        self.eviction_candidates_for_rss(current_rss_bytes()).await
+    }
 
-        let rss_bytes = current_rss_bytes();
+    async fn eviction_candidates_for_rss(
+        &self,
+        rss_bytes: Option<u64>,
+    ) -> ThreadResidencyEvictionCandidates {
         let Some(rss_bytes) = rss_bytes else {
-            return keep("process RSS is unavailable");
+            return no_eviction_candidates("process RSS is unavailable");
         };
         if rss_bytes <= self.policy.soft_cap_bytes {
-            return keep("process RSS is below the residency soft cap");
+            return no_eviction_candidates("process RSS is below the residency soft cap");
         }
 
-        self.note_observed(thread_id, has_subscribers, is_active)
-            .await;
-        let idle_cutoff = if rss_bytes > self.policy.hard_cap_bytes {
+        let above_hard_cap = rss_bytes > self.policy.hard_cap_bytes;
+        let idle_cutoff = if above_hard_cap {
             Duration::ZERO
         } else {
             self.policy.idle_min_ttl
         };
-        let mut state = self.state.lock().await;
-        let Some(record) = state.records.get_mut(&thread_id) else {
-            return keep("thread has no residency record yet");
-        };
-        record.has_subscribers = has_subscribers;
-        record.is_active = is_active;
-        let idle_for = record.last_accessed_at.elapsed();
-        if rss_bytes <= self.policy.hard_cap_bytes && idle_for < self.policy.idle_min_ttl {
-            return keep("process RSS is above the soft cap but thread is inside minimum idle TTL");
-        }
-        let Some(lru_thread_id) = oldest_unprotected_idle_thread(&state.records, idle_cutoff)
-        else {
-            return keep("no idle unsubscribed resident is eligible for eviction");
-        };
-        if lru_thread_id != thread_id {
-            return keep("a less-recently-used idle resident should be evicted first");
+        let now = Instant::now();
+        let state = self.state.lock().await;
+        let mut candidates = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                !record.has_subscribers
+                    && !record.is_active
+                    && now.saturating_duration_since(record.last_accessed_at) >= idle_cutoff
+            })
+            .map(|(thread_id, record)| (*thread_id, record.last_accessed_at))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return no_eviction_candidates(
+                "no idle unsubscribed resident is eligible for eviction",
+            );
         }
 
-        ThreadResidencyDecision {
-            should_unload: true,
-            reason: if rss_bytes > self.policy.hard_cap_bytes {
-                "process RSS is above the residency hard cap".to_string()
-            } else {
-                "process RSS is above the residency soft cap and thread is idle past minimum TTL"
-                    .to_string()
-            },
+        candidates.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+        let selected_candidates = if above_hard_cap {
+            candidates
+        } else {
+            candidates.into_iter().take(1).collect()
+        };
+        let reason = if above_hard_cap {
+            "process RSS is above the residency hard cap"
+        } else {
+            "process RSS is above the residency soft cap and thread is idle past minimum TTL"
+        };
+        ThreadResidencyEvictionCandidates {
+            thread_ids: selected_candidates
+                .into_iter()
+                .map(|(thread_id, _)| thread_id)
+                .collect(),
+            reason: reason.to_string(),
         }
     }
 
@@ -282,21 +284,6 @@ impl ThreadResidencyManager {
     }
 }
 
-fn oldest_unprotected_idle_thread(
-    records: &HashMap<ThreadId, ThreadResidencyRecord>,
-    idle_cutoff: Duration,
-) -> Option<ThreadId> {
-    records
-        .iter()
-        .filter(|(_, record)| {
-            !record.has_subscribers
-                && !record.is_active
-                && record.last_accessed_at.elapsed() >= idle_cutoff
-        })
-        .min_by_key(|(_, record)| record.last_accessed_at)
-        .map(|(thread_id, _)| *thread_id)
-}
-
 impl ThreadResidencyPolicy {
     fn from_env() -> Self {
         let soft_cap_bytes = read_u64_env(SOFT_CAP_ENV).unwrap_or(DEFAULT_SOFT_CAP_BYTES);
@@ -313,9 +300,9 @@ impl ThreadResidencyPolicy {
     }
 }
 
-fn keep(reason: &str) -> ThreadResidencyDecision {
-    ThreadResidencyDecision {
-        should_unload: false,
+fn no_eviction_candidates(reason: &str) -> ThreadResidencyEvictionCandidates {
+    ThreadResidencyEvictionCandidates {
+        thread_ids: Vec::new(),
         reason: reason.to_string(),
     }
 }
@@ -376,38 +363,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_decision_protects_active_and_subscribed_threads() {
-        let manager = ThreadResidencyManager::with_policy(0, 0, Duration::ZERO);
-        let thread_id = ThreadId::new();
-
-        assert!(
-            !manager
-                .unload_decision(thread_id, true, false)
-                .await
-                .should_unload
-        );
-        assert!(
-            !manager
-                .unload_decision(thread_id, false, true)
-                .await
-                .should_unload
-        );
-    }
-
-    #[tokio::test]
-    async fn unload_decision_keeps_idle_threads_when_under_soft_cap() {
+    async fn eviction_candidates_keep_many_idle_threads_under_soft_cap() {
         let manager = ThreadResidencyManager::with_policy(u64::MAX, u64::MAX, Duration::ZERO);
-        let thread_id = ThreadId::new();
+        for _ in 0..100 {
+            manager.note_loaded(ThreadId::new(), None).await;
+        }
 
-        manager.note_loaded(thread_id, None).await;
+        let candidates = manager.eviction_candidates_for_rss(Some(1)).await;
 
-        let decision = manager.unload_decision(thread_id, false, false).await;
-
-        assert!(!decision.should_unload, "{}", decision.reason);
+        assert!(candidates.thread_ids.is_empty(), "{}", candidates.reason);
     }
 
     #[tokio::test]
-    async fn unload_decision_evicts_lru_idle_thread_under_pressure() {
+    async fn eviction_candidates_select_lru_idle_thread_above_soft_cap() {
         let manager = ThreadResidencyManager::with_policy(0, u64::MAX, Duration::ZERO);
         let older_thread_id = ThreadId::new();
         let newer_thread_id = ThreadId::new();
@@ -416,10 +384,52 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         manager.note_loaded(newer_thread_id, None).await;
 
-        let newer_decision = manager.unload_decision(newer_thread_id, false, false).await;
-        let older_decision = manager.unload_decision(older_thread_id, false, false).await;
+        let candidates = manager.eviction_candidates_for_rss(Some(1)).await;
 
-        assert!(!newer_decision.should_unload, "{}", newer_decision.reason);
-        assert!(older_decision.should_unload, "{}", older_decision.reason);
+        assert_eq!(candidates.thread_ids, vec![older_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn eviction_candidates_ignore_idle_ttl_above_hard_cap() {
+        let manager = ThreadResidencyManager::with_policy(0, 0, Duration::from_secs(60 * 60));
+        let first_thread_id = ThreadId::new();
+        let second_thread_id = ThreadId::new();
+
+        manager.note_loaded(first_thread_id, None).await;
+        manager.note_loaded(second_thread_id, None).await;
+
+        let candidates = manager.eviction_candidates_for_rss(Some(1)).await;
+
+        assert_eq!(candidates.thread_ids.len(), 2);
+        assert!(candidates.thread_ids.contains(&first_thread_id));
+        assert!(candidates.thread_ids.contains(&second_thread_id));
+    }
+
+    #[tokio::test]
+    async fn eviction_candidates_protect_active_and_subscribed_threads() {
+        let manager = ThreadResidencyManager::with_policy(0, u64::MAX, Duration::ZERO);
+        let subscribed_thread_id = ThreadId::new();
+        let active_thread_id = ThreadId::new();
+
+        manager.note_loaded(subscribed_thread_id, None).await;
+        manager.note_loaded(active_thread_id, None).await;
+        manager
+            .note_observed(
+                subscribed_thread_id,
+                /*has_subscribers*/ true,
+                /*is_active*/ false,
+            )
+            .await;
+        manager
+            .note_observed(
+                active_thread_id,
+                /*has_subscribers*/ false,
+                /*is_active*/ true,
+            )
+            .await;
+
+        let candidates = manager.eviction_candidates_for_rss(Some(1)).await;
+
+        assert!(candidates.thread_ids.is_empty(), "{}", candidates.reason);
     }
 }

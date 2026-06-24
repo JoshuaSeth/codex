@@ -458,7 +458,6 @@ impl ThreadStateManager {
         true
     }
 
-    #[cfg(test)]
     pub(crate) async fn has_subscribers(&self, thread_id: ThreadId) -> bool {
         self.state
             .lock()
@@ -544,6 +543,7 @@ impl ThreadStateManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn subscribe_to_has_connections(
         &self,
         thread_id: ThreadId,

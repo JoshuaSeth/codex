@@ -329,6 +329,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
+    pub(super) thread_residency_reaper_shutdown: CancellationToken,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
 }
@@ -364,6 +365,16 @@ impl ThreadRequestProcessor {
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
     ) -> Self {
+        let thread_residency_reaper_shutdown = CancellationToken::new();
+        spawn_thread_residency_reaper(
+            Arc::clone(&thread_manager),
+            Arc::clone(&outgoing),
+            Arc::clone(&pending_thread_unloads),
+            thread_state_manager.clone(),
+            thread_residency_manager.clone(),
+            thread_watch_manager.clone(),
+            thread_residency_reaper_shutdown.clone(),
+        );
         Self {
             auth_manager,
             thread_manager,
@@ -380,6 +391,7 @@ impl ThreadRequestProcessor {
             thread_goal_processor,
             state_db,
             log_db,
+            thread_residency_reaper_shutdown,
             background_tasks: TaskTracker::new(),
             skills_watcher,
         }
@@ -956,7 +968,12 @@ impl ThreadRequestProcessor {
         self.thread_state_manager.clear_all_listeners().await;
     }
 
+    pub(crate) fn shutdown_residency_reaper(&self) {
+        self.thread_residency_reaper_shutdown.cancel();
+    }
+
     pub(crate) async fn shutdown_threads(&self) {
+        self.shutdown_residency_reaper();
         let report = self
             .thread_manager
             .shutdown_all_threads_bounded(Duration::from_secs(10))

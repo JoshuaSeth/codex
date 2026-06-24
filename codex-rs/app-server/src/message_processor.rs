@@ -568,6 +568,7 @@ impl MessageProcessor {
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         self.skills_watcher.shutdown();
+        self.thread_processor.shutdown_residency_reaper();
     }
 
     pub(crate) async fn process_request(
