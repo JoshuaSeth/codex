@@ -215,6 +215,14 @@ pub enum AccountSessionWorkspaceKind {
 #[ts(export_to = "v2/")]
 pub struct LogoutAccountResponse {}
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ReloadAccountResponse {
+    pub auth_mode: Option<AuthMode>,
+    pub plan_type: Option<PlanType>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

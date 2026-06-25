@@ -27,6 +27,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LogoutAccountResponse;
+use codex_app_server_protocol::ReloadAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -247,6 +248,84 @@ async fn logout_account_removes_auth_and_notifies() -> Result<()> {
     .await??;
     let account: GetAccountResponse = to_response(get_resp)?;
     assert_eq!(account.account, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reload_account_hot_swaps_file_backed_auth_and_notifies() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-token-old")
+            .account_id("account-old")
+            .chatgpt_account_id("account-old")
+            .email("old@example.com")
+            .plan_type("plus"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp =
+        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-token-new")
+            .account_id("account-new")
+            .chatgpt_account_id("account-new")
+            .email("new@example.com")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let reload_id = mcp.send_reload_account_request().await?;
+    let reload_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(reload_id)),
+    )
+    .await??;
+    let response: ReloadAccountResponse = to_response(reload_resp)?;
+    assert_eq!(response.auth_mode, Some(AuthMode::Chatgpt));
+    assert_eq!(response.plan_type, Some(AccountPlanType::Pro));
+
+    let note = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await??;
+    let parsed: ServerNotification = note.try_into()?;
+    let ServerNotification::AccountUpdated(payload) = parsed else {
+        bail!("unexpected notification: {parsed:?}");
+    };
+    assert_eq!(payload.auth_mode, Some(AuthMode::Chatgpt));
+    assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
+
+    let get_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
+        .await?;
+    let get_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+    )
+    .await??;
+    let account: GetAccountResponse = to_response(get_resp)?;
+    assert_eq!(
+        account.account,
+        Some(Account::Chatgpt {
+            email: "new@example.com".to_string(),
+            plan_type: AccountPlanType::Pro,
+        })
+    );
+
     Ok(())
 }
 

@@ -97,6 +97,13 @@ impl AccountRequestProcessor {
         self.logout_v2(request_id).await.map(|()| None)
     }
 
+    pub(crate) async fn reload_account(
+        &self,
+        request_id: ConnectionRequestId,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.reload_v2(request_id).await.map(|()| None)
+    }
+
     pub(crate) async fn cancel_login_account(
         &self,
         params: CancelLoginAccountParams,
@@ -737,6 +744,54 @@ impl AccountRequestProcessor {
                 .await;
         }
         Ok(())
+    }
+
+    async fn reload_v2(&self, request_id: ConnectionRequestId) -> Result<(), JSONRPCErrorError> {
+        let result = self.reload_account_response().await;
+        let account_updated = result
+            .as_ref()
+            .ok()
+            .map(|response| AccountUpdatedNotification {
+                auth_mode: response.auth_mode,
+                plan_type: response.plan_type.clone(),
+            });
+        self.outgoing.send_result(request_id, result).await;
+
+        if let Some(payload) = account_updated {
+            self.outgoing
+                .send_server_notification(ServerNotification::AccountUpdated(payload))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn reload_account_response(&self) -> Result<ReloadAccountResponse, JSONRPCErrorError> {
+        {
+            let mut guard = self.active_login.lock().await;
+            if let Some(active) = guard.take() {
+                drop(active);
+            }
+        }
+
+        self.auth_manager.reload().await;
+        self.config_manager.replace_cloud_config_bundle_loader(
+            self.auth_manager.clone(),
+            self.config.chatgpt_base_url.clone(),
+        );
+        self.config_manager
+            .sync_default_client_residency_requirement()
+            .await;
+        let auth = self.auth_manager.auth_cached();
+        Self::maybe_refresh_remote_installed_plugins_cache_for_current_config(
+            &self.config_manager,
+            &self.thread_manager,
+            auth.clone(),
+        )
+        .await;
+        Ok(ReloadAccountResponse {
+            auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
+            plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+        })
     }
 
     async fn refresh_token_if_requested(&self, do_refresh: bool) -> RefreshTokenRequestOutcome {
