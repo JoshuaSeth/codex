@@ -37,6 +37,7 @@ async fn thread_loaded_list_returns_loaded_thread_ids() -> Result<()> {
     let ThreadLoadedListResponse {
         mut data,
         next_cursor,
+        ..
     } = to_response::<ThreadLoadedListResponse>(resp)?;
     data.sort();
     assert_eq!(data, vec![thread_id]);
@@ -74,6 +75,7 @@ async fn thread_loaded_list_paginates() -> Result<()> {
     let ThreadLoadedListResponse {
         data: first_page,
         next_cursor,
+        ..
     } = to_response::<ThreadLoadedListResponse>(resp)?;
     assert_eq!(first_page, vec![expected[0].clone()]);
     assert_eq!(next_cursor, Some(expected[0].clone()));
@@ -92,6 +94,7 @@ async fn thread_loaded_list_paginates() -> Result<()> {
     let ThreadLoadedListResponse {
         data: second_page,
         next_cursor,
+        ..
     } = to_response::<ThreadLoadedListResponse>(resp)?;
     assert_eq!(second_page, vec![expected[1].clone()]);
     assert_eq!(next_cursor, None);

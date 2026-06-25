@@ -382,6 +382,11 @@ impl TestAppServer {
             .await
     }
 
+    /// Send an `account/reload` JSON-RPC request.
+    pub async fn send_reload_account_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("account/reload", /*params*/ None).await
+    }
+
     /// Send an `account/sendAddCreditsNudgeEmail` JSON-RPC request.
     pub async fn send_add_credits_nudge_email_request(
         &mut self,
