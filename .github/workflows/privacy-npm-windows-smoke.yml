@@ -1,0 +1,104 @@
+name: privacy-npm-windows-smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/privacy-npm-windows-smoke.yml"
+      - "codex-cli/bin/codex-privacy.js"
+      - "scripts/build_codex_package.py"
+      - "scripts/build_privacy_npm_packages.py"
+      - "scripts/codex_package/**"
+      - "scripts/privacy_filter_fixture.py"
+      - "scripts/privacy_filter_openai.py"
+      - "scripts/privacy_network_probe.py"
+      - "codex-rs/**"
+  workflow_dispatch:
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  smoke:
+    name: Build and install on clean Windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.3"
+
+      - name: Build canonical Windows package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageDir = Join-Path $env:RUNNER_TEMP 'codex-package-win32-x64'
+          $archive = Join-Path $env:RUNNER_TEMP 'codex-package-win32-x64.zip'
+          python scripts/build_codex_package.py `
+            --target x86_64-pc-windows-msvc `
+            --cargo-profile release `
+            --package-dir $packageDir `
+            --archive-output $archive `
+            --force
+          "PACKAGE_DIR=$packageDir" >> $env:GITHUB_ENV
+
+      - name: Stage split npm packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = Join-Path $env:RUNNER_TEMP 'privacy-npm'
+          python scripts/build_privacy_npm_packages.py `
+            --version 0.0.0-privacy.windows-smoke.${{ github.run_id }} `
+            --package-dir $env:PACKAGE_DIR `
+            --out-dir $outDir `
+            --pack `
+            --force
+          "NPM_OUT=$outDir" >> $env:GITHUB_ENV
+          Get-Content (Join-Path $outDir 'privacy-npm-manifest.json')
+
+      - name: Clean npm install and privacy smoke
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content (Join-Path $env:NPM_OUT 'privacy-npm-manifest.json') | ConvertFrom-Json
+          $platform = $manifest.platform_packages[0]
+          $prefix = Join-Path $env:RUNNER_TEMP 'codex-privacy-install'
+          npm install -g --prefix $prefix $platform.tarball
+          & (Join-Path $prefix 'codex-privacy.cmd') --version
+
+          $probe = Join-Path $env:RUNNER_TEMP 'windows_privacy_probe.json'
+          $fixture = (Resolve-Path 'scripts/privacy_filter_fixture.py').Path
+          $env:PITCHAI_CODEX_PRIVACY_FILTER_CMD = "python `"$fixture`""
+          python scripts/privacy_network_probe.py `
+            --codex (Join-Path $prefix 'codex-privacy.cmd') `
+            --detector-cmd $env:PITCHAI_CODEX_PRIVACY_FILTER_CMD `
+            --out $probe `
+            --timeout 240
+          Get-Content $probe
+
+      - name: Upload npm tarballs and probe proof
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: privacy-npm-windows-smoke
+          path: |
+            ${{ runner.temp }}/privacy-npm/*.tgz
+            ${{ runner.temp }}/privacy-npm/privacy-npm-manifest.json
+            ${{ runner.temp }}/windows_privacy_probe.json
