@@ -1,0 +1,26 @@
+{
+  "anonymized_outbound_payload": "Morgan Carter lives at 5514 Walnut St, Boulder, CO and uses casey.brooks@example.net or (875) 555-9375. Ask Morgan Carter to confirm.",
+  "backend_like_fake_response": "Drafted the note for Morgan Carter using Morgan Carter lives at 5514 Walnut St, Boulder, CO and uses casey.brooks@example.net or (875) 555-9375. Ask Morgan Carter to confirm..",
+  "detector_cmd": "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py",
+  "detector_kind": "openai/privacy-filter",
+  "detector_source": "https://huggingface.co/openai/privacy-filter",
+  "disabled_mode_payload": "Jane Smith lives at 14 Pearl St, Boston, MA and uses jane.smith@example.com or 212-555-0199. Ask Jane Smith to confirm.",
+  "mapping_leak_check": {
+    "mapping_secret_exported": false,
+    "outbound_or_backend_contains_real_values": [],
+    "raw_mapping_exported": false
+  },
+  "original_local_input": "Jane Smith lives at 14 Pearl St, Boston, MA and uses jane.smith@example.com or 212-555-0199. Ask Jane Smith to confirm.",
+  "restored_local_output": "Drafted the note for Jane Smith using Jane Smith lives at 14 Pearl St, Boston, MA and uses jane.smith@example.com or 212-555-0199. Ask Jane Smith to confirm..",
+  "safe_mapping_artifact": {
+    "fake_to_real_entries": 4,
+    "fake_values": [
+      "(875) 555-9375",
+      "5514 Walnut St, Boulder, CO",
+      "Morgan Carter",
+      "casey.brooks@example.net"
+    ],
+    "real_to_fake_entries": 4
+  },
+  "stable_fake_for_repeated_name": "Morgan Carter"
+}

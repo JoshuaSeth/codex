@@ -1,0 +1,27 @@
+{
+  "backend_like_fake_response": "Backend saw this anonymized prompt: <environment_context>\n  <cwd>/tmp/tmpagdhr6t8</cwd>\n  <shell>bash</shell>\n  <current_date>Cameron Foster</current_date>\n  <timezone>Etc/UTC</timezone>\n  <filesystem><workspace_roots><root>/tmp/tmpagdhr6t8</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>\nPlease summarize this contact twice: Quinn Bennett lives at 7722 Walnut St, Raleigh, NC, email casey.brooks@example.net, phone (834) 555-7834. Quinn Bennett needs a follow-up.",
+  "backend_like_fake_response_contains_real_values": [],
+  "binary": "/code/pitchai-cli-new/vendor/codex/codex-rs/target-privacy-release/release/codex",
+  "binary_sha256": "35ffe2040133bd2a4d2aedf501acb7d691028c9d9921d8ec96a9b86c922049c0",
+  "binary_size_bytes": 1381427024,
+  "captured_relevant_user_texts_contains_real_values": [],
+  "captured_request_candidate_fake_texts": [
+    "Please summarize this contact twice: Quinn Bennett lives at 7722 Walnut St, Raleigh, NC, email casey.brooks@example.net, phone (834) 555-7834. Quinn Bennett needs a follow-up."
+  ],
+  "captured_request_contains_real_values": [],
+  "detector": "openai/privacy-filter via scripts/privacy_filter_openai.py",
+  "detector_source": "https://huggingface.co/openai/privacy-filter",
+  "exit_code": 0,
+  "full_request_logged": false,
+  "privacy_enabled_env": "PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1",
+  "prompt": "Please summarize this contact twice: Jane Smith lives at 14 Pearl St, email jane.smith@example.com, phone (415) 555-1212. Jane Smith needs a follow-up.",
+  "secrets_logged": false,
+  "stderr_tail": "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir \"/tmp\" (codex_home: AbsolutePathBuf(\"/tmp/tmp4cdvf9if\"))\nReading additional input from stdin...\nOpenAI Codex v0.0.0\n--------\nworkdir: /tmp/tmpagdhr6t8\nmodel: gpt-4.1\nprovider: privacy-mock\napproval: never\nsandbox: read-only\nreasoning effort: none\nreasoning summaries: none\nsession id: 019f06c4-4b0b-7f42-b749-68590ff53686\n--------\nuser\nPlease summarize this contact twice: Jane Smith lives at 14 Pearl St, email jane.smith@example.com, phone (415) 555-1212. Jane Smith needs a follow-up.\nwarning: Model metadata for `gpt-4.1` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.\ncodex\nBackend saw this anonymized prompt: <environment_context>\n  <cwd>/tmp/tmpagdhr6t8</cwd>\n  <shell>bash</shell>\n  <current_date>2026-06-27</current_date>\n  <timezone>Etc/UTC</timezone>\n  <filesystem><workspace_roots><root>/tmp/tmpagdhr6t8</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>\nPlease summarize this contact twice: Jane Smith lives at 14 Pearl St, email jane.smith@example.com, phone (415) 555-1212. Jane Smith needs a follow-up.\ntokens used\n0\n",
+  "stdout": "Backend saw this anonymized prompt: <environment_context>\n  <cwd>/tmp/tmpagdhr6t8</cwd>\n  <shell>bash</shell>\n  <current_date>2026-06-27</current_date>\n  <timezone>Etc/UTC</timezone>\n  <filesystem><workspace_roots><root>/tmp/tmpagdhr6t8</root></workspace_roots><permission_profile type=\"managed\"><file_system type=\"restricted\"><entry access=\"read\"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>\nPlease summarize this contact twice: Jane Smith lives at 14 Pearl St, email jane.smith@example.com, phone (415) 555-1212. Jane Smith needs a follow-up.\n",
+  "stdout_restored_real_values": [
+    "Jane Smith",
+    "14 Pearl St",
+    "jane.smith@example.com",
+    "(415) 555-1212"
+  ]
+}

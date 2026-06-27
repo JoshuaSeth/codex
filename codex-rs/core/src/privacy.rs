@@ -130,12 +130,14 @@ impl PrivacyFilter {
 
     fn anonymize_response_item(&mut self, item: &mut ResponseItem) -> anyhow::Result<()> {
         match item {
-            ResponseItem::Message { content, .. } => {
-                for content_item in content {
-                    if let ContentItem::InputText { text } | ContentItem::OutputText { text } =
-                        content_item
-                    {
-                        *text = self.anonymize_text(text)?;
+            ResponseItem::Message { role, content, .. } => {
+                if role != "developer" && role != "system" {
+                    for content_item in content {
+                        if let ContentItem::InputText { text } | ContentItem::OutputText { text } =
+                            content_item
+                        {
+                            *text = self.anonymize_text(text)?;
+                        }
                     }
                 }
             }
@@ -496,6 +498,95 @@ print(json.dumps({{"spans": spans}}))
         };
         assert_eq!(filter.anonymize_text("Jane Smith").unwrap(), "Jane Smith");
         assert_eq!(filter.de_anonymize_text("Jane Smith"), "Jane Smith");
+    }
+
+    #[test]
+    fn anonymizes_conversation_messages_without_scanning_developer_messages() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let mut items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Developer context mentions Jane Smith for static policy text."
+                        .to_string(),
+                }],
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Jane Smith needs a follow-up.".to_string(),
+                }],
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Earlier summary: Jane Smith needs a follow-up.".to_string(),
+                }],
+                phase: None,
+            },
+        ];
+
+        filter.anonymize_items(&mut items).unwrap();
+
+        let ResponseItem::Message {
+            content: developer_content,
+            ..
+        } = &items[0]
+        else {
+            panic!("expected developer message");
+        };
+        let ContentItem::InputText {
+            text: developer_text,
+        } = &developer_content[0]
+        else {
+            panic!("expected developer input text");
+        };
+        assert_eq!(
+            developer_text,
+            "Developer context mentions Jane Smith for static policy text."
+        );
+
+        let ResponseItem::Message {
+            content: user_content,
+            ..
+        } = &items[1]
+        else {
+            panic!("expected user message");
+        };
+        let ContentItem::InputText { text: user_text } = &user_content[0] else {
+            panic!("expected user input text");
+        };
+        assert!(!user_text.contains("Jane Smith"));
+        assert_eq!(
+            filter.de_anonymize_text(user_text),
+            "Jane Smith needs a follow-up."
+        );
+
+        let ResponseItem::Message {
+            content: assistant_content,
+            ..
+        } = &items[2]
+        else {
+            panic!("expected assistant message");
+        };
+        let ContentItem::OutputText {
+            text: assistant_text,
+        } = &assistant_content[0]
+        else {
+            panic!("expected assistant output text");
+        };
+        assert!(!assistant_text.contains("Jane Smith"));
+        assert_eq!(
+            filter.de_anonymize_text(assistant_text),
+            "Earlier summary: Jane Smith needs a follow-up."
+        );
     }
 
     #[test]

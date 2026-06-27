@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -100,6 +101,14 @@ def _candidate_fake_texts(texts: list[str]) -> list[str]:
     return [text for text in texts if any(marker in text for marker in markers)]
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class ProbeState:
     request_json: dict[str, Any] | None = None
     backend_text: str | None = None
@@ -172,7 +181,19 @@ def main() -> int:
         cmd = [
             str(codex),
             "-c",
-            f"openai_base_url={json.dumps(base_url)}",
+            "model_provider=\"privacy-mock\"",
+            "-c",
+            "model=\"gpt-4.1\"",
+            "-c",
+            "model_providers.privacy-mock.name=\"Privacy Mock\"",
+            "-c",
+            f"model_providers.privacy-mock.base_url={json.dumps(base_url)}",
+            "-c",
+            "model_providers.privacy-mock.env_key=\"CODEX_API_KEY\"",
+            "-c",
+            "model_providers.privacy-mock.wire_api=\"responses\"",
+            "-c",
+            "model_providers.privacy-mock.supports_websockets=false",
             "exec",
             "--skip-git-repo-check",
             PROMPT,
@@ -219,18 +240,25 @@ def main() -> int:
     real_in_relevant_user_texts = [
         value for value in REAL_VALUES if any(value in text for text in outbound_user_texts)
     ]
+    real_in_backend_like_response = [
+        value for value in REAL_VALUES if state.backend_text and value in state.backend_text
+    ]
     real_restored_stdout = [value for value in REAL_VALUES if value in stdout]
     fake_request_values = _candidate_fake_texts(outbound_user_texts)
 
     proof = {
         "detector": "openai/privacy-filter via scripts/privacy_filter_openai.py",
+        "detector_source": "https://huggingface.co/openai/privacy-filter",
         "binary": str(codex),
+        "binary_size_bytes": codex.stat().st_size,
+        "binary_sha256": _sha256(codex),
         "privacy_enabled_env": "PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1",
         "prompt": PROMPT,
         "exit_code": proc.returncode,
         "captured_request_contains_real_values": real_in_request,
         "captured_relevant_user_texts_contains_real_values": real_in_relevant_user_texts,
         "captured_request_candidate_fake_texts": fake_request_values,
+        "backend_like_fake_response_contains_real_values": real_in_backend_like_response,
         "backend_like_fake_response": state.backend_text,
         "stdout_restored_real_values": real_restored_stdout,
         "stdout": stdout,
@@ -245,6 +273,16 @@ def main() -> int:
         raise RuntimeError(f"codex exited {proc.returncode}; see {out}")
     if real_in_request:
         raise RuntimeError(f"real values leaked into outbound request: {real_in_request}; see {out}")
+    if real_in_relevant_user_texts:
+        raise RuntimeError(
+            "real values leaked into outbound user text: "
+            f"{real_in_relevant_user_texts}; see {out}"
+        )
+    if real_in_backend_like_response:
+        raise RuntimeError(
+            "real values leaked into backend-like response: "
+            f"{real_in_backend_like_response}; see {out}"
+        )
     if len(fake_request_values) == 0:
         raise RuntimeError(f"captured request did not include fake PII values; see {out}")
     if len(real_restored_stdout) < len(REAL_VALUES):

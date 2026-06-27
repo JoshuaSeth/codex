@@ -16,6 +16,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("archive", type=Path)
     parser.add_argument("--detector-cmd", required=True)
+    parser.add_argument("--timeout", default="900")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as temp:
@@ -41,7 +42,7 @@ def main() -> int:
                 "--out",
                 str(proof),
                 "--timeout",
-                "180",
+                args.timeout,
             ],
             check=True,
         )

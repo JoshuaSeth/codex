@@ -6,10 +6,6 @@ Use GitHub Release assets as the internal source of truth, then expose the same
 asset through Homebrew for macOS/Linux developers. Keep npm as a convenience
 wrapper for Node-oriented environments, not the canonical binary store.
 
-For the exact current-artifact contents, target-machine requirements,
-release-build caveat, and upstream OpenAI Codex distribution comparison, see
-`docs/privacy_packaging_clarity_20260619.md`.
-
 - Linux servers: install the GitHub Release tarball with `install.sh`.
 - macOS developers: install from a PitchAI Homebrew tap formula that downloads
   the GitHub Release tarball and verifies SHA-256.
@@ -22,47 +18,68 @@ This keeps one binary artifact per target and avoids divergent Brew/npm builds.
 ## Build
 
 ```bash
-cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex --release
-python3 scripts/build_privacy_distribution.py --codex-bin codex-rs/target/release/codex
+env RUSTUP_TOOLCHAIN=1.95.0-x86_64-unknown-linux-gnu \
+  CARGO_TARGET_DIR=codex-rs/target-privacy-release \
+  CARGO_PROFILE_RELEASE_LTO=false \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex --release
+
+python3 scripts/build_privacy_distribution.py \
+  --codex-bin codex-rs/target-privacy-release/release/codex \
+  --version v0.0.0-privacy.20260627 \
+  --target linux-x86_64 \
+  --out-dir dist/privacy-release
 ```
 
 The builder emits:
 
 ```text
-dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz
-dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.manifest.json
+dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
+dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.manifest.json
 dist/privacy-release/homebrew/pitchai-codex-privacy.rb
-dist/privacy-release/pitchai-codex-privacy-0.0.0-privacy.20260618.tgz
+dist/privacy-release/pitchai-codex-privacy-0.0.0-privacy.20260627.tgz
 ```
 
-Published prerelease:
+Current internal artifact:
 
 ```text
-https://github.com/JoshuaSeth/codex/releases/tag/v0.0.0-privacy.20260618
+dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
+sha256 f4200df4692d85184e5536c5f2b32dd3c41c1a5d6c3f6fe664e8b8512982847b
 ```
 
-Linux x86_64 tarball:
+Canonical GitHub Release URL:
 
 ```text
-https://github.com/JoshuaSeth/codex/releases/download/v0.0.0-privacy.20260618/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz
+https://github.com/JoshuaSeth/codex/releases/download/v0.0.0-privacy.20260627/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
 ```
 
-Updated 2026-06-19: the validated artifact in this worktree is built from a
-release-profile GNU Linux Codex binary at `codex-rs/target/release/codex`. The
-remaining production-hardening gap is to move to upstream-style musl package
-artifacts with checksums/signing for fleet distribution.
+Release page:
+
+```text
+https://github.com/JoshuaSeth/codex/releases/tag/v0.0.0-privacy.20260627
+```
+
+The release-profile binary inside the archive is
+`codex-rs/target-privacy-release/release/codex`, size `1381427024`, SHA-256
+`35ffe2040133bd2a4d2aedf501acb7d691028c9d9921d8ec96a9b86c922049c0`.
+Rust is not required on target machines for this artifact.
 
 ## Install From Tarball
 
 ```bash
-tar -xzf pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz
-./pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64/install.sh "$HOME/.local"
+tar -xzf pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
+./pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64/install.sh "$HOME/.local"
 codex-privacy exec "Jane Smith lives at 14 Pearl St."
 ```
 
 The wrapper enables `PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1` and points
 `PITCHAI_CODEX_PRIVACY_FILTER_CMD` at the bundled OpenAI
 `openai/privacy-filter` adapter.
+
+Target machines need `uv`, Python 3.12 support, and internet or a prewarmed
+cache for the first `openai/privacy-filter` model load. The archive contains
+the compiled Codex binary, wrapper, install script, README, and privacy adapter
+scripts. It does not contain secrets, model weights, or reversible mapping data.
 
 ## Homebrew
 
@@ -85,62 +102,48 @@ packaging/homebrew/pitchai-codex-privacy.rb
 
 ## npm
 
-The current npm packaging follows the upstream Codex split-package model:
-
-- `@pitchai/codex-privacy`: small launcher package.
-- `@pitchai/codex-privacy-<platform>`: platform-specific native package with
-  the canonical `codex-package.json`, `bin/`, `codex-resources/`, and
-  `codex-path/` layout plus the privacy filter adapters under
-  `codex-resources/privacy/`.
-
-Before a private npm registry publish exists, install the platform tarball
-directly. Example for the Linux x64 local package build:
+The current generated npm tarball is internal/private and contains the same
+compiled binary plus wrapper. It contains no secrets.
 
 ```bash
-python3 scripts/build_privacy_npm_packages.py \
-  --version 0.0.0-privacy.20260623 \
-  --package-dir dist/privacy-npm-local/package-linux-x64 \
-  --out-dir dist/privacy-npm-local/npm \
-  --pack \
-  --force
-
-npm install -g ./dist/privacy-npm-local/npm/pitchai-codex-privacy-linux-x64-0.0.0-privacy.20260623-linux-x64.tgz
+npm install -g ./dist/privacy-release/pitchai-codex-privacy-0.0.0-privacy.20260627.tgz
 codex-privacy --version
 codex-privacy exec "Jane Smith lives at 14 Pearl St."
 ```
 
-For normal npm distribution, publish the small main package and the matching
-platform packages to a private registry. The main package depends on the
-platform packages as optional dependencies, matching the upstream OpenAI Codex
-npm install shape.
-
-The npm launcher requires `uv` on the target machine. It enables
-`PITCHAI_CODEX_PRIVACY_MIDDLEWARE=1` and points
-`PITCHAI_CODEX_PRIVACY_FILTER_CMD` at the bundled `privacy_filter_openai.py`
-adapter, which runs the real `openai/privacy-filter` model through
-Transformers. The npm package must not include model weights; `uv` resolves the
-Python/model dependencies on first privacy-filter execution.
+For normal npm distribution, publish this package to a private PitchAI registry
+or split it into upstream-style platform packages. The npm launcher requires
+Node 18+, `uv`, and Python 3.12 support on the target machine.
 
 ## Validation
 
 ```bash
 python3 scripts/validate_privacy_distribution.py \
-  dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz \
-  --detector-cmd "python3 /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_fixture.py"
+  dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz \
+  --detector-cmd "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" \
+  --timeout 1200
 ```
 
-The clean-install validation uses a deterministic fixture detector for speed and
-network capture. The primary detector remains the bundled OpenAI
-`openai/privacy-filter` adapter, validated separately by
-`scripts/privacy_lane_proof.py` and the Rust detector contract test.
+The clean-install validation installs into a temporary prefix, runs the installed
+binary against the local network-capture mock, uses the OpenAI
+`openai/privacy-filter` adapter, verifies outbound payloads contain no original
+PII, and verifies local stdout restores the original PII.
 
-Clean Linux container validation was run with:
+Release-binary network proof:
 
 ```bash
-docker run --rm \
-  -v /code/pitchai-cli-new/vendor/codex/dist/privacy-release:/dist:ro \
-  -v /code/pitchai-cli-new/vendor/codex/scripts/privacy_network_probe.py:/repo/scripts/privacy_network_probe.py:ro \
-  -v /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_fixture.py:/fixture.py:ro \
-  python:3.12-slim \
-  bash -lc 'set -euo pipefail; mkdir -p /work /proof; tar -xzf /dist/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64.tar.gz -C /work; /work/pitchai-codex-privacy-v0.0.0-privacy.20260618-linux-x86_64/install.sh /tmp/prefix; python3 /repo/scripts/privacy_network_probe.py --codex /tmp/prefix/lib/pitchai-codex-privacy/bin/codex --detector-cmd "python3 /fixture.py" --out /proof/container_probe.json --timeout 180'
+scripts/privacy_network_probe.py \
+  --codex codex-rs/target-privacy-release/release/codex \
+  --detector-cmd "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" \
+  --out docs/privacy_network_probe_20260627.json \
+  --timeout 1200
 ```
+
+`docs/privacy_network_probe_20260627.json` records:
+
+- `captured_request_contains_real_values: []`
+- `captured_relevant_user_texts_contains_real_values: []`
+- fake outbound text such as `Quinn Bennett`, `7722 Walnut St`, and
+  `casey.brooks@example.net`
+- restored stdout values `Jane Smith`, `14 Pearl St`,
+  `jane.smith@example.com`, and `(415) 555-1212`

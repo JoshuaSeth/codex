@@ -27,22 +27,35 @@ export PITCHAI_CODEX_PRIVACY_FILTER_CMD="uv run --python 3.12 --with 'transforme
 
 ## Packaged Artifact
 
-Build a downloadable Linux artifact:
+Build the current Linux release artifact:
 
 ```bash
-scripts/package_privacy_artifact.sh
+env RUSTUP_TOOLCHAIN=1.95.0-x86_64-unknown-linux-gnu \
+  CARGO_TARGET_DIR=codex-rs/target-privacy-release \
+  CARGO_PROFILE_RELEASE_LTO=false \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex --release
+
+python3 scripts/build_privacy_distribution.py \
+  --codex-bin codex-rs/target-privacy-release/release/codex \
+  --version v0.0.0-privacy.20260627 \
+  --target linux-x86_64 \
+  --out-dir dist/privacy-release
 ```
 
-The archive is written to:
+The validated archive is:
 
 ```text
-dist/codex-privacy-linux-x86_64.tar.gz
+dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
+sha256 f4200df4692d85184e5536c5f2b32dd3c41c1a5d6c3f6fe664e8b8512982847b
 ```
 
 After unpacking, run:
 
 ```bash
-./codex-privacy exec "Jane Smith lives at 14 Pearl St."
+tar -xzf pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz
+./pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64/install.sh "$HOME/.local"
+codex-privacy exec "Jane Smith lives at 14 Pearl St."
 ```
 
 The wrapper enables privacy mode and points Codex at the bundled OpenAI
@@ -50,16 +63,30 @@ privacy-filter adapter. The optional GLiNER adapter is packaged only as an alter
 detector for development; the primary supported path is `openai/privacy-filter`.
 The fixture adapter is packaged for local network-capture tests only.
 
-The validated artifact for the 2026-06-18 proof run is:
-
-```text
-dist/codex-privacy-linux-x86_64-debug.tar.gz
-```
+Target machines do not need Rust for the packaged artifact. They need `uv`,
+Python 3.12 support, and network/cache access the first time the bundled
+Transformers adapter downloads `openai/privacy-filter`. The package contains no
+secrets or mapping data; reversible mappings and the per-session secret are
+created only in local process memory.
 
 ## Proof Commands
 
 ```bash
 uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python scripts/privacy_lane_proof.py
-PITCHAI_CODEX_PRIVACY_FILTER_CMD="uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" cargo test --manifest-path codex-rs/Cargo.toml -p codex-core privacy::tests::model_backed_detector_contract_when_configured --lib -- --nocapture
-scripts/privacy_network_probe.py --codex codex-rs/target/debug/codex --detector-cmd "python3 /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_fixture.py"
+PITCHAI_CODEX_PRIVACY_FILTER_CMD="uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" cargo test --manifest-path codex-rs/Cargo.toml -p codex-core privacy --lib
+scripts/privacy_network_probe.py \
+  --codex codex-rs/target-privacy-release/release/codex \
+  --detector-cmd "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" \
+  --out docs/privacy_network_probe_20260627.json \
+  --timeout 1200
+python3 scripts/validate_privacy_distribution.py \
+  dist/privacy-release/pitchai-codex-privacy-v0.0.0-privacy.20260627-linux-x86_64.tar.gz \
+  --detector-cmd "uv run --python 3.12 --with 'transformers>=4.53.0' --with torch --with accelerate python /code/pitchai-cli-new/vendor/codex/scripts/privacy_filter_openai.py" \
+  --timeout 1200
 ```
+
+The built-binary proof artifact is
+`docs/privacy_network_probe_20260627.json`. It records that the captured
+outbound request and backend-like fake response contained none of the original
+PII, while local stdout restored `Jane Smith`, `14 Pearl St`,
+`jane.smith@example.com`, and `(415) 555-1212`.
