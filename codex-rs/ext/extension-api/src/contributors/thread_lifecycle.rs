@@ -1,4 +1,5 @@
 use crate::ExtensionData;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::SessionSource;
 
 /// Input supplied when the host starts a runtime for a thread.
@@ -29,6 +30,8 @@ pub struct ThreadIdleInput<'a> {
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.
     pub thread_store: &'a ExtensionData,
+    /// Latest account rate-limit snapshot observed by the host, if any.
+    pub latest_rate_limits: Option<&'a RateLimitSnapshot>,
 }
 
 /// Input supplied when the host stops a thread runtime.

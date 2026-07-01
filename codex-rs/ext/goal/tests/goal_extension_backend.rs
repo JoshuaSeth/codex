@@ -10,6 +10,7 @@ use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::NoopTurnItemEmitter;
+use codex_extension_api::ThreadIdleInput;
 use codex_extension_api::ThreadResumeInput;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
@@ -35,6 +36,8 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadGoalStatus;
@@ -597,6 +600,70 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
     assert_eq!(codex_state::ThreadGoalStatus::Blocked, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_usage_limit_stops_goal_before_auto_continuation() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    tool_by_name(&harness.tools(), "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship goal extension backend" }),
+        ))
+        .await?;
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
+                /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
+            ),
+        )
+        .await;
+    harness.stop_turn("turn-1").await;
+    harness.sink.clear();
+
+    let exhausted_rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(1782944524),
+        }),
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    harness
+        .notify_thread_idle(Some(&exhausted_rate_limits))
+        .await;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(23, goal.tokens_used);
+    assert_eq!(codex_state::ThreadGoalStatus::UsageLimited, goal.status);
+    assert_eq!(
+        vec![CapturedGoalEvent {
+            event_id: format!("{thread_id}:idle-usage-limit"),
+            turn_id: None,
+            status: ThreadGoalStatus::UsageLimited,
+            tokens_used: 23,
+        }],
+        harness.sink.goal_events()
+    );
     Ok(())
 }
 
@@ -1265,6 +1332,18 @@ impl GoalExtensionHarness {
                 .on_thread_resume(ThreadResumeInput {
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
+                })
+                .await;
+        }
+    }
+
+    async fn notify_thread_idle(&self, latest_rate_limits: Option<&RateLimitSnapshot>) {
+        for contributor in self.registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_idle(ThreadIdleInput {
+                    session_store: &self.session_store,
+                    thread_store: &self.thread_store,
+                    latest_rate_limits,
                 })
                 .await;
         }

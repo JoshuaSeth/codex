@@ -8805,6 +8805,13 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
                     self.expected_thread_id.to_string(),
                     input.thread_store.level_id()
                 );
+                assert_eq!(
+                    Some(100.0),
+                    input
+                        .latest_rate_limits
+                        .and_then(|rate_limits| rate_limits.primary.as_ref())
+                        .map(|primary| primary.used_percent)
+                );
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.idle_tx.send(()).await.expect("idle receiver open");
             })
@@ -8823,6 +8830,22 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
     session.services.extensions = Arc::new(builder.build());
 
     let session = Arc::new(session);
+    session
+        .record_rate_limits_info(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(1782944524),
+            }),
+            secondary: None,
+            credits: None,
+            individual_limit: None,
+            plan_type: None,
+            rate_limit_reached_type: None,
+        })
+        .await;
     session
         .spawn_task(Arc::new(turn_context), Vec::new(), CompletingTask)
         .await;

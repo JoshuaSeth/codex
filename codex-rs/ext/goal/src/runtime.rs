@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ThreadGoal;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
@@ -238,6 +239,70 @@ impl GoalRuntimeHandle {
     pub async fn usage_limit_active_goal_for_turn(&self, turn_id: &str) -> Result<(), String> {
         self.stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::UsageLimit)
             .await
+    }
+
+    pub(crate) async fn stop_active_goal_if_auto_continuation_usage_limited(
+        &self,
+        latest_rate_limits: Option<&RateLimitSnapshot>,
+    ) -> Result<bool, String> {
+        if !self.is_enabled() {
+            return Ok(false);
+        }
+        let Some(rate_limits) = latest_rate_limits else {
+            return Ok(false);
+        };
+        if !rate_limits_block_auto_goal_continuation(rate_limits) {
+            return Ok(false);
+        }
+
+        // Hold this through the read/status-update window so idle continuation
+        // cannot race with an external goal mutation.
+        let _goal_state_permit = self.goal_state_permit().await?;
+        let Some(active_goal) = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            self.inner.accounting_state.clear_active_goal();
+            return Ok(false);
+        };
+        if !matches!(
+            active_goal.status,
+            codex_state::ThreadGoalStatus::Active | codex_state::ThreadGoalStatus::BudgetLimited
+        ) {
+            self.inner.accounting_state.clear_active_goal();
+            return Ok(false);
+        }
+
+        let previous_status = Some(active_goal.status);
+        let Some(goal) = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .usage_limit_active_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            self.inner.accounting_state.clear_active_goal();
+            return Ok(false);
+        };
+        self.inner
+            .metrics
+            .record_terminal_if_status_changed(previous_status, &goal);
+        self.inner
+            .analytics
+            .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
+        self.inner.accounting_state.clear_active_goal();
+        let goal = protocol_goal_from_state(goal);
+        self.inner.event_emitter.thread_goal_updated(
+            format!("{}:idle-usage-limit", self.thread_id()),
+            /*turn_id*/ None,
+            goal,
+        );
+        Ok(true)
     }
 
     /// Accounts the ending turn and stops its active goal after a terminal error.
@@ -572,4 +637,14 @@ impl GoalRuntimeHandle {
                 .then_some(goal.status)
         }))
     }
+}
+
+fn rate_limits_block_auto_goal_continuation(rate_limits: &RateLimitSnapshot) -> bool {
+    if rate_limits.rate_limit_reached_type.is_some() {
+        return true;
+    }
+    rate_limits
+        .primary
+        .as_ref()
+        .is_some_and(|primary| primary.used_percent >= 100.0)
 }

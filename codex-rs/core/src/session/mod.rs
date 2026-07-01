@@ -3315,6 +3315,11 @@ impl Session {
         }
     }
 
+    pub(crate) async fn latest_rate_limits(&self) -> Option<RateLimitSnapshot> {
+        let state = self.state.lock().await;
+        state.latest_rate_limits.clone()
+    }
+
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
         let state = self.state.lock().await;
         state.mcp_dependency_prompted()

@@ -44,12 +44,14 @@ impl Session {
         {
             return;
         }
+        let latest_rate_limits = self.latest_rate_limits().await;
 
         for contributor in self.services.extensions.thread_lifecycle_contributors() {
             contributor
                 .on_thread_idle(codex_extension_api::ThreadIdleInput {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
+                    latest_rate_limits: latest_rate_limits.as_ref(),
                 })
                 .await;
         }

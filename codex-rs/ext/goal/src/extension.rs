@@ -157,6 +157,20 @@ where
                 return;
             };
 
+            match runtime
+                .stop_active_goal_if_auto_continuation_usage_limited(input.latest_rate_limits)
+                .await
+            {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to stop active goal at usage limit for idle thread {}: {err}",
+                        runtime.thread_id()
+                    );
+                    return;
+                }
+            }
             if let Err(err) = runtime.continue_if_idle().await {
                 tracing::warn!(
                     "failed to continue active goal for idle thread {}: {err}",
