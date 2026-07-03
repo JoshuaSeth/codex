@@ -166,6 +166,13 @@ In Azure:
 - Preferred for the final-updates channel: `PITCHAI_UPDATES_TELEGRAM_CHAT_ID` (or `TELEGRAM_UPDATES_CHAT_ID`)
 - Optional PM DB connectivity (`PITCHAI_PM_DB_URL` or the `PITCHAI_PM_DB_*` / `PITCHAI_DB_*` env set) lets the stop hook persist the sent Telegram `message_id` plus route metadata so replies to that specific final message can be mapped back to the originating Codex session
 
+As of 2026-07-03, ordinary operational stop-hook/final-update traffic should
+target the `PitchAI Updates` Telegram group via
+`PITCHAI_UPDATES_TELEGRAM_CHAT_ID=-5370767158` or
+`TELEGRAM_UPDATES_CHAT_ID=-5370767158`. Seth's private DM chat id is reserved
+for sensitive/private boss-only messages and explicit private-message reply
+chains.
+
 Stop-hook implementation: `tools/custom_tools/telegram_bot.py` (copied into the image as `/opt/pitchai/telegram_bot.py`).
 
 ## Build and push the container image
@@ -275,6 +282,8 @@ properties:
       - name: TELEGRAM_BOT_TOKEN
         secretRef: telegram-bot-token
       - name: TELEGRAM_CHAT_ID
+        secretRef: telegram-chat-id
+      - name: PITCHAI_UPDATES_TELEGRAM_CHAT_ID
         secretRef: telegram-chat-id
       - name: PITCHAI_CODEX_MODEL
         value: gpt-5.2-high

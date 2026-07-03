@@ -9,6 +9,13 @@ Current behavior also supports **reply-to-final-message routing**:
 - when tmux route metadata is available, the reply is submitted directly into that live tmux-backed Codex session and an `Enter` key is sent automatically
 - otherwise the dispatcher queues a bundle that resumes the same `conversation_id`
 
+Operational update routing changed on 2026-07-03: ordinary PitchAI update
+traffic should use the Telegram group named `PitchAI Updates`, not Seth's
+private DM. Keep private DM routing only for sensitive/private boss-only
+messages and explicit replies to a private boss-originated message. Use
+`PITCHAI_UPDATES_TELEGRAM_CHAT_ID=-5370767158` or
+`TELEGRAM_UPDATES_CHAT_ID=-5370767158` for ordinary final update targets.
+
 Constraints / decisions (per Seth):
 
 - **Reply in the same Telegram chat** where the command was sent.
@@ -74,7 +81,7 @@ Prompt file format: markdown, includes metadata + the user’s message. Example:
 ## Telegram command
 - ts_utc: 2025-12-25T01:23:45Z
 - update_id: 123456789
-- chat_id: 5246077032
+- chat_id: -5370767158
 - from_user_id: 11111111
 - from_username: sethvanderbijl
 
