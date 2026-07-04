@@ -289,9 +289,11 @@ pub(crate) fn resolve_thread_status(
     has_in_progress_turn: bool,
 ) -> ThreadStatus {
     // Running-turn events can arrive before the watch runtime state is observed by
-    // the listener loop. In that window we prefer to reflect a real active turn as
-    // `Active` instead of `Idle`/`NotLoaded`.
-    if has_in_progress_turn && matches!(status, ThreadStatus::Idle | ThreadStatus::NotLoaded) {
+    // the listener loop. A previous transient error can also leave the coarse
+    // watch status at `SystemError` while a resumed turn is appending fresh
+    // progress. In both cases, prefer the proven in-progress turn over stale
+    // live-state bookkeeping.
+    if has_in_progress_turn {
         return ThreadStatus::Active {
             active_flags: Vec::new(),
         };
@@ -579,22 +581,19 @@ mod tests {
 
     #[test]
     fn resolves_in_progress_turn_to_active_status() {
-        let status = resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
-
-        let status =
-            resolve_thread_status(ThreadStatus::NotLoaded, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
+        for status in [
+            ThreadStatus::Idle,
+            ThreadStatus::NotLoaded,
+            ThreadStatus::SystemError,
+        ] {
+            let resolved = resolve_thread_status(status, /*has_in_progress_turn*/ true);
+            assert_eq!(
+                resolved,
+                ThreadStatus::Active {
+                    active_flags: Vec::new(),
+                }
+            );
+        }
     }
 
     #[test]
