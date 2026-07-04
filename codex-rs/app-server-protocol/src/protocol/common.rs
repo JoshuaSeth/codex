@@ -629,6 +629,16 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadLoadedListResponse,
     },
+    ThreadStatusRead => "thread/status/read" {
+        params: v2::ThreadStatusReadParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadStatusReadResponse,
+    },
+    ThreadStatusList => "thread/status/list" {
+        params: v2::ThreadStatusListParams,
+        serialization: None,
+        response: v2::ThreadStatusListResponse,
+    },
     ThreadRead => "thread/read" {
         params: v2::ThreadReadParams,
         serialization: thread_id(params.thread_id),
