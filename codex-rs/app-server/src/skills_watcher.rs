@@ -62,13 +62,7 @@ impl SkillsWatcher {
     }
 
     pub(crate) fn register_runtime_extra_roots(&self, extra_roots: &[AbsolutePathBuf]) {
-        let roots = extra_roots
-            .iter()
-            .map(|root| WatchPath {
-                path: root.clone().into_path_buf(),
-                recursive: true,
-            })
-            .collect();
+        let roots = existing_skill_root_watch_paths(extra_roots.iter());
         let registration = self.subscriber.register_paths(roots);
         let mut guard = self
             .runtime_extra_roots_registration
@@ -109,16 +103,14 @@ impl SkillsWatcher {
             config.config_layer_stack.clone(),
             config.bundled_skills_enabled(),
         );
-        let roots = thread_manager
+        let skill_roots = thread_manager
             .skills_manager()
             .skill_roots_for_config(&skills_input, Some(environment.get_filesystem()))
             .await
             .into_iter()
-            .map(|root| WatchPath {
-                path: root.path.into_path_buf(),
-                recursive: true,
-            })
-            .collect();
+            .map(|root| root.path)
+            .collect::<Vec<_>>();
+        let roots = existing_skill_root_watch_paths(skill_roots.iter());
         self.subscriber.register_paths(roots)
     }
 
@@ -150,5 +142,60 @@ impl SkillsWatcher {
                     .await;
             }
         });
+    }
+}
+
+fn existing_skill_root_watch_paths<'a>(
+    roots: impl IntoIterator<Item = &'a AbsolutePathBuf>,
+) -> Vec<WatchPath> {
+    roots
+        .into_iter()
+        .filter_map(watch_path_for_existing_skill_root)
+        .collect()
+}
+
+fn watch_path_for_existing_skill_root(root: &AbsolutePathBuf) -> Option<WatchPath> {
+    match root.as_path().try_exists() {
+        Ok(true) => Some(WatchPath {
+            path: root.clone().into_path_buf(),
+            recursive: true,
+        }),
+        Ok(false) => None,
+        Err(err) => {
+            warn!(
+                "skipping skills watcher root `{}` because it could not be checked: {err}",
+                root.as_path().display()
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_skill_roots_are_watched_recursively() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root = AbsolutePathBuf::try_from(temp_dir.path().to_path_buf())
+            .expect("temp dir should be absolute");
+
+        let watch_path = watch_path_for_existing_skill_root(&root).expect("existing root");
+
+        assert_eq!(watch_path.path.as_path(), root.as_path());
+        assert!(watch_path.recursive);
+    }
+
+    #[test]
+    fn missing_skill_roots_are_not_watched_through_parent_fallback() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_root_path = temp_dir.path().join("missing").join("skills");
+        let missing_root =
+            AbsolutePathBuf::try_from(missing_root_path).expect("missing root should be absolute");
+
+        let watch_path = watch_path_for_existing_skill_root(&missing_root);
+
+        assert!(watch_path.is_none());
     }
 }
