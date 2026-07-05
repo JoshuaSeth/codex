@@ -143,10 +143,11 @@ impl ThreadWatchManager {
         self.running_turn_count_tx.subscribe()
     }
 
-    pub(crate) async fn note_turn_started(&self, thread_id: &str) {
+    pub(crate) async fn note_turn_started(&self, thread_id: &str, active_turn_id: Option<String>) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.is_loaded = true;
             runtime.running = true;
+            runtime.active_turn_id = active_turn_id;
             runtime.has_system_error = false;
         })
         .await;
@@ -163,6 +164,7 @@ impl ThreadWatchManager {
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
+            runtime.active_turn_id = None;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.is_loaded = false;
@@ -173,6 +175,7 @@ impl ThreadWatchManager {
     pub(crate) async fn note_system_error(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, |runtime| {
             runtime.running = false;
+            runtime.active_turn_id = None;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.has_system_error = true;
@@ -183,6 +186,7 @@ impl ThreadWatchManager {
     async fn clear_active_state(&self, thread_id: &str) {
         self.update_runtime_for_thread(thread_id, move |runtime| {
             runtime.running = false;
+            runtime.active_turn_id = None;
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
         })
@@ -295,6 +299,7 @@ pub(crate) fn resolve_thread_status(
     // live-state bookkeeping.
     if has_in_progress_turn {
         return ThreadStatus::Active {
+            active_turn_id: None,
             active_flags: Vec::new(),
         };
     }
@@ -426,6 +431,7 @@ impl ThreadWatchState {
 struct RuntimeFacts {
     is_loaded: bool,
     running: bool,
+    active_turn_id: Option<String>,
     pending_permission_requests: u32,
     pending_user_input_requests: u32,
     has_system_error: bool,
@@ -445,7 +451,10 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     }
 
     if runtime.running || !active_flags.is_empty() {
-        return ThreadStatus::Active { active_flags };
+        return ThreadStatus::Active {
+            active_turn_id: runtime.active_turn_id.clone(),
+            active_flags,
+        };
     }
 
     if runtime.has_system_error {
@@ -489,15 +498,53 @@ mod tests {
             ))
             .await;
 
-        manager.note_turn_started(NON_INTERACTIVE_THREAD_ID).await;
+        manager
+            .note_turn_started(NON_INTERACTIVE_THREAD_ID, None)
+            .await;
 
         assert_eq!(
             manager
                 .loaded_status_for_thread(NON_INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn tracks_active_turn_id_while_thread_is_running() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager
+            .note_turn_started(INTERACTIVE_THREAD_ID, Some("turn-1".to_string()))
+            .await;
+
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_turn_id: Some("turn-1".to_string()),
+                active_flags: vec![],
+            },
+        );
+
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
         );
     }
 
@@ -511,12 +558,13 @@ mod tests {
             ))
             .await;
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(
             manager
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             },
         );
@@ -529,6 +577,7 @@ mod tests {
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
             },
         );
@@ -541,6 +590,7 @@ mod tests {
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![
                     ThreadActiveFlag::WaitingOnApproval,
                     ThreadActiveFlag::WaitingOnUserInput,
@@ -553,6 +603,7 @@ mod tests {
             &manager,
             INTERACTIVE_THREAD_ID,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
             },
         )
@@ -563,6 +614,7 @@ mod tests {
             &manager,
             INTERACTIVE_THREAD_ID,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             },
         )
@@ -590,6 +642,7 @@ mod tests {
             assert_eq!(
                 resolved,
                 ThreadStatus::Active {
+                    active_turn_id: None,
                     active_flags: Vec::new(),
                 }
             );
@@ -621,7 +674,7 @@ mod tests {
             ))
             .await;
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         manager.note_system_error(INTERACTIVE_THREAD_ID).await;
 
         assert_eq!(
@@ -631,12 +684,13 @@ mod tests {
             ThreadStatus::SystemError,
         );
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(
             manager
                 .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
                 .await,
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             },
         );
@@ -652,7 +706,7 @@ mod tests {
             ))
             .await;
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
 
         assert_eq!(
@@ -672,7 +726,7 @@ mod tests {
                 codex_app_server_protocol::SessionSource::Cli,
             ))
             .await;
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
 
         let statuses = manager
             .loaded_statuses_for_threads(vec![
@@ -684,6 +738,7 @@ mod tests {
         assert_eq!(
             statuses.get(INTERACTIVE_THREAD_ID),
             Some(&ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             }),
         );
@@ -710,7 +765,7 @@ mod tests {
             .await;
         assert_eq!(manager.running_turn_count().await, 0);
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(manager.running_turn_count().await, 1);
 
         manager
@@ -741,12 +796,13 @@ mod tests {
             },
         );
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(
             recv_status_changed_notification(&mut outgoing_rx).await,
             ThreadStatusChangedNotification {
                 thread_id: INTERACTIVE_THREAD_ID.to_string(),
                 status: ThreadStatus::Active {
+                    active_turn_id: None,
                     active_flags: vec![],
                 },
             },
@@ -790,12 +846,13 @@ mod tests {
             "silent upsert should not emit thread/status/changed"
         );
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(
             recv_status_changed_notification(&mut outgoing_rx).await,
             ThreadStatusChangedNotification {
                 thread_id: INTERACTIVE_THREAD_ID.to_string(),
                 status: ThreadStatus::Active {
+                    active_turn_id: None,
                     active_flags: vec![],
                 },
             },
@@ -830,7 +887,7 @@ mod tests {
             .await
             .expect("non-interactive status watcher should subscribe");
 
-        manager.note_turn_started(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
 
         timeout(Duration::from_secs(1), interactive_rx.changed())
             .await
@@ -839,6 +896,7 @@ mod tests {
         assert_eq!(
             *interactive_rx.borrow(),
             ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             },
         );

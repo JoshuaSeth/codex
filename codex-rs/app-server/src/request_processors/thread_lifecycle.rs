@@ -427,6 +427,7 @@ mod tests {
         assert!(residency_candidate_is_protected(
             /*has_subscribers*/ false,
             &ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: Vec::new(),
             },
             &AgentStatus::Completed(None),

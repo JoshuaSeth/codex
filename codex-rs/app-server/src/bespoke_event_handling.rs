@@ -159,7 +159,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .note_accessed(conversation_id)
                 .await;
             thread_watch_manager
-                .note_turn_started(&conversation_id.to_string())
+                .note_turn_started(&conversation_id.to_string(), Some(payload.turn_id.clone()))
                 .await;
             let turn = {
                 let state = thread_state.lock().await;
@@ -3264,7 +3264,7 @@ mod tests {
         let thread_state = new_thread_state();
         let thread_watch_manager = ThreadWatchManager::new();
         thread_watch_manager
-            .note_turn_started(&conversation_id.to_string())
+            .note_turn_started(&conversation_id.to_string(), None)
             .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(
@@ -3304,6 +3304,7 @@ mod tests {
                 .loaded_status_for_thread(&conversation_id.to_string())
                 .await,
             codex_app_server_protocol::ThreadStatus::Active {
+                active_turn_id: None,
                 active_flags: vec![],
             }
         );
@@ -3424,7 +3425,7 @@ mod tests {
         let child_thread_id_string = child_thread_id.to_string();
         let thread_watch_manager = ThreadWatchManager::new();
         thread_watch_manager
-            .note_turn_started(&child_thread_id_string)
+            .note_turn_started(&child_thread_id_string, None)
             .await;
         assert_eq!(thread_watch_manager.running_turn_count().await, 1);
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);

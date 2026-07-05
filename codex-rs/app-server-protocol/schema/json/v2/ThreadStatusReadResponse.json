@@ -93,15 +93,11 @@
   "properties": {
     "status": {
       "$ref": "#/definitions/ThreadStatus"
-    },
-    "threadId": {
-      "type": "string"
     }
   },
   "required": [
-    "status",
-    "threadId"
+    "status"
   ],
-  "title": "ThreadStatusChangedNotification",
+  "title": "ThreadStatusReadResponse",
   "type": "object"
 }

@@ -1241,6 +1241,9 @@ pub enum ThreadStatus {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Active {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional = nullable)]
+        active_turn_id: Option<String>,
         active_flags: Vec<ThreadActiveFlag>,
     },
 }

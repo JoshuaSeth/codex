@@ -91,17 +91,16 @@
     }
   },
   "properties": {
-    "status": {
-      "$ref": "#/definitions/ThreadStatus"
-    },
-    "threadId": {
-      "type": "string"
+    "statuses": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ThreadStatus"
+      },
+      "type": "object"
     }
   },
   "required": [
-    "status",
-    "threadId"
+    "statuses"
   ],
-  "title": "ThreadStatusChangedNotification",
+  "title": "ThreadStatusListResponse",
   "type": "object"
 }

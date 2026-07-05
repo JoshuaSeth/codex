@@ -1890,6 +1890,12 @@
               },
               "type": "array"
             },
+            "activeTurnId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "active"

@@ -1,5 +1,110 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadResidencyDiagnostics": {
+      "properties": {
+        "evictionPollSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hardCapBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "idleMinTtlSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "loadedThreads": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "records": {
+          "items": {
+            "$ref": "#/definitions/ThreadResidencyRecord"
+          },
+          "type": "array"
+        },
+        "residentEstimatedBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rssBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "softCapBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "evictionPollSecs",
+        "hardCapBytes",
+        "idleMinTtlSecs",
+        "loadedThreads",
+        "records",
+        "residentEstimatedBytes",
+        "softCapBytes"
+      ],
+      "type": "object"
+    },
+    "ThreadResidencyRecord": {
+      "properties": {
+        "estimatedBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "idleForSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "loadedForSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "resumeDurationMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "resumeSource": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "idleForSecs",
+        "loadedForSecs",
+        "threadId"
+      ],
+      "type": "object"
+    }
+  },
   "properties": {
     "data": {
       "description": "Thread ids for sessions currently loaded in memory.",
@@ -14,10 +119,19 @@
         "string",
         "null"
       ]
+    },
+    "residency": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ThreadResidencyDiagnostics"
+        }
+      ],
+      "description": "Current app-server thread residency policy and loaded-thread diagnostics."
     }
   },
   "required": [
-    "data"
+    "data",
+    "residency"
   ],
   "title": "ThreadLoadedListResponse",
   "type": "object"
