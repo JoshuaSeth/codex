@@ -611,6 +611,10 @@ pub(super) async fn handle_pending_thread_resume_request(
             || active_turn
                 .as_ref()
                 .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
+    let in_progress_turn_id = active_turn
+        .as_ref()
+        .filter(|turn| matches!(turn.status, TurnStatus::InProgress))
+        .map(|turn| turn.id.clone());
 
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
@@ -631,6 +635,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         &mut thread,
         thread_status,
         has_live_in_progress_turn,
+        in_progress_turn_id,
     );
     let token_usage_thread = pending.include_turns.then(|| thread.clone());
     let mut initial_turns_page = if let Some(params) = pending.initial_turns_page.as_ref() {
@@ -841,8 +846,13 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
     thread: &mut Thread,
     loaded_status: ThreadStatus,
     has_live_in_progress_turn: bool,
+    in_progress_turn_id: Option<String>,
 ) {
-    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
+    let status = resolve_thread_status(
+        loaded_status,
+        has_live_in_progress_turn,
+        in_progress_turn_id,
+    );
     if !matches!(status, ThreadStatus::Active { .. }) {
         for turn in &mut thread.turns {
             if matches!(turn.status, TurnStatus::InProgress) {

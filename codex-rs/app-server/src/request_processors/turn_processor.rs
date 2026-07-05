@@ -1180,6 +1180,7 @@ impl TurnRequestProcessor {
                         .loaded_status_for_thread(&thread.id)
                         .await,
                     /*has_in_progress_turn*/ false,
+                    /*in_progress_turn_id*/ None,
                 );
                 let notif = thread_started_notification(thread);
                 self.outgoing

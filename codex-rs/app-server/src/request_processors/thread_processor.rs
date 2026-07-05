@@ -1243,6 +1243,7 @@ impl ThreadRequestProcessor {
                 ))
                 .await,
             /*has_in_progress_turn*/ false,
+            /*in_progress_turn_id*/ None,
         );
 
         let sandbox = thread_response_sandbox_policy(
@@ -1658,6 +1659,7 @@ impl ThreadRequestProcessor {
                 .loaded_status_for_thread(&thread.id)
                 .await,
             /*has_in_progress_turn*/ false,
+            /*in_progress_turn_id*/ None,
         );
 
         Ok(ThreadMetadataUpdateResponse { thread })
@@ -1710,6 +1712,7 @@ impl ThreadRequestProcessor {
                 .loaded_status_for_thread(&thread.id)
                 .await,
             /*has_in_progress_turn*/ false,
+            /*in_progress_turn_id*/ None,
         );
         self.attach_thread_name(thread_id, &mut thread).await;
         let thread_id = thread.id.clone();
@@ -2322,6 +2325,7 @@ impl ThreadRequestProcessor {
             &mut thread,
             thread_status,
             has_live_in_progress_turn,
+            /*in_progress_turn_id*/ None,
         );
         Ok(thread)
     }
@@ -2837,6 +2841,7 @@ impl ThreadRequestProcessor {
                     &mut thread,
                     thread_status,
                     /*has_live_in_progress_turn*/ false,
+                    /*in_progress_turn_id*/ None,
                 );
                 let config_snapshot = codex_thread.config_snapshot().await;
                 let sandbox = thread_response_sandbox_policy(
@@ -3594,6 +3599,7 @@ impl ThreadRequestProcessor {
                 .loaded_status_for_thread(&thread.id)
                 .await,
             /*has_in_progress_turn*/ false,
+            /*in_progress_turn_id*/ None,
         );
         let config_snapshot = forked_thread.config_snapshot().await;
         let sandbox = thread_response_sandbox_policy(
@@ -4041,8 +4047,17 @@ fn reconstruct_thread_turns_for_turns_list(
         || active_turn
             .as_ref()
             .is_some_and(|turn| matches!(turn.status, TurnStatus::InProgress));
+    let in_progress_turn_id = active_turn
+        .as_ref()
+        .filter(|turn| matches!(turn.status, TurnStatus::InProgress))
+        .map(|turn| turn.id.clone());
     let mut turns = build_api_turns_from_rollout_items(items);
-    normalize_thread_turns_status(&mut turns, loaded_status, has_live_in_progress_turn);
+    normalize_thread_turns_status(
+        &mut turns,
+        loaded_status,
+        has_live_in_progress_turn,
+        in_progress_turn_id,
+    );
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn);
     }
@@ -4053,8 +4068,13 @@ fn normalize_thread_turns_status(
     turns: &mut [Turn],
     loaded_status: ThreadStatus,
     has_live_in_progress_turn: bool,
+    in_progress_turn_id: Option<String>,
 ) {
-    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
+    let status = resolve_thread_status(
+        loaded_status,
+        has_live_in_progress_turn,
+        in_progress_turn_id,
+    );
     if matches!(status, ThreadStatus::Active { .. }) {
         return;
     }

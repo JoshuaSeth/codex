@@ -291,20 +291,28 @@ impl ThreadWatchManager {
 pub(crate) fn resolve_thread_status(
     status: ThreadStatus,
     has_in_progress_turn: bool,
+    in_progress_turn_id: Option<String>,
 ) -> ThreadStatus {
     // Running-turn events can arrive before the watch runtime state is observed by
     // the listener loop. A previous transient error can also leave the coarse
     // watch status at `SystemError` while a resumed turn is appending fresh
     // progress. In both cases, prefer the proven in-progress turn over stale
     // live-state bookkeeping.
-    if has_in_progress_turn {
-        return ThreadStatus::Active {
-            active_turn_id: None,
-            active_flags: Vec::new(),
-        };
+    if !has_in_progress_turn {
+        return status;
     }
 
-    status
+    let (status_active_turn_id, active_flags) = match status {
+        ThreadStatus::Active {
+            active_turn_id,
+            active_flags,
+        } => (active_turn_id, active_flags),
+        _ => (None, Vec::new()),
+    };
+    ThreadStatus::Active {
+        active_turn_id: in_progress_turn_id.or(status_active_turn_id),
+        active_flags,
+    }
 }
 
 #[derive(Default)]
@@ -638,11 +646,15 @@ mod tests {
             ThreadStatus::NotLoaded,
             ThreadStatus::SystemError,
         ] {
-            let resolved = resolve_thread_status(status, /*has_in_progress_turn*/ true);
+            let resolved = resolve_thread_status(
+                status,
+                /*has_in_progress_turn*/ true,
+                Some("turn-1".to_string()),
+            );
             assert_eq!(
                 resolved,
                 ThreadStatus::Active {
-                    active_turn_id: None,
+                    active_turn_id: Some("turn-1".to_string()),
                     active_flags: Vec::new(),
                 }
             );
@@ -650,15 +662,57 @@ mod tests {
     }
 
     #[test]
+    fn preserves_watched_active_turn_id_when_in_progress_turn_is_known_only_by_status() {
+        let resolved = resolve_thread_status(
+            ThreadStatus::Active {
+                active_turn_id: Some("turn-from-watch".to_string()),
+                active_flags: Vec::new(),
+            },
+            /*has_in_progress_turn*/ true,
+            /*in_progress_turn_id*/ None,
+        );
+
+        assert_eq!(
+            resolved,
+            ThreadStatus::Active {
+                active_turn_id: Some("turn-from-watch".to_string()),
+                active_flags: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_active_status_without_turn_id_when_no_turn_id_is_known() {
+        let resolved = resolve_thread_status(
+            ThreadStatus::Idle,
+            /*has_in_progress_turn*/ true,
+            /*in_progress_turn_id*/ None,
+        );
+
+        assert_eq!(
+            resolved,
+            ThreadStatus::Active {
+                active_turn_id: None,
+                active_flags: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn keeps_status_when_no_in_progress_turn() {
         assert_eq!(
-            resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ false),
+            resolve_thread_status(
+                ThreadStatus::Idle,
+                /*has_in_progress_turn*/ false,
+                /*in_progress_turn_id*/ None,
+            ),
             ThreadStatus::Idle
         );
         assert_eq!(
             resolve_thread_status(
                 ThreadStatus::SystemError,
-                /*has_in_progress_turn*/ false
+                /*has_in_progress_turn*/ false,
+                /*in_progress_turn_id*/ None,
             ),
             ThreadStatus::SystemError
         );

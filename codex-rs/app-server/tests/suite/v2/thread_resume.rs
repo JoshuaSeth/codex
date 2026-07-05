@@ -2762,7 +2762,7 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     // If the in-flight turn completes before that queued command runs, the response
     // can legitimately observe the thread as idle.
     match &thread.status {
-        ThreadStatus::Active { active_flags } => assert!(active_flags.is_empty()),
+        ThreadStatus::Active { active_flags, .. } => assert!(active_flags.is_empty()),
         ThreadStatus::Idle => {}
         status => panic!("unexpected thread status after running resume: {status:?}"),
     }
