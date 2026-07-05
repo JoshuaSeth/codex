@@ -924,10 +924,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::Error(ev) => {
-            thread_watch_manager
-                .note_system_error(&conversation_id.to_string())
-                .await;
-
             let message = ev.message.clone();
             let codex_error_info = ev.codex_error_info.clone();
             // If this error belongs to an in-flight `thread/rollback` request, fail that request
@@ -950,6 +946,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             if !ev.affects_turn_status() {
                 return;
             }
+
+            thread_watch_manager
+                .note_system_error(&conversation_id.to_string())
+                .await;
 
             let turn_error = TurnError {
                 message: ev.message,
@@ -3240,6 +3240,76 @@ mod tests {
                 codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
                 additional_details: None,
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_turn_fatal_error_does_not_mark_thread_system_error() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config.clone()).await?;
+        let thread_state = new_thread_state();
+        let thread_watch_manager = ThreadWatchManager::new();
+        thread_watch_manager
+            .note_turn_started(&conversation_id.to_string())
+            .await;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                    message: "cannot steer this turn kind".to_string(),
+                    codex_error_info: Some(CoreCodexErrorInfo::ActiveTurnNotSteerable {
+                        turn_kind: codex_protocol::protocol::NonSteerableTurnKind::Review,
+                    }),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            ThreadResidencyManager::new(),
+            thread_watch_manager.clone(),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            thread_watch_manager
+                .loaded_status_for_thread(&conversation_id.to_string())
+                .await,
+            codex_app_server_protocol::ThreadStatus::Active {
+                active_flags: vec![],
+            }
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "non-turn-fatal errors should not emit a user-facing error notification"
         );
         Ok(())
     }
