@@ -315,6 +315,31 @@ pub(crate) fn resolve_thread_status(
     }
 }
 
+pub(crate) fn status_with_live_active_turn_id(
+    status: ThreadStatus,
+    live_active_turn_id: Option<String>,
+) -> ThreadStatus {
+    let Some(live_active_turn_id) = live_active_turn_id else {
+        return status;
+    };
+
+    match status {
+        ThreadStatus::Active {
+            active_turn_id,
+            active_flags,
+        } => ThreadStatus::Active {
+            active_turn_id: active_turn_id.or(Some(live_active_turn_id)),
+            active_flags,
+        },
+        ThreadStatus::Idle | ThreadStatus::NotLoaded | ThreadStatus::SystemError => {
+            ThreadStatus::Active {
+                active_turn_id: Some(live_active_turn_id),
+                active_flags: Vec::new(),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThreadWatchState {
     runtime_by_thread_id: HashMap<String, RuntimeFacts>,
@@ -694,6 +719,39 @@ mod tests {
             ThreadStatus::Active {
                 active_turn_id: None,
                 active_flags: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn live_active_turn_id_backfills_stale_loaded_status() {
+        for status in [
+            ThreadStatus::Idle,
+            ThreadStatus::NotLoaded,
+            ThreadStatus::SystemError,
+        ] {
+            let resolved = status_with_live_active_turn_id(status, Some("turn-1".to_string()));
+            assert_eq!(
+                resolved,
+                ThreadStatus::Active {
+                    active_turn_id: Some("turn-1".to_string()),
+                    active_flags: Vec::new(),
+                }
+            );
+        }
+
+        let resolved = status_with_live_active_turn_id(
+            ThreadStatus::Active {
+                active_turn_id: None,
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+            },
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(
+            resolved,
+            ThreadStatus::Active {
+                active_turn_id: Some("turn-1".to_string()),
+                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
             }
         );
     }

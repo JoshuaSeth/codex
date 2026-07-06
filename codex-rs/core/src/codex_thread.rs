@@ -404,6 +404,10 @@ impl CodexThread {
         self.codex.agent_status().await
     }
 
+    pub async fn active_turn_id(&self) -> Option<String> {
+        self.codex.session.active_turn_id().await
+    }
+
     pub async fn list_background_terminals(&self) -> Vec<BackgroundTerminalInfo> {
         self.codex.session.list_background_terminals().await
     }

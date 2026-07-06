@@ -15,6 +15,7 @@ use crate::skills_watcher::SkillsWatcher;
 use crate::thread_residency::ThreadResidencyManager;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
+use crate::thread_status::status_with_live_active_turn_id;
 use chrono::Duration as ChronoDuration;
 use chrono::SecondsFormat;
 use codex_analytics::AnalyticsEventsClient;

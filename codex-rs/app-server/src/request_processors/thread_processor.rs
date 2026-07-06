@@ -2205,12 +2205,8 @@ impl ThreadRequestProcessor {
     ) -> Result<ThreadStatusReadResponse, JSONRPCErrorError> {
         let ThreadStatusReadParams { thread_id } = params;
         let status_id = ThreadId::from_string(&thread_id)
-            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?
-            .to_string();
-        let status = self
-            .thread_watch_manager
-            .loaded_status_for_thread(&status_id)
-            .await;
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let status = self.loaded_status_for_thread(status_id).await;
         Ok(ThreadStatusReadResponse { status })
     }
 
@@ -2222,15 +2218,28 @@ impl ThreadRequestProcessor {
         let mut status_ids = Vec::with_capacity(thread_ids.len());
         for thread_id in thread_ids {
             let status_id = ThreadId::from_string(&thread_id)
-                .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?
-                .to_string();
+                .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
             status_ids.push(status_id);
         }
-        let statuses = self
-            .thread_watch_manager
-            .loaded_statuses_for_threads(status_ids)
-            .await;
+        let mut statuses = HashMap::with_capacity(status_ids.len());
+        for status_id in status_ids {
+            let status = self.loaded_status_for_thread(status_id).await;
+            statuses.insert(status_id.to_string(), status);
+        }
         Ok(ThreadStatusListResponse { statuses })
+    }
+
+    async fn loaded_status_for_thread(&self, thread_id: ThreadId) -> ThreadStatus {
+        let thread_id_string = thread_id.to_string();
+        let status = self
+            .thread_watch_manager
+            .loaded_status_for_thread(&thread_id_string)
+            .await;
+        let live_active_turn_id = match self.thread_manager.get_thread(thread_id).await {
+            Ok(thread) => thread.active_turn_id().await,
+            Err(_) => None,
+        };
+        status_with_live_active_turn_id(status, live_active_turn_id)
     }
 
     async fn thread_read_response_inner(
