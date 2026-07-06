@@ -10,6 +10,7 @@ This is the recovery runbook for re-enrolling the PitchAI ChatGPT/Codex accounts
 - `info@pitchai.net`
 - `elise@pitchai.net`
 - `support@pitchai.net`
+- `onboarding.bigi.net` (broker label; logs in with mailbox `onboarding@pitchai.net`)
 
 ## Normal Health Check
 
@@ -39,6 +40,8 @@ codex-dev login
 
 When the browser asks for a code, read the latest OpenAI verification email from the matching Microsoft 365 mailbox. After the browser reaches the local Codex success page, `codex-dev` imports the new refresh token into auth-token-server and immediately probes usage.
 
+For `onboarding.bigi.net`, keep the broker label as `onboarding.bigi.net` but use the PitchAI shared mailbox `onboarding@pitchai.net` for the OpenAI one-time-code login. Microsoft 365 does not currently have a `bigi.net` tenant domain or a literal `onboarding.bigi.net` mailbox.
+
 ## Re-enroll One Google Account
 
 Use the same isolated `CODEX_HOME` pattern. If Google asks for authenticator MFA, use the 2FA helpers:
@@ -56,7 +59,7 @@ Enter the fresh 6-digit code in the browser, finish the Codex consent screen, an
 /usr/local/sbin/codex-auth-broker-probe-all --json
 ```
 
-Each target account should show `availability=available` unless its current 5-hour or weekly Codex window is genuinely exhausted. `active_lease=yes` means a live Codex process currently holds that account; it should release on normal shutdown or expire by `lease_expires_at`.
+Each target account should show `availability=available` unless its current 5-hour or weekly Codex window is genuinely exhausted. Active session metadata is informational only; it must not be treated as exclusive capacity or a reason to skip an otherwise valid account.
 
 ## Operational Notes
 
