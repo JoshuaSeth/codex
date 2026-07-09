@@ -7,6 +7,7 @@ from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,
     ApprovalsReviewer,
+    ReasoningEffort,
     ThreadListParams,
     ThreadResumeResponse,
     ThreadTokenUsageUpdatedNotification,
@@ -29,6 +30,11 @@ def test_generated_params_models_are_snake_case_and_dump_by_alias() -> None:
 def test_generated_v2_bundle_has_single_shared_plan_type_definition() -> None:
     source = (ROOT / "src" / "openai_codex" / "generated" / "v2_all.py").read_text()
     assert source.count("class PlanType(") == 1
+
+
+def test_generated_reasoning_effort_accepts_sol_modes() -> None:
+    assert ReasoningEffort.max.value == "max"
+    assert ReasoningEffort.ultra.value == "ultra"
 
 
 def test_thread_resume_response_accepts_auto_review_reviewer() -> None:

@@ -2723,6 +2723,8 @@ class ReasoningEffort(Enum):
     medium = "medium"
     high = "high"
     xhigh = "xhigh"
+    max = "max"
+    ultra = "ultra"
 
 
 class ReasoningEffortOption(BaseModel):
