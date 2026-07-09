@@ -27,6 +27,7 @@ use crate::context::AvailablePluginsInstructions;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentModeInstructions;
 use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
@@ -207,7 +208,7 @@ mod handlers;
 mod inject;
 mod input_queue;
 mod mcp;
-mod multi_agents;
+pub(crate) mod multi_agents;
 mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
@@ -3071,7 +3072,7 @@ impl Session {
         let multi_agent_v2_usage_hint_text =
             multi_agents::usage_hint_text(turn_context, &session_source);
 
-        let mut items = Vec::with_capacity(4);
+        let mut items = Vec::with_capacity(5);
         if let Some(developer_message) =
             crate::context_manager::updates::build_developer_update_item(developer_sections)
         {
@@ -3091,6 +3092,11 @@ impl Session {
                 ])
         {
             items.push(usage_hint_message);
+        }
+        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
+            items.push(ContextualUserFragment::into(
+                MultiAgentModeInstructions::new(multi_agent_mode),
+            ));
         }
         if let Some(contextual_user_message) =
             crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)

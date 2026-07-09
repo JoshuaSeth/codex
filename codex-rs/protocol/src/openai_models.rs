@@ -45,6 +45,8 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
+    Ultra,
     /// A model-defined effort value that this client does not know yet.
     Custom(String),
 }
@@ -59,6 +61,8 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
             Self::Custom(effort) => effort,
         }
     }
@@ -123,6 +127,8 @@ impl FromStr for ReasoningEffort {
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             "" => Err("reasoning_effort must not be empty".to_string()),
             effort => Ok(Self::Custom(effort.to_string())),
         }
