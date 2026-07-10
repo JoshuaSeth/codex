@@ -12,6 +12,25 @@ const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
+    ensure_call_outputs_present_with_mode(items, MissingOutputMode::Strict);
+}
+
+/// Repair calls interrupted before their outputs could be persisted.
+///
+/// Replay can legitimately end between a persisted call and its output when the process exits.
+/// Repair that boundary once while installing replayed history so every later prompt does not
+/// rediscover and report the same missing output. Live prompt normalization remains strict.
+pub(crate) fn repair_interrupted_call_outputs(items: &mut Vec<ResponseItem>) {
+    ensure_call_outputs_present_with_mode(items, MissingOutputMode::InterruptedReplay);
+}
+
+#[derive(Clone, Copy)]
+enum MissingOutputMode {
+    Strict,
+    InterruptedReplay,
+}
+
+fn ensure_call_outputs_present_with_mode(items: &mut Vec<ResponseItem>, mode: MissingOutputMode) {
     // Collect synthetic outputs to insert immediately after their calls.
     // Store the insertion position (index of call) alongside the item so
     // we can insert in reverse order and avoid index shifting.
@@ -72,9 +91,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                 });
 
                 if !has_output {
-                    error_or_panic(format!(
-                        "Custom tool call output is missing for call id: {call_id}"
-                    ));
+                    report_missing_custom_output(call_id, mode);
                     missing_outputs_to_insert.push((
                         idx,
                         ResponseItem::CustomToolCallOutput {
@@ -96,9 +113,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                     });
 
                     if !has_output {
-                        error_or_panic(format!(
-                            "Local shell call output is missing for call id: {call_id}"
-                        ));
+                        report_missing_local_shell_output(call_id, mode);
                         missing_outputs_to_insert.push((
                             idx,
                             ResponseItem::FunctionCallOutput {
@@ -116,6 +131,32 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     // Insert synthetic outputs in reverse index order to avoid re-indexing.
     for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
         items.insert(idx + 1, output_item);
+    }
+}
+
+fn report_missing_custom_output(call_id: &str, mode: MissingOutputMode) {
+    match mode {
+        MissingOutputMode::Strict => {
+            error_or_panic(format!(
+                "Custom tool call output is missing for call id: {call_id}"
+            ));
+        }
+        MissingOutputMode::InterruptedReplay => {
+            info!("repairing interrupted custom tool call after replay: {call_id}");
+        }
+    }
+}
+
+fn report_missing_local_shell_output(call_id: &str, mode: MissingOutputMode) {
+    match mode {
+        MissingOutputMode::Strict => {
+            error_or_panic(format!(
+                "Local shell call output is missing for call id: {call_id}"
+            ));
+        }
+        MissingOutputMode::InterruptedReplay => {
+            info!("repairing interrupted local shell call after replay: {call_id}");
+        }
     }
 }
 

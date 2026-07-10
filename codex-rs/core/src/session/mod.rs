@@ -191,6 +191,7 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
+use crate::context_manager::repair_interrupted_call_outputs;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
@@ -1338,6 +1339,7 @@ impl Session {
             // This meets image resizing requirements without modifying persisted rollouts.
             prepare_response_items(&mut history);
         }
+        repair_interrupted_call_outputs(&mut history);
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);

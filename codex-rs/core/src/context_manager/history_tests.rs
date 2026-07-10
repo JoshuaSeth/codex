@@ -1283,6 +1283,39 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
     );
 }
 
+#[test]
+fn replay_repair_adds_aborted_output_without_strict_prompt_validation() {
+    let mut items = vec![ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".to_string()),
+        call_id: "interrupted-tool".to_string(),
+        name: "exec".to_string(),
+        input: "{}".to_string(),
+    }];
+
+    normalize::repair_interrupted_call_outputs(&mut items);
+
+    let repaired_items = vec![
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: "interrupted-tool".to_string(),
+            name: "exec".to_string(),
+            input: "{}".to_string(),
+        },
+        ResponseItem::CustomToolCallOutput {
+            call_id: "interrupted-tool".to_string(),
+            name: None,
+            output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+        },
+    ];
+    assert_eq!(items, repaired_items);
+
+    normalize::ensure_call_outputs_present(&mut items);
+
+    assert_eq!(items, repaired_items);
+}
+
 #[cfg(not(debug_assertions))]
 #[test]
 fn normalize_removes_orphan_function_call_output() {
