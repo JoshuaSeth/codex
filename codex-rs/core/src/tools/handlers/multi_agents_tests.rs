@@ -4557,3 +4557,38 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("permission profile set");
     assert_eq!(config, expected);
 }
+
+#[tokio::test]
+async fn child_configs_downgrade_ultra_to_max() {
+    let (_session, mut turn) = make_session_and_context().await;
+    turn.reasoning_effort = Some(ReasoningEffort::Ultra);
+
+    let spawn_config = build_agent_spawn_config(
+        &BaseInstructions {
+            text: "base".to_string(),
+        },
+        &turn,
+    )
+    .expect("spawn config");
+    let resume_config = build_agent_resume_config(&turn).expect("resume config");
+
+    assert_eq!(
+        spawn_config.model_reasoning_effort,
+        Some(ReasoningEffort::Max)
+    );
+    assert_eq!(
+        resume_config.model_reasoning_effort,
+        Some(ReasoningEffort::Max)
+    );
+}
+
+#[tokio::test]
+async fn explicit_child_ultra_is_capped_at_max() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+
+    apply_subagent_reasoning_policy(&mut config);
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Max));
+}

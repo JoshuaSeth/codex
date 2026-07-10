@@ -230,8 +230,20 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     config.developer_instructions = turn.developer_instructions.clone();
     config.compact_prompt = turn.compact_prompt.clone();
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    apply_subagent_reasoning_policy(&mut config);
 
     Ok(config)
+}
+
+/// Keep proactive delegation on the root manager while child agents do the work at max effort.
+///
+/// `ultra` is a Codex orchestration mode as well as a reasoning setting. Letting a child inherit it
+/// recursively turns every delegated worker into another proactive manager. Child inference still
+/// gets Sol's maximum reasoning depth, but only the root manager retains automatic delegation.
+pub(crate) fn apply_subagent_reasoning_policy(config: &mut Config) {
+    if config.model_reasoning_effort == Some(ReasoningEffort::Ultra) {
+        config.model_reasoning_effort = Some(ReasoningEffort::Max);
+    }
 }
 
 pub(crate) fn reject_full_fork_spawn_overrides(
