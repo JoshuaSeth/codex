@@ -141,7 +141,12 @@ impl ThreadState {
 
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
-            self.turn_summary.started_at = payload.started_at;
+            // A previous turn can end without its terminal event reaching this listener.
+            // Never let that turn's error or command state contaminate the new turn.
+            self.turn_summary = TurnSummary {
+                started_at: payload.started_at,
+                ..TurnSummary::default()
+            };
         }
         self.current_turn_history.handle_event(event);
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
@@ -216,6 +221,35 @@ mod tests {
         ];
 
         assert_eq!(results, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn turn_started_discards_stale_previous_turn_summary() {
+        let mut state = ThreadState::default();
+        state.turn_summary.last_error = Some(TurnError {
+            message: "previous turn failed".to_string(),
+            codex_error_info: None,
+            additional_details: None,
+        });
+        state
+            .turn_summary
+            .command_execution_started
+            .insert("previous command".to_string());
+
+        state.track_current_turn_event(
+            "new-turn",
+            &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "new-turn".to_string(),
+                trace_id: None,
+                started_at: Some(42),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        );
+
+        assert_eq!(state.turn_summary.started_at, Some(42));
+        assert_eq!(state.turn_summary.last_error, None);
+        assert!(state.turn_summary.command_execution_started.is_empty());
     }
 
     fn thread_settings(model: &str) -> ThreadSettings {

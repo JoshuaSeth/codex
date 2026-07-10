@@ -153,12 +153,21 @@ impl ThreadWatchManager {
         .await;
     }
 
-    pub(crate) async fn note_turn_completed(&self, thread_id: &str, _failed: bool) {
-        self.clear_active_state(thread_id).await;
+    pub(crate) async fn note_turn_completed(&self, thread_id: &str, failed: bool) {
+        self.update_runtime_for_thread(thread_id, move |runtime| {
+            // The terminal result is authoritative after listener reattachment or recovery.
+            clear_active_runtime_state(runtime);
+            runtime.has_system_error = failed;
+        })
+        .await;
     }
 
     pub(crate) async fn note_turn_interrupted(&self, thread_id: &str) {
-        self.clear_active_state(thread_id).await;
+        self.update_runtime_for_thread(thread_id, |runtime| {
+            clear_active_runtime_state(runtime);
+            runtime.has_system_error = false;
+        })
+        .await;
     }
 
     pub(crate) async fn note_thread_shutdown(&self, thread_id: &str) {
@@ -168,6 +177,7 @@ impl ThreadWatchManager {
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.is_loaded = false;
+            runtime.has_system_error = false;
         })
         .await;
     }
@@ -179,16 +189,6 @@ impl ThreadWatchManager {
             runtime.pending_permission_requests = 0;
             runtime.pending_user_input_requests = 0;
             runtime.has_system_error = true;
-        })
-        .await;
-    }
-
-    async fn clear_active_state(&self, thread_id: &str) {
-        self.update_runtime_for_thread(thread_id, move |runtime| {
-            runtime.running = false;
-            runtime.active_turn_id = None;
-            runtime.pending_permission_requests = 0;
-            runtime.pending_user_input_requests = 0;
         })
         .await;
     }
@@ -286,6 +286,13 @@ impl ThreadWatchManager {
             ThreadWatchActiveGuardType::UserInput => &mut runtime.pending_user_input_requests,
         }
     }
+}
+
+fn clear_active_runtime_state(runtime: &mut RuntimeFacts) {
+    runtime.running = false;
+    runtime.active_turn_id = None;
+    runtime.pending_permission_requests = 0;
+    runtime.pending_user_input_requests = 0;
 }
 
 pub(crate) fn resolve_thread_status(
@@ -777,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_error_sets_idle_flag_until_next_turn() {
+    async fn successful_terminal_transition_clears_system_error() {
         let manager = ThreadWatchManager::new();
         manager
             .upsert_thread(test_thread(
@@ -796,6 +803,48 @@ mod tests {
             ThreadStatus::SystemError,
         );
 
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, false)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
+        );
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
+        manager.note_system_error(INTERACTIVE_THREAD_ID).await;
+        manager.note_turn_interrupted(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_transition_sets_system_error() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
+        manager
+            .note_turn_completed(INTERACTIVE_THREAD_ID, true)
+            .await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::SystemError,
+        );
+
         manager.note_turn_started(INTERACTIVE_THREAD_ID, None).await;
         assert_eq!(
             manager
@@ -805,6 +854,33 @@ mod tests {
                 active_turn_id: None,
                 active_flags: vec![],
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn unload_does_not_preserve_runtime_system_error() {
+        let manager = ThreadWatchManager::new();
+        let thread = test_thread(
+            INTERACTIVE_THREAD_ID,
+            codex_app_server_protocol::SessionSource::Cli,
+        );
+        manager.upsert_thread(thread.clone()).await;
+        manager.note_system_error(INTERACTIVE_THREAD_ID).await;
+
+        manager.note_thread_shutdown(INTERACTIVE_THREAD_ID).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::NotLoaded,
+        );
+
+        manager.upsert_thread(thread).await;
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle,
         );
     }
 
