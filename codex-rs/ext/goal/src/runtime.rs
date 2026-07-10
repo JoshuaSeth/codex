@@ -640,11 +640,9 @@ impl GoalRuntimeHandle {
 }
 
 fn rate_limits_block_auto_goal_continuation(rate_limits: &RateLimitSnapshot) -> bool {
-    if rate_limits.rate_limit_reached_type.is_some() {
-        return true;
-    }
-    rate_limits
-        .primary
-        .as_ref()
-        .is_some_and(|primary| primary.used_percent >= 100.0)
+    // Window percentages describe the account that served one response. They are
+    // not a rejection and, behind an auth broker, are not the capacity of the
+    // next request. Let the next turn reach the provider so the broker can select
+    // another account; a real quota rejection still stops the goal below.
+    rate_limits.rate_limit_reached_type.is_some()
 }

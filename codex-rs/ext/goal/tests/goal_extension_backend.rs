@@ -36,6 +36,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
@@ -604,7 +605,7 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn idle_usage_limit_stops_goal_before_auto_continuation() -> anyhow::Result<()> {
+async fn explicit_idle_usage_limit_stops_goal_before_auto_continuation() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
@@ -642,7 +643,7 @@ async fn idle_usage_limit_stops_goal_before_auto_continuation() -> anyhow::Resul
         credits: None,
         individual_limit: None,
         plan_type: None,
-        rate_limit_reached_type: None,
+        rate_limit_reached_type: Some(RateLimitReachedType::RateLimitReached),
     };
     harness
         .notify_thread_idle(Some(&exhausted_rate_limits))
@@ -664,6 +665,63 @@ async fn idle_usage_limit_stops_goal_before_auto_continuation() -> anyhow::Resul
         }],
         harness.sink.goal_events()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn advisory_hundred_percent_does_not_stop_goal_before_auto_continuation() -> anyhow::Result<()>
+{
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    tool_by_name(&harness.tools(), "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship goal extension backend" }),
+        ))
+        .await?;
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
+                /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
+            ),
+        )
+        .await;
+    harness.stop_turn("turn-1").await;
+    harness.sink.clear();
+
+    let advisory_rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(1782944524),
+        }),
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    harness
+        .notify_thread_idle(Some(&advisory_rate_limits))
+        .await;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(23, goal.tokens_used);
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
     Ok(())
 }
 
