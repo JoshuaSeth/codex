@@ -229,6 +229,12 @@ impl GoalService {
         if objective.is_some() {
             fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
         }
+        if let Some(runtime) = runtime.as_ref() {
+            // Keep the permit held until the active turn has lost authority to
+            // terminally update the previous objective. Full runtime effects
+            // run after the protocol response to preserve notification order.
+            runtime.stage_external_goal_set(&goal);
+        }
         Ok(GoalSetOutcome {
             goal: protocol_goal_from_state(goal.clone()),
             state_goal: goal,
@@ -267,6 +273,9 @@ impl GoalService {
                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
             })?;
         let cleared = cleared_goal.is_some();
+        if cleared && let Some(runtime) = runtime.as_ref() {
+            runtime.stage_external_goal_clear();
+        }
         drop(goal_state_permit);
         drop(runtime);
 

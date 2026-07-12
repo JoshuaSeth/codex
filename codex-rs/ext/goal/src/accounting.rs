@@ -13,6 +13,7 @@ use tokio::sync::SemaphorePermit;
 pub(crate) struct GoalAccountingState {
     inner: Mutex<GoalAccountingInner>,
     progress_accounting_lock: Semaphore,
+    goal_state_lock: Semaphore,
 }
 
 #[derive(Debug)]
@@ -28,6 +29,7 @@ struct GoalTurnAccounting {
     current_token_usage: TokenUsage,
     last_accounted_token_usage: TokenUsage,
     active_goal_id: Option<String>,
+    terminal_update_goal_id: Option<String>,
     account_tokens: bool,
 }
 
@@ -97,6 +99,13 @@ impl GoalAccountingState {
         self.progress_accounting_lock.acquire().await
     }
 
+    /// Serializes persistent goal mutations with their in-memory turn ownership updates.
+    pub(crate) async fn goal_state_permit(
+        &self,
+    ) -> Result<SemaphorePermit<'_>, tokio::sync::AcquireError> {
+        self.goal_state_lock.acquire().await
+    }
+
     pub(crate) fn turn_is_current_active_goal(&self, turn_id: &str) -> bool {
         let inner = self.inner();
         if inner.current_turn_id.as_deref() != Some(turn_id) {
@@ -139,6 +148,7 @@ impl GoalAccountingState {
         }
         if let Some(turn) = inner.turns.get_mut(turn_id) {
             turn.active_goal_id = Some(goal_id.clone());
+            turn.terminal_update_goal_id = Some(goal_id.clone());
             if inner.current_turn_id.as_deref() == Some(turn_id) {
                 inner.wall_clock.mark_active_goal(goal_id);
             }
@@ -157,9 +167,45 @@ impl GoalAccountingState {
         }
         let turn = inner.turns.get_mut(turn_id.as_str())?;
         turn.active_goal_id = Some(goal_id.clone());
+        turn.terminal_update_goal_id = Some(goal_id.clone());
         turn.reset_baseline_to_current();
         inner.wall_clock.mark_active_goal(goal_id);
         Some(turn_id)
+    }
+
+    pub(crate) fn mark_current_turn_external_goal_active(
+        &self,
+        goal_id: impl Into<String>,
+    ) -> Option<String> {
+        let mut inner = self.inner();
+        let turn_id = inner.current_turn_id.clone()?;
+        let goal_id = goal_id.into();
+        if inner.budget_limit_reported_goal_id.as_deref() != Some(goal_id.as_str()) {
+            inner.budget_limit_reported_goal_id = None;
+        }
+        let turn = inner.turns.get_mut(turn_id.as_str())?;
+        let already_staged = turn.active_goal_id.as_deref() == Some(goal_id.as_str())
+            && turn.terminal_update_goal_id.is_none();
+        turn.active_goal_id = Some(goal_id.clone());
+        // A model may have produced update_goal before an external replacement
+        // reached this turn. Let the turn keep working, but require a later turn
+        // to make a terminal decision about the externally supplied objective.
+        turn.terminal_update_goal_id = None;
+        if !already_staged {
+            turn.reset_baseline_to_current();
+        }
+        inner.wall_clock.mark_active_goal(goal_id);
+        Some(turn_id)
+    }
+
+    pub(crate) fn terminal_update_goal_id_for_turn(&self, turn_id: &str) -> Option<String> {
+        let inner = self.inner();
+        if inner.current_turn_id.as_deref() != Some(turn_id) {
+            return None;
+        }
+        let turn = inner.turns.get(turn_id)?;
+        let terminal_goal_id = turn.terminal_update_goal_id.as_ref()?;
+        (turn.active_goal_id.as_ref() == Some(terminal_goal_id)).then(|| terminal_goal_id.clone())
     }
 
     pub(crate) fn mark_idle_goal_active(&self, goal_id: impl Into<String>) {
@@ -176,6 +222,7 @@ impl GoalAccountingState {
         let turn_id = inner.current_turn_id.clone()?;
         if let Some(turn) = inner.turns.get_mut(turn_id.as_str()) {
             turn.active_goal_id = None;
+            turn.terminal_update_goal_id = None;
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
@@ -188,6 +235,7 @@ impl GoalAccountingState {
             && let Some(turn) = inner.turns.get_mut(turn_id.as_str())
         {
             turn.active_goal_id = None;
+            turn.terminal_update_goal_id = None;
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
@@ -244,6 +292,7 @@ impl GoalAccountingState {
             turn.last_accounted_token_usage = snapshot.current_token_usage.clone();
             if clear_active_goal {
                 turn.active_goal_id = None;
+                turn.terminal_update_goal_id = None;
             }
         }
         inner.wall_clock.mark_accounted(snapshot.time_delta_seconds);
@@ -306,6 +355,7 @@ impl Default for GoalAccountingState {
         Self {
             inner: Mutex::new(GoalAccountingInner::default()),
             progress_accounting_lock: Semaphore::new(/*permits*/ 1),
+            goal_state_lock: Semaphore::new(/*permits*/ 1),
         }
     }
 }
@@ -360,6 +410,7 @@ impl GoalTurnAccounting {
             last_accounted_token_usage: current_token_usage.clone(),
             current_token_usage,
             active_goal_id: None,
+            terminal_update_goal_id: None,
             account_tokens,
         }
     }

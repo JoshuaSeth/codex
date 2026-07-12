@@ -134,6 +134,7 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
     let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
     let tools = harness.tools();
 
     let create_tool = tool_by_name(&tools, "create_goal");
@@ -961,6 +962,85 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn stale_update_goal_cannot_terminalize_external_objective_replacement() -> anyhow::Result<()>
+{
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "old objective" }),
+        ))
+        .await?;
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("replacement objective"),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: GoalTokenBudgetUpdate::Keep,
+            },
+        )
+        .await?;
+    outcome.apply_runtime_effects(&harness.goal_service).await;
+
+    let stale_update = tool_call(
+        "update_goal",
+        "call-stale-block",
+        json!({ "status": "blocked" }),
+    );
+    let error = match tool_by_name(&tools, "update_goal")
+        .handle(stale_update)
+        .await
+    {
+        Ok(_) => panic!("the old turn must not block an externally replaced goal"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "cannot update goal because the active goal was set or replaced externally during this turn; continue working on the updated objective and let a later goal turn mark it complete or blocked"
+                .to_string()
+        )
+    );
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("replacement goal should exist"))?;
+    assert_eq!("replacement objective", goal.objective);
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+
+    harness.stop_turn("turn-1").await;
+    harness.start_turn("turn-2", &TokenUsage::default()).await;
+    let mut current_update = tool_call(
+        "update_goal",
+        "call-current-complete",
+        json!({ "status": "complete" }),
+    );
+    current_update.turn_id = "turn-2".to_string();
+    tool_by_name(&tools, "update_goal")
+        .handle(current_update)
+        .await?;
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("completed goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Complete, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_goal_mutation_start_accounts_active_goal_progress() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
@@ -1063,6 +1143,16 @@ async fn goal_service_external_set_active_resets_baseline_without_live_thread() 
             },
         )
         .await?;
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 125, /*cached_input_tokens*/ 0,
+                /*output_tokens*/ 0, /*reasoning_output_tokens*/ 0,
+                /*total_tokens*/ 125,
+            ),
+        )
+        .await;
     outcome.apply_runtime_effects(&harness.goal_service).await;
 
     harness

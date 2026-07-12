@@ -18,7 +18,6 @@ use crate::metrics::GoalMetrics;
 use crate::steering::continuation_steering_item;
 use crate::steering::objective_updated_steering_item;
 use crate::tool::protocol_goal_from_state;
-use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 
 #[derive(Clone)]
@@ -47,7 +46,6 @@ struct GoalRuntimeInner {
     accounting_state: Arc<GoalAccountingState>,
     enabled: AtomicBool,
     tools_available_for_thread: bool,
-    goal_state_lock: Semaphore,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -99,7 +97,6 @@ impl GoalRuntimeHandle {
                 accounting_state,
                 enabled: AtomicBool::new(config.enabled),
                 tools_available_for_thread: config.tools_available_for_thread,
-                goal_state_lock: Semaphore::new(/*permits*/ 1),
             }),
         }
     }
@@ -126,8 +123,8 @@ impl GoalRuntimeHandle {
 
     pub(crate) async fn goal_state_permit(&self) -> Result<SemaphorePermit<'_>, String> {
         self.inner
-            .goal_state_lock
-            .acquire()
+            .accounting_state
+            .goal_state_permit()
             .await
             .map_err(|err| err.to_string())
     }
@@ -190,26 +187,49 @@ impl GoalRuntimeHandle {
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
+        self.stage_external_goal_set(&goal);
         match goal.status {
             codex_state::ThreadGoalStatus::Active => {
-                if self.inner.accounting_state.current_turn_id().is_some() {
-                    let _ = self
-                        .inner
-                        .accounting_state
-                        .mark_current_turn_goal_active(goal.goal_id.clone());
-                } else {
-                    self.inner
-                        .accounting_state
-                        .mark_idle_goal_active(goal.goal_id.clone());
-                }
                 if objective_changed {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
                 self.continue_if_idle().await?;
             }
+            codex_state::ThreadGoalStatus::BudgetLimited
+            | codex_state::ThreadGoalStatus::Paused
+            | codex_state::ThreadGoalStatus::Blocked
+            | codex_state::ThreadGoalStatus::UsageLimited
+            | codex_state::ThreadGoalStatus::Complete => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_external_goal_set(&self, goal: &codex_state::ThreadGoal) {
+        if !self.is_enabled() {
+            return;
+        }
+
+        match goal.status {
+            codex_state::ThreadGoalStatus::Active => {
+                if self.inner.accounting_state.current_turn_id().is_some() {
+                    let _ = self
+                        .inner
+                        .accounting_state
+                        .mark_current_turn_external_goal_active(goal.goal_id.clone());
+                } else {
+                    self.inner
+                        .accounting_state
+                        .mark_idle_goal_active(goal.goal_id.clone());
+                }
+            }
             codex_state::ThreadGoalStatus::BudgetLimited => {
-                if self.inner.accounting_state.current_turn_id().is_none() {
+                if self.inner.accounting_state.current_turn_id().is_some() {
+                    let _ = self
+                        .inner
+                        .accounting_state
+                        .mark_current_turn_external_goal_active(goal.goal_id.clone());
+                } else {
                     self.inner.accounting_state.clear_active_goal();
                 }
             }
@@ -220,7 +240,6 @@ impl GoalRuntimeHandle {
                 self.inner.accounting_state.clear_active_goal();
             }
         }
-        Ok(())
     }
 
     pub async fn apply_external_goal_clear(
@@ -232,8 +251,14 @@ impl GoalRuntimeHandle {
         }
 
         self.inner.analytics.cleared(&goal);
-        self.inner.accounting_state.clear_active_goal();
+        self.stage_external_goal_clear();
         Ok(())
+    }
+
+    pub(crate) fn stage_external_goal_clear(&self) {
+        if self.is_enabled() {
+            self.inner.accounting_state.clear_active_goal();
+        }
     }
 
     pub async fn usage_limit_active_goal_for_turn(&self, turn_id: &str) -> Result<(), String> {
