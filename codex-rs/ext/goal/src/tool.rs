@@ -27,6 +27,8 @@ use crate::spec::create_create_goal_tool;
 use crate::spec::create_get_goal_tool;
 use crate::spec::create_update_goal_tool;
 
+const EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR: &str = "cannot update goal because the active goal was set or replaced externally during this turn; continue working on the updated objective and let a later goal turn mark it complete or blocked";
+
 #[derive(Clone)]
 pub(crate) struct GoalToolExecutor {
     kind: GoalToolKind,
@@ -186,6 +188,13 @@ impl GoalToolExecutor {
         validate_thread_goal_objective(&request.objective)
             .map_err(FunctionCallError::RespondToModel)?;
         validate_goal_budget(request.token_budget).map_err(FunctionCallError::RespondToModel)?;
+        let _goal_state_permit =
+            self.accounting_state
+                .goal_state_permit()
+                .await
+                .map_err(|err| {
+                    FunctionCallError::Fatal(format!("goal state semaphore closed: {err}"))
+                })?;
 
         let goal = self
             .state_db
@@ -232,6 +241,19 @@ impl GoalToolExecutor {
                     .to_string(),
             ));
         }
+        let _goal_state_permit =
+            self.accounting_state
+                .goal_state_permit()
+                .await
+                .map_err(|err| {
+                    FunctionCallError::Fatal(format!("goal state semaphore closed: {err}"))
+                })?;
+        let expected_goal_id = self
+            .accounting_state
+            .terminal_update_goal_id_for_turn(invocation.turn_id.as_str())
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string())
+            })?;
 
         self.account_active_goal_progress(
             match args.status {
@@ -247,7 +269,7 @@ impl GoalToolExecutor {
         )
         .await?;
         let previous_status = self
-            .current_goal_status_for_metrics(/*expected_goal_id*/ None)
+            .current_goal_status_for_metrics(Some(expected_goal_id.as_str()))
             .await?;
         let goal = self
             .state_db
@@ -258,7 +280,7 @@ impl GoalToolExecutor {
                     objective: None,
                     status: Some(state_status_from_protocol(args.status)),
                     token_budget: None,
-                    expected_goal_id: None,
+                    expected_goal_id: Some(expected_goal_id),
                 },
             )
             .await
@@ -266,9 +288,7 @@ impl GoalToolExecutor {
                 FunctionCallError::RespondToModel(format!("failed to update goal: {err}"))
             })?
             .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "cannot update goal because this thread has no goal".to_string(),
-                )
+                FunctionCallError::RespondToModel(EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string())
             })?;
         self.metrics
             .record_terminal_if_status_changed(previous_status, &goal);
