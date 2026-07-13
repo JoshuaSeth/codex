@@ -8426,6 +8426,34 @@ impl SessionTask for CompletingTask {
     }
 }
 
+#[derive(Clone)]
+struct GatedCompletingTask {
+    started: Arc<tokio::sync::Notify>,
+    finish: Arc<tokio::sync::Notify>,
+}
+
+impl SessionTask for GatedCompletingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.gated_completing"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> Option<String> {
+        self.started.notify_one();
+        self.finish.notified().await;
+        None
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NeverEndingTask {
     kind: TaskKind,
@@ -8896,6 +8924,67 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
     session.emit_thread_idle_lifecycle_if_idle().await;
 
     assert_eq!(0, calls.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_task_completion_starts_pending_trigger_turn() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let (_prewarm_tx, prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let prewarm_handle = tokio::spawn(async move {
+        let _ = prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+    sess.set_session_startup_prewarm(
+        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+            prewarm_handle,
+            std::time::Instant::now(),
+            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+        ),
+    )
+    .await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        GatedCompletingTask {
+            started: Arc::clone(&started),
+            finish: Arc::clone(&finish),
+        },
+    )
+    .await;
+    timeout(StdDuration::from_secs(2), started.notified())
+        .await
+        .expect("first turn should start");
+    while rx.try_recv().is_ok() {}
+
+    sess.input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "late trigger update".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+    finish.notify_one();
+
+    let next_turn_id = timeout(StdDuration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("event channel should stay open");
+            if let EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. }) = event.msg
+                && turn_id != tc.sub_id
+            {
+                return turn_id;
+            }
+        }
+    })
+    .await
+    .expect("pending trigger mail should start a new turn after normal completion");
+
+    assert_ne!(next_turn_id, tc.sub_id);
+    assert!(!sess.input_queue.has_trigger_turn_mailbox_items().await);
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]

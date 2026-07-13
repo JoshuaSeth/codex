@@ -1,5 +1,6 @@
 mod compact;
 mod lifecycle;
+mod post_task;
 mod regular;
 mod review;
 mod user_shell;
@@ -770,7 +771,7 @@ impl Session {
         if !cleared_active_turn {
             return;
         }
-        self.emit_thread_idle_lifecycle_if_idle().await;
+        post_task::schedule_reconciliation(Arc::clone(self));
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
