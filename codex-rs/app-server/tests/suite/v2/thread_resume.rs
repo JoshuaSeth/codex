@@ -104,6 +104,12 @@ use super::analytics::mount_analytics_capture;
 use super::analytics::thread_initialized_event;
 use super::analytics::wait_for_analytics_payload;
 use super::analytics::wait_for_goal_event;
+use super::connection_handling_websocket::connect_websocket;
+use super::connection_handling_websocket::read_notification_for_method;
+use super::connection_handling_websocket::read_response_for_id;
+use super::connection_handling_websocket::send_initialize_request;
+use super::connection_handling_websocket::send_request;
+use super::connection_handling_websocket::spawn_websocket_server;
 
 #[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
@@ -1507,6 +1513,257 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     let clear_again: ThreadGoalClearResponse = to_response(clear_again_resp)?;
     assert!(!clear_again.cleared);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_goal_continues_after_tool_turn_without_final_message() -> Result<()> {
+    let first_tool_arguments = serde_json::to_string(&json!({
+        "cmd": "printf first-goal-turn",
+        "yield_time_ms": 500,
+    }))?;
+    let complete_goal_arguments = serde_json::to_string(&json!({
+        "status": "complete",
+    }))?;
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![
+            responses::ev_response_created("materialize-thread"),
+            responses::ev_completed("materialize-thread"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("first-goal-tool"),
+            responses::ev_function_call(
+                "call-first-goal-tool",
+                "exec_command",
+                &first_tool_arguments,
+            ),
+            responses::ev_completed("first-goal-tool"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("first-goal-turn-end"),
+            responses::ev_completed("first-goal-turn-end"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("second-goal-complete"),
+            responses::ev_function_call(
+                "call-complete-goal",
+                "update_goal",
+                &complete_goal_arguments,
+            ),
+            responses::ev_completed("second-goal-complete"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("second-goal-final"),
+            responses::ev_assistant_message("second-goal-final-message", "Goal complete."),
+            responses::ev_completed("second-goal-final"),
+        ]),
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+    )?;
+
+    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT.saturating_mul(2), mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let materialize_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "materialize this thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(materialize_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let goal_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id,
+                "objective": "finish across as many turns as needed",
+            })),
+        )
+        .await?;
+    let goal_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(goal_id)),
+    )
+    .await??;
+    let goal: ThreadGoalSetResponse = to_response(goal_resp)?;
+    assert_eq!(goal.goal.status, ThreadGoalStatus::Active);
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/goal/updated"),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    wait_for_responses_request_count(&server, /*expected_count*/ 5).await?;
+    let persisted_goal =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string())
+            .await?
+            .thread_goals()
+            .get_thread_goal(ThreadId::from_string(&thread.id)?)
+            .await?
+            .expect("goal should remain persisted");
+    assert_eq!(
+        persisted_goal.status,
+        codex_state::ThreadGoalStatus::Complete
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_goal_continues_after_dispatch_websocket_disconnects() -> Result<()> {
+    let complete_goal_arguments = serde_json::to_string(&json!({
+        "status": "complete",
+    }))?;
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![
+            responses::ev_response_created("materialize-thread"),
+            responses::ev_completed("materialize-thread"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("first-goal-turn"),
+            responses::ev_completed("first-goal-turn"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("second-goal-complete"),
+            responses::ev_function_call(
+                "call-complete-goal",
+                "update_goal",
+                &complete_goal_arguments,
+            ),
+            responses::ev_completed("second-goal-complete"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("second-goal-final"),
+            responses::ev_assistant_message("second-goal-final-message", "Goal complete."),
+            responses::ev_completed("second-goal-final"),
+        ]),
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+    )?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut websocket = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut websocket, /*id*/ 1, "goal_dispatcher").await?;
+    read_response_for_id(&mut websocket, /*id*/ 1).await?;
+
+    send_request(
+        &mut websocket,
+        "thread/start",
+        /*id*/ 2,
+        Some(serde_json::to_value(ThreadStartParams {
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    let start_resp = read_response_for_id(&mut websocket, /*id*/ 2).await?;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    send_request(
+        &mut websocket,
+        "turn/start",
+        /*id*/ 3,
+        Some(serde_json::to_value(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "materialize this thread".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })?),
+    )
+    .await?;
+    read_response_for_id(&mut websocket, /*id*/ 3).await?;
+    read_notification_for_method(&mut websocket, "turn/completed").await?;
+
+    send_request(
+        &mut websocket,
+        "thread/goal/set",
+        /*id*/ 4,
+        Some(json!({
+            "threadId": thread.id,
+            "objective": "finish across as many turns as needed",
+        })),
+    )
+    .await?;
+    let goal_resp = read_response_for_id(&mut websocket, /*id*/ 4).await?;
+    let goal: ThreadGoalSetResponse = to_response(goal_resp)?;
+    assert_eq!(goal.goal.status, ThreadGoalStatus::Active);
+    websocket.close(None).await?;
+    drop(websocket);
+
+    wait_for_responses_request_count(&server, /*expected_count*/ 4).await?;
+    let persisted_goal =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string())
+            .await?
+            .thread_goals()
+            .get_thread_goal(ThreadId::from_string(&thread.id)?)
+            .await?
+            .expect("goal should remain persisted");
+    assert_eq!(
+        persisted_goal.status,
+        codex_state::ThreadGoalStatus::Complete
+    );
+
+    process.kill().await?;
     Ok(())
 }
 
