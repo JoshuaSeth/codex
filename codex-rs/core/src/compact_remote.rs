@@ -8,6 +8,7 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::replace_goal_context_before_compaction_summary;
 use crate::context_manager::ContextManager;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -46,6 +47,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     turn_context: Arc<TurnContext>,
     turn_state: Arc<OnceLock<String>>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -54,6 +56,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         &turn_context,
         Some(turn_state),
         initial_context_injection,
+        current_goal_context,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -80,6 +83,7 @@ pub(crate) async fn run_remote_compact_task(
         &turn_context,
         /*turn_state*/ None,
         InitialContextInjection::DoNotInject,
+        None,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -93,6 +97,7 @@ async fn run_remote_compact_task_inner(
     turn_context: &Arc<TurnContext>,
     turn_state: Option<Arc<OnceLock<String>>>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -137,6 +142,7 @@ async fn run_remote_compact_task_inner(
         turn_context,
         turn_state,
         initial_context_injection,
+        current_goal_context,
         compaction_metadata,
         &mut analytics_details,
     )
@@ -171,6 +177,7 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     turn_state: Option<Arc<OnceLock<String>>>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
@@ -267,6 +274,8 @@ async fn run_remote_compact_task_inner_impl(
         initial_context_injection,
     )
     .await;
+    new_history =
+        replace_goal_context_before_compaction_summary(new_history, current_goal_context.as_ref());
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

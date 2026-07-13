@@ -8,6 +8,7 @@ use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
+use crate::compact::replace_goal_context_before_compaction_summary;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
@@ -58,6 +59,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     turn_context: Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -66,6 +68,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         &turn_context,
         Some(client_session),
         initial_context_injection,
+        current_goal_context,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -91,6 +94,7 @@ pub(crate) async fn run_remote_compact_task(
         &turn_context,
         /*client_session*/ None,
         InitialContextInjection::DoNotInject,
+        None,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -103,6 +107,7 @@ async fn run_remote_compact_task_inner(
     turn_context: &Arc<TurnContext>,
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -147,6 +152,7 @@ async fn run_remote_compact_task_inner(
         turn_context,
         client_session,
         initial_context_injection,
+        current_goal_context,
         compaction_metadata,
         &mut analytics_details,
     )
@@ -181,6 +187,7 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
@@ -290,13 +297,15 @@ async fn run_remote_compact_task_inner_impl(
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
     let new_window_id = sess.advance_auto_compact_window_id().await;
-    let new_history = process_compacted_history(
+    let mut new_history = process_compacted_history(
         sess.as_ref(),
         turn_context.as_ref(),
         compacted_history,
         initial_context_injection,
     )
     .await;
+    new_history =
+        replace_goal_context_before_compaction_summary(new_history, current_goal_context.as_ref());
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

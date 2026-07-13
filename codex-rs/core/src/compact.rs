@@ -73,6 +73,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -88,6 +89,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         turn_context,
         input,
         initial_context_injection,
+        current_goal_context,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -114,6 +116,7 @@ pub(crate) async fn run_compact_task(
         turn_context,
         input,
         InitialContextInjection::DoNotInject,
+        None,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -127,6 +130,7 @@ async fn run_compact_task_inner(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -163,6 +167,7 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         input,
         initial_context_injection,
+        current_goal_context,
         compaction_metadata,
     )
     .await;
@@ -198,6 +203,7 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -307,6 +313,8 @@ async fn run_compact_task_inner_impl(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
+    new_history =
+        replace_goal_context_before_compaction_summary(new_history, current_goal_context.as_ref());
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
@@ -461,6 +469,49 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+pub(crate) fn is_goal_context_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+    role == "user"
+        && content.iter().any(|content_item| {
+            let ContentItem::InputText { text } = content_item else {
+                return false;
+            };
+            crate::context::internal_model_context_source(text) == Some("goal")
+        })
+}
+
+pub(crate) fn replace_goal_context_before_compaction_summary(
+    mut history: Vec<ResponseItem>,
+    current_goal_context: Option<&ResponseItem>,
+) -> Vec<ResponseItem> {
+    history.retain(|item| !is_goal_context_item(item));
+    let Some(current_goal_context) = current_goal_context else {
+        return history;
+    };
+
+    let insertion_index = history
+        .iter()
+        .rposition(is_compaction_summary_item)
+        .unwrap_or(history.len());
+    history.insert(insertion_index, current_goal_context.clone());
+    history
+}
+
+fn is_compaction_summary_item(item: &ResponseItem) -> bool {
+    if matches!(
+        item,
+        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
+    ) {
+        return true;
+    }
+    let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
+        return false;
+    };
+    is_summary_message(&user.message())
 }
 
 /// Inserts canonical initial context into compacted replacement history at the

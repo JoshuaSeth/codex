@@ -11,6 +11,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
+use crate::compact::is_goal_context_item;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
@@ -169,6 +170,7 @@ pub(crate) async fn run_turn(
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
         return None;
     }
+    let mut current_goal_context = latest_goal_context_from_turn_inputs(&input);
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
@@ -179,6 +181,9 @@ pub(crate) async fn run_turn(
     }))
     .await;
     for response_item in injection_items {
+        if is_goal_context_item(&response_item) {
+            current_goal_context = Some(response_item.clone());
+        }
         sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
             .await;
     }
@@ -213,6 +218,9 @@ pub(crate) async fn run_turn(
 
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
+        }
+        if let Some(goal_context) = latest_goal_context_from_turn_inputs(&pending_input) {
+            current_goal_context = Some(goal_context);
         }
 
         // Construct the input that we will send to the model.
@@ -305,6 +313,7 @@ pub(crate) async fn run_turn(
                         &turn_context,
                         &mut client_session,
                         InitialContextInjection::BeforeLastUserMessage,
+                        current_goal_context.clone(),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
                     )
@@ -453,6 +462,15 @@ async fn run_hooks_and_record_inputs(
         }
     }
     blocked_input && !accepted_user_input
+}
+
+fn latest_goal_context_from_turn_inputs(input: &[TurnInput]) -> Option<ResponseItem> {
+    input.iter().rev().find_map(|input_item| {
+        let TurnInput::ResponseItem(response_item) = input_item else {
+            return None;
+        };
+        is_goal_context_item(response_item).then(|| response_item.clone())
+    })
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -794,6 +812,7 @@ async fn run_pre_sampling_compact(
             turn_context,
             client_session,
             InitialContextInjection::DoNotInject,
+            None,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
         )
@@ -838,6 +857,7 @@ async fn maybe_run_previous_model_inline_compact(
             &previous_model_turn_context,
             client_session,
             InitialContextInjection::DoNotInject,
+            None,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
         )
@@ -875,6 +895,7 @@ async fn maybe_run_previous_model_inline_compact(
             &previous_model_turn_context,
             client_session,
             InitialContextInjection::DoNotInject,
+            None,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
         )
@@ -893,6 +914,7 @@ async fn run_auto_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
+    current_goal_context: Option<ResponseItem>,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -908,6 +930,7 @@ async fn run_auto_compact(
                 Arc::clone(turn_context),
                 client_session,
                 initial_context_injection,
+                current_goal_context,
                 reason,
                 phase,
             )
@@ -924,6 +947,7 @@ async fn run_auto_compact(
             Arc::clone(turn_context),
             client_session.turn_state(),
             initial_context_injection,
+            current_goal_context,
             reason,
             phase,
         )
@@ -938,6 +962,7 @@ async fn run_auto_compact(
             Arc::clone(sess),
             Arc::clone(turn_context),
             initial_context_injection,
+            current_goal_context,
             reason,
             phase,
         )

@@ -89,22 +89,7 @@ impl ContextualUserFragment for InternalModelContextFragment {
     }
 
     fn matches_text(text: &str) -> bool {
-        let trimmed = text.trim();
-        if matches_legacy_goal_context(trimmed) {
-            return true;
-        }
-
-        let Some(rest) = trimmed.strip_prefix(CONTEXT_START_MARKER) else {
-            return false;
-        };
-        let Some(rest) = rest.strip_prefix(SOURCE_ATTR_START) else {
-            return false;
-        };
-        let Some((source, body_and_close)) = rest.split_once(SOURCE_ATTR_END) else {
-            return false;
-        };
-
-        is_valid_source(source) && body_and_close.ends_with(CONTEXT_END_MARKER)
+        internal_model_context_source(text).is_some()
     }
 
     fn body(&self) -> String {
@@ -112,6 +97,18 @@ impl ContextualUserFragment for InternalModelContextFragment {
         let body = &self.body;
         format!(" source=\"{source}\">\n{body}\n")
     }
+}
+
+pub(crate) fn internal_model_context_source(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if matches_legacy_goal_context(trimmed) {
+        return Some("goal");
+    }
+
+    let rest = trimmed.strip_prefix(CONTEXT_START_MARKER)?;
+    let rest = rest.strip_prefix(SOURCE_ATTR_START)?;
+    let (source, body_and_close) = rest.split_once(SOURCE_ATTR_END)?;
+    (is_valid_source(source) && body_and_close.ends_with(CONTEXT_END_MARKER)).then_some(source)
 }
 
 fn matches_legacy_goal_context(text: &str) -> bool {

@@ -1,4 +1,7 @@
 use super::*;
+use crate::context::ContextualUserFragment;
+use crate::context::InternalContextSource;
+use crate::context::InternalModelContextFragment;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -32,6 +35,13 @@ fn user_message(text: &str) -> ResponseItem {
         }],
         phase: None,
     }
+}
+
+fn goal_context(text: &str) -> ResponseItem {
+    ContextualUserFragment::into(InternalModelContextFragment::new(
+        InternalContextSource::from_static("goal"),
+        text,
+    ))
 }
 
 #[test]
@@ -149,6 +159,85 @@ fn collect_user_messages_filters_legacy_warnings() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec!["real user message".to_string()], collected);
+}
+
+#[test]
+fn goal_context_detection_is_source_specific() {
+    let goal = goal_context("continue the current objective");
+    let extension = ContextualUserFragment::into(InternalModelContextFragment::new(
+        InternalContextSource::from_static("extension"),
+        "unrelated internal context",
+    ));
+
+    assert!(is_goal_context_item(&goal));
+    assert!(!is_goal_context_item(&extension));
+    assert!(!is_goal_context_item(&user_message("ordinary user input")));
+}
+
+#[test]
+fn current_goal_context_supersedes_stale_goal_before_remote_summary() {
+    let stale_goal = goal_context("pause the campaign");
+    let current_goal = goal_context("resume the campaign");
+    let compaction = ResponseItem::Compaction {
+        encrypted_content: "encrypted".to_string(),
+    };
+    let history = vec![
+        user_message("historical pause request"),
+        stale_goal,
+        compaction.clone(),
+    ];
+
+    let refreshed = replace_goal_context_before_compaction_summary(history, Some(&current_goal));
+
+    assert_eq!(
+        refreshed,
+        vec![
+            user_message("historical pause request"),
+            current_goal,
+            compaction,
+        ]
+    );
+}
+
+#[test]
+fn current_goal_context_is_inserted_before_local_summary() {
+    let current_goal = goal_context("resume the campaign");
+    let summary = user_message(&format!("{SUMMARY_PREFIX}\ncompacted work"));
+    let history = vec![user_message("historical pause request"), summary.clone()];
+
+    let refreshed = replace_goal_context_before_compaction_summary(history, Some(&current_goal));
+
+    assert_eq!(
+        refreshed,
+        vec![
+            user_message("historical pause request"),
+            current_goal,
+            summary,
+        ]
+    );
+}
+
+#[test]
+fn normal_turn_compaction_does_not_resurrect_historical_goal_context() {
+    let history = vec![
+        goal_context("obsolete goal"),
+        user_message("new ordinary task"),
+        ResponseItem::Compaction {
+            encrypted_content: "encrypted".to_string(),
+        },
+    ];
+
+    let refreshed = replace_goal_context_before_compaction_summary(history, None);
+
+    assert_eq!(
+        refreshed,
+        vec![
+            user_message("new ordinary task"),
+            ResponseItem::Compaction {
+                encrypted_content: "encrypted".to_string(),
+            },
+        ]
+    );
 }
 
 #[test]

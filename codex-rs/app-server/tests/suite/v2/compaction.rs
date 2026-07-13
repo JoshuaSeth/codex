@@ -21,6 +21,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
+use codex_app_server_protocol::ThreadGoalSetResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -249,6 +251,193 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_mid_turn_compaction_preserves_current_goal_after_stale_user_instruction()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    run_goal_compaction_preservation_test(GoalCompactionImplementation::Local).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_legacy_mid_turn_compaction_preserves_current_goal_after_stale_user_instruction()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    run_goal_compaction_preservation_test(GoalCompactionImplementation::RemoteLegacy).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_v2_mid_turn_compaction_preserves_current_goal_after_stale_user_instruction()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    run_goal_compaction_preservation_test(GoalCompactionImplementation::RemoteV2).await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalCompactionImplementation {
+    Local,
+    RemoteLegacy,
+    RemoteV2,
+}
+
+async fn run_goal_compaction_preservation_test(
+    implementation: GoalCompactionImplementation,
+) -> Result<()> {
+    const CURRENT_GOAL: &str = "RESUME_THE_CAMPAIGN_CURRENT";
+    const STALE_USER_INSTRUCTION: &str = "PAUSE_THE_CAMPAIGN_OBSOLETE";
+
+    let server = responses::start_mock_server().await;
+    let shell_arguments = serde_json::to_string(&serde_json::json!({
+        "cmd": "printf goal-compaction-test",
+        "yield_time_ms": 500,
+    }))?;
+    let complete_goal_arguments = serde_json::to_string(&serde_json::json!({
+        "status": "complete",
+    }))?;
+    let mut response_bodies = vec![
+        responses::sse(vec![
+            responses::ev_assistant_message("stale-turn-message", "Paused."),
+            responses::ev_completed_with_tokens("stale-turn-response", 50),
+        ]),
+        responses::sse(vec![
+            responses::ev_function_call("goal-tool-call", "exec_command", &shell_arguments),
+            responses::ev_completed_with_tokens("goal-tool-response", 500),
+        ]),
+    ];
+    match implementation {
+        GoalCompactionImplementation::Local => response_bodies.push(responses::sse(vec![
+            responses::ev_assistant_message(
+                "local-goal-summary-message",
+                "LOCAL_GOAL_COMPACTION_SUMMARY",
+            ),
+            responses::ev_completed_with_tokens("local-goal-summary-response", 20),
+        ])),
+        GoalCompactionImplementation::RemoteLegacy => {
+            responses::mount_compact_user_history_with_summary_once(
+                &server,
+                "LEGACY_GOAL_COMPACTION_CHECKPOINT",
+            )
+            .await;
+        }
+        GoalCompactionImplementation::RemoteV2 => response_bodies.push(responses::sse(vec![
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "GOAL_COMPACTION_CHECKPOINT",
+                },
+            }),
+            responses::ev_completed("goal-compaction-response"),
+        ])),
+    }
+    response_bodies.extend([
+        responses::sse(vec![
+            responses::ev_function_call(
+                "goal-complete-call",
+                "update_goal",
+                &complete_goal_arguments,
+            ),
+            responses::ev_completed_with_tokens("goal-complete-response", 80),
+        ]),
+        responses::sse(vec![
+            responses::ev_assistant_message("goal-final-message", "Goal complete."),
+            responses::ev_completed_with_tokens("goal-final-response", 80),
+        ]),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, response_bodies).await;
+
+    let codex_home = TempDir::new()?;
+    let mut feature_flags = BTreeMap::from([(Feature::Goals, true)]);
+    let requires_openai_auth = match implementation {
+        GoalCompactionImplementation::Local => None,
+        GoalCompactionImplementation::RemoteLegacy => {
+            feature_flags.insert(Feature::RemoteCompactionV2, false);
+            Some(true)
+        }
+        GoalCompactionImplementation::RemoteV2 => {
+            feature_flags.insert(Feature::RemoteCompactionV2, true);
+            Some(true)
+        }
+    };
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        &feature_flags,
+        /*auto_compact_limit*/ 200,
+        requires_openai_auth,
+        "mock_provider",
+        COMPACT_PROMPT,
+    )?;
+    if requires_openai_auth.is_some() {
+        write_chatgpt_auth(
+            codex_home.path(),
+            ChatGptAuthFixture::new("access-chatgpt").plan_type("pro"),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+
+    let mut mcp = if requires_openai_auth.is_some() {
+        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?
+    } else {
+        TestAppServer::new(codex_home.path()).await?
+    };
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    send_turn_and_wait(&mut mcp, &thread_id, STALE_USER_INSTRUCTION).await?;
+
+    let goal_request_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(serde_json::json!({
+                "threadId": thread_id,
+                "objective": CURRENT_GOAL,
+            })),
+        )
+        .await?;
+    let goal_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(goal_request_id)),
+    )
+    .await??;
+    let goal: ThreadGoalSetResponse = to_response(goal_response)?;
+    assert_eq!(goal.goal.status, ThreadGoalStatus::Active);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = responses_log.requests();
+    let (expected_request_count, post_compaction_request_index) = match implementation {
+        GoalCompactionImplementation::Local | GoalCompactionImplementation::RemoteV2 => (5, 3),
+        GoalCompactionImplementation::RemoteLegacy => (4, 2),
+    };
+    assert_eq!(requests.len(), expected_request_count);
+    let post_compaction_body = requests[post_compaction_request_index].body_json();
+    let post_compaction_input = post_compaction_body
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .expect("post-compaction request should contain input");
+    let stale_index = input_item_text_index(post_compaction_input, STALE_USER_INSTRUCTION)
+        .expect("stale user instruction should remain as historical context");
+    let current_goal_indices = input_item_text_indices(post_compaction_input, CURRENT_GOAL);
+    let compaction_index = compaction_boundary_index(post_compaction_input, implementation)
+        .expect("post-compaction request should contain the compaction checkpoint");
+
+    assert_eq!(current_goal_indices.len(), 1);
+    assert!(
+        stale_index < current_goal_indices[0],
+        "current goal must supersede the stale user instruction by appearing later"
+    );
+    assert!(
+        current_goal_indices[0] < compaction_index,
+        "current goal must be retained immediately before the compaction checkpoint"
+    );
+    assert_eq!(current_goal_indices[0] + 1, compaction_index);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -469,4 +658,42 @@ async fn wait_for_context_compaction_completed(
 
 fn parse_json_header(value: &str) -> serde_json::Value {
     serde_json::from_str(value).unwrap_or_else(|err| panic!("turn metadata should be json: {err}"))
+}
+
+fn input_item_text_index(items: &[serde_json::Value], expected: &str) -> Option<usize> {
+    input_item_text_indices(items, expected).into_iter().next()
+}
+
+fn input_item_text_indices(items: &[serde_json::Value], expected: &str) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| input_item_contains_text(item, expected).then_some(index))
+        .collect()
+}
+
+fn compaction_boundary_index(
+    items: &[serde_json::Value],
+    implementation: GoalCompactionImplementation,
+) -> Option<usize> {
+    items.iter().position(|item| match implementation {
+        GoalCompactionImplementation::Local => {
+            input_item_contains_text(item, "LOCAL_GOAL_COMPACTION_SUMMARY")
+        }
+        GoalCompactionImplementation::RemoteLegacy | GoalCompactionImplementation::RemoteV2 => {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+        }
+    })
+}
+
+fn input_item_contains_text(item: &serde_json::Value, expected: &str) -> bool {
+    item.get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(expected))
+            })
+        })
 }
