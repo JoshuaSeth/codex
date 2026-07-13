@@ -135,7 +135,7 @@ Example with notification opt-out:
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; if the source thread is currently mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread. Experimental clients can pass `excludeTurns: true` when they plan to page fork history via `thread/turns/list` instead of receiving the full turn array immediately. Accepts the same permission override rules as `thread/start`.
 - `thread/start`, `thread/resume`, and `thread/fork` responses include the legacy `sandbox` compatibility projection. Experimental clients can read `runtimeWorkspaceRoots` for the thread-scoped runtime roots and `activePermissionProfile` for the named or implicit built-in profile identity/provenance when known.
 - `thread/list` — page through stored threads; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Experimental clients can use `parentThreadId` to filter direct spawned children represented by persisted spawn-edge state. Review and Guardian threads are not included because they do not participate in that spawn-edge lifecycle. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. Subagent threads also include `parentThreadId` when the immediate parent is known.
-- `thread/loaded/list` — list the thread ids currently loaded in memory.
+- `thread/loaded/list` — list the thread ids currently loaded in memory and return the current memory-aware residency policy and diagnostics.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/turns/list` — experimental; page through a stored thread’s turn history without resuming it; supports cursor-based pagination with `sortDirection`, `itemsView`, `nextCursor`, and `backwardsCursor`.
 - `thread/turns/items/list` — experimental; reserved for paging full items for one turn. The API shape is present, but app-server currently returns an unsupported-method JSON-RPC error.
@@ -152,7 +152,7 @@ Example with notification opt-out:
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
 - `thread/archive` — move a thread’s rollout file into the archived directory and attempt to move any spawned descendant thread rollout files; returns `{}` on success and emits `thread/archived` for each archived thread.
 - `thread/delete` — hard-delete an active or archived thread and any spawned descendant threads; returns `{}` on success and emits `thread/deleted` for each deleted thread.
-- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server keeps the thread loaded and unloads it only after it has had no subscribers and no thread activity for 30 minutes, then emits `thread/closed`.
+- `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. Losing the last subscriber does not start a fixed unload timer. The memory-aware residency policy keeps the thread loaded while process RSS is at or below the soft cap. Above the soft cap, an idle unsubscribed thread becomes eligible only after the minimum idle TTL; above the hard cap, idle unsubscribed threads are eligible immediately. Active and subscribed threads remain protected. An actual unload emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
 - `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
@@ -407,12 +407,25 @@ Enable `capabilities.experimentalApi` during initialization, then use `thread/li
 
 ### Example: List loaded threads
 
-`thread/loaded/list` returns thread ids currently loaded in memory. This is useful when you want to check which sessions are active without scanning rollouts on disk.
+`thread/loaded/list` returns thread ids currently loaded in memory plus residency diagnostics. This is useful when you want to inspect active memory residency without scanning rollouts on disk.
+
+The default policy is a 20 GiB process-RSS soft cap, a 32 GiB hard cap, a six-hour minimum idle TTL, and a 60-second eviction poll. The idle TTL is only an eligibility condition after RSS exceeds the soft cap; it is not an unconditional unload timeout. Above the soft cap, each poll selects at most one least-recently-used idle unsubscribed thread. Above the hard cap, each poll selects every idle unsubscribed thread. Active and subscribed threads are protected in both cases. Deployments can override the defaults with `CODEX_APP_SERVER_RESIDENCY_SOFT_BYTES`, `CODEX_APP_SERVER_RESIDENCY_HARD_BYTES`, `CODEX_APP_SERVER_RESIDENCY_IDLE_MIN_TTL_SECS`, and `CODEX_APP_SERVER_RESIDENCY_EVICTION_POLL_SECS`.
 
 ```json
 { "method": "thread/loaded/list", "id": 21 }
 { "id": 21, "result": {
-    "data": ["thr_123", "thr_456"]
+    "data": ["thr_123", "thr_456"],
+    "nextCursor": null,
+    "residency": {
+        "softCapBytes": 21474836480,
+        "hardCapBytes": 34359738368,
+        "idleMinTtlSecs": 21600,
+        "evictionPollSecs": 60,
+        "rssBytes": 4294967296,
+        "loadedThreads": 2,
+        "residentEstimatedBytes": 104857600,
+        "records": []
+    }
 } }
 ```
 
@@ -442,14 +455,14 @@ Enable `capabilities.experimentalApi` during initialization, then use `thread/li
 - `notSubscribed` when the connection was not subscribed to that thread.
 - `notLoaded` when the thread is not loaded.
 
-If this was the last subscriber, the server does not unload the thread immediately. It unloads the thread after the thread has had no subscribers and no thread activity for 30 minutes, then emits `thread/closed` and a `thread/status/changed` transition to `notLoaded`.
+If this was the last subscriber, the server does not unload the thread immediately or start a fixed timeout. The thread remains loaded while process RSS is at or below the residency soft cap. If memory pressure later makes this idle unsubscribed thread eligible and the final active/subscriber guard still passes, app-server unloads it and emits `thread/closed` plus a `thread/status/changed` transition to `notLoaded`.
 
 ```json
 { "method": "thread/unsubscribe", "id": 22, "params": { "threadId": "thr_123" } }
 { "id": 22, "result": { "status": "unsubscribed" } }
 ```
 
-Later, after the idle unload timeout:
+Later, only if the memory-aware residency policy selects the thread:
 
 ```json
 { "method": "thread/status/changed", "params": {
