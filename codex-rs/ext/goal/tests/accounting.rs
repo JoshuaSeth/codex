@@ -51,6 +51,38 @@ fn goal_accounting_ignores_plan_mode_turns() {
     assert_eq!(None, recorded);
 }
 
+#[test]
+fn goal_accounting_counts_each_failed_goal_turn_once() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+
+    assert_eq!(Some(1), state.mark_turn_error("turn-1"));
+    assert_eq!(Some(1), state.mark_turn_error("turn-1"));
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    assert_eq!(Some(2), state.mark_turn_error("turn-2"));
+    state.finish_turn("turn-2");
+    assert_eq!(2, state.consecutive_turn_errors());
+}
+
+#[test]
+fn successful_goal_turn_resets_consecutive_turn_errors() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+    assert_eq!(Some(1), state.mark_turn_error("turn-1"));
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    state.finish_turn("turn-2");
+
+    assert_eq!(0, state.consecutive_turn_errors());
+}
+
 fn token_usage(
     input_tokens: i64,
     cached_input_tokens: i64,

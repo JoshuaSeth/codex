@@ -38,7 +38,6 @@ use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
-use crate::runtime::ActiveGoalStopReason;
 use crate::runtime::GoalRuntimeConfig;
 use crate::runtime::GoalRuntimeHandle;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
@@ -316,23 +315,47 @@ where
                 return;
             };
 
-            let reason = match input.error {
-                CodexErrorInfo::UsageLimitExceeded => ActiveGoalStopReason::UsageLimit,
-                // The turn has ended because the error was non-retryable or its
-                // retries were exhausted. Block the goal to prevent automatic
-                // continuation from looping and consuming tokens, as can happen
-                // with compaction errors.
-                _ => ActiveGoalStopReason::TurnError,
+            if matches!(&input.error, CodexErrorInfo::UsageLimitExceeded) {
+                if let Err(err) = runtime
+                    .usage_limit_active_goal_for_turn(input.turn_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?input.error,
+                        "failed to stop active goal after usage-limit error: {err}"
+                    );
+                }
+                return;
+            }
+
+            let Some(consecutive_turn_errors) =
+                runtime.accounting_state().mark_turn_error(input.turn_id)
+            else {
+                return;
             };
             if let Err(err) = runtime
-                .stop_active_goal_for_turn(input.turn_id, reason)
+                .account_active_goal_progress(
+                    input.turn_id,
+                    &format!("{}:turn-error-progress", input.turn_id),
+                    codex_state::GoalAccountingMode::ActiveOnly,
+                    BudgetLimitedGoalDisposition::KeepActive,
+                )
                 .await
             {
                 tracing::warn!(
+                    thread_id = %runtime.thread_id(),
+                    turn_id = input.turn_id,
                     error = ?input.error,
-                    "failed to stop active goal after turn error: {err}"
+                    "failed to account active goal progress after technical turn error: {err}"
                 );
             }
+            tracing::warn!(
+                thread_id = %runtime.thread_id(),
+                turn_id = input.turn_id,
+                error = ?input.error,
+                consecutive_turn_errors,
+                "technical turn failure preserved the active goal for bounded recovery"
+            );
         })
     }
 }

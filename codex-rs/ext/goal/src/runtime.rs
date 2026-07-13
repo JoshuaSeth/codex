@@ -28,6 +28,7 @@ const CONTINUATION_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(1_500),
 ];
+const TURN_ERROR_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
 
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
@@ -38,11 +39,6 @@ pub(crate) struct GoalRuntimeConfig {
     pub(crate) analytics: GoalAnalytics,
     pub(crate) enabled: bool,
     pub(crate) tools_available_for_thread: bool,
-}
-
-pub(crate) enum ActiveGoalStopReason {
-    TurnError,
-    UsageLimit,
 }
 
 struct GoalRuntimeInner {
@@ -209,6 +205,7 @@ impl GoalRuntimeHandle {
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
+        self.inner.accounting_state.reset_consecutive_turn_errors();
         self.stage_external_goal_set(&goal);
         match goal.status {
             codex_state::ThreadGoalStatus::Active => {
@@ -284,8 +281,7 @@ impl GoalRuntimeHandle {
     }
 
     pub async fn usage_limit_active_goal_for_turn(&self, turn_id: &str) -> Result<(), String> {
-        self.stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::UsageLimit)
-            .await
+        self.stop_active_goal_for_usage_limit(turn_id).await
     }
 
     pub(crate) async fn stop_active_goal_if_auto_continuation_usage_limited(
@@ -352,12 +348,8 @@ impl GoalRuntimeHandle {
         Ok(true)
     }
 
-    /// Accounts the ending turn and stops its active goal after a terminal error.
-    pub(crate) async fn stop_active_goal_for_turn(
-        &self,
-        turn_id: &str,
-        reason: ActiveGoalStopReason,
-    ) -> Result<(), String> {
+    /// Accounts the ending turn and stops its active goal after a usage-limit error.
+    async fn stop_active_goal_for_usage_limit(&self, turn_id: &str) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
         }
@@ -373,14 +365,8 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
-        let (event_name, status) = match reason {
-            ActiveGoalStopReason::TurnError => {
-                ("turn-error", codex_state::ThreadGoalStatus::Blocked)
-            }
-            ActiveGoalStopReason::UsageLimit => {
-                ("usage-limit", codex_state::ThreadGoalStatus::UsageLimited)
-            }
-        };
+        let event_name = "usage-limit";
+        let status = codex_state::ThreadGoalStatus::UsageLimited;
         self.account_active_goal_progress(
             turn_id,
             &format!("{turn_id}:{event_name}-progress"),
@@ -400,9 +386,10 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
-        let can_stop = active_goal.status == codex_state::ThreadGoalStatus::Active
-            || (active_goal.status == codex_state::ThreadGoalStatus::BudgetLimited
-                && status == codex_state::ThreadGoalStatus::UsageLimited);
+        let can_stop = matches!(
+            active_goal.status,
+            codex_state::ThreadGoalStatus::Active | codex_state::ThreadGoalStatus::BudgetLimited
+        );
         if !can_stop {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -469,6 +456,26 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        let consecutive_turn_errors = self.inner.accounting_state.consecutive_turn_errors();
+        if consecutive_turn_errors > TURN_ERROR_RETRY_DELAYS.len() as u32 {
+            tracing::error!(
+                thread_id = %self.thread_id(),
+                consecutive_turn_errors,
+                "automatic goal continuation is waiting for external recovery after repeated technical turn failures"
+            );
+            return Ok(());
+        }
+        if consecutive_turn_errors > 0 {
+            let delay = TURN_ERROR_RETRY_DELAYS[(consecutive_turn_errors - 1) as usize];
+            tracing::warn!(
+                thread_id = %self.thread_id(),
+                consecutive_turn_errors,
+                retry_delay_seconds = delay.as_secs(),
+                "retrying active goal after a technical turn failure"
+            );
+            sleep(delay).await;
+        }
+
         let mut attempt = self.continue_if_idle_once().await?;
         for delay in CONTINUATION_RETRY_DELAYS {
             let GoalContinuationAttempt::Retry(_) = attempt else {

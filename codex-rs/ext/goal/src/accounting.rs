@@ -22,6 +22,8 @@ struct GoalAccountingInner {
     turns: HashMap<String, GoalTurnAccounting>,
     wall_clock: GoalWallClockAccounting,
     budget_limit_reported_goal_id: Option<String>,
+    consecutive_turn_error_goal_id: Option<String>,
+    consecutive_turn_errors: u32,
 }
 
 #[derive(Debug)]
@@ -31,6 +33,7 @@ struct GoalTurnAccounting {
     active_goal_id: Option<String>,
     terminal_update_goal_id: Option<String>,
     account_tokens: bool,
+    had_turn_error: bool,
 }
 
 #[derive(Debug)]
@@ -153,6 +156,35 @@ impl GoalAccountingState {
                 inner.wall_clock.mark_active_goal(goal_id);
             }
         }
+    }
+
+    pub(crate) fn mark_turn_error(&self, turn_id: &str) -> Option<u32> {
+        let mut inner = self.inner();
+        let goal_id = {
+            let turn = inner.turns.get_mut(turn_id)?;
+            let goal_id = turn.active_goal_id.clone()?;
+            if turn.had_turn_error {
+                return Some(inner.consecutive_turn_errors);
+            }
+            turn.had_turn_error = true;
+            goal_id
+        };
+        if inner.consecutive_turn_error_goal_id.as_deref() != Some(goal_id.as_str()) {
+            inner.consecutive_turn_error_goal_id = Some(goal_id);
+            inner.consecutive_turn_errors = 0;
+        }
+        inner.consecutive_turn_errors = inner.consecutive_turn_errors.saturating_add(1);
+        Some(inner.consecutive_turn_errors)
+    }
+
+    pub(crate) fn consecutive_turn_errors(&self) -> u32 {
+        self.inner().consecutive_turn_errors
+    }
+
+    pub(crate) fn reset_consecutive_turn_errors(&self) {
+        let mut inner = self.inner();
+        inner.consecutive_turn_error_goal_id = None;
+        inner.consecutive_turn_errors = 0;
     }
 
     pub(crate) fn mark_current_turn_goal_active(
@@ -306,7 +338,14 @@ impl GoalAccountingState {
 
     pub(crate) fn finish_turn(&self, turn_id: &str) {
         let mut inner = self.inner();
-        inner.turns.remove(turn_id);
+        let finished_turn = inner.turns.remove(turn_id);
+        if finished_turn
+            .as_ref()
+            .is_some_and(|turn| turn.active_goal_id.is_some() && !turn.had_turn_error)
+        {
+            inner.consecutive_turn_error_goal_id = None;
+            inner.consecutive_turn_errors = 0;
+        }
         if inner.current_turn_id.as_deref() == Some(turn_id) {
             inner.current_turn_id = None;
         }
@@ -389,6 +428,8 @@ impl Default for GoalAccountingInner {
             turns: HashMap::new(),
             wall_clock: GoalWallClockAccounting::new(),
             budget_limit_reported_goal_id: None,
+            consecutive_turn_error_goal_id: None,
+            consecutive_turn_errors: 0,
         }
     }
 }
@@ -412,6 +453,7 @@ impl GoalTurnAccounting {
             active_goal_id: None,
             terminal_update_goal_id: None,
             account_tokens,
+            had_turn_error: false,
         }
     }
 
