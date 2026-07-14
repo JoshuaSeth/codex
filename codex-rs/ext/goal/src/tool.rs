@@ -14,8 +14,10 @@ use codex_protocol::protocol::validate_thread_goal_objective;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::accounting::BlockedGoalDecision;
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::accounting::REQUIRED_CONSECUTIVE_BLOCKED_TURNS;
 use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
@@ -254,6 +256,21 @@ impl GoalToolExecutor {
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string())
             })?;
+        if args.status == ThreadGoalStatus::Blocked {
+            let decision = self
+                .accounting_state
+                .record_blocked_goal_attempt(invocation.turn_id.as_str(), expected_goal_id.as_str())
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string(),
+                    )
+                })?;
+            if let BlockedGoalDecision::Continue { blocked_turns } = decision {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "cannot mark this goal blocked yet: blocked audit {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
+                )));
+            }
+        }
 
         self.account_active_goal_progress(
             match args.status {

@@ -880,7 +880,7 @@ async fn usage_limit_stale_turn_does_not_stop_current_goal() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<()> {
+async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
     seed_thread_metadata(runtime.as_ref(), thread_id).await?;
@@ -898,21 +898,68 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
         .await?;
     harness.sink.clear();
 
+    let update_tool = tool_by_name(&tools, "update_goal");
+    let first_invocation = tool_call(
+        "update_goal",
+        "call-update-goal-1",
+        json!({ "status": "blocked" }),
+    );
+    let first_error = match update_tool.handle(first_invocation).await {
+        Ok(_) => panic!("first blocked turn should keep the goal active"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked yet: blocked audit 1/3. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
+                .to_string()
+        ),
+        first_error
+    );
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+
+    harness.stop_turn("turn-1").await;
+    harness.start_turn("turn-2", &TokenUsage::default()).await;
+    let mut second_invocation = tool_call(
+        "update_goal",
+        "call-update-goal-2",
+        json!({ "status": "blocked" }),
+    );
+    second_invocation.turn_id = "turn-2".to_string();
+    let second_error = match update_tool.handle(second_invocation).await {
+        Ok(_) => panic!("second blocked turn should keep the goal active"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked yet: blocked audit 2/3. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
+                .to_string()
+        ),
+        second_error
+    );
+
+    harness.stop_turn("turn-2").await;
+    harness.start_turn("turn-3", &TokenUsage::default()).await;
+
     harness
         .record_token_usage(
-            "turn-1",
+            "turn-3",
             &token_usage(
                 /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
                 /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
             ),
         )
         .await;
-    let update_tool = tool_by_name(&tools, "update_goal");
-    let invocation = tool_call(
+    let mut invocation = tool_call(
         "update_goal",
-        "call-update-goal",
+        "call-update-goal-3",
         json!({ "status": "blocked" }),
     );
+    invocation.turn_id = "turn-3".to_string();
     let output = update_tool.handle(invocation.clone()).await?;
     let result = output.code_mode_result(&invocation.payload);
 
@@ -944,14 +991,14 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
     assert_eq!(
         vec![
             CapturedGoalEvent {
-                event_id: "call-update-goal".to_string(),
-                turn_id: Some("turn-1".to_string()),
+                event_id: "call-update-goal-3".to_string(),
+                turn_id: Some("turn-3".to_string()),
                 status: ThreadGoalStatus::Active,
                 tokens_used: 23,
             },
             CapturedGoalEvent {
-                event_id: "call-update-goal".to_string(),
-                turn_id: Some("turn-1".to_string()),
+                event_id: "call-update-goal-3".to_string(),
+                turn_id: Some("turn-3".to_string()),
                 status: ThreadGoalStatus::Blocked,
                 tokens_used: 23,
             },

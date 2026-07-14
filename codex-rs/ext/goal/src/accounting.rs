@@ -9,6 +9,8 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 
+pub(crate) const REQUIRED_CONSECUTIVE_BLOCKED_TURNS: u32 = 3;
+
 #[derive(Debug)]
 pub(crate) struct GoalAccountingState {
     inner: Mutex<GoalAccountingInner>,
@@ -24,6 +26,8 @@ struct GoalAccountingInner {
     budget_limit_reported_goal_id: Option<String>,
     consecutive_turn_error_goal_id: Option<String>,
     consecutive_turn_errors: u32,
+    blocked_attempt_goal_id: Option<String>,
+    consecutive_blocked_turns: u32,
 }
 
 #[derive(Debug)]
@@ -34,6 +38,7 @@ struct GoalTurnAccounting {
     terminal_update_goal_id: Option<String>,
     account_tokens: bool,
     had_turn_error: bool,
+    blocked_attempted: bool,
 }
 
 #[derive(Debug)]
@@ -66,6 +71,12 @@ pub(crate) enum BudgetLimitedGoalDisposition {
 pub(crate) struct RecordedTokenDelta {
     pub(crate) turn_delta: i64,
     pub(crate) thread_unflushed_delta: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedGoalDecision {
+    Continue { blocked_turns: u32 },
+    Allow,
 }
 
 impl GoalAccountingState {
@@ -201,6 +212,7 @@ impl GoalAccountingState {
         turn.active_goal_id = Some(goal_id.clone());
         turn.terminal_update_goal_id = Some(goal_id.clone());
         turn.reset_baseline_to_current();
+        inner.reset_blocked_goal_audit();
         inner.wall_clock.mark_active_goal(goal_id);
         Some(turn_id)
     }
@@ -215,6 +227,7 @@ impl GoalAccountingState {
         if inner.budget_limit_reported_goal_id.as_deref() != Some(goal_id.as_str()) {
             inner.budget_limit_reported_goal_id = None;
         }
+        inner.reset_blocked_goal_audit();
         let turn = inner.turns.get_mut(turn_id.as_str())?;
         let already_staged = turn.active_goal_id.as_deref() == Some(goal_id.as_str())
             && turn.terminal_update_goal_id.is_none();
@@ -240,12 +253,46 @@ impl GoalAccountingState {
         (turn.active_goal_id.as_ref() == Some(terminal_goal_id)).then(|| terminal_goal_id.clone())
     }
 
+    pub(crate) fn record_blocked_goal_attempt(
+        &self,
+        turn_id: &str,
+        goal_id: &str,
+    ) -> Option<BlockedGoalDecision> {
+        let mut inner = self.inner();
+        if inner.current_turn_id.as_deref() != Some(turn_id) {
+            return None;
+        }
+        let turn = inner.turns.get(turn_id)?;
+        if turn.active_goal_id.as_deref() != Some(goal_id) {
+            return None;
+        }
+        if inner.blocked_attempt_goal_id.as_deref() != Some(goal_id) {
+            inner.blocked_attempt_goal_id = Some(goal_id.to_string());
+            inner.consecutive_blocked_turns = 0;
+        }
+        let already_recorded = inner.turns.get(turn_id)?.blocked_attempted;
+        if !already_recorded {
+            inner.turns.get_mut(turn_id)?.blocked_attempted = true;
+            inner.consecutive_blocked_turns = inner.consecutive_blocked_turns.saturating_add(1);
+        }
+        Some(
+            if inner.consecutive_blocked_turns >= REQUIRED_CONSECUTIVE_BLOCKED_TURNS {
+                BlockedGoalDecision::Allow
+            } else {
+                BlockedGoalDecision::Continue {
+                    blocked_turns: inner.consecutive_blocked_turns,
+                }
+            },
+        )
+    }
+
     pub(crate) fn mark_idle_goal_active(&self, goal_id: impl Into<String>) {
         let mut inner = self.inner();
         let goal_id = goal_id.into();
         if inner.budget_limit_reported_goal_id.as_deref() != Some(goal_id.as_str()) {
             inner.budget_limit_reported_goal_id = None;
         }
+        inner.reset_blocked_goal_audit();
         inner.wall_clock.mark_active_goal(goal_id);
     }
 
@@ -258,6 +305,7 @@ impl GoalAccountingState {
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        inner.reset_blocked_goal_audit();
         Some(turn_id)
     }
 
@@ -271,6 +319,7 @@ impl GoalAccountingState {
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        inner.reset_blocked_goal_audit();
     }
 
     pub(crate) fn progress_snapshot(&self, turn_id: &str) -> Option<GoalProgressSnapshot> {
@@ -330,6 +379,7 @@ impl GoalAccountingState {
         inner.wall_clock.mark_accounted(snapshot.time_delta_seconds);
         if clear_active_goal {
             inner.wall_clock.clear_active_goal();
+            inner.reset_blocked_goal_audit();
         }
         if status != ThreadGoalStatus::BudgetLimited {
             inner.budget_limit_reported_goal_id = None;
@@ -345,6 +395,11 @@ impl GoalAccountingState {
         {
             inner.consecutive_turn_error_goal_id = None;
             inner.consecutive_turn_errors = 0;
+        }
+        if finished_turn.as_ref().is_some_and(|turn| {
+            turn.active_goal_id.is_some() && !turn.had_turn_error && !turn.blocked_attempted
+        }) {
+            inner.reset_blocked_goal_audit();
         }
         if inner.current_turn_id.as_deref() == Some(turn_id) {
             inner.current_turn_id = None;
@@ -362,6 +417,7 @@ impl GoalAccountingState {
         inner.wall_clock.mark_accounted(snapshot.time_delta_seconds);
         if clear_active_goal {
             inner.wall_clock.clear_active_goal();
+            inner.reset_blocked_goal_audit();
         }
         if status != ThreadGoalStatus::BudgetLimited {
             inner.budget_limit_reported_goal_id = None;
@@ -373,6 +429,7 @@ impl GoalAccountingState {
         inner.wall_clock.reset_baseline();
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        inner.reset_blocked_goal_audit();
     }
 
     pub(crate) fn mark_budget_limit_reported_if_new(&self, goal_id: &str) -> bool {
@@ -430,11 +487,18 @@ impl Default for GoalAccountingInner {
             budget_limit_reported_goal_id: None,
             consecutive_turn_error_goal_id: None,
             consecutive_turn_errors: 0,
+            blocked_attempt_goal_id: None,
+            consecutive_blocked_turns: 0,
         }
     }
 }
 
 impl GoalAccountingInner {
+    fn reset_blocked_goal_audit(&mut self) {
+        self.blocked_attempt_goal_id = None;
+        self.consecutive_blocked_turns = 0;
+    }
+
     fn thread_unflushed_token_delta(&self) -> i64 {
         self.turns
             .values()
@@ -454,6 +518,7 @@ impl GoalTurnAccounting {
             terminal_update_goal_id: None,
             account_tokens,
             had_turn_error: false,
+            blocked_attempted: false,
         }
     }
 
