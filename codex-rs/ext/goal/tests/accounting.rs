@@ -3,6 +3,7 @@
 #[path = "../src/accounting.rs"]
 mod accounting;
 
+use accounting::BlockedGoalDecision;
 use accounting::GoalAccountingState;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::protocol::TokenUsage;
@@ -81,6 +82,108 @@ fn successful_goal_turn_resets_consecutive_turn_errors() {
     state.finish_turn("turn-2");
 
     assert_eq!(0, state.consecutive_turn_errors());
+}
+
+#[test]
+fn blocked_goal_requires_three_distinct_consecutive_turns() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-1", "goal-1")
+    );
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-1", "goal-1")
+    );
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 2 }),
+        state.record_blocked_goal_attempt("turn-2", "goal-1")
+    );
+    state.finish_turn("turn-2");
+
+    state.start_turn("turn-3", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-3", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Allow),
+        state.record_blocked_goal_attempt("turn-3", "goal-1")
+    );
+}
+
+#[test]
+fn successful_intervening_goal_turn_resets_blocked_audit() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-1", "goal-1")
+    );
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    state.finish_turn("turn-2");
+
+    state.start_turn("turn-3", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-3", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-3", "goal-1")
+    );
+}
+
+#[test]
+fn technical_error_turn_does_not_reset_blocked_audit() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-1", "goal-1")
+    );
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    assert_eq!(Some(1), state.mark_turn_error("turn-2"));
+    state.finish_turn("turn-2");
+
+    state.start_turn("turn-3", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-3", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 2 }),
+        state.record_blocked_goal_attempt("turn-3", "goal-1")
+    );
+}
+
+#[test]
+fn external_goal_update_resets_blocked_audit() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-1", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-1", "goal-1")
+    );
+    assert_eq!(
+        Some("turn-1".to_string()),
+        state.mark_current_turn_external_goal_active("goal-1")
+    );
+    state.finish_turn("turn-1");
+
+    state.start_turn("turn-2", ModeKind::Default, &TokenUsage::default());
+    state.mark_turn_goal_active("turn-2", "goal-1");
+    assert_eq!(
+        Some(BlockedGoalDecision::Continue { blocked_turns: 1 }),
+        state.record_blocked_goal_attempt("turn-2", "goal-1")
+    );
 }
 
 fn token_usage(
