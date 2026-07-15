@@ -733,17 +733,12 @@ impl RolloutRecorder {
             }
             RolloutRecorderParams::Resume { path } => {
                 let path = compression::materialize_rollout_for_append(path.as_path()).await?;
-                (
-                    Some(
-                        tokio::fs::OpenOptions::new()
-                            .append(true)
-                            .open(&path)
-                            .await?,
-                    ),
-                    None,
-                    path,
-                    None,
-                )
+                let file = tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .await?;
+                lock_rollout_writer(&file, path.as_path())?;
+                (Some(file), None, path, None)
             }
         };
 
@@ -1612,10 +1607,39 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
         )));
     };
     fs::create_dir_all(parent)?;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(path)
+        .open(&path)?;
+    lock_rollout_writer(&file, path.as_path())?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lock_rollout_writer<T: std::os::fd::AsRawFd>(file: &T, path: &Path) -> std::io::Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = IoError::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Err(IoError::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "rollout writer ownership conflict: another Codex runtime already owns {}",
+                path.display()
+            ),
+        ));
+    }
+    Err(IoError::new(
+        error.kind(),
+        format!("failed to lock rollout writer {}: {error}", path.display()),
+    ))
+}
+
+#[cfg(not(unix))]
+fn lock_rollout_writer<T>(_file: &T, _path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Mutable state owned by the background rollout writer.
@@ -1867,8 +1891,9 @@ pub async fn append_rollout_item_to_path(
     let rollout_path = compression::materialize_rollout_for_append(rollout_path).await?;
     let file = tokio::fs::OpenOptions::new()
         .append(true)
-        .open(rollout_path)
+        .open(&rollout_path)
         .await?;
+    lock_rollout_writer(&file, rollout_path.as_path())?;
     let mut writer = JsonlWriter { file };
     writer.write_rollout_item(item).await
 }
