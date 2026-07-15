@@ -68,6 +68,35 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     Ok(path)
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_rollout_allows_only_one_live_writer() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let first_recorder =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
+
+    let second_result =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await;
+    let second_error = match second_result {
+        Ok(_) => panic!("a second rollout writer must be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(second_error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(
+        second_error
+            .to_string()
+            .contains("rollout writer ownership conflict")
+    );
+    first_recorder.shutdown().await?;
+    let replacement_recorder =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path)).await?;
+    replacement_recorder.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
