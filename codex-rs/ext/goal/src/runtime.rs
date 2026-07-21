@@ -30,6 +30,10 @@ const CONTINUATION_RETRY_DELAYS: [Duration; 3] = [
 ];
 const TURN_ERROR_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(10)];
 
+pub(crate) fn technical_turn_retry_budget_exhausted(consecutive_turn_errors: u32) -> bool {
+    consecutive_turn_errors > TURN_ERROR_RETRY_DELAYS.len() as u32
+}
+
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
     inner: Arc<GoalRuntimeInner>,
@@ -457,7 +461,7 @@ impl GoalRuntimeHandle {
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
         let consecutive_turn_errors = self.inner.accounting_state.consecutive_turn_errors();
-        if consecutive_turn_errors > TURN_ERROR_RETRY_DELAYS.len() as u32 {
+        if technical_turn_retry_budget_exhausted(consecutive_turn_errors) {
             tracing::error!(
                 thread_id = %self.thread_id(),
                 consecutive_turn_errors,
