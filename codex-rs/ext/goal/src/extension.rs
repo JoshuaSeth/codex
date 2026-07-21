@@ -40,6 +40,7 @@ use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
 use crate::runtime::GoalRuntimeConfig;
 use crate::runtime::GoalRuntimeHandle;
+use crate::runtime::technical_turn_retry_budget_exhausted;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::steering::budget_limit_steering_item;
 use crate::tool::GoalToolExecutor;
@@ -333,6 +334,32 @@ where
             else {
                 return;
             };
+            let exhausted_http_429 =
+                matches!(
+                    &input.error,
+                    CodexErrorInfo::ResponseTooManyFailedAttempts {
+                        http_status_code: Some(429)
+                    }
+                ) && technical_turn_retry_budget_exhausted(consecutive_turn_errors);
+            if exhausted_http_429 {
+                tracing::warn!(
+                    thread_id = %runtime.thread_id(),
+                    turn_id = input.turn_id,
+                    error = ?input.error,
+                    consecutive_turn_errors,
+                    "repeated HTTP 429 failures exhausted bounded goal retries; treating the active goal as usage-limited for account recovery"
+                );
+                if let Err(err) = runtime
+                    .usage_limit_active_goal_for_turn(input.turn_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?input.error,
+                        "failed to stop active goal after repeated HTTP 429 failures: {err}"
+                    );
+                }
+                return;
+            }
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     input.turn_id,
