@@ -423,6 +423,7 @@ fn sample_turn_steer_request(
             thread_id: thread_id.to_string(),
             expected_turn_id: expected_turn_id.to_string(),
             client_user_message_id: None,
+            completion_work_id: None,
             input: vec![
                 UserInput::Text {
                     text: "more".to_string(),
