@@ -2338,6 +2338,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             environments: None,
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: "first turn".to_string(),
                 text_elements: Vec::new(),
@@ -2382,6 +2383,7 @@ async fn turn_start_updates_sandbox_and_cwd_between_turns_v2() -> Result<()> {
             environments: None,
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: "second turn".to_string(),
                 text_elements: Vec::new(),
@@ -3529,6 +3531,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected() -> Result<()> {
         .send_turn_steer_request(TurnSteerParams {
             thread_id: child_thread_id,
             client_user_message_id: None,
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: "direct app-server steer".to_string(),
                 text_elements: Vec::new(),

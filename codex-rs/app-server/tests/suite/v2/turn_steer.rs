@@ -70,6 +70,7 @@ async fn turn_steer_requires_active_turn() -> Result<()> {
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
             client_user_message_id: Some("client-steer-message-1".to_string()),
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: "steer".to_string(),
                 text_elements: Vec::new(),
@@ -182,6 +183,7 @@ async fn turn_steer_rejects_oversized_text_input() -> Result<()> {
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: oversized_input.clone(),
                 text_elements: Vec::new(),
@@ -295,6 +297,7 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
             client_user_message_id: Some("client-steer-message-1".to_string()),
+            completion_work_id: None,
             input: vec![V2UserInput::Text {
                 text: "steer".to_string(),
                 text_elements: Vec::new(),
@@ -438,6 +441,7 @@ async fn turn_steer_rejects_context_only_input_without_merging_context() -> Resu
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
             client_user_message_id: None,
+            completion_work_id: None,
             input: Vec::new(),
             responsesapi_client_metadata: None,
             additional_context,

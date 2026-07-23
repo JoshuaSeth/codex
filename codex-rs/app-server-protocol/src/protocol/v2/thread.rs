@@ -739,6 +739,9 @@ impl From<codex_protocol::protocol::ThreadGoal> for ThreadGoal {
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalSetParams {
     pub thread_id: String,
+    /// Durable control-plane work identity whose callback completes with this goal.
+    #[ts(optional = nullable)]
+    pub completion_work_id: Option<String>,
     #[ts(optional = nullable)]
     pub objective: Option<String>,
     #[ts(optional = nullable)]
@@ -1314,6 +1317,50 @@ pub struct ThreadInjectItemsParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadInjectItemsResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadCallbackInsertParams {
+    pub delivery_id: String,
+    pub event_id: String,
+    pub completion_work_id: String,
+    pub thread_id: String,
+    pub source_agent_display_id: String,
+    pub execution_kind: String,
+    pub execution_id: String,
+    pub terminal_status: String,
+    pub callback_text: String,
+    pub final_text: String,
+    pub terminal_at_ms: i64,
+    pub payload_digest: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadCallbackInsertOutcome {
+    Accepted,
+    Duplicate,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadCallbackInsertState {
+    Pending,
+    Delivered,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadCallbackInsertResponse {
+    pub outcome: ThreadCallbackInsertOutcome,
+    pub state: ThreadCallbackInsertState,
+    pub call_id: String,
+    pub needs_rehydrate: bool,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

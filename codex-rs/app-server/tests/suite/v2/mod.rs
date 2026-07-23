@@ -7,6 +7,7 @@ mod collaboration_mode_list;
 #[cfg(unix)]
 mod command_exec;
 mod compaction;
+mod completion_callbacks;
 mod config_rpc;
 mod connection_handling_websocket;
 #[cfg(unix)]
@@ -50,6 +51,7 @@ mod review;
 mod safety_check_downgrade;
 mod skills_list;
 mod thread_archive;
+mod thread_callback_insert;
 mod thread_delete;
 mod thread_fork;
 mod thread_inject_items;

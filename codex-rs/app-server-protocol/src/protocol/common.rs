@@ -664,6 +664,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadInjectItemsResponse,
     },
+    /// Durably insert one idempotent PitchAI completion notification.
+    ThreadCallbackInsert => "thread/callback/insert" {
+        params: v2::ThreadCallbackInsertParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadCallbackInsertResponse,
+    },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,
         serialization: global_shared_read("config"),
@@ -1932,6 +1938,7 @@ mod tests {
             request_id: request_id(),
             params: v2::ThreadGoalSetParams {
                 thread_id: "goal-thread".to_string(),
+                completion_work_id: None,
                 objective: Some("ship it".to_string()),
                 status: None,
                 token_budget: None,
@@ -3306,6 +3313,7 @@ mod tests {
             request_id: RequestId::Integer(1),
             params: v2::ThreadGoalSetParams {
                 thread_id: "thr_123".to_string(),
+                completion_work_id: None,
                 objective: Some("ship goal mode".to_string()),
                 status: Some(v2::ThreadGoalStatus::Active),
                 token_budget: Some(Some(10_000)),

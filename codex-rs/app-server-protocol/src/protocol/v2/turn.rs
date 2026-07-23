@@ -67,6 +67,9 @@ pub struct TurnStartParams {
     pub thread_id: String,
     #[ts(optional = nullable)]
     pub client_user_message_id: Option<String>,
+    /// Durable control-plane work identity whose callback completes with this turn.
+    #[ts(optional = nullable)]
+    pub completion_work_id: Option<String>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
     ///
@@ -166,6 +169,9 @@ pub struct TurnSteerParams {
     pub thread_id: String,
     #[ts(optional = nullable)]
     pub client_user_message_id: Option<String>,
+    /// Durable control-plane work identity whose callback completes with the active turn.
+    #[ts(optional = nullable)]
+    pub completion_work_id: Option<String>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
     ///

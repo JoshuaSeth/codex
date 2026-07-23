@@ -224,6 +224,13 @@
         "null"
       ]
     },
+    "completionWorkId": {
+      "description": "Durable control-plane work identity whose callback completes with the active turn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "expectedTurnId": {
       "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
       "type": "string"
