@@ -5,11 +5,12 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct GoalStore {
     pool: Arc<SqlitePool>,
+    completions: CompletionStore,
 }
 
 impl GoalStore {
-    pub(crate) fn new(pool: Arc<SqlitePool>) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: Arc<SqlitePool>, completions: CompletionStore) -> Self {
+        Self { pool, completions }
     }
 
     pub(crate) async fn close(&self) {
@@ -72,54 +73,49 @@ WHERE thread_id = ?
         status: crate::ThreadGoalStatus,
         token_budget: Option<i64>,
     ) -> anyhow::Result<crate::ThreadGoal> {
-        let goal_id = Uuid::new_v4().to_string();
-        let now_ms = datetime_to_epoch_millis(Utc::now());
-        let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
-        let row = sqlx::query(
-            r#"
-INSERT INTO thread_goals (
-    thread_id,
-    goal_id,
-    objective,
-    status,
-    token_budget,
-    tokens_used,
-    time_used_seconds,
-    created_at_ms,
-    updated_at_ms
-) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
-ON CONFLICT(thread_id) DO UPDATE SET
-    goal_id = excluded.goal_id,
-    objective = excluded.objective,
-    status = excluded.status,
-    token_budget = excluded.token_budget,
-    tokens_used = 0,
-    time_used_seconds = 0,
-    created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
-RETURNING
-    thread_id,
-    goal_id,
-    objective,
-    status,
-    token_budget,
-    tokens_used,
-    time_used_seconds,
-    created_at_ms,
-    updated_at_ms
-            "#,
+        let mut transaction = self.pool.begin().await?;
+        let goal = replace_thread_goal_on_connection(
+            &mut transaction,
+            thread_id,
+            objective,
+            status,
+            token_budget,
         )
-        .bind(thread_id.to_string())
-        .bind(goal_id)
-        .bind(objective)
-        .bind(status.as_str())
-        .bind(token_budget)
-        .bind(now_ms)
-        .bind(now_ms)
-        .fetch_one(self.pool.as_ref())
         .await?;
+        transaction.commit().await?;
+        Ok(goal)
+    }
 
-        thread_goal_from_row(&row)
+    pub async fn replace_thread_goal_with_completion(
+        &self,
+        thread_id: ThreadId,
+        objective: &str,
+        status: crate::ThreadGoalStatus,
+        token_budget: Option<i64>,
+        completion_work_id: &str,
+    ) -> anyhow::Result<crate::ThreadGoal> {
+        let mut transaction = self.pool.begin().await?;
+        let goal = replace_thread_goal_on_connection(
+            &mut transaction,
+            thread_id,
+            objective,
+            status,
+            token_budget,
+        )
+        .await?;
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        self.completions
+            .bind_goal_in_transaction(
+                &mut transaction,
+                completion_work_id,
+                thread_id,
+                &goal.goal_id,
+                now_ms,
+            )
+            .await?;
+        transaction.commit().await?;
+        self.completions.notify_sender();
+        Ok(goal)
     }
 
     pub async fn insert_thread_goal(
@@ -185,148 +181,40 @@ RETURNING
         thread_id: ThreadId,
         update: GoalUpdate,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
-        let GoalUpdate {
-            objective,
-            status,
-            token_budget,
-            expected_goal_id,
-        } = update;
-        let objective = objective.as_deref();
-        let expected_goal_id = expected_goal_id.as_deref();
-        let now_ms = datetime_to_epoch_millis(Utc::now());
-        let result = match (status, token_budget) {
-            (Some(status), Some(token_budget)) => {
-                sqlx::query(
-                    r#"
-UPDATE thread_goals
-SET
-    objective = COALESCE(?, objective),
-    status = CASE
-        WHEN status = ? AND ? IN (?, ?) THEN status
-        WHEN ? = 'active' AND ? IS NOT NULL AND tokens_used >= ? THEN ?
-        ELSE ?
-    END,
-    token_budget = ?,
-    updated_at_ms = ?
-WHERE thread_id = ?
-  AND (? IS NULL OR goal_id = ?)
-            "#,
-                )
-                .bind(objective)
-                .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
-                .bind(status.as_str())
-                .bind(crate::ThreadGoalStatus::Paused.as_str())
-                .bind(crate::ThreadGoalStatus::Blocked.as_str())
-                .bind(status.as_str())
-                .bind(token_budget)
-                .bind(token_budget)
-                .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
-                .bind(status.as_str())
-                .bind(token_budget)
-                .bind(now_ms)
-                .bind(thread_id.to_string())
-                .bind(expected_goal_id)
-                .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
-                .await?
-            }
-            (Some(status), None) => {
-                sqlx::query(
-                    r#"
-UPDATE thread_goals
-SET
-    objective = COALESCE(?, objective),
-    status = CASE
-        WHEN status = ? AND ? IN (?, ?) THEN status
-        WHEN ? = 'active' AND token_budget IS NOT NULL AND tokens_used >= token_budget THEN ?
-        ELSE ?
-    END,
-    updated_at_ms = ?
-WHERE thread_id = ?
-  AND (? IS NULL OR goal_id = ?)
-            "#,
-                )
-                .bind(objective)
-                .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
-                .bind(status.as_str())
-                .bind(crate::ThreadGoalStatus::Paused.as_str())
-                .bind(crate::ThreadGoalStatus::Blocked.as_str())
-                .bind(status.as_str())
-                .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
-                .bind(status.as_str())
-                .bind(now_ms)
-                .bind(thread_id.to_string())
-                .bind(expected_goal_id)
-                .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
-                .await?
-            }
-            (None, Some(token_budget)) => {
-                sqlx::query(
-                    r#"
-UPDATE thread_goals
-SET
-    objective = COALESCE(?, objective),
-    token_budget = ?,
-    status = CASE
-        WHEN status = 'active' AND ? IS NOT NULL AND tokens_used >= ? THEN ?
-        ELSE status
-    END,
-    updated_at_ms = ?
-WHERE thread_id = ?
-  AND (? IS NULL OR goal_id = ?)
-            "#,
-                )
-                .bind(objective)
-                .bind(token_budget)
-                .bind(token_budget)
-                .bind(token_budget)
-                .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
-                .bind(now_ms)
-                .bind(thread_id.to_string())
-                .bind(expected_goal_id)
-                .bind(expected_goal_id)
-                .execute(self.pool.as_ref())
-                .await?
-            }
-            (None, None) => {
-                if let Some(objective) = objective {
-                    sqlx::query(
-                        r#"
-UPDATE thread_goals
-SET
-    objective = ?,
-    updated_at_ms = ?
-WHERE thread_id = ?
-  AND (? IS NULL OR goal_id = ?)
-            "#,
-                    )
-                    .bind(objective)
-                    .bind(now_ms)
-                    .bind(thread_id.to_string())
-                    .bind(expected_goal_id)
-                    .bind(expected_goal_id)
-                    .execute(self.pool.as_ref())
-                    .await?
-                } else {
-                    let goal = self.get_thread_goal(thread_id).await?;
-                    return Ok(match (goal, expected_goal_id) {
-                        (Some(goal), Some(expected_goal_id))
-                            if goal.goal_id != expected_goal_id =>
-                        {
-                            None
-                        }
-                        (goal, _) => goal,
-                    });
-                }
-            }
-        };
-
-        if result.rows_affected() == 0 {
-            return Ok(None);
+        let mut transaction = self.pool.begin().await?;
+        let goal = update_thread_goal_on_connection(&mut transaction, thread_id, update).await?;
+        transaction.commit().await?;
+        if goal.is_some() {
+            self.completions.notify_sender();
         }
+        Ok(goal)
+    }
 
-        self.get_thread_goal(thread_id).await
+    pub async fn update_thread_goal_with_completion(
+        &self,
+        thread_id: ThreadId,
+        update: GoalUpdate,
+        completion_work_id: &str,
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        let mut transaction = self.pool.begin().await?;
+        let goal = update_thread_goal_on_connection(&mut transaction, thread_id, update).await?;
+        if let Some(goal) = goal.as_ref() {
+            let now_ms = datetime_to_epoch_millis(Utc::now());
+            self.completions
+                .bind_goal_in_transaction(
+                    &mut transaction,
+                    completion_work_id,
+                    thread_id,
+                    &goal.goal_id,
+                    now_ms,
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        if goal.is_some() {
+            self.completions.notify_sender();
+        }
+        Ok(goal)
     }
 
     pub async fn pause_active_thread_goal(
@@ -378,6 +266,7 @@ WHERE thread_id = ?
             return Ok(None);
         }
 
+        self.completions.notify_sender();
         self.get_thread_goal(thread_id).await
     }
 
@@ -519,8 +408,252 @@ RETURNING
         };
 
         let updated = thread_goal_from_row(&row)?;
+        self.completions.notify_sender();
         Ok(GoalAccountingOutcome::Updated(updated))
     }
+}
+
+async fn replace_thread_goal_on_connection(
+    connection: &mut SqliteConnection,
+    thread_id: ThreadId,
+    objective: &str,
+    status: crate::ThreadGoalStatus,
+    token_budget: Option<i64>,
+) -> anyhow::Result<crate::ThreadGoal> {
+    let goal_id = Uuid::new_v4().to_string();
+    let now_ms = datetime_to_epoch_millis(Utc::now());
+    let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
+    let row = sqlx::query(
+        r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = excluded.goal_id,
+    objective = excluded.objective,
+    status = excluded.status,
+    token_budget = excluded.token_budget,
+    tokens_used = 0,
+    time_used_seconds = 0,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms
+RETURNING
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .bind(goal_id)
+    .bind(objective)
+    .bind(status.as_str())
+    .bind(token_budget)
+    .bind(now_ms)
+    .bind(now_ms)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    thread_goal_from_row(&row)
+}
+
+async fn update_thread_goal_on_connection(
+    connection: &mut SqliteConnection,
+    thread_id: ThreadId,
+    update: GoalUpdate,
+) -> anyhow::Result<Option<crate::ThreadGoal>> {
+    let GoalUpdate {
+        objective,
+        status,
+        token_budget,
+        expected_goal_id,
+    } = update;
+    let objective = objective.as_deref();
+    let expected_goal_id = expected_goal_id.as_deref();
+    let now_ms = datetime_to_epoch_millis(Utc::now());
+    let result = match (status, token_budget) {
+        (Some(status), Some(token_budget)) => {
+            sqlx::query(
+                r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE(?, objective),
+    status = CASE
+        WHEN status = ? AND ? IN (?, ?) THEN status
+        WHEN ? = 'active' AND ? IS NOT NULL AND tokens_used >= ? THEN ?
+        ELSE ?
+    END,
+    token_budget = ?,
+    updated_at_ms = ?
+WHERE thread_id = ?
+  AND (? IS NULL OR goal_id = ?)
+            "#,
+            )
+            .bind(objective)
+            .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
+            .bind(status.as_str())
+            .bind(crate::ThreadGoalStatus::Paused.as_str())
+            .bind(crate::ThreadGoalStatus::Blocked.as_str())
+            .bind(status.as_str())
+            .bind(token_budget)
+            .bind(token_budget)
+            .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
+            .bind(status.as_str())
+            .bind(token_budget)
+            .bind(now_ms)
+            .bind(thread_id.to_string())
+            .bind(expected_goal_id)
+            .bind(expected_goal_id)
+            .execute(&mut *connection)
+            .await?
+        }
+        (Some(status), None) => {
+            sqlx::query(
+                r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE(?, objective),
+    status = CASE
+        WHEN status = ? AND ? IN (?, ?) THEN status
+        WHEN ? = 'active' AND token_budget IS NOT NULL AND tokens_used >= token_budget THEN ?
+        ELSE ?
+    END,
+    updated_at_ms = ?
+WHERE thread_id = ?
+  AND (? IS NULL OR goal_id = ?)
+            "#,
+            )
+            .bind(objective)
+            .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
+            .bind(status.as_str())
+            .bind(crate::ThreadGoalStatus::Paused.as_str())
+            .bind(crate::ThreadGoalStatus::Blocked.as_str())
+            .bind(status.as_str())
+            .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
+            .bind(status.as_str())
+            .bind(now_ms)
+            .bind(thread_id.to_string())
+            .bind(expected_goal_id)
+            .bind(expected_goal_id)
+            .execute(&mut *connection)
+            .await?
+        }
+        (None, Some(token_budget)) => {
+            sqlx::query(
+                r#"
+UPDATE thread_goals
+SET
+    objective = COALESCE(?, objective),
+    token_budget = ?,
+    status = CASE
+        WHEN status = 'active' AND ? IS NOT NULL AND tokens_used >= ? THEN ?
+        ELSE status
+    END,
+    updated_at_ms = ?
+WHERE thread_id = ?
+  AND (? IS NULL OR goal_id = ?)
+            "#,
+            )
+            .bind(objective)
+            .bind(token_budget)
+            .bind(token_budget)
+            .bind(token_budget)
+            .bind(crate::ThreadGoalStatus::BudgetLimited.as_str())
+            .bind(now_ms)
+            .bind(thread_id.to_string())
+            .bind(expected_goal_id)
+            .bind(expected_goal_id)
+            .execute(&mut *connection)
+            .await?
+        }
+        (None, None) => {
+            if let Some(objective) = objective {
+                sqlx::query(
+                    r#"
+UPDATE thread_goals
+SET
+    objective = ?,
+    updated_at_ms = ?
+WHERE thread_id = ?
+  AND (? IS NULL OR goal_id = ?)
+            "#,
+                )
+                .bind(objective)
+                .bind(now_ms)
+                .bind(thread_id.to_string())
+                .bind(expected_goal_id)
+                .bind(expected_goal_id)
+                .execute(&mut *connection)
+                .await?
+            } else {
+                let row = sqlx::query(
+                    r#"
+SELECT
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+FROM thread_goals
+WHERE thread_id = ?
+                        "#,
+                )
+                .bind(thread_id.to_string())
+                .fetch_optional(&mut *connection)
+                .await?;
+                let goal = row.map(|row| thread_goal_from_row(&row)).transpose()?;
+                return Ok(match (goal, expected_goal_id) {
+                    (Some(goal), Some(expected_goal_id)) if goal.goal_id != expected_goal_id => {
+                        None
+                    }
+                    (goal, _) => goal,
+                });
+            }
+        }
+    };
+
+    if result.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        r#"
+SELECT
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+FROM thread_goals
+WHERE thread_id = ?
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await?;
+
+    row.map(|row| thread_goal_from_row(&row)).transpose()
 }
 
 fn thread_goal_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::ThreadGoal> {

@@ -4,10 +4,15 @@ use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_state::CompletionBindingState;
 use codex_utils_path_uri::PathUri;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
+const MAX_CALLBACK_TEXT_CHARS: usize = 65_536;
+const MAX_CALLBACK_FINAL_TEXT_CHARS: usize = 1_048_576;
+const MAX_CALLBACK_IDENTITY_CHARS: usize = 256;
+const MAX_CALLBACK_EXECUTION_ID_CHARS: usize = 128;
 
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
@@ -24,6 +29,8 @@ pub(crate) struct TurnRequestProcessor {
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<Semaphore>,
     skills_watcher: Arc<SkillsWatcher>,
+    state_db: Option<StateDbHandle>,
+    callback_boot_id: String,
 }
 
 fn map_additional_context(
@@ -65,6 +72,105 @@ struct ThreadSettingsBuildParams {
     personality: Option<Personality>,
 }
 
+fn validate_callback_insert_params(
+    params: &ThreadCallbackInsertParams,
+) -> Result<(), JSONRPCErrorError> {
+    let callback_text_valid = !params.callback_text.trim().is_empty()
+        && params.callback_text.chars().count() <= MAX_CALLBACK_TEXT_CHARS;
+    let final_text_valid = params.final_text.chars().count() <= MAX_CALLBACK_FINAL_TEXT_CHARS;
+    let source_identity_valid = !params.source_agent_display_id.trim().is_empty()
+        && params.source_agent_display_id.chars().count() <= MAX_CALLBACK_IDENTITY_CHARS;
+    let execution_id_valid = !params.execution_id.is_empty()
+        && params.execution_id.chars().count() <= MAX_CALLBACK_EXECUTION_ID_CHARS;
+    if callback_text_valid && final_text_valid && source_identity_valid && execution_id_valid {
+        return Ok(());
+    }
+    Err(invalid_request(
+        "completion callback text or identity fields exceed their allowed bounds",
+    ))
+}
+
+fn callback_insert_response(
+    outcome: ThreadCallbackInsertOutcome,
+    state: ThreadCallbackInsertState,
+    call_id: String,
+    needs_rehydrate: bool,
+) -> ThreadCallbackInsertResponse {
+    ThreadCallbackInsertResponse {
+        outcome,
+        state,
+        call_id,
+        needs_rehydrate,
+    }
+}
+
+async fn inject_callback_into_thread(
+    thread: &CodexThread,
+    record: &CompletionCallbackRecord,
+) -> Result<(), String> {
+    let items = callback_response_items(record);
+    let Err(items) = thread.inject_if_running(items).await else {
+        return Ok(());
+    };
+    match thread.try_start_turn_if_idle(items).await {
+        Ok(()) => Ok(()),
+        Err(rejection) => {
+            let reason = rejection.reason();
+            let items = rejection.into_input();
+            if thread.inject_if_running(items).await.is_ok() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "callback could not enter the target thread yet: {reason:?}"
+                ))
+            }
+        }
+    }
+}
+
+fn callback_response_items(record: &CompletionCallbackRecord) -> Vec<ResponseItem> {
+    let callback = &record.callback;
+    let arguments = serde_json::json!({
+        "completion_work_id": callback.completion_work_id,
+        "delivery_id": callback.delivery_id,
+        "event_id": callback.event_id,
+        "execution_id": callback.execution_id,
+        "execution_kind": callback.execution_kind,
+        "source_agent_id": callback.source_agent_display_id,
+        "terminal_status": callback.terminal_status,
+    })
+    .to_string();
+    let output = format!(
+        "PitchAI completion callback\n\
+         Source agent: {}\n\
+         Work type: {}\n\
+         Terminal state: {}\n\
+         Callback note: {}\n\
+         Result:\n{}\n\n\
+         This is a completion notification, not a correction or new assignment. \
+         Continue the current task. Mention this callback briefly in an in-between \
+         progress update and include it in the final answer.",
+        callback.source_agent_display_id,
+        callback.execution_kind,
+        callback.terminal_status,
+        callback.callback_text,
+        callback.final_text,
+    );
+    vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "pitchai_completion_callback".to_string(),
+            namespace: None,
+            arguments,
+            call_id: record.call_id.clone(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: record.call_id.clone(),
+            output: FunctionCallOutputPayload::from_text(output),
+        },
+    ]
+}
+
 impl TurnRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -81,6 +187,7 @@ impl TurnRequestProcessor {
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
+        state_db: Option<StateDbHandle>,
     ) -> Self {
         Self {
             auth_manager,
@@ -96,6 +203,8 @@ impl TurnRequestProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             skills_watcher,
+            state_db,
+            callback_boot_id: Uuid::now_v7().to_string(),
         }
     }
 
@@ -121,6 +230,15 @@ impl TurnRequestProcessor {
         params: ThreadInjectItemsParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.thread_inject_items_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_callback_insert(
+        &self,
+        params: ThreadCallbackInsertParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_callback_insert_response_inner(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -362,6 +480,15 @@ impl TurnRequestProcessor {
         self.outgoing.request_trace_context(request_id).await
     }
 
+    fn completion_state_db(
+        &self,
+        thread: &CodexThread,
+    ) -> Result<StateDbHandle, JSONRPCErrorError> {
+        thread.state_db().ok_or_else(|| {
+            internal_error("completion tracking requires a persistent app-server state database")
+        })
+    }
+
     async fn submit_core_op(
         &self,
         request_id: &ConnectionRequestId,
@@ -430,6 +557,7 @@ impl TurnRequestProcessor {
         let environment_selections = self.parse_environment_selections(params.environments)?;
 
         // Map v2 input items to core input items.
+        let completion_work_id = params.completion_work_id;
         let mapped_items: Vec<CoreInputItem> = params
             .input
             .into_iter()
@@ -470,18 +598,96 @@ impl TurnRequestProcessor {
             additional_context,
             thread_settings,
         };
-        let turn_id = thread
-            .submit_user_input_with_client_user_message_id(
-                turn_op,
-                self.request_trace_context(&request_id).await,
-                client_user_message_id,
-            )
-            .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to start turn: {err}"));
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        let turn_id = if let Some(completion_work_id) = completion_work_id.as_deref() {
+            let state_db = self.completion_state_db(thread.as_ref())?;
+            let completions = state_db.completions();
+            let _admission_guard = completions.lock_turn_admission().await;
+            let existing_binding = completions
+                .existing_turn_binding(completion_work_id, thread_id)
+                .await
+                .map_err(|err| {
+                    internal_error(format!(
+                        "failed to read existing turn completion binding: {err}"
+                    ))
+                })?;
+            let (turn_id, binding_state) = match existing_binding {
+                Some(existing) => existing,
+                None => {
+                    let turn_id = completion_work_id.to_string();
+                    let binding_state = completions
+                        .bind_turn(completion_work_id, thread_id, &turn_id)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!("failed to bind turn completion: {err}"))
+                        })?;
+                    (turn_id, binding_state)
+                }
+            };
+            if binding_state != CompletionBindingState::Terminal {
+                let submitted_in_process = completions
+                    .turn_was_submitted_in_process(completion_work_id)
+                    .await;
+                let active_turn_matches =
+                    thread.active_turn_id().await.as_deref() == Some(turn_id.as_str());
+                if submitted_in_process || active_turn_matches {
+                    completions
+                        .mark_turn_submitted(completion_work_id)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!(
+                                "failed to confirm retried turn submission: {err}"
+                            ))
+                        })?;
+                } else {
+                    let submission = codex_protocol::protocol::Submission {
+                        id: turn_id.clone(),
+                        op: turn_op,
+                        client_user_message_id,
+                        trace: self.request_trace_context(&request_id).await,
+                    };
+                    if let Err(err) = thread.submit_user_input_with_id(submission).await {
+                        if let Err(release_err) = completions
+                            .release_registered_turn_binding(completion_work_id)
+                            .await
+                        {
+                            tracing::error!(
+                                %completion_work_id,
+                                error = %release_err,
+                                "failed to release rejected turn completion binding"
+                            );
+                        }
+                        let error = internal_error(format!("failed to start turn: {err}"));
+                        self.track_error_response(&request_id, &error, /*error_type*/ None);
+                        return Err(error);
+                    }
+                    completions
+                        .note_turn_submitted(completion_work_id, thread_id, &turn_id)
+                        .await;
+                    completions
+                        .mark_turn_submitted(completion_work_id)
+                        .await
+                        .map_err(|err| {
+                            internal_error(format!(
+                                "turn was accepted but its completion binding could not be confirmed: {err}"
+                            ))
+                        })?;
+                }
+            }
+            turn_id
+        } else {
+            thread
+                .submit_user_input_with_client_user_message_id(
+                    turn_op,
+                    self.request_trace_context(&request_id).await,
+                    client_user_message_id,
+                )
+                .await
+                .map_err(|err| {
+                    let error = internal_error(format!("failed to start turn: {err}"));
+                    self.track_error_response(&request_id, &error, /*error_type*/ None);
+                    error
+                })?
+        };
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;
@@ -765,6 +971,110 @@ impl TurnRequestProcessor {
         Ok(ThreadInjectItemsResponse {})
     }
 
+    async fn thread_callback_insert_response_inner(
+        &self,
+        params: ThreadCallbackInsertParams,
+    ) -> Result<ThreadCallbackInsertResponse, JSONRPCErrorError> {
+        validate_callback_insert_params(&params)?;
+        let state_db = self.state_db.as_ref().ok_or_else(|| {
+            internal_error(
+                "completion callback insertion requires a persistent app-server state database",
+            )
+        })?;
+        let callback = CompletionCallback {
+            delivery_id: params.delivery_id,
+            event_id: params.event_id,
+            completion_work_id: params.completion_work_id,
+            target_thread_id: params.thread_id,
+            source_agent_display_id: params.source_agent_display_id,
+            execution_kind: params.execution_kind,
+            execution_id: params.execution_id,
+            terminal_status: params.terminal_status,
+            callback_text: params.callback_text,
+            final_text: params.final_text,
+            terminal_at_ms: params.terminal_at_ms,
+            payload_digest: params.payload_digest,
+        };
+        let acceptance = state_db
+            .completions()
+            .accept_callback(callback)
+            .await
+            .map_err(|err| invalid_request(format!("invalid completion callback: {err}")))?;
+        let outcome = if acceptance.inserted {
+            ThreadCallbackInsertOutcome::Accepted
+        } else {
+            ThreadCallbackInsertOutcome::Duplicate
+        };
+        let record = acceptance.record;
+        if record.state == CompletionCallbackState::Delivered {
+            return Ok(callback_insert_response(
+                outcome,
+                ThreadCallbackInsertState::Delivered,
+                record.call_id,
+                false,
+            ));
+        }
+        let thread_id = ThreadId::from_string(&record.callback.target_thread_id)
+            .map_err(|err| invalid_request(format!("invalid callback thread id: {err}")))?;
+        let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
+            return Ok(callback_insert_response(
+                outcome,
+                ThreadCallbackInsertState::Pending,
+                record.call_id,
+                true,
+            ));
+        };
+        if thread.contains_response_call_id(&record.call_id).await {
+            state_db
+                .completions()
+                .mark_callback_delivered(&record.callback.delivery_id)
+                .await
+                .map_err(|err| {
+                    internal_error(format!(
+                        "failed to mark visible completion callback delivered: {err}"
+                    ))
+                })?;
+            return Ok(callback_insert_response(
+                outcome,
+                ThreadCallbackInsertState::Delivered,
+                record.call_id,
+                false,
+            ));
+        }
+        let injection_started = state_db
+            .completions()
+            .begin_callback_injection(&record.callback.delivery_id, &self.callback_boot_id)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to claim completion callback insertion: {err}"
+                ))
+            })?;
+        if injection_started
+            && let Err(err) = inject_callback_into_thread(thread.as_ref(), &record).await
+        {
+            state_db
+                .completions()
+                .retry_callback_injection(
+                    &record.callback.delivery_id,
+                    &self.callback_boot_id,
+                    &err,
+                )
+                .await
+                .map_err(|store_err| {
+                    internal_error(format!(
+                        "callback insertion failed ({err}); retry state also failed: {store_err}"
+                    ))
+                })?;
+        }
+        Ok(callback_insert_response(
+            outcome,
+            ThreadCallbackInsertState::Pending,
+            record.call_id,
+            false,
+        ))
+    }
+
     async fn set_app_server_client_info(
         thread: &CodexThread,
         app_server_client_name: Option<String>,
@@ -789,12 +1099,12 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnSteerParams,
     ) -> Result<TurnSteerResponse, JSONRPCErrorError> {
-        let (_, thread) = self
-            .load_thread(&params.thread_id)
-            .await
-            .inspect_err(|error| {
-                self.track_error_response(request_id, error, /*error_type*/ None);
-            })?;
+        let (thread_id, thread) =
+            self.load_thread(&params.thread_id)
+                .await
+                .inspect_err(|error| {
+                    self.track_error_response(request_id, error, /*error_type*/ None);
+                })?;
         self.ensure_direct_input_allowed(request_id, thread.as_ref())
             .await?;
 
@@ -813,6 +1123,7 @@ impl TurnRequestProcessor {
             return Err(error);
         }
 
+        let completion_work_id = params.completion_work_id;
         let mapped_items: Vec<CoreInputItem> = params
             .input
             .into_iter()
@@ -820,76 +1131,132 @@ impl TurnRequestProcessor {
             .collect();
         let additional_context = map_additional_context(params.additional_context);
 
-        let turn_id = thread
-            .steer_input(
-                mapped_items,
-                additional_context,
-                Some(&params.expected_turn_id),
-                params.client_user_message_id,
-                params.responsesapi_client_metadata,
-            )
-            .await
-            .map_err(|err| {
-                let (message, data, error_type) = match err {
-                    SteerInputError::NoActiveTurn(_) => (
-                        "no active turn to steer".to_string(),
-                        None,
-                        Some(AnalyticsJsonRpcError::TurnSteer(
-                            TurnSteerRequestError::NoActiveTurn,
-                        )),
-                    ),
-                    SteerInputError::ExpectedTurnMismatch { expected, actual } => (
-                        format!("expected active turn id `{expected}` but found `{actual}`"),
-                        None,
-                        Some(AnalyticsJsonRpcError::TurnSteer(
-                            TurnSteerRequestError::ExpectedTurnMismatch,
-                        )),
-                    ),
-                    SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
-                        let (message, turn_steer_error) = match turn_kind {
-                            codex_protocol::protocol::NonSteerableTurnKind::Review => (
-                                "cannot steer a review turn".to_string(),
-                                TurnSteerRequestError::NonSteerableReview,
-                            ),
-                            codex_protocol::protocol::NonSteerableTurnKind::Compact => (
-                                "cannot steer a compact turn".to_string(),
-                                TurnSteerRequestError::NonSteerableCompact,
-                            ),
-                        };
-                        let error = TurnError {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                                turn_kind: turn_kind.into(),
-                            }),
-                            additional_details: None,
-                        };
-                        let data = match serde_json::to_value(error) {
-                            Ok(data) => Some(data),
-                            Err(error) => {
-                                tracing::error!(
-                                    ?error,
-                                    "failed to serialize active-turn-not-steerable turn error"
-                                );
-                                None
-                            }
-                        };
-                        (
-                            message,
-                            data,
-                            Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
+        let completion_work_id = completion_work_id.as_deref();
+        let steer_result = match completion_work_id {
+            Some(completion_work_id) => {
+                let state_db = self.completion_state_db(thread.as_ref())?;
+                let completions = state_db.completions();
+                let _admission_guard = completions.lock_turn_admission().await;
+                let binding_state = completions
+                    .bind_turn(completion_work_id, thread_id, &params.expected_turn_id)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!("failed to bind turn completion: {err}"))
+                    })?;
+                if binding_state != CompletionBindingState::Registered {
+                    Ok(params.expected_turn_id.clone())
+                } else {
+                    let steer_result = thread
+                        .steer_input(
+                            mapped_items,
+                            additional_context,
+                            Some(&params.expected_turn_id),
+                            params.client_user_message_id,
+                            params.responsesapi_client_metadata,
                         )
+                        .await;
+                    if steer_result.is_ok() {
+                        completions
+                            .note_turn_submitted(
+                                completion_work_id,
+                                thread_id,
+                                &params.expected_turn_id,
+                            )
+                            .await;
+                        completions
+                            .mark_turn_submitted(completion_work_id)
+                            .await
+                            .map_err(|err| {
+                                internal_error(format!(
+                                    "steer was accepted but its completion binding could not be confirmed: {err}"
+                                ))
+                            })?;
+                    } else if let Err(release_err) = completions
+                        .release_registered_turn_binding(completion_work_id)
+                        .await
+                    {
+                        tracing::error!(
+                            %completion_work_id,
+                            error = %release_err,
+                            "failed to release rejected steer completion binding"
+                        );
                     }
-                    SteerInputError::EmptyInput => (
-                        "input must not be empty".to_string(),
-                        None,
-                        Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
-                    ),
-                };
-                let mut error = invalid_request(message);
-                error.data = data;
-                self.track_error_response(request_id, &error, error_type);
-                error
-            })?;
+                    steer_result
+                }
+            }
+            None => {
+                thread
+                    .steer_input(
+                        mapped_items,
+                        additional_context,
+                        Some(&params.expected_turn_id),
+                        params.client_user_message_id,
+                        params.responsesapi_client_metadata,
+                    )
+                    .await
+            }
+        };
+        let turn_id = steer_result.map_err(|err| {
+            let (message, data, error_type) = match err {
+                SteerInputError::NoActiveTurn(_) => (
+                    "no active turn to steer".to_string(),
+                    None,
+                    Some(AnalyticsJsonRpcError::TurnSteer(
+                        TurnSteerRequestError::NoActiveTurn,
+                    )),
+                ),
+                SteerInputError::ExpectedTurnMismatch { expected, actual } => (
+                    format!("expected active turn id `{expected}` but found `{actual}`"),
+                    None,
+                    Some(AnalyticsJsonRpcError::TurnSteer(
+                        TurnSteerRequestError::ExpectedTurnMismatch,
+                    )),
+                ),
+                SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
+                    let (message, turn_steer_error) = match turn_kind {
+                        codex_protocol::protocol::NonSteerableTurnKind::Review => (
+                            "cannot steer a review turn".to_string(),
+                            TurnSteerRequestError::NonSteerableReview,
+                        ),
+                        codex_protocol::protocol::NonSteerableTurnKind::Compact => (
+                            "cannot steer a compact turn".to_string(),
+                            TurnSteerRequestError::NonSteerableCompact,
+                        ),
+                    };
+                    let error = TurnError {
+                        message: message.clone(),
+                        codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                            turn_kind: turn_kind.into(),
+                        }),
+                        additional_details: None,
+                    };
+                    let data = match serde_json::to_value(error) {
+                        Ok(data) => Some(data),
+                        Err(error) => {
+                            tracing::error!(
+                                ?error,
+                                "failed to serialize active-turn-not-steerable turn error"
+                            );
+                            None
+                        }
+                    };
+                    (
+                        message,
+                        data,
+                        Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
+                    )
+                }
+                SteerInputError::EmptyInput => (
+                    "input must not be empty".to_string(),
+                    None,
+                    Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
+                ),
+            };
+            let mut error = invalid_request(message);
+            error.data = data;
+            self.track_error_response(request_id, &error, error_type);
+            error
+        })?;
         Ok(TurnSteerResponse { turn_id })
     }
 

@@ -758,6 +758,31 @@
           "type": "object"
         },
         {
+          "description": "Durably insert one idempotent PitchAI completion notification.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/callback/insert"
+              ],
+              "title": "Thread/callback/insertRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadCallbackInsertParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/callback/insertRequest",
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "$ref": "#/definitions/v2/RequestId"
@@ -16260,6 +16285,103 @@
         "title": "ThreadArchivedNotification",
         "type": "object"
       },
+      "ThreadCallbackInsertOutcome": {
+        "enum": [
+          "accepted",
+          "duplicate"
+        ],
+        "type": "string"
+      },
+      "ThreadCallbackInsertParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "callbackText": {
+            "type": "string"
+          },
+          "completionWorkId": {
+            "type": "string"
+          },
+          "deliveryId": {
+            "type": "string"
+          },
+          "eventId": {
+            "type": "string"
+          },
+          "executionId": {
+            "type": "string"
+          },
+          "executionKind": {
+            "type": "string"
+          },
+          "finalText": {
+            "type": "string"
+          },
+          "payloadDigest": {
+            "type": "string"
+          },
+          "sourceAgentDisplayId": {
+            "type": "string"
+          },
+          "terminalAtMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "terminalStatus": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "callbackText",
+          "completionWorkId",
+          "deliveryId",
+          "eventId",
+          "executionId",
+          "executionKind",
+          "finalText",
+          "payloadDigest",
+          "sourceAgentDisplayId",
+          "terminalAtMs",
+          "terminalStatus",
+          "threadId"
+        ],
+        "title": "ThreadCallbackInsertParams",
+        "type": "object"
+      },
+      "ThreadCallbackInsertResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "callId": {
+            "type": "string"
+          },
+          "needsRehydrate": {
+            "type": "boolean"
+          },
+          "outcome": {
+            "$ref": "#/definitions/v2/ThreadCallbackInsertOutcome"
+          },
+          "state": {
+            "$ref": "#/definitions/v2/ThreadCallbackInsertState"
+          }
+        },
+        "required": [
+          "callId",
+          "needsRehydrate",
+          "outcome",
+          "state"
+        ],
+        "title": "ThreadCallbackInsertResponse",
+        "type": "object"
+      },
+      "ThreadCallbackInsertState": {
+        "enum": [
+          "pending",
+          "delivered"
+        ],
+        "type": "string"
+      },
       "ThreadClosedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -16614,6 +16736,13 @@
       "ThreadGoalSetParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "completionWorkId": {
+            "description": "Durable control-plane work identity whose callback completes with this goal.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "objective": {
             "type": [
               "string",
@@ -19376,6 +19505,13 @@
               "null"
             ]
           },
+          "completionWorkId": {
+            "description": "Durable control-plane work identity whose callback completes with this turn.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cwd": {
             "description": "Override the working directory for this turn and subsequent turns.",
             "type": [
@@ -19504,6 +19640,13 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "clientUserMessageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completionWorkId": {
+            "description": "Durable control-plane work identity whose callback completes with the active turn.",
             "type": [
               "string",
               "null"

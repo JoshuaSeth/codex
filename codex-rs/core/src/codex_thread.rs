@@ -262,6 +262,17 @@ impl CodexThread {
             .await
     }
 
+    pub async fn submit_user_input_with_id(&self, submission: Submission) -> CodexResult<()> {
+        debug_assert!(matches!(submission.op, Op::UserInput { .. }));
+        self.codex
+            .session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_op(self.session_configured.thread_id, &submission.op)
+            .await?;
+        self.codex.submit_with_id(submission).await
+    }
+
     /// Persist whether this thread is eligible for future memory generation.
     pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
         self.codex.set_thread_memory_mode(mode).await
@@ -469,6 +480,22 @@ impl CodexThread {
             .await;
         self.codex.session.flush_rollout().await?;
         Ok(())
+    }
+
+    pub async fn contains_response_call_id(&self, expected_call_id: &str) -> bool {
+        self.codex
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .iter()
+            .any(|item| match item {
+                ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::FunctionCallOutput { call_id, .. }
+                | ResponseItem::CustomToolCall { call_id, .. }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => call_id == expected_call_id,
+                _ => false,
+            })
     }
 
     pub fn rollout_path(&self) -> Option<PathBuf> {

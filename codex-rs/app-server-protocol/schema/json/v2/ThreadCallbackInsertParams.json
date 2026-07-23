@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "callbackText": {
+      "type": "string"
+    },
+    "completionWorkId": {
+      "type": "string"
+    },
+    "deliveryId": {
+      "type": "string"
+    },
+    "eventId": {
+      "type": "string"
+    },
+    "executionId": {
+      "type": "string"
+    },
+    "executionKind": {
+      "type": "string"
+    },
+    "finalText": {
+      "type": "string"
+    },
+    "payloadDigest": {
+      "type": "string"
+    },
+    "sourceAgentDisplayId": {
+      "type": "string"
+    },
+    "terminalAtMs": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "terminalStatus": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "callbackText",
+    "completionWorkId",
+    "deliveryId",
+    "eventId",
+    "executionId",
+    "executionKind",
+    "finalText",
+    "payloadDigest",
+    "sourceAgentDisplayId",
+    "terminalAtMs",
+    "terminalStatus",
+    "threadId"
+  ],
+  "title": "ThreadCallbackInsertParams",
+  "type": "object"
+}

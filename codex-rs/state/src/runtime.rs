@@ -59,6 +59,7 @@ use tracing::warn;
 
 mod agent_jobs;
 mod backfill;
+mod completions;
 mod goals;
 mod logs;
 mod memories;
@@ -68,6 +69,14 @@ mod remote_control;
 mod test_support;
 mod threads;
 
+pub use completions::CompletionBindingState;
+pub use completions::CompletionCallback;
+pub use completions::CompletionCallbackAcceptance;
+pub use completions::CompletionCallbackRecord;
+pub use completions::CompletionCallbackState;
+pub use completions::CompletionOutboxEvent;
+pub use completions::CompletionOutboxStats;
+pub use completions::CompletionStore;
 pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
@@ -152,6 +161,7 @@ pub struct StateRuntime {
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
+    completions: CompletionStore,
     thread_goals: GoalStore,
     memories: MemoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
@@ -283,8 +293,10 @@ impl StateRuntime {
             }
         };
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
+        let completions = CompletionStore::new(Arc::clone(&goals_pool)).await?;
         let runtime = Arc::new(Self {
-            thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
+            thread_goals: GoalStore::new(Arc::clone(&goals_pool), completions.clone()),
+            completions,
             memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
             pool,
             logs_pool,
@@ -308,6 +320,10 @@ impl StateRuntime {
 
     pub fn thread_goals(&self) -> &GoalStore {
         &self.thread_goals
+    }
+
+    pub fn completions(&self) -> &CompletionStore {
+        &self.completions
     }
 
     pub fn memories(&self) -> &MemoryStore {

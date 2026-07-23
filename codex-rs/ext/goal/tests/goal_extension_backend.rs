@@ -1124,6 +1124,7 @@ async fn stale_update_goal_cannot_terminalize_external_objective_replacement() -
                 objective: GoalObjectiveUpdate::Set("replacement objective"),
                 status: Some(ThreadGoalStatus::Active),
                 token_budget: GoalTokenBudgetUpdate::Keep,
+                completion_work_id: None,
             },
         )
         .await?;
@@ -1277,6 +1278,7 @@ async fn goal_service_external_set_active_resets_baseline_without_live_thread() 
                 objective: GoalObjectiveUpdate::Set("new objective"),
                 status: Some(ThreadGoalStatus::Active),
                 token_budget: GoalTokenBudgetUpdate::Keep,
+                completion_work_id: None,
             },
         )
         .await?;
@@ -1416,6 +1418,7 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
                 objective: GoalObjectiveUpdate::Set(" ship goal API ownership "),
                 status: None,
                 token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
+                completion_work_id: None,
             },
         )
         .await?;

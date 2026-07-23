@@ -111,6 +111,20 @@ impl ThreadGoalRequestProcessor {
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
+        let _completion_admission = if params.completion_work_id.is_some() {
+            Some(state_db.completions().lock_goal_admission().await)
+        } else {
+            None
+        };
+        if let Some(goal) = self
+            .existing_completion_goal(&state_db, thread_id, &params)
+            .await?
+        {
+            self.outgoing
+                .send_response(request_id, ThreadGoalSetResponse { goal })
+                .await;
+            return Ok(());
+        }
 
         let listener_command_tx = {
             let thread_state = self.thread_state_manager.thread_state(thread_id).await;
@@ -134,6 +148,7 @@ impl ThreadGoalRequestProcessor {
                         Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
                         None => GoalTokenBudgetUpdate::Keep,
                     },
+                    completion_work_id: params.completion_work_id.as_deref(),
                 },
             )
             .await
@@ -149,6 +164,59 @@ impl ThreadGoalRequestProcessor {
             .await;
         outcome.apply_runtime_effects(&self.goal_service).await;
         Ok(())
+    }
+
+    async fn existing_completion_goal(
+        &self,
+        state_db: &StateDbHandle,
+        thread_id: ThreadId,
+        params: &ThreadGoalSetParams,
+    ) -> Result<Option<ThreadGoal>, JSONRPCErrorError> {
+        let Some(completion_work_id) = params.completion_work_id.as_deref() else {
+            return Ok(None);
+        };
+        let binding = state_db
+            .completions()
+            .existing_goal_binding(completion_work_id, thread_id)
+            .await
+            .map_err(|err| internal_error(format!("failed to read completion binding: {err}")))?;
+        let Some((goal_id, _binding_state)) = binding else {
+            return Ok(None);
+        };
+        let state_goal = state_db
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await
+            .map_err(|err| internal_error(format!("failed to read thread goal: {err}")))?
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "completion work id {completion_work_id} belongs to a goal that no longer exists"
+                ))
+            })?;
+        if state_goal.goal_id != goal_id {
+            return Err(invalid_request(format!(
+                "completion work id {completion_work_id} belongs to an earlier goal"
+            )));
+        }
+        if params
+            .objective
+            .as_deref()
+            .is_some_and(|objective| objective.trim() != state_goal.objective)
+            || params
+                .token_budget
+                .is_some_and(|token_budget| token_budget != state_goal.token_budget)
+        {
+            return Err(invalid_request(format!(
+                "completion work id {completion_work_id} is already bound to different goal intent"
+            )));
+        }
+        let goal = self
+            .goal_service
+            .get_thread_goal(state_db, thread_id)
+            .await
+            .map_err(goal_service_error)?
+            .ok_or_else(|| internal_error("bound thread goal disappeared during retry"))?;
+        Ok(Some(ThreadGoal::from(goal)))
     }
 
     async fn thread_goal_get_inner(

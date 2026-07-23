@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadCallbackInsertOutcome": {
+      "enum": [
+        "accepted",
+        "duplicate"
+      ],
+      "type": "string"
+    },
+    "ThreadCallbackInsertState": {
+      "enum": [
+        "pending",
+        "delivered"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "callId": {
+      "type": "string"
+    },
+    "needsRehydrate": {
+      "type": "boolean"
+    },
+    "outcome": {
+      "$ref": "#/definitions/ThreadCallbackInsertOutcome"
+    },
+    "state": {
+      "$ref": "#/definitions/ThreadCallbackInsertState"
+    }
+  },
+  "required": [
+    "callId",
+    "needsRehydrate",
+    "outcome",
+    "state"
+  ],
+  "title": "ThreadCallbackInsertResponse",
+  "type": "object"
+}

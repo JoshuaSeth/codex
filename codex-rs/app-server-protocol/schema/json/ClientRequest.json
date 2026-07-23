@@ -3242,6 +3242,62 @@
       ],
       "type": "object"
     },
+    "ThreadCallbackInsertParams": {
+      "properties": {
+        "callbackText": {
+          "type": "string"
+        },
+        "completionWorkId": {
+          "type": "string"
+        },
+        "deliveryId": {
+          "type": "string"
+        },
+        "eventId": {
+          "type": "string"
+        },
+        "executionId": {
+          "type": "string"
+        },
+        "executionKind": {
+          "type": "string"
+        },
+        "finalText": {
+          "type": "string"
+        },
+        "payloadDigest": {
+          "type": "string"
+        },
+        "sourceAgentDisplayId": {
+          "type": "string"
+        },
+        "terminalAtMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "terminalStatus": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "callbackText",
+        "completionWorkId",
+        "deliveryId",
+        "eventId",
+        "executionId",
+        "executionKind",
+        "finalText",
+        "payloadDigest",
+        "sourceAgentDisplayId",
+        "terminalAtMs",
+        "terminalStatus",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadCompactStartParams": {
       "properties": {
         "threadId": {
@@ -3389,6 +3445,13 @@
     },
     "ThreadGoalSetParams": {
       "properties": {
+        "completionWorkId": {
+          "description": "Durable control-plane work identity whose callback completes with this goal.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "objective": {
           "type": [
             "string",
@@ -4193,6 +4256,13 @@
             "null"
           ]
         },
+        "completionWorkId": {
+          "description": "Durable control-plane work identity whose callback completes with this turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "cwd": {
           "description": "Override the working directory for this turn and subsequent turns.",
           "type": [
@@ -4280,6 +4350,13 @@
     "TurnSteerParams": {
       "properties": {
         "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "completionWorkId": {
+          "description": "Durable control-plane work identity whose callback completes with the active turn.",
           "type": [
             "string",
             "null"
@@ -5031,6 +5108,31 @@
         "params"
       ],
       "title": "Thread/injectItemsRequest",
+      "type": "object"
+    },
+    {
+      "description": "Durably insert one idempotent PitchAI completion notification.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/callback/insert"
+          ],
+          "title": "Thread/callback/insertRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadCallbackInsertParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/callback/insertRequest",
       "type": "object"
     },
     {

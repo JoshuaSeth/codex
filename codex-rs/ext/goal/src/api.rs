@@ -51,6 +51,7 @@ pub struct GoalSetRequest<'a> {
     pub objective: GoalObjectiveUpdate<'a>,
     pub status: Option<ThreadGoalStatus>,
     pub token_budget: GoalTokenBudgetUpdate,
+    pub completion_work_id: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +106,7 @@ impl GoalService {
             objective,
             status,
             token_budget,
+            completion_work_id,
         } = request;
         let status = status.map(state_status_from_protocol);
         let objective = match objective {
@@ -152,18 +154,31 @@ impl GoalService {
                 })?;
             if let Some(existing_goal) = existing_goal.as_ref() {
                 let previous_goal = PreviousGoalSnapshot::from(existing_goal);
-                state_db
-                    .thread_goals()
-                    .update_thread_goal(
-                        thread_id,
-                        codex_state::GoalUpdate {
-                            objective: Some(objective.to_string()),
-                            status,
-                            token_budget,
-                            expected_goal_id: Some(existing_goal.goal_id.clone()),
-                        },
-                    )
-                    .await
+                let update = codex_state::GoalUpdate {
+                    objective: Some(objective.to_string()),
+                    status,
+                    token_budget,
+                    expected_goal_id: Some(existing_goal.goal_id.clone()),
+                };
+                let updated_goal = match completion_work_id {
+                    Some(completion_work_id) => {
+                        state_db
+                            .thread_goals()
+                            .update_thread_goal_with_completion(
+                                thread_id,
+                                update,
+                                completion_work_id,
+                            )
+                            .await
+                    }
+                    None => {
+                        state_db
+                            .thread_goals()
+                            .update_thread_goal(thread_id, update)
+                            .await
+                    }
+                };
+                updated_goal
                     .map_err(|err| {
                         GoalServiceError::Internal(format!("failed to update thread goal: {err}"))
                     })?
@@ -174,15 +189,33 @@ impl GoalService {
                     })
                     .map(|goal| (goal, Some(previous_goal)))?
             } else {
-                state_db
-                    .thread_goals()
-                    .replace_thread_goal(
-                        thread_id,
-                        objective,
-                        status.unwrap_or(codex_state::ThreadGoalStatus::Active),
-                        token_budget.flatten(),
-                    )
-                    .await
+                let status = status.unwrap_or(codex_state::ThreadGoalStatus::Active);
+                let replaced_goal = match completion_work_id {
+                    Some(completion_work_id) => {
+                        state_db
+                            .thread_goals()
+                            .replace_thread_goal_with_completion(
+                                thread_id,
+                                objective,
+                                status,
+                                token_budget.flatten(),
+                                completion_work_id,
+                            )
+                            .await
+                    }
+                    None => {
+                        state_db
+                            .thread_goals()
+                            .replace_thread_goal(
+                                thread_id,
+                                objective,
+                                status,
+                                token_budget.flatten(),
+                            )
+                            .await
+                    }
+                };
+                replaced_goal
                     .map_err(|err| {
                         GoalServiceError::Internal(format!("failed to replace thread goal: {err}"))
                     })
@@ -202,19 +235,27 @@ impl GoalService {
                     ))
                 })?;
             let previous_goal = PreviousGoalSnapshot::from(&existing_goal);
-            let expected_goal_id = existing_goal.goal_id.clone();
-            state_db
-                .thread_goals()
-                .update_thread_goal(
-                    thread_id,
-                    codex_state::GoalUpdate {
-                        objective: None,
-                        status,
-                        token_budget,
-                        expected_goal_id: Some(expected_goal_id),
-                    },
-                )
-                .await
+            let update = codex_state::GoalUpdate {
+                objective: None,
+                status,
+                token_budget,
+                expected_goal_id: Some(existing_goal.goal_id.clone()),
+            };
+            let updated_goal = match completion_work_id {
+                Some(completion_work_id) => {
+                    state_db
+                        .thread_goals()
+                        .update_thread_goal_with_completion(thread_id, update, completion_work_id)
+                        .await
+                }
+                None => {
+                    state_db
+                        .thread_goals()
+                        .update_thread_goal(thread_id, update)
+                        .await
+                }
+            };
+            updated_goal
                 .map_err(|err| {
                     GoalServiceError::Internal(format!("failed to update thread goal: {err}"))
                 })?

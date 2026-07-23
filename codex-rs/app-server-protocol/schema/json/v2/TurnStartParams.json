@@ -515,6 +515,13 @@
         "null"
       ]
     },
+    "completionWorkId": {
+      "description": "Durable control-plane work identity whose callback completes with this turn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "cwd": {
       "description": "Override the working directory for this turn and subsequent turns.",
       "type": [
