@@ -57,7 +57,7 @@ pub(crate) fn start(
     store: Option<CompletionStore>,
     shutdown: CancellationToken,
 ) -> io::Result<Option<JoinHandle<()>>> {
-    let Some(config) = CompletionOutboxSenderConfig::from_environment()? else {
+    let Some(config) = CompletionWebhookSenderConfig::from_environment()? else {
         return Ok(None);
     };
     let store = store.ok_or_else(|| {
