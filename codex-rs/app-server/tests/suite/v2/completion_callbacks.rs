@@ -32,9 +32,11 @@ const CENTRAL_URL_ENV: &str = "PITCHAI_PLATFORM_CENTRAL_URL";
 const CELL_TOKEN_ENV: &str = "PITCHAI_PLATFORM_CELL_TOKEN";
 const NORMAL_WORK_ID: &str = "10000000-0000-0000-0000-000000000101";
 const GOAL_WORK_ID: &str = "10000000-0000-0000-0000-000000000102";
+const CALLBACK_PROTOCOL_VERSION: &str = "pitchai-completion-callback/v1";
+const CALLBACK_TEXT: &str = "Report this completion to the Events inbox.";
 
 #[tokio::test]
-async fn turn_completion_persists_one_normal_completion_event() -> Result<()> {
+async fn turn_completion_persists_central_and_webhook_events() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Normal callback evidence").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -46,6 +48,7 @@ async fn turn_completion_persists_one_normal_completion_event() -> Result<()> {
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
             completion_work_id: Some(NORMAL_WORK_ID.to_string()),
+            completion_callback_metadata: Some(callback_metadata()),
             input: vec![UserInput::Text {
                 text: "Finish this normal callback test.".to_string(),
                 text_elements: Vec::new(),
@@ -75,6 +78,18 @@ async fn turn_completion_persists_one_normal_completion_event() -> Result<()> {
     assert_eq!(turn.id, event.execution_id);
     assert_eq!("completed", event.terminal_status);
     assert_eq!("Normal callback evidence", event.final_text);
+
+    let webhook_outbox = claim_webhook_outbox(codex_home.path()).await?;
+    assert_eq!(1, webhook_outbox.len());
+    let webhook_event = &webhook_outbox[0];
+    assert_eq!(NORMAL_WORK_ID, webhook_event.event_id);
+    assert_eq!(thread_id, webhook_event.thread_id);
+    assert_eq!("normal", webhook_event.execution_kind);
+    assert_eq!(turn.id, webhook_event.execution_id);
+    assert_eq!(
+        callback_metadata(),
+        serde_json::from_str(&webhook_event.callback_metadata_json)?
+    );
     Ok(())
 }
 
@@ -126,6 +141,10 @@ async fn exact_turn_start_retry_returns_same_turn_without_duplicate_model_work()
         "an exact retry must not run the model twice"
     );
     assert_eq!(1, claim_outbox(codex_home.path()).await?.len());
+    assert!(
+        claim_webhook_outbox(codex_home.path()).await?.is_empty(),
+        "work without callback metadata must not emit a webhook"
+    );
     Ok(())
 }
 
@@ -242,6 +261,7 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
             Some(json!({
                 "threadId": thread_id,
                 "completionWorkId": GOAL_WORK_ID,
+                "completionCallbackMetadata": callback_metadata(),
                 "objective": "Complete only after explicit persisted goal success.",
                 "status": "active",
             })),
@@ -269,6 +289,10 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
     assert!(
         intermediate_outbox.is_empty(),
         "an ordinary assistant final must not finish a goal callback"
+    );
+    assert!(
+        claim_webhook_outbox(codex_home.path()).await?.is_empty(),
+        "an ordinary assistant final must not emit a goal webhook"
     );
 
     let complete_request = app_server
@@ -303,6 +327,17 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
     assert!(!event.execution_id.is_empty());
     assert_eq!("complete", event.terminal_status);
     assert_eq!("", event.final_text);
+
+    let webhook_outbox = claim_webhook_outbox(codex_home.path()).await?;
+    assert_eq!(1, webhook_outbox.len());
+    let webhook_event = &webhook_outbox[0];
+    assert_eq!(GOAL_WORK_ID, webhook_event.event_id);
+    assert_eq!("goal", webhook_event.execution_kind);
+    assert_eq!("complete", webhook_event.terminal_status);
+    assert_eq!(
+        callback_metadata(),
+        serde_json::from_str(&webhook_event.callback_metadata_json)?
+    );
 
     let duplicate_outbox = claim_outbox(codex_home.path()).await?;
     assert!(
@@ -424,6 +459,23 @@ async fn claim_outbox(codex_home: &Path) -> Result<Vec<CompletionOutboxEvent>> {
         .claim_outbox(/* limit */ 10, OUTBOX_LEASE_MS)
         .await?;
     Ok(events)
+}
+
+async fn claim_webhook_outbox(codex_home: &Path) -> Result<Vec<CompletionOutboxEvent>> {
+    let state_db =
+        StateRuntime::init(codex_home.to_path_buf(), "mock_provider".to_string()).await?;
+    let events = state_db
+        .completions()
+        .claim_webhook_outbox(/* limit */ 10, OUTBOX_LEASE_MS)
+        .await?;
+    Ok(events)
+}
+
+fn callback_metadata() -> serde_json::Value {
+    json!({
+        "protocol_version": CALLBACK_PROTOCOL_VERSION,
+        "text": CALLBACK_TEXT,
+    })
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
