@@ -88,7 +88,7 @@ async fn turn_completion_persists_central_and_webhook_events() -> Result<()> {
     assert_eq!(turn.id, webhook_event.execution_id);
     assert_eq!(
         callback_metadata(),
-        serde_json::from_str(&webhook_event.callback_metadata_json)?
+        serde_json::from_str::<serde_json::Value>(&webhook_event.callback_metadata_json)?
     );
     Ok(())
 }
@@ -336,7 +336,7 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
     assert_eq!("complete", webhook_event.terminal_status);
     assert_eq!(
         callback_metadata(),
-        serde_json::from_str(&webhook_event.callback_metadata_json)?
+        serde_json::from_str::<serde_json::Value>(&webhook_event.callback_metadata_json)?
     );
 
     let duplicate_outbox = claim_outbox(codex_home.path()).await?;
