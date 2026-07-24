@@ -1611,6 +1611,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_terminal_goal_status_emits_one_webhook_event() {
+        let terminal_statuses = [
+            (crate::ThreadGoalStatus::Complete, "complete"),
+            (crate::ThreadGoalStatus::Blocked, "blocked"),
+            (crate::ThreadGoalStatus::UsageLimited, "usageLimited"),
+            (crate::ThreadGoalStatus::BudgetLimited, "budgetLimited"),
+        ];
+        let callback_metadata_json = r#"{"protocol_version":"pitchai-completion-callback/v1","text":"Publish terminal goal state."}"#;
+
+        for (index, (status, expected_status)) in terminal_statuses.into_iter().enumerate() {
+            let runtime = test_runtime().await;
+            let thread_id = test_thread_id();
+            upsert_test_thread(&runtime, thread_id).await;
+            let completion_work_id = format!("10000000-0000-0000-0000-00000000020{index}");
+            let goal = runtime
+                .thread_goals()
+                .replace_thread_goal_with_completion_metadata(
+                    thread_id,
+                    "reach one supported terminal state",
+                    crate::ThreadGoalStatus::Active,
+                    /*token_budget*/ None,
+                    &completion_work_id,
+                    callback_metadata_json,
+                )
+                .await
+                .expect("tracked goal should persist");
+
+            runtime
+                .thread_goals()
+                .update_thread_goal(
+                    thread_id,
+                    GoalUpdate {
+                        objective: None,
+                        status: Some(status),
+                        token_budget: None,
+                        expected_goal_id: Some(goal.goal_id),
+                    },
+                )
+                .await
+                .expect("terminal goal status should persist")
+                .expect("goal should still exist");
+
+            let webhook_events = runtime
+                .completions()
+                .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                .await
+                .expect("terminal goal should emit a webhook event");
+            assert_eq!(1, webhook_events.len());
+            assert_eq!(expected_status, webhook_events[0].terminal_status);
+            assert_eq!(
+                Vec::<CompletionOutboxEvent>::new(),
+                runtime
+                    .completions()
+                    .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                    .await
+                    .expect("terminal goal webhook should emit exactly once")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn immediately_limited_goal_is_bound_and_emitted_in_one_transaction() {
         let runtime = test_runtime().await;
         let thread_id = test_thread_id();
