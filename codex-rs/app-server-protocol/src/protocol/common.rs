@@ -1939,6 +1939,7 @@ mod tests {
             params: v2::ThreadGoalSetParams {
                 thread_id: "goal-thread".to_string(),
                 completion_work_id: None,
+                completion_callback_metadata: None,
                 objective: Some("ship it".to_string()),
                 status: None,
                 token_budget: None,
@@ -3314,6 +3315,7 @@ mod tests {
             params: v2::ThreadGoalSetParams {
                 thread_id: "thr_123".to_string(),
                 completion_work_id: None,
+                completion_callback_metadata: None,
                 objective: Some("ship goal mode".to_string()),
                 status: Some(v2::ThreadGoalStatus::Active),
                 token_budget: Some(Some(10_000)),
