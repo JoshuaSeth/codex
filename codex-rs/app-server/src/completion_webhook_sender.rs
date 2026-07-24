@@ -397,6 +397,13 @@ mod tests {
 
     const TOKEN: &str = "test-completion-webhook-token";
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailureMode {
+        HttpUnavailable,
+        Disconnect,
+        Timeout,
+    }
+
     #[test]
     fn configuration_preserves_the_fixed_webhook_path() {
         let config = CompletionWebhookSenderConfig::from_values(
@@ -501,89 +508,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_webhook_is_attempted_once_without_blocking_central_completion() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let runtime =
-            StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
-                .await
-                .expect("state runtime");
-        let store = runtime.completions().clone();
-        let event = sample_event();
-        let thread_id = ThreadId::from_string(&event.thread_id).expect("thread id");
-        store
-            .bind_turn_with_callback_metadata(
-                &event.completion_work_id,
-                thread_id,
-                &event.execution_id,
-                &event.callback_metadata_json,
-            )
-            .await
-            .expect("binding");
-        store
-            .complete_turn(
-                thread_id,
-                &event.execution_id,
-                &event.final_text,
-                event.terminal_at_ms,
-            )
-            .await
-            .expect("completion");
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}/capture", listener.local_addr().expect("address"));
-        let capture = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0_u8; 4096];
-                let count = stream.read(&mut buffer).await.expect("read");
-                request.extend_from_slice(&buffer[..count]);
-                if count == 0 || complete_http_request(&request) {
-                    break;
-                }
-            }
-            stream
-                .write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    async fn failed_webhooks_are_attempted_once_without_blocking_central_completion() {
+        for failure_mode in [
+            FailureMode::HttpUnavailable,
+            FailureMode::Disconnect,
+            FailureMode::Timeout,
+        ] {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let runtime =
+                StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
+                    .await
+                    .expect("state runtime");
+            let store = runtime.completions().clone();
+            let event = sample_event();
+            let thread_id = ThreadId::from_string(&event.thread_id).expect("thread id");
+            store
+                .bind_turn_with_callback_metadata(
+                    &event.completion_work_id,
+                    thread_id,
+                    &event.execution_id,
+                    &event.callback_metadata_json,
                 )
                 .await
-                .expect("respond");
-            request
-        });
-        let config =
-            CompletionWebhookSenderConfig::from_values(&endpoint, Some(TOKEN), Some("dev-main"))
-                .expect("config");
-        let shutdown = CancellationToken::new();
-        let sender = tokio::spawn(run(
-            store.clone(),
-            config,
-            Client::builder().build().expect("client"),
-            shutdown.clone(),
-        ));
+                .expect("binding");
+            store
+                .complete_turn(
+                    thread_id,
+                    &event.execution_id,
+                    &event.final_text,
+                    event.terminal_at_ms,
+                )
+                .await
+                .expect("completion");
 
-        let request = timeout(Duration::from_secs(5), capture)
-            .await
-            .expect("one webhook request should arrive")
-            .expect("capture task");
-        assert!(complete_http_request(&request));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let stats = store.webhook_outbox_stats().await.expect("stats");
-            if stats.sent_count == 1 {
-                assert_eq!(1, stats.total_attempts);
-                assert_eq!(0, stats.pending_count);
-                assert_eq!(0, stats.sending_count);
-                break;
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let endpoint = format!("http://{}/capture", listener.local_addr().expect("address"));
+            let capture = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 4096];
+                    let count = stream.read(&mut buffer).await.expect("read");
+                    request.extend_from_slice(&buffer[..count]);
+                    if count == 0 || complete_http_request(&request) {
+                        break;
+                    }
+                }
+                match failure_mode {
+                    FailureMode::HttpUnavailable => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("respond");
+                    }
+                    FailureMode::Disconnect => {}
+                    FailureMode::Timeout => sleep(Duration::from_millis(250)).await,
+                }
+                request
+            });
+            let config = CompletionWebhookSenderConfig::from_values(
+                &endpoint,
+                Some(TOKEN),
+                Some("dev-main"),
+            )
+            .expect("config");
+            let request_timeout = if failure_mode == FailureMode::Timeout {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(5)
+            };
+            let client = Client::builder()
+                .timeout(request_timeout)
+                .build()
+                .expect("client");
+            let shutdown = CancellationToken::new();
+            let sender = tokio::spawn(run(store.clone(), config, client, shutdown.clone()));
+
+            let request = timeout(Duration::from_secs(5), capture)
+                .await
+                .expect("one webhook request should arrive")
+                .expect("capture task");
+            assert!(complete_http_request(&request));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let stats = store.webhook_outbox_stats().await.expect("stats");
+                if stats.sent_count == 1 {
+                    assert_eq!(1, stats.total_attempts);
+                    assert_eq!(0, stats.pending_count);
+                    assert_eq!(0, stats.sending_count);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "attempt was not finalized");
+                sleep(Duration::from_millis(20)).await;
             }
-            assert!(Instant::now() < deadline, "attempt was not finalized");
-            sleep(Duration::from_millis(20)).await;
-        }
-        let central_stats = store.outbox_stats().await.expect("central stats");
-        assert_eq!(1, central_stats.pending_count);
-        assert_eq!(0, central_stats.total_attempts);
+            let central_stats = store.outbox_stats().await.expect("central stats");
+            assert_eq!(1, central_stats.pending_count);
+            assert_eq!(0, central_stats.total_attempts);
 
-        shutdown.cancel();
-        sender.await.expect("sender");
+            shutdown.cancel();
+            sender.await.expect("sender");
+        }
     }
 
     fn sample_event() -> CompletionOutboxEvent {
