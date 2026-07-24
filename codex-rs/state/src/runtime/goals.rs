@@ -94,6 +94,26 @@ WHERE thread_id = ?
         token_budget: Option<i64>,
         completion_work_id: &str,
     ) -> anyhow::Result<crate::ThreadGoal> {
+        self.replace_thread_goal_with_completion_metadata(
+            thread_id,
+            objective,
+            status,
+            token_budget,
+            completion_work_id,
+            "",
+        )
+        .await
+    }
+
+    pub async fn replace_thread_goal_with_completion_metadata(
+        &self,
+        thread_id: ThreadId,
+        objective: &str,
+        status: crate::ThreadGoalStatus,
+        token_budget: Option<i64>,
+        completion_work_id: &str,
+        callback_metadata_json: &str,
+    ) -> anyhow::Result<crate::ThreadGoal> {
         let mut transaction = self.pool.begin().await?;
         let goal = replace_thread_goal_on_connection(
             &mut transaction,
@@ -110,6 +130,7 @@ WHERE thread_id = ?
                 completion_work_id,
                 thread_id,
                 &goal.goal_id,
+                callback_metadata_json,
                 now_ms,
             )
             .await?;
@@ -196,6 +217,17 @@ RETURNING
         update: GoalUpdate,
         completion_work_id: &str,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
+        self.update_thread_goal_with_completion_metadata(thread_id, update, completion_work_id, "")
+            .await
+    }
+
+    pub async fn update_thread_goal_with_completion_metadata(
+        &self,
+        thread_id: ThreadId,
+        update: GoalUpdate,
+        completion_work_id: &str,
+        callback_metadata_json: &str,
+    ) -> anyhow::Result<Option<crate::ThreadGoal>> {
         let mut transaction = self.pool.begin().await?;
         let goal = update_thread_goal_on_connection(&mut transaction, thread_id, update).await?;
         if let Some(goal) = goal.as_ref() {
@@ -206,6 +238,7 @@ RETURNING
                     completion_work_id,
                     thread_id,
                     &goal.goal_id,
+                    callback_metadata_json,
                     now_ms,
                 )
                 .await?;

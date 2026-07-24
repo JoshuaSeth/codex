@@ -29,6 +29,7 @@ pub struct CompletionOutboxEvent {
     pub thread_id: String,
     pub execution_kind: String,
     pub execution_id: String,
+    pub callback_metadata_json: String,
     pub terminal_status: String,
     pub final_text: String,
     pub terminal_at_ms: i64,
@@ -50,6 +51,16 @@ pub enum CompletionBindingState {
     Registered,
     Active,
     Terminal,
+}
+
+struct ExecutionBinding<'a> {
+    completion_work_id: &'a str,
+    thread_id: ThreadId,
+    execution_kind: &'static str,
+    execution_id: &'a str,
+    callback_metadata_json: &'a str,
+    initial_state: &'static str,
+    now_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +119,7 @@ impl CompletionStore {
     }
 
     pub(crate) fn notify_sender(&self) {
-        self.notify.notify_one();
+        self.notify.notify_waiters();
     }
 
     pub async fn lock_turn_admission(&self) -> OwnedMutexGuard<()> {
@@ -155,16 +166,30 @@ impl CompletionStore {
         thread_id: ThreadId,
         turn_id: &str,
     ) -> anyhow::Result<CompletionBindingState> {
+        self.bind_turn_with_callback_metadata(completion_work_id, thread_id, turn_id, "")
+            .await
+    }
+
+    pub async fn bind_turn_with_callback_metadata(
+        &self,
+        completion_work_id: &str,
+        thread_id: ThreadId,
+        turn_id: &str,
+        callback_metadata_json: &str,
+    ) -> anyhow::Result<CompletionBindingState> {
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let mut transaction = self.pool.begin().await?;
         let state = bind_execution(
             &mut transaction,
-            completion_work_id,
-            thread_id,
-            "normal",
-            turn_id,
-            "registered",
-            now_ms,
+            ExecutionBinding {
+                completion_work_id,
+                thread_id,
+                execution_kind: "normal",
+                execution_id: turn_id,
+                callback_metadata_json,
+                initial_state: "registered",
+                now_ms,
+            },
         )
         .await?;
         transaction.commit().await?;
@@ -176,9 +201,19 @@ impl CompletionStore {
         completion_work_id: &str,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<(String, CompletionBindingState)>> {
+        self.existing_turn_binding_with_callback_metadata(completion_work_id, thread_id, "")
+            .await
+    }
+
+    pub async fn existing_turn_binding_with_callback_metadata(
+        &self,
+        completion_work_id: &str,
+        thread_id: ThreadId,
+        callback_metadata_json: &str,
+    ) -> anyhow::Result<Option<(String, CompletionBindingState)>> {
         let row = sqlx::query(
             r#"
-SELECT thread_id, execution_kind, execution_id, state
+SELECT thread_id, execution_kind, execution_id, callback_metadata_json, state
 FROM completion_bindings
 WHERE completion_work_id = ?
             "#,
@@ -191,8 +226,11 @@ WHERE completion_work_id = ?
         };
         let stored_thread_id: String = row.try_get("thread_id")?;
         let execution_kind: String = row.try_get("execution_kind")?;
+        let stored_callback_metadata_json: String = row.try_get("callback_metadata_json")?;
         anyhow::ensure!(
-            stored_thread_id == thread_id.to_string() && execution_kind == "normal",
+            stored_thread_id == thread_id.to_string()
+                && execution_kind == "normal"
+                && stored_callback_metadata_json == callback_metadata_json,
             "completion work id is already bound to different execution intent"
         );
         let execution_id = row.try_get("execution_id")?;
@@ -281,6 +319,7 @@ INSERT OR IGNORE INTO completion_outbox (
     thread_id,
     execution_kind,
     execution_id,
+    callback_metadata_json,
     terminal_status,
     final_text,
     terminal_at_ms,
@@ -295,6 +334,7 @@ SELECT
     binding.thread_id,
     binding.execution_kind,
     binding.execution_id,
+    binding.callback_metadata_json,
     'completed',
     ?,
     ?,
@@ -400,6 +440,7 @@ RETURNING
     thread_id,
     execution_kind,
     execution_id,
+    callback_metadata_json,
     terminal_status,
     final_text,
     terminal_at_ms,
@@ -421,6 +462,7 @@ RETURNING
                     thread_id: row.try_get("thread_id")?,
                     execution_kind: row.try_get("execution_kind")?,
                     execution_id: row.try_get("execution_id")?,
+                    callback_metadata_json: row.try_get("callback_metadata_json")?,
                     terminal_status: row.try_get("terminal_status")?,
                     final_text: row.try_get("final_text")?,
                     terminal_at_ms: row.try_get("terminal_at_ms")?,
@@ -466,6 +508,140 @@ SELECT
     COALESCE(SUM(attempt_count), 0) AS total_attempts,
     MIN(CASE WHEN state IN ('pending', 'sending') THEN created_at_ms END) AS oldest_unsent_at_ms
 FROM completion_outbox
+            "#,
+        )
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        Ok(CompletionOutboxStats {
+            pending_count: row.try_get::<Option<i64>, _>("pending_count")?.unwrap_or(0),
+            sending_count: row.try_get::<Option<i64>, _>("sending_count")?.unwrap_or(0),
+            sent_count: row.try_get::<Option<i64>, _>("sent_count")?.unwrap_or(0),
+            total_attempts: row.try_get("total_attempts")?,
+            oldest_unsent_at_ms: row.try_get("oldest_unsent_at_ms")?,
+        })
+    }
+
+    pub async fn claim_webhook_outbox(
+        &self,
+        limit: i64,
+        lease_duration_ms: i64,
+    ) -> anyhow::Result<Vec<CompletionOutboxEvent>> {
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let lease_expires_at_ms = now_ms.saturating_add(lease_duration_ms);
+        let mut transaction = self.pool.begin().await?;
+        let rows = sqlx::query(
+            r#"
+SELECT event_id
+FROM completion_webhook_outbox
+WHERE available_at_ms <= ?
+  AND (
+      state = 'pending'
+      OR (state = 'sending' AND lease_expires_at_ms <= ?)
+  )
+ORDER BY created_at_ms, event_id
+LIMIT ?
+            "#,
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(limit)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event_id: String = row.try_get("event_id")?;
+            let lease_id = Uuid::new_v4().to_string();
+            let claimed = sqlx::query(
+                r#"
+UPDATE completion_webhook_outbox
+SET
+    state = 'sending',
+    attempt_count = attempt_count + 1,
+    lease_id = ?,
+    lease_expires_at_ms = ?,
+    updated_at_ms = ?
+WHERE event_id = ?
+  AND available_at_ms <= ?
+  AND (
+      state = 'pending'
+      OR (state = 'sending' AND lease_expires_at_ms <= ?)
+  )
+RETURNING
+    event_id,
+    completion_work_id,
+    thread_id,
+    execution_kind,
+    execution_id,
+    callback_metadata_json,
+    terminal_status,
+    final_text,
+    terminal_at_ms,
+    attempt_count
+                "#,
+            )
+            .bind(&lease_id)
+            .bind(lease_expires_at_ms)
+            .bind(now_ms)
+            .bind(event_id)
+            .bind(now_ms)
+            .bind(now_ms)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(row) = claimed {
+                events.push(CompletionOutboxEvent {
+                    event_id: row.try_get("event_id")?,
+                    completion_work_id: row.try_get("completion_work_id")?,
+                    thread_id: row.try_get("thread_id")?,
+                    execution_kind: row.try_get("execution_kind")?,
+                    execution_id: row.try_get("execution_id")?,
+                    callback_metadata_json: row.try_get("callback_metadata_json")?,
+                    terminal_status: row.try_get("terminal_status")?,
+                    final_text: row.try_get("final_text")?,
+                    terminal_at_ms: row.try_get("terminal_at_ms")?,
+                    attempt: row.try_get("attempt_count")?,
+                    lease_id,
+                });
+            }
+        }
+        transaction.commit().await?;
+        Ok(events)
+    }
+
+    pub async fn next_webhook_outbox_wakeup_delay_ms(
+        &self,
+        maximum_delay_ms: i64,
+    ) -> anyhow::Result<i64> {
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let due_at_ms: Option<i64> = sqlx::query_scalar(
+            r#"
+SELECT MIN(
+    CASE state
+        WHEN 'pending' THEN available_at_ms
+        WHEN 'sending' THEN lease_expires_at_ms
+    END
+)
+FROM completion_webhook_outbox
+WHERE state IN ('pending', 'sending')
+            "#,
+        )
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        let delay_ms = due_at_ms
+            .map(|due_at_ms| due_at_ms.saturating_sub(now_ms).max(0))
+            .unwrap_or(maximum_delay_ms);
+        Ok(delay_ms.min(maximum_delay_ms).max(0))
+    }
+
+    pub async fn webhook_outbox_stats(&self) -> anyhow::Result<CompletionOutboxStats> {
+        let row = sqlx::query(
+            r#"
+SELECT
+    SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+    SUM(CASE WHEN state = 'sending' THEN 1 ELSE 0 END) AS sending_count,
+    SUM(CASE WHEN state = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+    COALESCE(SUM(attempt_count), 0) AS total_attempts,
+    MIN(CASE WHEN state IN ('pending', 'sending') THEN created_at_ms END) AS oldest_unsent_at_ms
+FROM completion_webhook_outbox
             "#,
         )
         .fetch_one(self.pool.as_ref())
@@ -682,6 +858,35 @@ WHERE event_id = ? AND state = 'sending' AND lease_id = ?
         Ok(updated == 1)
     }
 
+    pub async fn mark_webhook_attempted(
+        &self,
+        event_id: &str,
+        lease_id: &str,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let updated = sqlx::query(
+            r#"
+UPDATE completion_webhook_outbox
+SET
+    state = 'sent',
+    lease_id = NULL,
+    lease_expires_at_ms = NULL,
+    last_error = ?,
+    updated_at_ms = ?
+WHERE event_id = ? AND state = 'sending' AND lease_id = ?
+            "#,
+        )
+        .bind(error)
+        .bind(now_ms)
+        .bind(event_id)
+        .bind(lease_id)
+        .execute(self.pool.as_ref())
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
     pub async fn retry_later(
         &self,
         event_id: &str,
@@ -724,16 +929,20 @@ WHERE event_id = ? AND state = 'sending' AND lease_id = ?
         completion_work_id: &str,
         thread_id: ThreadId,
         goal_id: &str,
+        callback_metadata_json: &str,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         bind_execution(
             &mut *connection,
-            completion_work_id,
-            thread_id,
-            "goal",
-            goal_id,
-            "active",
-            now_ms,
+            ExecutionBinding {
+                completion_work_id,
+                thread_id,
+                execution_kind: "goal",
+                execution_id: goal_id,
+                callback_metadata_json,
+                initial_state: "active",
+                now_ms,
+            },
         )
         .await?;
         enqueue_terminal_goal_if_needed(connection, completion_work_id, now_ms).await
@@ -744,9 +953,19 @@ WHERE event_id = ? AND state = 'sending' AND lease_id = ?
         completion_work_id: &str,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<(String, CompletionBindingState)>> {
+        self.existing_goal_binding_with_callback_metadata(completion_work_id, thread_id, "")
+            .await
+    }
+
+    pub async fn existing_goal_binding_with_callback_metadata(
+        &self,
+        completion_work_id: &str,
+        thread_id: ThreadId,
+        callback_metadata_json: &str,
+    ) -> anyhow::Result<Option<(String, CompletionBindingState)>> {
         let row = sqlx::query(
             r#"
-SELECT thread_id, execution_kind, execution_id, state
+SELECT thread_id, execution_kind, execution_id, callback_metadata_json, state
 FROM completion_bindings
 WHERE completion_work_id = ?
             "#,
@@ -759,8 +978,11 @@ WHERE completion_work_id = ?
         };
         let stored_thread_id: String = row.try_get("thread_id")?;
         let execution_kind: String = row.try_get("execution_kind")?;
+        let stored_callback_metadata_json: String = row.try_get("callback_metadata_json")?;
         anyhow::ensure!(
-            stored_thread_id == thread_id.to_string() && execution_kind == "goal",
+            stored_thread_id == thread_id.to_string()
+                && execution_kind == "goal"
+                && stored_callback_metadata_json == callback_metadata_json,
             "completion work id is already bound to different execution intent"
         );
         let execution_id = row.try_get("execution_id")?;
@@ -891,13 +1113,17 @@ fn bounded_completion_final_text(final_text: &str) -> Cow<'_, str> {
 
 async fn bind_execution(
     connection: &mut SqliteConnection,
-    completion_work_id: &str,
-    thread_id: ThreadId,
-    execution_kind: &str,
-    execution_id: &str,
-    initial_state: &str,
-    now_ms: i64,
+    binding: ExecutionBinding<'_>,
 ) -> anyhow::Result<String> {
+    let ExecutionBinding {
+        completion_work_id,
+        thread_id,
+        execution_kind,
+        execution_id,
+        callback_metadata_json,
+        initial_state,
+        now_ms,
+    } = binding;
     let parsed_work_id = Uuid::parse_str(completion_work_id)
         .map_err(|err| anyhow::anyhow!("completion work id must be a UUID: {err}"))?;
     anyhow::ensure!(
@@ -911,16 +1137,18 @@ INSERT OR IGNORE INTO completion_bindings (
     thread_id,
     execution_kind,
     execution_id,
+    callback_metadata_json,
     state,
     created_at_ms,
     updated_at_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(completion_work_id)
     .bind(thread_id.to_string())
     .bind(execution_kind)
     .bind(execution_id)
+    .bind(callback_metadata_json)
     .bind(initial_state)
     .bind(now_ms)
     .bind(now_ms)
@@ -928,7 +1156,7 @@ INSERT OR IGNORE INTO completion_bindings (
     .await?;
     let row = sqlx::query(
         r#"
-SELECT thread_id, execution_kind, execution_id, state
+SELECT thread_id, execution_kind, execution_id, callback_metadata_json, state
 FROM completion_bindings
 WHERE completion_work_id = ?
         "#,
@@ -939,10 +1167,12 @@ WHERE completion_work_id = ?
     let stored_thread_id: String = row.try_get("thread_id")?;
     let stored_execution_kind: String = row.try_get("execution_kind")?;
     let stored_execution_id: String = row.try_get("execution_id")?;
+    let stored_callback_metadata_json: String = row.try_get("callback_metadata_json")?;
     let stored_state: String = row.try_get("state")?;
     if stored_thread_id != thread_id.to_string()
         || stored_execution_kind != execution_kind
         || stored_execution_id != execution_id
+        || stored_callback_metadata_json != callback_metadata_json
     {
         anyhow::bail!("completion work id is already bound to different execution intent");
     }
@@ -971,6 +1201,7 @@ INSERT OR IGNORE INTO completion_outbox (
     thread_id,
     execution_kind,
     execution_id,
+    callback_metadata_json,
     terminal_status,
     final_text,
     terminal_at_ms,
@@ -985,6 +1216,7 @@ SELECT
     binding.thread_id,
     binding.execution_kind,
     binding.execution_id,
+    binding.callback_metadata_json,
     CASE goal.status
         WHEN 'usage_limited' THEN 'usageLimited'
         WHEN 'budget_limited' THEN 'budgetLimited'
@@ -1068,9 +1300,16 @@ mod tests {
         let runtime = test_runtime().await;
         let thread_id = test_thread_id();
         let completion_work_id = "10000000-0000-0000-0000-000000000001";
+        let callback_metadata_json =
+            r#"{"protocol_version":"pitchai-completion-callback/v1","text":"Publish the result."}"#;
         let binding_state = runtime
             .completions()
-            .bind_turn(completion_work_id, thread_id, "turn-1")
+            .bind_turn_with_callback_metadata(
+                completion_work_id,
+                thread_id,
+                "turn-1",
+                callback_metadata_json,
+            )
             .await
             .expect("turn binding should persist");
         assert_eq!(CompletionBindingState::Registered, binding_state);
@@ -1100,6 +1339,7 @@ mod tests {
         assert_eq!("turn-1", first_event.execution_id);
         assert_eq!("completed", first_event.terminal_status);
         assert_eq!("finished", first_event.final_text);
+        assert_eq!(callback_metadata_json, first_event.callback_metadata_json);
         assert_eq!(1, first_event.attempt);
 
         let concurrent_claim = runtime
@@ -1144,6 +1384,35 @@ mod tests {
                 .claim_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
                 .await
                 .expect("sent completion should not be claimable")
+        );
+
+        let webhook_claim = runtime
+            .completions()
+            .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+            .await
+            .expect("callback completion should have an independent webhook event");
+        assert_eq!(1, webhook_claim.len());
+        assert_eq!(
+            callback_metadata_json,
+            webhook_claim[0].callback_metadata_json
+        );
+        let webhook_finalized = runtime
+            .completions()
+            .mark_webhook_attempted(
+                &webhook_claim[0].event_id,
+                &webhook_claim[0].lease_id,
+                "receiver unavailable",
+            )
+            .await
+            .expect("one webhook attempt should be finalized");
+        assert!(webhook_finalized);
+        assert_eq!(
+            Vec::<CompletionOutboxEvent>::new(),
+            runtime
+                .completions()
+                .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                .await
+                .expect("a failed webhook must not retry in the app-server")
         );
     }
 
@@ -1280,14 +1549,16 @@ mod tests {
         let thread_id = test_thread_id();
         upsert_test_thread(&runtime, thread_id).await;
         let completion_work_id = "10000000-0000-0000-0000-000000000002";
+        let callback_metadata_json = r#"{"protocol_version":"pitchai-completion-callback/v1","text":"Publish goal completion."}"#;
         let goal = runtime
             .thread_goals()
-            .replace_thread_goal_with_completion(
+            .replace_thread_goal_with_completion_metadata(
                 thread_id,
                 "finish the callback test",
                 crate::ThreadGoalStatus::Active,
                 /*token_budget*/ None,
                 completion_work_id,
+                callback_metadata_json,
             )
             .await
             .expect("tracked goal should persist atomically");
@@ -1325,6 +1596,18 @@ mod tests {
         assert_eq!("goal", claimed[0].execution_kind);
         assert_eq!(goal.goal_id, claimed[0].execution_id);
         assert_eq!("complete", claimed[0].terminal_status);
+        assert_eq!(callback_metadata_json, claimed[0].callback_metadata_json);
+        let webhook_claim = runtime
+            .completions()
+            .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+            .await
+            .expect("terminal goal should emit a webhook event");
+        assert_eq!(1, webhook_claim.len());
+        assert_eq!("goal", webhook_claim[0].execution_kind);
+        assert_eq!(
+            callback_metadata_json,
+            webhook_claim[0].callback_metadata_json
+        );
     }
 
     #[tokio::test]
@@ -1355,6 +1638,14 @@ mod tests {
         assert_eq!(1, claimed.len());
         assert_eq!("budgetLimited", claimed[0].terminal_status);
         assert_eq!(goal.goal_id, claimed[0].execution_id);
+        assert_eq!(
+            Vec::<CompletionOutboxEvent>::new(),
+            runtime
+                .completions()
+                .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                .await
+                .expect("work without callback metadata must not emit a webhook")
+        );
     }
 
     #[tokio::test]

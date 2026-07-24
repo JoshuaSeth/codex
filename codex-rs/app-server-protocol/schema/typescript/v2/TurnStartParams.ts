@@ -13,7 +13,10 @@ import type { UserInput } from "./UserInput";
 export type TurnStartParams = {threadId: string, clientUserMessageId?: string | null, /**
  * Durable control-plane work identity whose callback completes with this turn.
  */
-completionWorkId?: string | null, input: Array<UserInput>, /**
+completionWorkId?: string | null, /**
+ * Opaque metadata published by the completion webhook producer.
+ */
+completionCallbackMetadata?: JsonValue | null, input: Array<UserInput>, /**
  * Override the working directory for this turn and subsequent turns.
  */
 cwd?: string | null, /**

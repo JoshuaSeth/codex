@@ -742,6 +742,9 @@ pub struct ThreadGoalSetParams {
     /// Durable control-plane work identity whose callback completes with this goal.
     #[ts(optional = nullable)]
     pub completion_work_id: Option<String>,
+    /// Opaque metadata published by the completion webhook producer.
+    #[ts(optional = nullable)]
+    pub completion_callback_metadata: Option<JsonValue>,
     #[ts(optional = nullable)]
     pub objective: Option<String>,
     #[ts(optional = nullable)]

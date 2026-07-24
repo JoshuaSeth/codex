@@ -85,7 +85,9 @@ mod app_server_tracing;
 mod attestation;
 mod bespoke_event_handling;
 mod command_exec;
+mod completion_callback_metadata;
 mod completion_outbox_sender;
+mod completion_webhook_sender;
 mod config;
 mod config_manager;
 mod config_manager_service;
@@ -709,6 +711,12 @@ pub async fn run_main_with_transport_options(
             .map(|state_db| state_db.completions().clone()),
         transport_shutdown_token.clone(),
     )?;
+    let completion_webhook_sender_handle = completion_webhook_sender::start(
+        state_db
+            .as_ref()
+            .map(|state_db| state_db.completions().clone()),
+        transport_shutdown_token.clone(),
+    )?;
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
@@ -1182,6 +1190,9 @@ pub async fn run_main_with_transport_options(
 
     transport_shutdown_token.cancel();
     if let Some(handle) = completion_sender_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = completion_webhook_sender_handle {
         let _ = handle.await;
     }
     for handle in transport_accept_handles {

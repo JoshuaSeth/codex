@@ -70,6 +70,9 @@ pub struct TurnStartParams {
     /// Durable control-plane work identity whose callback completes with this turn.
     #[ts(optional = nullable)]
     pub completion_work_id: Option<String>,
+    /// Opaque metadata published by the completion webhook producer.
+    #[ts(optional = nullable)]
+    pub completion_callback_metadata: Option<JsonValue>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
     ///
@@ -172,6 +175,9 @@ pub struct TurnSteerParams {
     /// Durable control-plane work identity whose callback completes with the active turn.
     #[ts(optional = nullable)]
     pub completion_work_id: Option<String>,
+    /// Opaque metadata published by the completion webhook producer.
+    #[ts(optional = nullable)]
+    pub completion_callback_metadata: Option<JsonValue>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
     ///

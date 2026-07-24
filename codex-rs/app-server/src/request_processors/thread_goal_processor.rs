@@ -1,4 +1,5 @@
 use super::*;
+use crate::completion_callback_metadata::canonical_completion_callback_metadata;
 use codex_goal_extension::GoalObjectiveUpdate;
 use codex_goal_extension::GoalService;
 use codex_goal_extension::GoalServiceError;
@@ -107,6 +108,10 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        let completion_callback_metadata_json = canonical_completion_callback_metadata(
+            params.completion_work_id.as_deref(),
+            params.completion_callback_metadata.as_ref(),
+        )?;
         self.thread_residency_manager.note_accessed(thread_id).await;
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
@@ -149,6 +154,10 @@ impl ThreadGoalRequestProcessor {
                         None => GoalTokenBudgetUpdate::Keep,
                     },
                     completion_work_id: params.completion_work_id.as_deref(),
+                    completion_callback_metadata_json: Some(
+                        completion_callback_metadata_json.as_str(),
+                    )
+                    .filter(|metadata| !metadata.is_empty()),
                 },
             )
             .await
@@ -175,9 +184,17 @@ impl ThreadGoalRequestProcessor {
         let Some(completion_work_id) = params.completion_work_id.as_deref() else {
             return Ok(None);
         };
+        let completion_callback_metadata_json = canonical_completion_callback_metadata(
+            params.completion_work_id.as_deref(),
+            params.completion_callback_metadata.as_ref(),
+        )?;
         let binding = state_db
             .completions()
-            .existing_goal_binding(completion_work_id, thread_id)
+            .existing_goal_binding_with_callback_metadata(
+                completion_work_id,
+                thread_id,
+                &completion_callback_metadata_json,
+            )
             .await
             .map_err(|err| internal_error(format!("failed to read completion binding: {err}")))?;
         let Some((goal_id, _binding_state)) = binding else {

@@ -475,6 +475,7 @@ mod tests {
             thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
             execution_kind: "normal".to_string(),
             execution_id: "turn-1".to_string(),
+            callback_metadata_json: String::new(),
             terminal_status: "completed".to_string(),
             final_text: "done".to_string(),
             terminal_at_ms: 1_000,
