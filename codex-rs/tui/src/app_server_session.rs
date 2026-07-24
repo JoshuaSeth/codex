@@ -766,6 +766,7 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     client_user_message_id: None,
                     completion_work_id: None,
+                    completion_callback_metadata: None,
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
@@ -829,6 +830,7 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     client_user_message_id: None,
                     completion_work_id: None,
+                    completion_callback_metadata: None,
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
@@ -921,6 +923,7 @@ impl AppServerSession {
                 params: ThreadGoalSetParams {
                     thread_id: thread_id.to_string(),
                     completion_work_id: None,
+                    completion_callback_metadata: None,
                     objective,
                     status,
                     token_budget,
