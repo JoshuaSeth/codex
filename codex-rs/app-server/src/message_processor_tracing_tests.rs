@@ -655,6 +655,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     thread_id,
                     client_user_message_id: None,
                     completion_work_id: None,
+                    completion_callback_metadata: None,
                     input: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),

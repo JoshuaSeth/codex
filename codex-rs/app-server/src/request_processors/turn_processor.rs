@@ -1,4 +1,5 @@
 use super::*;
+use crate::completion_callback_metadata::canonical_completion_callback_metadata;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -557,6 +558,10 @@ impl TurnRequestProcessor {
         let environment_selections = self.parse_environment_selections(params.environments)?;
 
         // Map v2 input items to core input items.
+        let completion_callback_metadata_json = canonical_completion_callback_metadata(
+            params.completion_work_id.as_deref(),
+            params.completion_callback_metadata.as_ref(),
+        )?;
         let completion_work_id = params.completion_work_id;
         let mapped_items: Vec<CoreInputItem> = params
             .input
@@ -603,7 +608,11 @@ impl TurnRequestProcessor {
             let completions = state_db.completions();
             let _admission_guard = completions.lock_turn_admission().await;
             let existing_binding = completions
-                .existing_turn_binding(completion_work_id, thread_id)
+                .existing_turn_binding_with_callback_metadata(
+                    completion_work_id,
+                    thread_id,
+                    &completion_callback_metadata_json,
+                )
                 .await
                 .map_err(|err| {
                     internal_error(format!(
@@ -615,7 +624,12 @@ impl TurnRequestProcessor {
                 None => {
                     let turn_id = completion_work_id.to_string();
                     let binding_state = completions
-                        .bind_turn(completion_work_id, thread_id, &turn_id)
+                        .bind_turn_with_callback_metadata(
+                            completion_work_id,
+                            thread_id,
+                            &turn_id,
+                            &completion_callback_metadata_json,
+                        )
                         .await
                         .map_err(|err| {
                             internal_error(format!("failed to bind turn completion: {err}"))
@@ -1123,6 +1137,10 @@ impl TurnRequestProcessor {
             return Err(error);
         }
 
+        let completion_callback_metadata_json = canonical_completion_callback_metadata(
+            params.completion_work_id.as_deref(),
+            params.completion_callback_metadata.as_ref(),
+        )?;
         let completion_work_id = params.completion_work_id;
         let mapped_items: Vec<CoreInputItem> = params
             .input
@@ -1138,7 +1156,12 @@ impl TurnRequestProcessor {
                 let completions = state_db.completions();
                 let _admission_guard = completions.lock_turn_admission().await;
                 let binding_state = completions
-                    .bind_turn(completion_work_id, thread_id, &params.expected_turn_id)
+                    .bind_turn_with_callback_metadata(
+                        completion_work_id,
+                        thread_id,
+                        &params.expected_turn_id,
+                        &completion_callback_metadata_json,
+                    )
                     .await
                     .map_err(|err| {
                         internal_error(format!("failed to bind turn completion: {err}"))

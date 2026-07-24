@@ -52,6 +52,7 @@ pub struct GoalSetRequest<'a> {
     pub status: Option<ThreadGoalStatus>,
     pub token_budget: GoalTokenBudgetUpdate,
     pub completion_work_id: Option<&'a str>,
+    pub completion_callback_metadata_json: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +108,7 @@ impl GoalService {
             status,
             token_budget,
             completion_work_id,
+            completion_callback_metadata_json,
         } = request;
         let status = status.map(state_status_from_protocol);
         let objective = match objective {
@@ -164,10 +166,11 @@ impl GoalService {
                     Some(completion_work_id) => {
                         state_db
                             .thread_goals()
-                            .update_thread_goal_with_completion(
+                            .update_thread_goal_with_completion_metadata(
                                 thread_id,
                                 update,
                                 completion_work_id,
+                                completion_callback_metadata_json.unwrap_or_default(),
                             )
                             .await
                     }
@@ -194,12 +197,13 @@ impl GoalService {
                     Some(completion_work_id) => {
                         state_db
                             .thread_goals()
-                            .replace_thread_goal_with_completion(
+                            .replace_thread_goal_with_completion_metadata(
                                 thread_id,
                                 objective,
                                 status,
                                 token_budget.flatten(),
                                 completion_work_id,
+                                completion_callback_metadata_json.unwrap_or_default(),
                             )
                             .await
                     }
@@ -245,7 +249,12 @@ impl GoalService {
                 Some(completion_work_id) => {
                     state_db
                         .thread_goals()
-                        .update_thread_goal_with_completion(thread_id, update, completion_work_id)
+                        .update_thread_goal_with_completion_metadata(
+                            thread_id,
+                            update,
+                            completion_work_id,
+                            completion_callback_metadata_json.unwrap_or_default(),
+                        )
                         .await
                 }
                 None => {

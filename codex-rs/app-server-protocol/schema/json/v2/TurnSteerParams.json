@@ -224,6 +224,9 @@
         "null"
       ]
     },
+    "completionCallbackMetadata": {
+      "description": "Opaque metadata published by the completion webhook producer."
+    },
     "completionWorkId": {
       "description": "Durable control-plane work identity whose callback completes with the active turn.",
       "type": [
