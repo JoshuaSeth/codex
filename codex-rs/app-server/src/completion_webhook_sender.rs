@@ -1,3 +1,4 @@
+use crate::completion_callback_metadata::canonical_completion_callback_metadata;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
@@ -20,19 +21,24 @@ use tracing::warn;
 const WEBHOOK_URL_ENV: &str = "PITCHAI_CODEX_APP_SERVER_COMPLETION_WEBHOOK_URL";
 const WEBHOOK_TOKEN_ENV: &str = "PITCHAI_CODEX_APP_SERVER_COMPLETION_WEBHOOK_TOKEN";
 const SOURCE_CELL_SLUG_ENV: &str = "PITCHAI_PLATFORM_CELL_SLUG";
-const WEBHOOK_PROTOCOL_VERSION: &str = "pitchai-completion-webhook/v1";
+const WEBHOOK_PROTOCOL_VERSION: &str = "pitchai-completion-webhook/v2";
 const CLAIM_BATCH_SIZE: i64 = 8;
 const CLAIM_LEASE_MS: i64 = 60_000;
 const MAX_IDLE_SCAN_MS: i64 = 30_000;
 const STORE_ERROR_RETRY_MS: i64 = 1_000;
+const WEBHOOK_RETRY_BASE_MS: i64 = 1_000;
+const WEBHOOK_RETRY_MAX_MS: i64 = 300_000;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_CALLBACK_TEXT_CHARACTERS: usize = 65_536;
+const MIN_WEBHOOK_TOKEN_CHARACTERS: usize = 32;
+const MAX_WEBHOOK_CALLBACK_TEXT_CHARACTERS: usize = 4_096;
 const MAX_RECORDED_ERROR_CHARACTERS: usize = 16_384;
+const REDACTED_CALLBACK_TEXT: &str = "[redacted: callback text contained a potential secret]";
+const TRUNCATED_CALLBACK_SUFFIX: &str = " … [truncated for private event ingestion]";
 
 pub(crate) struct CompletionWebhookSenderConfig {
     endpoint: Url,
-    token: Option<String>,
+    token: String,
     source_cell_slug: Option<String>,
 }
 
@@ -47,10 +53,18 @@ struct CompletionWebhookPayload<'a> {
     execution_kind: &'a str,
     execution_id: &'a str,
     terminal_status: &'a str,
-    final_text: &'a str,
     terminal_at: String,
     callback_metadata: &'a Value,
+    final_output_reference: CompletionFinalOutputReference<'a>,
     correlation_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct CompletionFinalOutputReference<'a> {
+    storage: &'static str,
+    source_thread_id: &'a str,
+    execution_kind: &'a str,
+    execution_id: &'a str,
 }
 
 pub(crate) fn start(
@@ -106,7 +120,14 @@ impl CompletionWebhookSenderConfig {
         source_cell_slug: Option<&str>,
     ) -> io::Result<Self> {
         let endpoint = parse_webhook_url(endpoint)?;
-        let token = token.map(validate_secret).transpose()?.map(str::to_string);
+        let token = token
+            .ok_or_else(|| {
+                invalid_configuration(format!(
+                    "{WEBHOOK_TOKEN_ENV} is required when {WEBHOOK_URL_ENV} is configured"
+                ))
+            })
+            .and_then(validate_secret)?
+            .to_string();
         let source_cell_slug = source_cell_slug
             .map(validate_cell_slug)
             .transpose()?
@@ -174,40 +195,103 @@ async fn deliver_event(
     client: &Client,
     event: &CompletionOutboxEvent,
 ) {
-    let attempt_error = match callback_metadata(event) {
-        Ok(metadata) => post_event(config, client, event, &metadata)
-            .await
-            .err()
-            .map(|error| bounded_error(&error)),
-        Err(error) => Some(bounded_error(&error)),
+    let metadata = match callback_metadata(event) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            finalize_invalid_event(store, event, &error).await;
+            return;
+        }
     };
-    let stored_error = attempt_error.as_deref().unwrap_or_default();
+    match post_event(config, client, event, &metadata).await {
+        Ok(()) => match store
+            .mark_webhook_attempted(&event.event_id, &event.lease_id, "")
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    event_id = %event.event_id,
+                    completion_work_id = %event.completion_work_id,
+                    attempt = event.attempt,
+                    "completion webhook accepted"
+                );
+            }
+            Ok(false) => {
+                warn!(
+                    event_id = %event.event_id,
+                    attempt = event.attempt,
+                    "completion webhook lease changed before acceptance was finalized"
+                );
+            }
+            Err(err) => {
+                error!(
+                    event_id = %event.event_id,
+                    attempt = event.attempt,
+                    error = %err,
+                    "failed to finalize accepted completion webhook"
+                );
+            }
+        },
+        Err(error) => {
+            let stored_error = bounded_error(&error);
+            let delay_ms = webhook_retry_delay_ms(event.attempt);
+            match store
+                .retry_webhook_later(&event.event_id, &event.lease_id, &stored_error, delay_ms)
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        completion_work_id = %event.completion_work_id,
+                        attempt = event.attempt,
+                        retry_delay_ms = delay_ms,
+                        error = %stored_error,
+                        "completion webhook failed and remains durably pending"
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        attempt = event.attempt,
+                        "completion webhook lease changed before retry was scheduled"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        event_id = %event.event_id,
+                        attempt = event.attempt,
+                        error = %err,
+                        "failed to persist completion webhook retry"
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn finalize_invalid_event(
+    store: &CompletionStore,
+    event: &CompletionOutboxEvent,
+    error: &str,
+) {
+    let stored_error = bounded_error(error);
     match store
-        .mark_webhook_attempted(&event.event_id, &event.lease_id, stored_error)
+        .mark_webhook_attempted(&event.event_id, &event.lease_id, &stored_error)
         .await
     {
-        Ok(true) if attempt_error.is_none() => {
-            info!(
-                event_id = %event.event_id,
-                completion_work_id = %event.completion_work_id,
-                attempt = event.attempt,
-                "completion webhook accepted"
-            );
-        }
         Ok(true) => {
             warn!(
                 event_id = %event.event_id,
                 completion_work_id = %event.completion_work_id,
                 attempt = event.attempt,
                 error = %stored_error,
-                "completion webhook attempt failed and was finalized without retry"
+                "completion webhook metadata is invalid and cannot be retried"
             );
         }
         Ok(false) => {
             warn!(
                 event_id = %event.event_id,
                 attempt = event.attempt,
-                "completion webhook lease changed before the attempt was finalized"
+                "completion webhook lease changed before invalid metadata was finalized"
             );
         }
         Err(err) => {
@@ -215,10 +299,17 @@ async fn deliver_event(
                 event_id = %event.event_id,
                 attempt = event.attempt,
                 error = %err,
-                "failed to finalize completion webhook attempt"
+                "failed to finalize invalid completion webhook"
             );
         }
     }
+}
+
+fn webhook_retry_delay_ms(attempt: i64) -> i64 {
+    let exponent = u32::try_from(attempt.saturating_sub(1).clamp(0, 9)).unwrap_or(9);
+    WEBHOOK_RETRY_BASE_MS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(WEBHOOK_RETRY_MAX_MS)
 }
 
 async fn post_event(
@@ -236,15 +327,18 @@ async fn post_event(
         execution_kind: &event.execution_kind,
         execution_id: &event.execution_id,
         terminal_status: &event.terminal_status,
-        final_text: &event.final_text,
         terminal_at: terminal_timestamp(event.terminal_at_ms)?,
         callback_metadata,
+        final_output_reference: CompletionFinalOutputReference {
+            storage: "pitchai_cli_app_server_state",
+            source_thread_id: &event.thread_id,
+            execution_kind: &event.execution_kind,
+            execution_id: &event.execution_id,
+        },
         correlation_id: &event.completion_work_id,
     };
     let mut request = client.post(config.endpoint.clone()).json(&payload);
-    if let Some(token) = config.token.as_deref() {
-        request = request.bearer_auth(token);
-    }
+    request = request.bearer_auth(&config.token);
     let response = request
         .send()
         .await
@@ -265,25 +359,133 @@ fn callback_metadata(event: &CompletionOutboxEvent) -> Result<Value, String> {
             "completion callback metadata is absent; webhook was not attempted".to_string(),
         );
     }
-    let metadata: Value = serde_json::from_str(&event.callback_metadata_json)
+    let mut metadata: Value = serde_json::from_str(&event.callback_metadata_json)
         .map_err(|err| format!("stored completion callback metadata is invalid JSON: {err}"))?;
+    canonical_completion_callback_metadata(Some(&event.completion_work_id), Some(&metadata))
+        .map_err(|_| {
+            "stored completion callback metadata violates the producer contract".to_string()
+        })?;
+    let text = metadata
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "stored completion callback metadata has no text".to_string())?;
+    let safe_text = safe_callback_text(text);
     let object = metadata
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| "stored completion callback metadata is not an object".to_string())?;
-    let text = object.get("text").and_then(Value::as_str);
-    let invalid_text = text.is_none_or(|text| {
-        text.trim().is_empty() || text.chars().count() > MAX_CALLBACK_TEXT_CHARACTERS
-    });
-    if object.len() != 2
-        || object.get("protocol_version").and_then(Value::as_str)
-            != Some("pitchai-completion-callback/v1")
-        || invalid_text
-    {
-        return Err(
-            "stored completion callback metadata violates the producer contract".to_string(),
-        );
-    }
+    object.insert("text".to_string(), Value::String(safe_text));
     Ok(metadata)
+}
+
+fn safe_callback_text(text: &str) -> String {
+    if contains_potential_secret(text) {
+        return REDACTED_CALLBACK_TEXT.to_string();
+    }
+    let mut characters = text.chars();
+    let bounded: String = characters
+        .by_ref()
+        .take(MAX_WEBHOOK_CALLBACK_TEXT_CHARACTERS)
+        .collect();
+    if characters.next().is_none() {
+        bounded
+    } else {
+        format!("{bounded}{TRUNCATED_CALLBACK_SUFFIX}")
+    }
+}
+
+fn contains_potential_secret(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if (lower.contains("-----begin") && lower.contains("private key-----"))
+        || contains_bearer_credential(&lower)
+        || contains_credential_url(text)
+    {
+        return true;
+    }
+    if text
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'')
+        })
+        .any(looks_like_known_token)
+    {
+        return true;
+    }
+    text.lines().any(line_contains_assigned_secret)
+}
+
+fn contains_bearer_credential(text: &str) -> bool {
+    text.split_once("bearer ").is_some_and(|(_, remainder)| {
+        remainder
+            .split_whitespace()
+            .next()
+            .is_some_and(|value| value.len() >= 12)
+    })
+}
+
+fn contains_credential_url(text: &str) -> bool {
+    text.split_whitespace().any(|word| {
+        let Some((_, authority_and_path)) = word.split_once("://") else {
+            return false;
+        };
+        authority_and_path
+            .split_once('@')
+            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+    })
+}
+
+fn looks_like_known_token(raw: &str) -> bool {
+    let token = raw.trim_matches(|character: char| {
+        matches!(
+            character,
+            '(' | ')' | '[' | ']' | '{' | '}' | '.' | ':' | '='
+        )
+    });
+    let lower = token.to_ascii_lowercase();
+    [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix) && token.len() >= prefix.len() + 12)
+        || (token.starts_with("eyJ") && token.matches('.').count() == 2 && token.len() >= 32)
+}
+
+fn line_contains_assigned_secret(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "password",
+        "passwd",
+        "client_secret",
+        "client-secret",
+        "api_key",
+        "api-key",
+        "access_token",
+        "refresh_token",
+        "private_key",
+    ]
+    .iter()
+    .any(|label| {
+        let Some(index) = lower.find(label) else {
+            return false;
+        };
+        let remainder = line[index + label.len()..].trim_start();
+        let Some(value) = remainder
+            .strip_prefix('=')
+            .or_else(|| remainder.strip_prefix(':'))
+            .map(str::trim)
+        else {
+            return false;
+        };
+        value
+            .split_whitespace()
+            .next()
+            .is_some_and(|candidate| candidate.len() >= 8)
+    })
 }
 
 fn terminal_timestamp(epoch_millis: i64) -> Result<String, String> {
@@ -325,9 +527,12 @@ fn parse_webhook_url(raw: &str) -> io::Result<Url> {
 }
 
 fn validate_secret(value: &str) -> io::Result<&str> {
-    if value.trim() != value || value.is_empty() || value.chars().any(char::is_control) {
+    if value.trim() != value
+        || value.chars().count() < MIN_WEBHOOK_TOKEN_CHARACTERS
+        || value.chars().any(char::is_whitespace)
+    {
         return Err(invalid_configuration(format!(
-            "{WEBHOOK_TOKEN_ENV} must be non-empty, unpadded, and contain no control characters"
+            "{WEBHOOK_TOKEN_ENV} must contain at least {MIN_WEBHOOK_TOKEN_CHARACTERS} non-whitespace characters"
         )));
     }
     Ok(value)
@@ -395,7 +600,7 @@ mod tests {
     use tokio::time::sleep;
     use tokio::time::timeout;
 
-    const TOKEN: &str = "test-completion-webhook-token";
+    const TOKEN: &str = "test-completion-webhook-token-20260727";
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FailureMode {
@@ -417,7 +622,7 @@ mod tests {
             config.endpoint.as_str(),
             "https://events.example.test/webhooks/pitchai/completions"
         );
-        assert_eq!(config.token.as_deref(), Some(TOKEN));
+        assert_eq!(config.token, TOKEN);
         assert_eq!(config.source_cell_slug.as_deref(), Some("dev-main"));
     }
 
@@ -442,10 +647,18 @@ mod tests {
         assert!(
             CompletionWebhookSenderConfig::from_values(
                 "http://127.0.0.1:8123/callback",
-                None,
+                Some(TOKEN),
                 None,
             )
             .is_ok()
+        );
+        assert!(
+            CompletionWebhookSenderConfig::from_values(
+                "http://127.0.0.1:8123/callback",
+                None,
+                None,
+            )
+            .is_err()
         );
     }
 
@@ -486,9 +699,13 @@ mod tests {
         let request = capture.await.expect("capture");
 
         assert!(request.contains("POST /capture HTTP/1.1"));
-        assert!(request.contains("authorization: Bearer test-completion-webhook-token"));
-        assert!(request.contains("\"protocol_version\":\"pitchai-completion-webhook/v1\""));
+        assert!(request.contains("authorization: Bearer test-completion-webhook-token-20260727"));
+        assert!(request.contains("\"protocol_version\":\"pitchai-completion-webhook/v2\""));
         assert!(request.contains("\"callback_metadata\""));
+        assert!(request.contains("\"source_agent_id\":\"worker-agent\""));
+        assert!(request.contains("\"project_title\":\"PitchAI Infrastructure\""));
+        assert!(request.contains("\"final_output_reference\""));
+        assert!(!request.contains("\"final_text\""));
         assert!(!request.contains("\"target\""));
         assert!(!request.contains("\"recipient\""));
         assert!(!request.contains("\"route\""));
@@ -508,7 +725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_webhooks_are_attempted_once_without_blocking_central_completion() {
+    async fn failed_webhooks_remain_durably_pending_without_blocking_central_completion() {
         for failure_mode in [
             FailureMode::HttpUnavailable,
             FailureMode::Disconnect,
@@ -594,13 +811,13 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let stats = store.webhook_outbox_stats().await.expect("stats");
-                if stats.sent_count == 1 {
+                if stats.pending_count == 1 && stats.total_attempts == 1 {
                     assert_eq!(1, stats.total_attempts);
-                    assert_eq!(0, stats.pending_count);
                     assert_eq!(0, stats.sending_count);
+                    assert_eq!(0, stats.sent_count);
                     break;
                 }
-                assert!(Instant::now() < deadline, "attempt was not finalized");
+                assert!(Instant::now() < deadline, "retry was not persisted");
                 sleep(Duration::from_millis(20)).await;
             }
             let central_stats = store.outbox_stats().await.expect("central stats");
@@ -612,6 +829,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn webhook_retry_delay_is_exponential_and_caps_at_five_minutes() {
+        assert_eq!(1_000, webhook_retry_delay_ms(1));
+        assert_eq!(256_000, webhook_retry_delay_ms(9));
+        assert_eq!(WEBHOOK_RETRY_MAX_MS, webhook_retry_delay_ms(10));
+        assert_eq!(WEBHOOK_RETRY_MAX_MS, webhook_retry_delay_ms(i64::MAX));
+    }
+
+    #[test]
+    fn callback_text_is_bounded_and_secret_assignments_are_removed() {
+        let long_text = "a".repeat(MAX_WEBHOOK_CALLBACK_TEXT_CHARACTERS + 1);
+
+        assert!(safe_callback_text(&long_text).ends_with(TRUNCATED_CALLBACK_SUFFIX));
+        assert_eq!(
+            REDACTED_CALLBACK_TEXT,
+            safe_callback_text("client_secret=supersecretvalue")
+        );
+        assert_eq!(
+            REDACTED_CALLBACK_TEXT,
+            safe_callback_text("Use Bearer abcdefghijklmnopqrstuvwxyz")
+        );
+        assert_eq!(
+            "Report whether Jef's password reset completed.",
+            safe_callback_text("Report whether Jef's password reset completed.")
+        );
+    }
+
     fn sample_event() -> CompletionOutboxEvent {
         CompletionOutboxEvent {
             event_id: "10000000-0000-0000-0000-000000000001".to_string(),
@@ -620,8 +864,18 @@ mod tests {
             execution_kind: "normal".to_string(),
             execution_id: "10000000-0000-0000-0000-000000000001".to_string(),
             callback_metadata_json: json!({
-                "protocol_version": "pitchai-completion-callback/v1",
-                "text": "Publish this result."
+                "protocol_version": "pitchai-completion-callback/v2",
+                "text": "Publish this result.",
+                "context": {
+                    "source_agent_id": "worker-agent",
+                    "project_id": "pitchai_infrastructure",
+                    "project_title": "PitchAI Infrastructure",
+                    "command_work_id": "10000000-0000-0000-0000-000000000001",
+                    "origin_actor_kind": "agent",
+                    "origin_agent_id": "ori",
+                    "origin_source_ref_kind": "codex_thread",
+                    "origin_source_ref_id": "40000000-0000-0000-0000-000000000001"
+                }
             })
             .to_string(),
             terminal_status: "completed".to_string(),
