@@ -326,6 +326,15 @@ impl ThreadGoalRequestProcessor {
         thread_id: ThreadId,
         state_db: &StateDbHandle,
     ) -> Result<(), JSONRPCErrorError> {
+        match state_db.get_thread(thread_id).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    "failed to read existing thread metadata before goal reconciliation for {thread_id}: {err}"
+                );
+            }
+        }
         let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
         let rollout_path = match running_thread.as_ref() {
             Some(thread) => thread.rollout_path().ok_or_else(|| {
