@@ -8987,6 +8987,47 @@ async fn normal_task_completion_starts_pending_trigger_turn() {
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_leaves_pending_trigger_turn_queued() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        GatedCompletingTask {
+            started: Arc::clone(&started),
+            finish,
+        },
+    )
+    .await;
+    timeout(StdDuration::from_secs(2), started.notified())
+        .await
+        .expect("active turn should start");
+    while rx.try_recv().is_ok() {}
+
+    sess.input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "work that must survive residency shutdown".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+
+    sess.abort_all_tasks_for_shutdown().await;
+
+    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event.msg, EventMsg::TurnStarted(_)),
+            "shutdown must not start queued work while persistence is closing"
+        );
+    }
+}
+
 #[tokio::test]
 async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
