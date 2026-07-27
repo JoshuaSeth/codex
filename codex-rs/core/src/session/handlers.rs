@@ -43,7 +43,6 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
-use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -583,7 +582,10 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    // Shutdown must leave trigger-turn mailbox work queued for the next
+    // session. Restarting it here races persistence teardown and can leave an
+    // orphan task writing through a recorder that shutdown already removed.
+    sess.abort_all_tasks_for_shutdown().await;
     let _ = sess.conversation.shutdown().await;
     sess.services
         .unified_exec_manager
