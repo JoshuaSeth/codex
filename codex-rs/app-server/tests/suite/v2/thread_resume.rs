@@ -1232,6 +1232,7 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
+    let rollout_file_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &thread_id);
 
     let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -1267,6 +1268,8 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
         .await?
         .expect("thread metadata should exist");
     assert_eq!(thread_metadata.preview.as_deref(), Some("keep polishing"));
+    let thread_metadata_updated_at = thread_metadata.updated_at;
+    set_rollout_mtime(&rollout_file_path, "2030-01-07T00:00:00Z")?;
     let persisted_goal = state_db
         .thread_goals()
         .get_thread_goal(thread_id)
@@ -1312,6 +1315,7 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 
     assert_eq!(persisted_goal.goal_id, updated_goal.goal_id);
     assert_eq!(thread_metadata.preview.as_deref(), Some("keep polishing"));
+    assert_eq!(thread_metadata.updated_at, thread_metadata_updated_at);
     assert_eq!(edit.goal.objective, "keep polishing with clearer wording");
     assert_eq!(edit.goal.status, ThreadGoalStatus::BudgetLimited);
     assert_eq!(edit.goal.token_budget, Some(40));
