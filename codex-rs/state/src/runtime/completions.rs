@@ -887,6 +887,42 @@ WHERE event_id = ? AND state = 'sending' AND lease_id = ?
         Ok(updated == 1)
     }
 
+    pub async fn retry_webhook_later(
+        &self,
+        event_id: &str,
+        lease_id: &str,
+        error: &str,
+        delay_ms: i64,
+    ) -> anyhow::Result<bool> {
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let available_at_ms = now_ms.saturating_add(delay_ms.max(0));
+        let updated = sqlx::query(
+            r#"
+UPDATE completion_webhook_outbox
+SET
+    state = 'pending',
+    available_at_ms = ?,
+    lease_id = NULL,
+    lease_expires_at_ms = NULL,
+    last_error = ?,
+    updated_at_ms = ?
+WHERE event_id = ? AND state = 'sending' AND lease_id = ?
+            "#,
+        )
+        .bind(available_at_ms)
+        .bind(error)
+        .bind(now_ms)
+        .bind(event_id)
+        .bind(lease_id)
+        .execute(self.pool.as_ref())
+        .await?
+        .rows_affected();
+        if updated == 1 {
+            self.notify_sender();
+        }
+        Ok(updated == 1)
+    }
+
     pub async fn retry_later(
         &self,
         event_id: &str,
@@ -1396,24 +1432,31 @@ mod tests {
             callback_metadata_json,
             webhook_claim[0].callback_metadata_json
         );
-        let webhook_finalized = runtime
+        let webhook_retry_scheduled = runtime
             .completions()
-            .mark_webhook_attempted(
+            .retry_webhook_later(
                 &webhook_claim[0].event_id,
                 &webhook_claim[0].lease_id,
                 "receiver unavailable",
+                /*delay_ms*/ 0,
             )
             .await
-            .expect("one webhook attempt should be finalized");
+            .expect("webhook retry should be persisted");
+        assert!(webhook_retry_scheduled);
+        let webhook_retry = runtime
+            .completions()
+            .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+            .await
+            .expect("failed webhook should remain claimable");
+        assert_eq!(1, webhook_retry.len());
+        assert_eq!(2, webhook_retry[0].attempt);
+        assert_ne!(webhook_claim[0].lease_id, webhook_retry[0].lease_id);
+        let webhook_finalized = runtime
+            .completions()
+            .mark_webhook_attempted(&webhook_retry[0].event_id, &webhook_retry[0].lease_id, "")
+            .await
+            .expect("accepted webhook should be finalized");
         assert!(webhook_finalized);
-        assert_eq!(
-            Vec::<CompletionOutboxEvent>::new(),
-            runtime
-                .completions()
-                .claim_webhook_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
-                .await
-                .expect("a failed webhook must not retry in the app-server")
-        );
     }
 
     #[tokio::test]
