@@ -295,6 +295,15 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { update_thread_metadata::update_thread_metadata(self, params).await })
     }
 
+    fn apply_thread_metadata_patch(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(
+            async move { update_thread_metadata::apply_thread_metadata_patch(self, params).await },
+        )
+    }
+
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { archive_thread::archive_thread(self, params).await })
     }
