@@ -111,6 +111,7 @@ mod thread_processor_behavior_tests {
     use chrono::DateTime;
     use chrono::Utc;
     use codex_app_server_protocol::ServerRequestPayload;
+    use codex_app_server_protocol::ThreadActiveFlag;
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_config::CloudConfigBundleLoader;
@@ -144,9 +145,209 @@ mod thread_processor_behavior_tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::future::pending;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn status_list_snapshots_many_thread_ids_in_one_batch() {
+        const THREAD_COUNT: usize = 64;
+        let thread_ids = (0..THREAD_COUNT)
+            .map(|_| ThreadId::new())
+            .collect::<Vec<_>>();
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_calls_for_read = Arc::clone(&snapshot_calls);
+
+        let statuses = loaded_statuses_with_bounded_live_active_turn_ids(
+            thread_ids,
+            move |thread_ids| {
+                snapshot_calls_for_read.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(thread_ids.len(), THREAD_COUNT);
+                    thread_ids
+                        .into_iter()
+                        .map(|thread_id| (thread_id, ThreadStatus::NotLoaded))
+                        .collect()
+                }
+            },
+            |_| async { None },
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(snapshot_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(statuses.len(), THREAD_COUNT);
+        assert!(
+            statuses
+                .values()
+                .all(|status| status == &ThreadStatus::NotLoaded)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_list_preserves_and_backfills_live_active_turn_ids() {
+        let preserved_id = ThreadId::new();
+        let active_without_id = ThreadId::new();
+        let stale_idle = ThreadId::new();
+        let stale_not_loaded = ThreadId::new();
+        let stale_system_error = ThreadId::new();
+        let watch_statuses = HashMap::from([
+            (
+                preserved_id.to_string(),
+                ThreadStatus::Active {
+                    active_turn_id: Some("turn-from-watch".to_string()),
+                    active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+                },
+            ),
+            (
+                active_without_id.to_string(),
+                ThreadStatus::Active {
+                    active_turn_id: None,
+                    active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                },
+            ),
+            (stale_idle.to_string(), ThreadStatus::Idle),
+            (stale_not_loaded.to_string(), ThreadStatus::NotLoaded),
+            (stale_system_error.to_string(), ThreadStatus::SystemError),
+        ]);
+        let live_active_turn_ids = Arc::new(HashMap::from([
+            (active_without_id, Some("turn-from-core-active".to_string())),
+            (stale_idle, Some("turn-from-core-idle".to_string())),
+            (stale_not_loaded, None),
+            (stale_system_error, Some("turn-from-core-error".to_string())),
+        ]));
+        let queried_thread_ids = Arc::new(StdMutex::new(Vec::new()));
+        let queried_thread_ids_for_read = Arc::clone(&queried_thread_ids);
+        let live_active_turn_ids_for_read = Arc::clone(&live_active_turn_ids);
+
+        let statuses = loaded_statuses_with_bounded_live_active_turn_ids(
+            vec![
+                preserved_id,
+                active_without_id,
+                stale_idle,
+                stale_not_loaded,
+                stale_system_error,
+            ],
+            move |_| async move { watch_statuses },
+            move |thread_id| {
+                queried_thread_ids_for_read
+                    .lock()
+                    .expect("query record lock")
+                    .push(thread_id);
+                let live_active_turn_id = live_active_turn_ids_for_read
+                    .get(&thread_id)
+                    .cloned()
+                    .flatten();
+                async move { live_active_turn_id }
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(
+            statuses,
+            HashMap::from([
+                (
+                    preserved_id.to_string(),
+                    ThreadStatus::Active {
+                        active_turn_id: Some("turn-from-watch".to_string()),
+                        active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+                    },
+                ),
+                (
+                    active_without_id.to_string(),
+                    ThreadStatus::Active {
+                        active_turn_id: Some("turn-from-core-active".to_string()),
+                        active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
+                    },
+                ),
+                (
+                    stale_idle.to_string(),
+                    ThreadStatus::Active {
+                        active_turn_id: Some("turn-from-core-idle".to_string()),
+                        active_flags: Vec::new(),
+                    },
+                ),
+                (stale_not_loaded.to_string(), ThreadStatus::NotLoaded),
+                (
+                    stale_system_error.to_string(),
+                    ThreadStatus::Active {
+                        active_turn_id: Some("turn-from-core-error".to_string()),
+                        active_flags: Vec::new(),
+                    },
+                ),
+            ])
+        );
+        let queried_thread_ids = queried_thread_ids.lock().expect("query record lock");
+        assert_eq!(queried_thread_ids.len(), 4);
+        assert!(!queried_thread_ids.contains(&preserved_id));
+    }
+
+    #[tokio::test]
+    async fn status_list_bounds_one_blocked_core_active_turn_read() {
+        const THREAD_COUNT: usize = 12;
+        let thread_ids = (0..THREAD_COUNT)
+            .map(|_| ThreadId::new())
+            .collect::<Vec<_>>();
+        let blocked_thread_id = thread_ids[0];
+        let watch_statuses = thread_ids
+            .iter()
+            .map(|thread_id| {
+                let status = if *thread_id == blocked_thread_id {
+                    ThreadStatus::SystemError
+                } else {
+                    ThreadStatus::Idle
+                };
+                (thread_id.to_string(), status)
+            })
+            .collect::<HashMap<_, _>>();
+        let read_barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let read_barrier_for_reads = Arc::clone(&read_barrier);
+        let expected_thread_ids = thread_ids.clone();
+
+        let statuses = tokio::time::timeout(
+            Duration::from_secs(1),
+            loaded_statuses_with_bounded_live_active_turn_ids(
+                thread_ids,
+                move |_| async move { watch_statuses },
+                move |thread_id| {
+                    let read_barrier = Arc::clone(&read_barrier_for_reads);
+                    async move {
+                        read_barrier.wait().await;
+                        if thread_id == blocked_thread_id {
+                            pending::<Option<String>>().await
+                        } else {
+                            Some(format!("turn-{thread_id}"))
+                        }
+                    }
+                },
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("one blocked core read must not stall the status batch");
+
+        let expected_statuses = expected_thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                let status = if thread_id == blocked_thread_id {
+                    ThreadStatus::SystemError
+                } else {
+                    ThreadStatus::Active {
+                        active_turn_id: Some(format!("turn-{thread_id}")),
+                        active_flags: Vec::new(),
+                    }
+                };
+                (thread_id.to_string(), status)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses, expected_statuses);
+    }
 
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {
