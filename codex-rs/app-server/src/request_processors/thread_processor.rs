@@ -5,9 +5,11 @@ use codex_extension_api::ExtensionDataInit;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_utils_path_uri::PathUri;
+use futures::future::join_all;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
+const THREAD_STATUS_LIST_LIVE_BACKFILL_TIMEOUT: Duration = Duration::from_millis(250);
 
 struct ThreadListFilters {
     model_providers: Option<Vec<String>>,
@@ -17,6 +19,61 @@ struct ThreadListFilters {
     search_term: Option<String>,
     use_state_db_only: bool,
     parent_thread_id: Option<ThreadId>,
+}
+
+async fn loaded_statuses_with_bounded_live_active_turn_ids<
+    SnapshotStatuses,
+    SnapshotStatusesFuture,
+    ReadLiveActiveTurnId,
+    ReadLiveActiveTurnIdFuture,
+>(
+    thread_ids: Vec<ThreadId>,
+    snapshot_statuses: SnapshotStatuses,
+    read_live_active_turn_id: ReadLiveActiveTurnId,
+    live_read_timeout: Duration,
+) -> HashMap<String, ThreadStatus>
+where
+    SnapshotStatuses: FnOnce(Vec<String>) -> SnapshotStatusesFuture,
+    SnapshotStatusesFuture: std::future::Future<Output = HashMap<String, ThreadStatus>>,
+    ReadLiveActiveTurnId: Fn(ThreadId) -> ReadLiveActiveTurnIdFuture,
+    ReadLiveActiveTurnIdFuture: std::future::Future<Output = Option<String>>,
+{
+    let thread_ids_by_string: HashMap<String, ThreadId> = thread_ids
+        .into_iter()
+        .map(|thread_id| (thread_id.to_string(), thread_id))
+        .collect();
+    let mut statuses = snapshot_statuses(thread_ids_by_string.keys().cloned().collect()).await;
+    let live_active_turn_ids = thread_ids_by_string
+        .into_iter()
+        .filter(|(thread_id, _)| {
+            !matches!(
+                statuses.get(thread_id),
+                Some(ThreadStatus::Active {
+                    active_turn_id: Some(_),
+                    ..
+                })
+            )
+        })
+        .map(|(thread_id_string, thread_id)| {
+            let live_active_turn_id = read_live_active_turn_id(thread_id);
+            async move {
+                let live_active_turn_id =
+                    tokio::time::timeout(live_read_timeout, live_active_turn_id)
+                        .await
+                        .ok()
+                        .flatten();
+                (thread_id_string, live_active_turn_id)
+            }
+        });
+    for (thread_id, live_active_turn_id) in join_all(live_active_turn_ids).await {
+        if let Some(status) = statuses.remove(&thread_id) {
+            statuses.insert(
+                thread_id,
+                status_with_live_active_turn_id(status, live_active_turn_id),
+            );
+        }
+    }
+    statuses
 }
 
 fn collect_resume_override_mismatches(
@@ -2221,11 +2278,27 @@ impl ThreadRequestProcessor {
                 .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
             status_ids.push(status_id);
         }
-        let mut statuses = HashMap::with_capacity(status_ids.len());
-        for status_id in status_ids {
-            let status = self.loaded_status_for_thread(status_id).await;
-            statuses.insert(status_id.to_string(), status);
-        }
+        let thread_watch_manager = self.thread_watch_manager.clone();
+        let thread_manager = Arc::clone(&self.thread_manager);
+        let statuses = loaded_statuses_with_bounded_live_active_turn_ids(
+            status_ids,
+            move |thread_ids| async move {
+                thread_watch_manager
+                    .loaded_statuses_for_threads(thread_ids)
+                    .await
+            },
+            move |thread_id| {
+                let thread_manager = Arc::clone(&thread_manager);
+                async move {
+                    match thread_manager.get_thread(thread_id).await {
+                        Ok(thread) => thread.active_turn_id().await,
+                        Err(_) => None,
+                    }
+                }
+            },
+            THREAD_STATUS_LIST_LIVE_BACKFILL_TIMEOUT,
+        )
+        .await;
         Ok(ThreadStatusListResponse { statuses })
     }
 
