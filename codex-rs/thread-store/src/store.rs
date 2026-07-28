@@ -120,6 +120,20 @@ pub trait ThreadStore: Any + Send + Sync {
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, StoredThread>;
 
+    /// Applies a literal metadata patch without requiring a materialized thread response.
+    ///
+    /// Live append paths use this operation when they only need to synchronize derived metadata.
+    /// Implementations may avoid reading persisted rollout history to construct a return value.
+    fn apply_thread_metadata_patch(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.update_thread_metadata(params).await?;
+            Ok(())
+        })
+    }
+
     /// Archives a thread.
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>;
 

@@ -55,7 +55,7 @@ pub(super) async fn update_thread_metadata(
 
     let needs_rollout_compat = needs_rollout_compatibility_update(&patch);
     let require_sqlite_write = sqlite_write_failure_should_block(&patch);
-    let updated = apply_metadata_update(
+    apply_metadata_update(
         store,
         thread_id,
         patch.clone(),
@@ -64,7 +64,15 @@ pub(super) async fn update_thread_metadata(
     )
     .await?;
     if !needs_rollout_compat {
-        return Ok(updated);
+        return read_thread::read_thread(
+            store,
+            ReadThreadParams {
+                thread_id,
+                include_archived: params.include_archived,
+                include_history: false,
+            },
+        )
+        .await;
     }
 
     let live_thread_loaded = live_writer::rollout_path(store, thread_id).await.is_ok();
@@ -185,6 +193,28 @@ pub(super) async fn update_thread_metadata(
     Ok(thread)
 }
 
+pub(super) async fn apply_thread_metadata_patch(
+    store: &LocalThreadStore,
+    params: UpdateThreadMetadataParams,
+) -> ThreadStoreResult<()> {
+    if params.patch.is_empty() {
+        return Ok(());
+    }
+    if needs_rollout_compatibility_update(&params.patch) {
+        update_thread_metadata(store, params).await?;
+        return Ok(());
+    }
+    let require_sqlite_write = sqlite_write_failure_should_block(&params.patch);
+    apply_metadata_update(
+        store,
+        params.thread_id,
+        params.patch,
+        params.include_archived,
+        require_sqlite_write,
+    )
+    .await
+}
+
 async fn refresh_resolved_rollout_path(resolved: &mut ResolvedRolloutPath) {
     if let Some(path) = codex_rollout::existing_rollout_path(resolved.path.as_path()).await {
         resolved.path = path;
@@ -197,7 +227,7 @@ async fn apply_metadata_update(
     patch: ThreadMetadataPatch,
     include_archived: bool,
     require_sqlite_write: bool,
-) -> ThreadStoreResult<StoredThread> {
+) -> ThreadStoreResult<()> {
     let live_rollout_path = live_writer::rollout_path(store, thread_id).await.ok();
     let mut rollout_path = patch.rollout_path.clone().or(live_rollout_path);
     let mut rollout_path_archived = rollout_path
@@ -351,15 +381,7 @@ async fn apply_metadata_update(
         }
     }
 
-    read_thread::read_thread(
-        store,
-        ReadThreadParams {
-            thread_id,
-            include_archived,
-            include_history: false,
-        },
-    )
-    .await
+    Ok(())
 }
 
 fn needs_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
@@ -682,6 +704,48 @@ mod tests {
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
+
+    #[tokio::test]
+    async fn apply_thread_metadata_patch_indexes_observed_facts_without_readback() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(300);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-03T13-30-00", uuid).expect("session file");
+        let updated_at = chrono::DateTime::parse_from_rfc3339("2026-07-28T17:34:48.759Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+
+        store
+            .apply_thread_metadata_patch(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    preview: Some("Observed preview".to_string()),
+                    updated_at: Some(updated_at),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("apply metadata patch");
+
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(metadata.rollout_path, rollout_path);
+        assert_eq!(metadata.preview.as_deref(), Some("Observed preview"));
+        assert_eq!(metadata.updated_at, updated_at);
+    }
 
     #[tokio::test]
     async fn update_thread_metadata_sets_name_on_active_rollout_and_indexes_name() {

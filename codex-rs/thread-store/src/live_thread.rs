@@ -154,7 +154,7 @@ impl LiveThread {
             .observe_appended_items(canonical_items.as_slice());
         if let Some(update) = update {
             self.thread_store
-                .update_thread_metadata(UpdateThreadMetadataParams {
+                .apply_thread_metadata_patch(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
                     patch: update.patch.clone(),
                     include_archived: true,
@@ -288,7 +288,7 @@ impl LiveThread {
             return Ok(());
         };
         self.thread_store
-            .update_thread_metadata(UpdateThreadMetadataParams {
+            .apply_thread_metadata_patch(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch: update.patch.clone(),
                 include_archived: true,
