@@ -43,6 +43,7 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
+use crate::session::turn_context::SamplingReasoningConfig;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
@@ -192,6 +193,7 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    let mut sampling_request_index = 0usize;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let display_roots = turn_diff_display_roots(turn_context.as_ref()).await;
@@ -219,6 +221,12 @@ pub(crate) async fn run_turn(
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
         }
+        if pending_input
+            .iter()
+            .any(|item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()))
+        {
+            sampling_request_index = 0;
+        }
         if let Some(goal_context) = latest_goal_context_from_turn_inputs(&pending_input) {
             current_goal_context = Some(goal_context);
         }
@@ -239,6 +247,8 @@ pub(crate) async fn run_turn(
             CodexResponsesRequestKind::Turn,
         );
         let tokens_before_sampling = sess.get_total_token_usage().await;
+        let sampling_reasoning =
+            turn_context.reasoning_for_sampling_request(sampling_request_index);
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -247,6 +257,7 @@ pub(crate) async fn run_turn(
             &mut client_session,
             &responses_metadata,
             sampling_request_input.clone(),
+            &sampling_reasoning,
             cancellation_token.child_token(),
         )
         .await
@@ -256,6 +267,7 @@ pub(crate) async fn run_turn(
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
+                sampling_request_index = sampling_request_index.saturating_add(1);
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status, estimated_token_count) = async {
                     let has_pending_input =
@@ -1060,6 +1072,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
+    sampling_reasoning: &SamplingReasoningConfig,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(sess.as_ref(), turn_context.as_ref(), &cancellation_token).await?;
@@ -1103,6 +1116,7 @@ async fn run_sampling_request(
             client_session,
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
+            sampling_reasoning,
             &prompt,
             cancellation_token.child_token(),
         )
@@ -1833,6 +1847,7 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
+    sampling_reasoning: &SamplingReasoningConfig,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -1840,7 +1855,7 @@ async fn try_run_sampling_request(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = &turn_context.sandbox_policy(),
-        effort = turn_context.reasoning_effort,
+        effort = sampling_reasoning.effort,
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
@@ -1855,8 +1870,8 @@ async fn try_run_sampling_request(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
-            turn_context.reasoning_summary,
+            sampling_reasoning.effort.clone(),
+            sampling_reasoning.summary,
             turn_context.config.service_tier.clone(),
             responses_metadata,
             &inference_trace,
@@ -1875,7 +1890,16 @@ async fn try_run_sampling_request(
     )> = None;
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
-    let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
+    let reasoning_effort = if turn_context.model_info.supports_reasoning_summaries {
+        sampling_reasoning
+            .effort
+            .clone()
+            .or_else(|| turn_context.model_info.default_reasoning_level.clone())
+    } else {
+        None
+    }
+    .map(|effort| effort.to_string())
+    .unwrap_or_else(|| "default".to_string());
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
