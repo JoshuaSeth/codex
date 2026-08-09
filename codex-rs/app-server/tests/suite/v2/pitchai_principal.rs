@@ -325,7 +325,8 @@ async fn legacy_resume_migrates_identity_before_writer_and_survives_restart() ->
 }
 
 #[tokio::test]
-async fn legacy_resume_replaces_stale_skills_context_before_model_request() -> Result<()> {
+async fn compacted_legacy_resume_replaces_stale_skills_context_before_model_request() -> Result<()>
+{
     let (server, codex_home, catalog) = create_managed_fixture().await?;
     let thread_id = create_fake_rollout(
         codex_home.path(),
@@ -360,11 +361,32 @@ async fn legacy_resume_replaces_stale_skills_context_before_model_request() -> R
     let legacy_lines = [
         json!({
             "timestamp": "2026-08-09T09:15:01Z",
-            "type": "response_item",
+            "type": "compacted",
             "payload": {
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": stale_skills}],
+                "message": "legacy compacted summary",
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "compacted replacement history must survive",
+                        }],
+                    },
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": stale_skills}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "legacy compacted assistant history",
+                        }],
+                    },
+                ],
             },
         })
         .to_string(),
@@ -435,6 +457,7 @@ async fn legacy_resume_replaces_stale_skills_context_before_model_request() -> R
         .body_json::<Value>()
         .context("model request should be JSON")?
         .to_string();
+    assert!(model_request.contains("compacted replacement history must survive"));
     assert_eq!(model_request.matches("<skills_instructions>").count(), 1);
     assert!(model_request.contains("- pitchai-jeff-m365-azure:"));
     for forbidden in [
