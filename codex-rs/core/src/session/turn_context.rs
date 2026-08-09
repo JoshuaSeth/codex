@@ -780,6 +780,10 @@ impl Session {
             .await;
         let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
         let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots);
+        let skills_input = match self.pitchai_skill_principal().await {
+            Some(principal) => skills_input.with_pitchai_principal(principal),
+            None => skills_input,
+        };
         let fs = primary_turn_environment
             .map(|turn_environment| turn_environment.environment.get_filesystem());
         let skills_outcome = Arc::new(

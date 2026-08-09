@@ -1,9 +1,11 @@
 use super::input_queue::InputQueue;
+use super::pitchai_principal::resolve_and_bind_pitchai_principal;
 use super::*;
 use crate::agents_md::LoadedAgentsMd;
 use crate::config::ConstraintError;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
+use codex_config::PitchAiSkillPrincipal;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::SessionId;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -37,6 +39,11 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Immutable tenant/user identity used for managed skill selection.
+    ///
+    /// Legacy threads may bind it once when they are first authoritatively
+    /// resumed. A loaded thread can never switch to another principal.
+    pub(crate) pitchai_skill_principal: Mutex<Option<PitchAiSkillPrincipal>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -479,7 +486,7 @@ impl Session {
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
-        initial_history: InitialHistory,
+        mut initial_history: InitialHistory,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
         plugins_manager: Arc<PluginsManager>,
@@ -494,6 +501,9 @@ impl Session {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
+        let pitchai_skill_principal =
+            resolve_and_bind_pitchai_principal(config.as_ref(), &mut initial_history).await?;
+        let persisted_principal_for_create = pitchai_skill_principal.clone();
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration.collaboration_mode.model(),
@@ -544,6 +554,7 @@ impl Session {
                             },
                             dynamic_tools: session_configuration.dynamic_tools.clone(),
                             multi_agent_version: initial_multi_agent_version,
+                            pitchai_principal: persisted_principal_for_create.clone(),
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
@@ -1056,6 +1067,7 @@ impl Session {
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
+                pitchai_skill_principal: Mutex::new(pitchai_skill_principal),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,

@@ -581,6 +581,26 @@ impl CodexThread {
         self.codex.session.get_config().await
     }
 
+    /// Requires this thread's durable managed identity to match `principal`.
+    ///
+    /// Legacy identity migration occurs only during cold resume, before the
+    /// live rollout writer opens. A loaded unbound thread cannot be rebound in
+    /// memory because that would be lost at restart.
+    pub async fn require_pitchai_skill_principal(
+        &self,
+        principal: codex_config::PitchAiSkillPrincipal,
+    ) -> CodexResult<()> {
+        self.codex
+            .session
+            .require_pitchai_skill_principal(principal)
+            .await
+    }
+
+    /// Returns the managed PitchAI identity currently bound to this thread.
+    pub async fn pitchai_skill_principal(&self) -> Option<codex_config::PitchAiSkillPrincipal> {
+        self.codex.session.pitchai_skill_principal().await
+    }
+
     /// Resolves the MCP runtime configuration using this thread's extension data.
     pub async fn runtime_mcp_config(&self, config: &crate::config::Config) -> codex_mcp::McpConfig {
         self.codex.session.runtime_mcp_config(config).await

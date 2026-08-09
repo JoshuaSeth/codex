@@ -534,6 +534,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(&request_id, error, /*error_type*/ None);
                 })?;
+        require_bound_pitchai_principal(thread.as_ref()).await?;
         self.thread_residency_manager.note_accessed(thread_id).await;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
@@ -1038,6 +1039,17 @@ impl TurnRequestProcessor {
                 true,
             ));
         };
+        if require_bound_pitchai_principal(thread.as_ref())
+            .await
+            .is_err()
+        {
+            return Ok(callback_insert_response(
+                outcome,
+                ThreadCallbackInsertState::Pending,
+                record.call_id,
+                true,
+            ));
+        }
         if thread.contains_response_call_id(&record.call_id).await {
             state_db
                 .completions()
@@ -1119,6 +1131,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(request_id, error, /*error_type*/ None);
                 })?;
+        require_bound_pitchai_principal(thread.as_ref()).await?;
         self.ensure_direct_input_allowed(request_id, thread.as_ref())
             .await?;
 

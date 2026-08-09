@@ -18,6 +18,7 @@ use codex_config::LoaderOverrides;
 use codex_config::NetworkConstraints;
 use codex_config::NetworkDomainPermissionToml;
 use codex_config::NetworkDomainPermissionsToml;
+use codex_config::PitchAiSkillPrincipal;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_config::loader::project_trust_key;
@@ -3670,6 +3671,7 @@ async fn attach_thread_persistence(session: &mut Session) -> PathBuf {
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             multi_agent_version: None,
+            pitchai_principal: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
@@ -5057,12 +5059,37 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
+        pitchai_skill_principal: Mutex::new(None),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
 
     (session, turn_context)
+}
+
+#[tokio::test]
+async fn loaded_unbound_session_cannot_gain_ephemeral_pitchai_identity() {
+    let (session, _) = make_session_and_context().await;
+    let principal = PitchAiSkillPrincipal {
+        schema_version: 1,
+        tenant_id: "9bc52e7e-79df-5a9b-a4c7-d4eb29d24f12".to_string(),
+        user_id: "baef2f0b-181b-571d-b66b-7a52d79eb963".to_string(),
+    };
+
+    let error = session
+        .require_pitchai_skill_principal(principal.clone())
+        .await
+        .expect_err("loaded unbound identity must require cold durable migration")
+        .to_string();
+
+    assert_eq!(
+        error,
+        "Managed PitchAI thread is not durably bound to an authoritative tenant/user principal; unload it and resume from canonical storage before starting work."
+    );
+    assert!(!error.contains(principal.tenant_id.as_str()));
+    assert!(!error.contains(principal.user_id.as_str()));
+    assert!(session.pitchai_skill_principal().await.is_none());
 }
 
 async fn make_session_with_config(
@@ -6435,6 +6462,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
             multi_agent_version: None,
+            pitchai_principal: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
@@ -7062,6 +7090,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
+        pitchai_skill_principal: Mutex::new(None),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),

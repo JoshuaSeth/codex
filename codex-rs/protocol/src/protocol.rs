@@ -2546,6 +2546,65 @@ impl InitialHistory {
     }
 }
 
+/// Return the unique managed PitchAI principal persisted for `thread_id`.
+///
+/// A rollout may contain more than one `session_meta` line for compatibility
+/// with older metadata update paths. Conflicting identity-bearing lines are
+/// rejected instead of choosing one by position.
+pub fn pitchai_skill_principal_from_rollout_items(
+    items: &[RolloutItem],
+    thread_id: ThreadId,
+) -> Result<Option<PitchAiSkillPrincipal>, &'static str> {
+    let mut principal = None;
+    for item in items {
+        let RolloutItem::SessionMeta(meta_line) = item else {
+            continue;
+        };
+        if meta_line.meta.id != thread_id {
+            continue;
+        }
+        let Some(candidate) = meta_line.meta.pitchai_principal.as_ref() else {
+            continue;
+        };
+        match principal.as_ref() {
+            Some(existing) if existing != candidate => {
+                return Err(
+                    "Persisted PitchAI thread identity metadata is internally inconsistent.",
+                );
+            }
+            Some(_) => {}
+            None => principal = Some(candidate.clone()),
+        }
+    }
+    Ok(principal)
+}
+
+pub const PITCHAI_SKILL_PRINCIPAL_SCHEMA_VERSION: u8 = 1;
+
+pub fn validate_pitchai_skill_principal(
+    principal: &PitchAiSkillPrincipal,
+) -> Result<(), &'static str> {
+    if principal.schema_version != PITCHAI_SKILL_PRINCIPAL_SCHEMA_VERSION
+        || !is_canonical_pitchai_principal_uuid(&principal.tenant_id)
+        || !is_canonical_pitchai_principal_uuid(&principal.user_id)
+    {
+        return Err(
+            "Managed PitchAI skill principal is malformed or uses an unsupported schema version.",
+        );
+    }
+    Ok(())
+}
+
+fn is_canonical_pitchai_principal_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+    })
+}
+
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
     items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
@@ -2878,6 +2937,12 @@ pub struct SessionMeta {
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mode: Option<String>,
+    /// Immutable managed PitchAI tenant/user identity for this thread.
+    ///
+    /// This contains identifiers only. Credentials remain in identity-scoped
+    /// providers and are never serialized into rollout history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitchai_principal: Option<PitchAiSkillPrincipal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<MultiAgentVersion>,
 }
@@ -2901,9 +2966,18 @@ impl Default for SessionMeta {
             base_instructions: None,
             dynamic_tools: None,
             memory_mode: None,
+            pitchai_principal: None,
             multi_agent_version: None,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct PitchAiSkillPrincipal {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub user_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, TS)]
@@ -5238,6 +5312,60 @@ mod tests {
             ),
             Some(MultiAgentVersion::V2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pitchai_principal_requires_one_consistent_binding_for_thread() -> Result<()> {
+        let thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
+        let other_thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c9")?;
+        let thomas = PitchAiSkillPrincipal {
+            schema_version: 1,
+            tenant_id: "9bc52e7e-79df-5a9b-a4c7-d4eb29d24f12".to_string(),
+            user_id: "baef2f0b-181b-571d-b66b-7a52d79eb963".to_string(),
+        };
+        let jef = PitchAiSkillPrincipal {
+            schema_version: 1,
+            tenant_id: thomas.tenant_id.clone(),
+            user_id: "340fb61c-ed7b-57c4-b2f2-c1cd8e7986fd".to_string(),
+        };
+        let session_meta = |id, principal| {
+            RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id,
+                    pitchai_principal: principal,
+                    ..Default::default()
+                },
+                git: None,
+            })
+        };
+
+        assert_eq!(
+            pitchai_skill_principal_from_rollout_items(
+                &[
+                    session_meta(other_thread_id, Some(jef.clone())),
+                    session_meta(thread_id, None),
+                    session_meta(thread_id, Some(thomas.clone())),
+                    session_meta(thread_id, Some(thomas.clone())),
+                ],
+                thread_id,
+            ),
+            Ok(Some(thomas.clone()))
+        );
+
+        let error = pitchai_skill_principal_from_rollout_items(
+            &[
+                session_meta(thread_id, Some(thomas)),
+                session_meta(thread_id, Some(jef)),
+            ],
+            thread_id,
+        )
+        .expect_err("conflicting persisted identities must fail closed");
+        assert_eq!(
+            error,
+            "Persisted PitchAI thread identity metadata is internally inconsistent."
+        );
+        assert!(!error.contains("67e55044"));
         Ok(())
     }
 

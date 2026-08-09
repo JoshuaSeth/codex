@@ -963,6 +963,7 @@ impl ThreadRequestProcessor {
             thread_source,
             environments,
         } = params;
+        required_pitchai_principal_from_config(config.as_ref())?;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
@@ -2693,6 +2694,13 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
         let resume_started_at = std::time::Instant::now();
+        let requested_principal = required_pitchai_principal_from_config(params.config.as_ref())?;
+        if managed_pitchai_catalog_enabled() && (params.history.is_some() || params.path.is_some())
+        {
+            return Err(invalid_request(
+                "Managed PitchAI thread resume requires canonical stored history selected by thread id; client-supplied history and paths are not authoritative identity sources.",
+            ));
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -2790,6 +2798,14 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        if let InitialHistory::Resumed(resumed) = &thread_history {
+            validate_requested_principal_against_rollout(
+                resumed.history.as_slice(),
+                resumed.conversation_id,
+                requested_principal.as_ref(),
+                /*require_persisted*/ false,
+            )?;
+        }
 
         let history_cwd = thread_history.session_cwd();
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
@@ -3001,7 +3017,10 @@ impl ThreadRequestProcessor {
                     .await;
             }
             Err(err) => {
-                let error = internal_error(format!("error resuming thread: {err}"));
+                let error = match err {
+                    CodexErr::InvalidRequest(message) => invalid_request(message),
+                    err => internal_error(format!("error resuming thread: {err}")),
+                };
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -3096,6 +3115,10 @@ impl ThreadRequestProcessor {
                     active_path.display()
                 )));
             }
+            let requested_principal =
+                required_pitchai_principal_from_config(params.config.as_ref())?;
+            require_matching_pitchai_principal(existing_thread.as_ref(), requested_principal)
+                .await?;
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
             if !mismatch_details.is_empty() {
@@ -3493,6 +3516,12 @@ impl ThreadRequestProcessor {
             thread_source,
             exclude_turns,
         } = params;
+        let requested_principal = required_pitchai_principal_from_config(cli_overrides.as_ref())?;
+        if managed_pitchai_catalog_enabled() && path.is_some() {
+            return Err(invalid_request(
+                "Managed PitchAI thread fork requires canonical stored history selected by thread id; a client-supplied path is not an authoritative identity source.",
+            ));
+        }
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
@@ -3516,6 +3545,12 @@ impl ThreadRequestProcessor {
                     "thread {source_thread_id} did not include persisted history"
                 ))
             })?;
+        validate_requested_principal_against_rollout(
+            history_items.as_slice(),
+            source_thread_id,
+            requested_principal.as_ref(),
+            /*require_persisted*/ true,
+        )?;
         let history_cwd = Some(source_thread.cwd.clone());
 
         // Persist Windows sandbox mode.

@@ -753,7 +753,7 @@ impl AccountRequestProcessor {
             .ok()
             .map(|response| AccountUpdatedNotification {
                 auth_mode: response.auth_mode,
-                plan_type: response.plan_type.clone(),
+                plan_type: response.plan_type,
             });
         self.outgoing.send_result(request_id, result).await;
 

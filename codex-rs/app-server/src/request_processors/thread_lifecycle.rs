@@ -409,46 +409,6 @@ pub(super) async fn ensure_listener_task_running(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn residency_candidate_final_guard_protects_subscribed_threads() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ true,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_protects_threads_that_became_active() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Active {
-                active_turn_id: None,
-                active_flags: Vec::new(),
-            },
-            &AgentStatus::Completed(None),
-        ));
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Running,
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
-        assert!(!residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-}
-
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
     match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
         Ok(Ok(())) => ThreadShutdownResult::Complete,
@@ -861,4 +821,44 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         }
     }
     thread.status = status;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residency_candidate_final_guard_protects_subscribed_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ true,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_threads_that_became_active() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Active {
+                active_turn_id: None,
+                active_flags: Vec::new(),
+            },
+            &AgentStatus::Completed(None),
+        ));
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Running,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
+        assert!(!residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
 }

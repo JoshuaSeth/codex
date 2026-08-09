@@ -210,6 +210,7 @@ mod inject;
 mod input_queue;
 mod mcp;
 pub(crate) mod multi_agents;
+mod pitchai_principal;
 mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
@@ -1524,6 +1525,30 @@ impl Session {
             .session_configuration
             .original_config_do_not_use
             .clone()
+    }
+
+    pub(crate) async fn require_pitchai_skill_principal(
+        &self,
+        principal: codex_config::PitchAiSkillPrincipal,
+    ) -> CodexResult<()> {
+        let bound_principal = self.pitchai_skill_principal.lock().await;
+        match bound_principal.as_ref() {
+            Some(existing) if existing != &principal => Err(CodexErr::InvalidRequest(
+                "PitchAI skill principal does not match the identity already bound to this thread."
+                    .to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => Err(CodexErr::InvalidRequest(
+                "Managed PitchAI thread is not durably bound to an authoritative tenant/user principal; unload it and resume from canonical storage before starting work."
+                    .to_string(),
+            )),
+        }
+    }
+
+    pub(crate) async fn pitchai_skill_principal(
+        &self,
+    ) -> Option<codex_config::PitchAiSkillPrincipal> {
+        self.pitchai_skill_principal.lock().await.clone()
     }
 
     pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::UserInstructions> {
