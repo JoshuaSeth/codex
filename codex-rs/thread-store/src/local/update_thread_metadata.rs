@@ -999,9 +999,10 @@ mod tests {
             .await
             .expect("sqlite metadata read")
             .expect("sqlite metadata");
+        let permission_profile: PermissionProfile = PermissionProfile::Disabled;
         assert_eq!(
             metadata.sandbox_policy,
-            serde_json::to_string(&PermissionProfile::Disabled).expect("serialize profile")
+            serde_json::to_string(&permission_profile).expect("serialize profile")
         );
     }
 

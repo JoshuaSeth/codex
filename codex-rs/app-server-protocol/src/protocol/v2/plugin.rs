@@ -28,6 +28,7 @@ pub struct SkillsListParams {
     pub force_reload: bool,
 
     /// Authoritative tenant/user identity for a managed PitchAI skill profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub pitchai_principal: Option<PitchAiSkillPrincipal>,
 }
@@ -178,6 +179,9 @@ pub enum PluginListMarketplaceKind {
     #[serde(rename = "shared-with-me")]
     #[ts(rename = "shared-with-me")]
     SharedWithMe,
+    #[serde(rename = "created-by-me-remote")]
+    #[ts(rename = "created-by-me-remote")]
+    CreatedByMeRemote,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

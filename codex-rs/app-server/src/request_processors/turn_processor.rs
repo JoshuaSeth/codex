@@ -164,10 +164,12 @@ fn callback_response_items(record: &CompletionCallbackRecord) -> Vec<ResponseIte
             namespace: None,
             arguments,
             call_id: record.call_id.clone(),
+            metadata: None,
         },
         ResponseItem::FunctionCallOutput {
             call_id: record.call_id.clone(),
             output: FunctionCallOutputPayload::from_text(output),
+            metadata: None,
         },
     ]
 }
@@ -300,6 +302,16 @@ impl TurnRequestProcessor {
         params: ThreadRealtimeAppendTextParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.thread_realtime_append_text_inner(request_id, params)
+            .await
+            .map(|response| response.map(Into::into))
+    }
+
+    pub(crate) async fn thread_realtime_append_speech(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadRealtimeAppendSpeechParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_realtime_append_speech_inner(request_id, params)
             .await
             .map(|response| response.map(Into::into))
     }
@@ -572,8 +584,9 @@ impl TurnRequestProcessor {
         let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !mapped_items.is_empty();
         let cwd = resolve_request_cwd(params.cwd)?;
-        let environments =
-            Self::build_environment_override(thread.as_ref(), cwd, environment_selections).await;
+        let environments = self
+            .build_environment_override(thread.as_ref(), cwd, environment_selections)
+            .await;
         let thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
@@ -733,28 +746,36 @@ impl TurnRequestProcessor {
     }
 
     async fn build_environment_override(
+        &self,
         thread: &CodexThread,
         cwd: Option<AbsolutePathBuf>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
     ) -> Option<TurnEnvironmentSelections> {
-        if cwd.is_none() && environment_selections.is_none() {
-            return None;
+        match (cwd, environment_selections) {
+            (None, None) => None,
+            (Some(cwd), None) => {
+                let environment_selections =
+                    self.thread_manager.default_environment_selections(&cwd);
+                Some(TurnEnvironmentSelections::new(cwd, environment_selections))
+            }
+            (cwd, Some(environment_selections)) => {
+                let legacy_fallback_cwd = match cwd {
+                    Some(cwd) => cwd,
+                    None => {
+                        let snapshot = thread.config_snapshot().await;
+                        environment_selections
+                            .iter()
+                            .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
+                            .and_then(|selection| selection.cwd.to_abs_path().ok())
+                            .unwrap_or_else(|| snapshot.cwd().clone())
+                    }
+                };
+                Some(TurnEnvironmentSelections::new(
+                    legacy_fallback_cwd,
+                    environment_selections,
+                ))
+            }
         }
-
-        let snapshot = thread.config_snapshot().await;
-        let environment_selections =
-            environment_selections.unwrap_or_else(|| snapshot.environment_selections().to_vec());
-        let legacy_fallback_cwd = cwd.unwrap_or_else(|| {
-            environment_selections
-                .iter()
-                .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
-                .and_then(|selection| selection.cwd.to_abs_path().ok())
-                .unwrap_or_else(|| snapshot.cwd().clone())
-        });
-        Some(TurnEnvironmentSelections::new(
-            legacy_fallback_cwd,
-            environment_selections,
-        ))
     }
 
     async fn build_thread_settings_overrides(
@@ -918,12 +939,9 @@ impl TurnRequestProcessor {
     ) -> Result<ThreadSettingsUpdateResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
         let cwd = resolve_request_cwd(params.cwd)?;
-        let environments = Self::build_environment_override(
-            thread.as_ref(),
-            cwd,
-            /*environment_selections*/ None,
-        )
-        .await;
+        let environments = self
+            .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
+            .await;
         let thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
@@ -1330,8 +1348,11 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 architecture: params.architecture,
+                codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
+                codex_response_item_prefix: params.codex_response_item_prefix,
                 model: params.model,
                 output_modality: params.output_modality,
+                include_startup_context: params.include_startup_context.unwrap_or(true),
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
                 transport: params.transport.map(|transport| match transport {
@@ -1404,6 +1425,31 @@ impl TurnRequestProcessor {
             ))
         })?;
         Ok(Some(ThreadRealtimeAppendTextResponse::default()))
+    }
+
+    async fn thread_realtime_append_speech_inner(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadRealtimeAppendSpeechParams,
+    ) -> Result<Option<ThreadRealtimeAppendSpeechResponse>, JSONRPCErrorError> {
+        let Some((_, thread)) = self
+            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.submit_core_op(
+            request_id,
+            thread.as_ref(),
+            Op::RealtimeConversationSpeech(ConversationSpeechParams { text: params.text }),
+        )
+        .await
+        .map_err(|err| {
+            internal_error(format!(
+                "failed to append realtime conversation speech: {err}"
+            ))
+        })?;
+        Ok(Some(ThreadRealtimeAppendSpeechResponse::default()))
     }
 
     async fn thread_realtime_stop_inner(

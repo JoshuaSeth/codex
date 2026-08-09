@@ -2565,9 +2565,6 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     .await??;
     primary.clear_message_buffer();
 
-    let mut secondary = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
-
     let turn_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
@@ -2590,7 +2587,10 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     )
     .await??;
 
-    let resume_id = secondary
+    // PitchAI enforces one live rollout writer per thread. Exercise an in-flight
+    // resume through the owning app-server instead of starting a competing
+    // runtime against the same rollout.
+    let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,
             ..Default::default()
@@ -2598,7 +2598,7 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
         .await?;
     let resume_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        secondary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
     let ThreadResumeResponse {
@@ -2710,6 +2710,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
                     text: "history override".to_string(),
                 }],
                 phase: None,
+                metadata: None,
             }]),
             ..Default::default()
         })
@@ -3089,6 +3090,9 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    // Cold resume is valid only after the original rollout writer has exited.
+    drop(primary);
 
     let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
@@ -3717,6 +3721,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
             text: history_text.to_string(),
         }],
         phase: None,
+        metadata: None,
     }];
 
     // Resume with explicit history and override the model.
@@ -3885,6 +3890,9 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    // Cold resume is valid only after the original rollout writer has exited.
+    drop(primary);
 
     let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;

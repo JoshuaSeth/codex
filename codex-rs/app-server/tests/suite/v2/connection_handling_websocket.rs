@@ -826,6 +826,26 @@ pub(super) async fn assert_no_message(stream: &mut WsClient, wait_for: Duration)
     }
 }
 
+pub(super) async fn assert_no_notification_for_method(
+    stream: &mut WsClient,
+    method: &str,
+    wait_for: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + wait_for;
+    loop {
+        match tokio::time::timeout_at(deadline, read_jsonrpc_message(stream)).await {
+            Ok(Ok(JSONRPCMessage::Notification(notification)))
+                if notification.method == method =>
+            {
+                bail!("received unexpected duplicate notification for method `{method}`")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
 pub(super) fn create_config_toml(
     codex_home: &Path,
     server_uri: &str,

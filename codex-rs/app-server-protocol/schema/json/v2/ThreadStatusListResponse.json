@@ -67,6 +67,7 @@
               "type": "array"
             },
             "activeTurnId": {
+              "default": null,
               "type": [
                 "string",
                 "null"
