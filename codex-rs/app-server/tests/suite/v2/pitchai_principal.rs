@@ -10,7 +10,10 @@ use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::PitchAiSkillPrincipal as AppServerPitchAiSkillPrincipal;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SkillsListParams;
+use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -20,12 +23,18 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::PitchAiSkillPrincipal;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TurnContextItem;
 use codex_rollout::read_session_meta_line;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -316,6 +325,269 @@ async fn legacy_resume_migrates_identity_before_writer_and_survives_restart() ->
 }
 
 #[tokio::test]
+async fn legacy_resume_replaces_stale_skills_context_before_model_request() -> Result<()> {
+    let (server, codex_home, catalog) = create_managed_fixture().await?;
+    let thread_id = create_fake_rollout(
+        codex_home.path(),
+        "2026-08-09T09-15-00",
+        "2026-08-09T09:15:00Z",
+        "legacy user history must survive",
+        Some("mock_provider"),
+        None,
+    )?;
+    let path = rollout_path(codex_home.path(), "2026-08-09T09-15-00", &thread_id);
+    let stale_skills = "<skills_instructions>\n## Skills\n### Available skills\n- pitchai-thomas-m365: stale Thomas capability\n- seth-private: stale Seth capability\n- stale-secret-sentinel: must not reach the model\n</skills_instructions>";
+    let turn_context = TurnContextItem {
+        turn_id: Some("legacy-turn".to_string()),
+        cwd: PathBuf::from("/"),
+        workspace_roots: None,
+        current_date: Some("2026-08-09".to_string()),
+        timezone: Some("UTC".to_string()),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
+        network: None,
+        file_system_sandbox_policy: None,
+        model: "gpt-5.3-codex".to_string(),
+        comp_hash: None,
+        personality: None,
+        collaboration_mode: None,
+        multi_agent_version: None,
+        realtime_active: Some(false),
+        effort: None,
+        summary: ReasoningSummary::Auto,
+    };
+    let legacy_lines = [
+        json!({
+            "timestamp": "2026-08-09T09:15:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": stale_skills}],
+            },
+        })
+        .to_string(),
+        json!({
+            "timestamp": "2026-08-09T09:15:02Z",
+            "type": "turn_context",
+            "payload": serde_json::to_value(turn_context)?,
+        })
+        .to_string(),
+    ];
+    std::fs::write(
+        &path,
+        format!(
+            "{}{}\n",
+            std::fs::read_to_string(&path)?,
+            legacy_lines.join("\n")
+        ),
+    )?;
+
+    let mut app_server = start_managed_server(&codex_home, &catalog).await?;
+    let resume_id = app_server
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            config: Some(principal_config(JEF_ID)),
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let _: ThreadResumeResponse = to_response(response)?;
+    let before_turn = std::fs::read_to_string(&path)?;
+    assert!(before_turn.contains("stale-secret-sentinel"));
+
+    let turn_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id,
+            input: vec![UserInput::Text {
+                text: "Report the currently available skills.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("mock server should retain requests")?;
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 1);
+    let model_request = model_requests[0]
+        .body_json::<Value>()
+        .context("model request should be JSON")?
+        .to_string();
+    assert_eq!(model_request.matches("<skills_instructions>").count(), 1);
+    assert!(model_request.contains("- pitchai-jeff-m365-azure:"));
+    for forbidden in [
+        "pitchai-thomas-m365",
+        "seth-private",
+        "stale-secret-sentinel",
+    ] {
+        assert!(!model_request.contains(forbidden));
+    }
+
+    let persisted = std::fs::read_to_string(path)?;
+    assert!(persisted.starts_with(&before_turn));
+    assert!(persisted.contains("stale-secret-sentinel"));
+    assert!(persisted.contains("pitchai-jeff-m365-azure"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn force_reload_revokes_managed_skill_before_next_model_request() -> Result<()> {
+    let (server, codex_home, catalog) = create_managed_fixture().await?;
+    let mut app_server = start_managed_server(&codex_home, &catalog).await?;
+    let cwd = codex_home.path().to_path_buf();
+    let start_id = app_server
+        .send_thread_start_request(ThreadStartParams {
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            config: Some(principal_config(JEF_ID)),
+            ..Default::default()
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(start_response)?;
+    let rollout_path = thread
+        .path
+        .context("managed thread should have a rollout path")?;
+
+    let first_turn_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "Report the initial managed skills.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(first_turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let before_revocation = std::fs::read_to_string(&rollout_path)?;
+    assert!(before_revocation.contains("pitchai-jeff-m365-azure"));
+
+    std::fs::remove_dir_all(
+        catalog
+            .path()
+            .join("profiles/users")
+            .join(JEF_ID)
+            .join("skills/pitchai-jeff-m365-azure"),
+    )?;
+    let skills_id = app_server
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![cwd],
+            force_reload: true,
+            pitchai_principal: Some(AppServerPitchAiSkillPrincipal {
+                schema_version: 1,
+                tenant_id: TENANT_ID.to_string(),
+                user_id: JEF_ID.to_string(),
+            }),
+        })
+        .await?;
+    let skills_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(skills_id)),
+    )
+    .await??;
+    let SkillsListResponse { data } = to_response(skills_response)?;
+    let refreshed = data
+        .first()
+        .context("force-reloaded skills response should include the requested CWD")?;
+    assert!(
+        refreshed
+            .skills
+            .iter()
+            .any(|skill| skill.name == "system-shared")
+    );
+    assert!(
+        refreshed
+            .skills
+            .iter()
+            .all(|skill| skill.name != "pitchai-jeff-m365-azure")
+    );
+
+    let second_turn_id = app_server
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: "Report the force-reloaded managed skills.".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_response_message(RequestId::Integer(second_turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("mock server should retain requests")?;
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 2);
+    let refreshed_request = model_requests[1]
+        .body_json::<Value>()
+        .context("force-reloaded model request should be JSON")?
+        .to_string();
+    assert_eq!(
+        refreshed_request.matches("<skills_instructions>").count(),
+        1
+    );
+    assert!(refreshed_request.contains("- system-shared:"));
+    assert!(!refreshed_request.contains("pitchai-jeff-m365-azure"));
+    assert!(!refreshed_request.contains("pitchai-thomas-m365"));
+
+    let persisted = std::fs::read_to_string(rollout_path)?;
+    assert!(persisted.starts_with(&before_revocation));
+    assert_eq!(persisted.matches("<skills_instructions>").count(), 2);
+    assert!(persisted.contains("pitchai-jeff-m365-azure"));
+    assert!(persisted.contains("system-shared"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_unbound_thread_cannot_be_forked_into_a_caller_selected_principal() -> Result<()> {
     let codex_home = TempDir::new()?;
     let catalog = create_catalog()?;
@@ -536,5 +808,38 @@ fn create_catalog() -> Result<TempDir> {
     ] {
         std::fs::create_dir_all(root)?;
     }
+    write_skill(
+        &catalog.path().join(".system"),
+        "system-shared",
+        "approved system capability",
+    )?;
+    write_skill(
+        &catalog
+            .path()
+            .join("profiles/users")
+            .join(THOMAS_ID)
+            .join("skills"),
+        "pitchai-thomas-m365",
+        "Thomas-only capability",
+    )?;
+    write_skill(
+        &catalog
+            .path()
+            .join("profiles/users")
+            .join(JEF_ID)
+            .join("skills"),
+        "pitchai-jeff-m365-azure",
+        "Jef-only capability",
+    )?;
     Ok(catalog)
+}
+
+fn write_skill(root: &Path, name: &str, description: &str) -> Result<()> {
+    let skill_dir = root.join(name);
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
+    )?;
+    Ok(())
 }
