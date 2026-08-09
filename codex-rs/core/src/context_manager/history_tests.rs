@@ -148,7 +148,7 @@ fn for_prompt_keeps_only_latest_skills_context_without_rewriting_history() {
         ]
     );
 
-    let prompt = history.clone().for_prompt(&default_input_modalities());
+    let prompt = history.for_prompt(&default_input_modalities());
     assert_eq!(
         prompt,
         vec![
