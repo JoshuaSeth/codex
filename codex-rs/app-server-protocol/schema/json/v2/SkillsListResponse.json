@@ -140,6 +140,7 @@
     "SkillScope": {
       "enum": [
         "user",
+        "tenant",
         "repo",
         "system",
         "admin"

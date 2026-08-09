@@ -67,6 +67,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
     };
     let skill_scope = match invocation.skill_scope {
         SkillScope::User => "user",
+        SkillScope::Tenant => "tenant",
         SkillScope::Repo => "repo",
         SkillScope::System => "system",
         SkillScope::Admin => "admin",

@@ -499,7 +499,17 @@ impl CatalogRequestProcessor {
         &self,
         params: SkillsListParams,
     ) -> Result<SkillsListResponse, JSONRPCErrorError> {
-        let SkillsListParams { cwds, force_reload } = params;
+        let SkillsListParams {
+            cwds,
+            force_reload,
+            pitchai_principal,
+        } = params;
+        let pitchai_principal =
+            pitchai_principal.map(|principal| codex_config::PitchAiSkillPrincipal {
+                schema_version: principal.schema_version,
+                tenant_id: principal.tenant_id,
+                user_id: principal.user_id,
+            });
         let cwds = if cwds.is_empty() {
             vec![self.config.cwd.to_path_buf()]
         } else {
@@ -524,6 +534,7 @@ impl CatalogRequestProcessor {
                 let fs = fs.clone();
                 let plugins_manager = &plugins_manager;
                 let skills_manager = &skills_manager;
+                let pitchai_principal = pitchai_principal.clone();
                 async move {
                     let (cwd_abs, config_layer_stack) = match self.resolve_cwd_config(&cwd).await {
                         Ok(resolved) => resolved,
@@ -559,6 +570,10 @@ impl CatalogRequestProcessor {
                         config_layer_stack,
                         config.bundled_skills_enabled(),
                     );
+                    let skills_input = match pitchai_principal {
+                        Some(principal) => skills_input.with_pitchai_principal(principal),
+                        None => skills_input,
+                    };
                     let outcome = skills_manager
                         .skills_for_cwd(&skills_input, force_reload, fs)
                         .await;

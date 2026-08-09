@@ -26,6 +26,19 @@ pub struct SkillsListParams {
     /// When true, bypass the skills cache and re-scan skills from disk.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force_reload: bool,
+
+    /// Authoritative tenant/user identity for a managed PitchAI skill profile.
+    #[ts(optional = nullable)]
+    pub pitchai_principal: Option<PitchAiSkillPrincipal>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PitchAiSkillPrincipal {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub user_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -402,6 +415,7 @@ pub enum PluginSharePrincipalRole {
 #[ts(export_to = "v2/")]
 pub enum SkillScope {
     User,
+    Tenant,
     Repo,
     System,
     Admin,
@@ -850,6 +864,7 @@ impl From<CoreSkillScope> for SkillScope {
     fn from(value: CoreSkillScope) -> Self {
         match value {
             CoreSkillScope::User => Self::User,
+            CoreSkillScope::Tenant => Self::Tenant,
             CoreSkillScope::Repo => Self::Repo,
             CoreSkillScope::System => Self::System,
             CoreSkillScope::Admin => Self::Admin,

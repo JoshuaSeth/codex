@@ -768,6 +768,7 @@ pub async fn load_plugin_skills(
             file_system: Arc::clone(&LOCAL_FS),
             plugin_id: Some(plugin_id.as_key()),
             plugin_root: Some(plugin_root.clone()),
+            allowed_source_root: None,
         })
         .collect::<Vec<_>>();
     let outcome = load_skills_from_roots(roots).await;

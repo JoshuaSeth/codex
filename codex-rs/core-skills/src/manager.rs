@@ -19,10 +19,12 @@ use crate::config_rules::SkillConfigRules;
 use crate::config_rules::resolve_disabled_skill_paths;
 use crate::config_rules::skill_config_rules_from_stack;
 use crate::loader::SkillRoot;
-use crate::loader::load_skills_from_roots;
-use crate::loader::skill_roots;
+use crate::loader::load_skills_from_roots_with_name_precedence;
+use crate::loader::skill_roots_with_diagnostics;
+use crate::pitchai_principal::managed_pitchai_catalog_enabled;
 use crate::system::install_system_skills;
 use crate::system::uninstall_system_skills;
+use codex_config::PitchAiSkillPrincipal;
 use codex_config::SkillsConfig;
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,7 @@ pub struct SkillsLoadInput {
     pub effective_skill_roots: Vec<PluginSkillRoot>,
     pub config_layer_stack: ConfigLayerStack,
     pub bundled_skills_enabled: bool,
+    pub pitchai_principal: Option<PitchAiSkillPrincipal>,
 }
 
 impl SkillsLoadInput {
@@ -45,7 +48,13 @@ impl SkillsLoadInput {
             effective_skill_roots,
             config_layer_stack,
             bundled_skills_enabled,
+            pitchai_principal: None,
         }
+    }
+
+    pub fn with_pitchai_principal(mut self, principal: PitchAiSkillPrincipal) -> Self {
+        self.pitchai_principal = Some(principal);
+        self
     }
 }
 
@@ -107,14 +116,34 @@ impl SkillsManager {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> SkillLoadOutcome {
-        let roots = self.skill_roots_for_config(input, fs).await;
+        let mut resolution = skill_roots_with_diagnostics(
+            fs,
+            &input.config_layer_stack,
+            &input.cwd,
+            input.effective_skill_roots.clone(),
+            self.extra_roots(),
+            input.pitchai_principal.as_ref(),
+        )
+        .await;
+        if !input.bundled_skills_enabled {
+            resolution
+                .roots
+                .retain(|root| root.scope != SkillScope::System);
+        }
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        let cache_key = config_skills_cache_key(&roots, &skill_config_rules);
+        if !resolution.errors.is_empty() {
+            return self
+                .build_skill_outcome(resolution.roots, &skill_config_rules, resolution.errors)
+                .await;
+        }
+        let cache_key = config_skills_cache_key(&resolution.roots, &skill_config_rules);
         if let Some(outcome) = self.cached_outcome_for_config(&cache_key) {
             return outcome;
         }
 
-        let outcome = self.build_skill_outcome(roots, &skill_config_rules).await;
+        let outcome = self
+            .build_skill_outcome(resolution.roots, &skill_config_rules, resolution.errors)
+            .await;
         let mut cache = self
             .cache_by_config
             .write()
@@ -128,14 +157,16 @@ impl SkillsManager {
         input: &SkillsLoadInput,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> Vec<SkillRoot> {
-        let mut roots = skill_roots(
+        let mut roots = skill_roots_with_diagnostics(
             fs,
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
             self.extra_roots(),
+            input.pitchai_principal.as_ref(),
         )
-        .await;
+        .await
+        .roots;
         if !input.bundled_skills_enabled {
             roots.retain(|root| root.scope != SkillScope::System);
         }
@@ -148,33 +179,59 @@ impl SkillsManager {
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> SkillLoadOutcome {
-        let use_cwd_cache = fs.is_some();
-        if use_cwd_cache
+        let use_legacy_cwd_cache =
+            fs.is_some() && input.pitchai_principal.is_none() && !managed_pitchai_catalog_enabled();
+        if use_legacy_cwd_cache
             && !force_reload
             && let Some(outcome) = self.cached_outcome_for_cwd(&input.cwd)
         {
             return outcome;
         }
 
-        let mut roots = skill_roots(
+        let mut resolution = skill_roots_with_diagnostics(
             fs.clone(),
             &input.config_layer_stack,
             &input.cwd,
             input.effective_skill_roots.clone(),
             self.extra_roots(),
+            input.pitchai_principal.as_ref(),
         )
         .await;
+        let roots = &mut resolution.roots;
         if !bundled_skills_enabled_from_stack(&input.config_layer_stack) {
             roots.retain(|root| root.scope != SkillScope::System);
         }
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
-        let outcome = self.build_skill_outcome(roots, &skill_config_rules).await;
-        if use_cwd_cache {
+        let managed_cache_key = roots
+            .iter()
+            .any(|root| root.scope == SkillScope::Tenant)
+            .then(|| config_skills_cache_key(roots, &skill_config_rules));
+        if !force_reload
+            && resolution.errors.is_empty()
+            && let Some(cache_key) = managed_cache_key.as_ref()
+            && let Some(outcome) = self.cached_outcome_for_config(cache_key)
+        {
+            return outcome;
+        }
+        let outcome = self
+            .build_skill_outcome(
+                std::mem::take(roots),
+                &skill_config_rules,
+                resolution.errors,
+            )
+            .await;
+        if use_legacy_cwd_cache {
             let mut cache = self
                 .cache_by_cwd
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.insert(input.cwd.clone(), outcome.clone());
+        } else if let Some(cache_key) = managed_cache_key {
+            let mut cache = self
+                .cache_by_config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(cache_key, outcome.clone());
         }
         outcome
     }
@@ -184,11 +241,15 @@ impl SkillsManager {
         &self,
         roots: Vec<SkillRoot>,
         skill_config_rules: &SkillConfigRules,
+        mut errors: Vec<crate::SkillError>,
     ) -> SkillLoadOutcome {
-        let outcome = crate::filter_skill_load_outcome_for_product(
-            load_skills_from_roots(roots).await,
+        let enforce_name_precedence = roots.iter().any(|root| root.scope == SkillScope::Tenant);
+        let mut outcome = crate::filter_skill_load_outcome_for_product(
+            load_skills_from_roots_with_name_precedence(roots, enforce_name_precedence).await,
             self.restriction_product,
         );
+        errors.append(&mut outcome.errors);
+        outcome.errors = errors;
         let disabled_paths = resolve_disabled_skill_paths(&outcome.skills, skill_config_rules);
         finalize_skill_outcome(outcome, disabled_paths)
     }
@@ -280,8 +341,9 @@ fn config_skills_cache_key(
                 let scope_rank = match root.scope {
                     SkillScope::Repo => 0,
                     SkillScope::User => 1,
-                    SkillScope::System => 2,
-                    SkillScope::Admin => 3,
+                    SkillScope::Tenant => 2,
+                    SkillScope::System => 3,
+                    SkillScope::Admin => 4,
                 };
                 (root.path.clone(), scope_rank, root.plugin_id.clone())
             })

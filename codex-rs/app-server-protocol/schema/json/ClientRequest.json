@@ -1705,6 +1705,27 @@
       ],
       "type": "string"
     },
+    "PitchAiSkillPrincipal": {
+      "properties": {
+        "schemaVersion": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tenantId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "tenantId",
+        "userId"
+      ],
+      "type": "object"
+    },
     "PluginInstallParams": {
       "properties": {
         "marketplacePath": {
@@ -3171,6 +3192,17 @@
         "forceReload": {
           "description": "When true, bypass the skills cache and re-scan skills from disk.",
           "type": "boolean"
+        },
+        "pitchaiPrincipal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PitchAiSkillPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative tenant/user identity for a managed PitchAI skill profile."
         }
       },
       "type": "object"

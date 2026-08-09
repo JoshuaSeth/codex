@@ -5,6 +5,7 @@ pub mod loader;
 pub mod manager;
 mod mention_counts;
 pub mod model;
+mod pitchai_principal;
 pub mod remote;
 pub mod render;
 mod skill_instructions;

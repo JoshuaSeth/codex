@@ -897,8 +897,9 @@ fn prompt_scope_rank(scope: SkillScope) -> u8 {
     match scope {
         SkillScope::System => 0,
         SkillScope::Admin => 1,
-        SkillScope::Repo => 2,
+        SkillScope::Tenant => 2,
         SkillScope::User => 3,
+        SkillScope::Repo => 4,
     }
 }
 

@@ -33,6 +33,21 @@ pub struct SkillsConfig {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<SkillConfig>,
+
+    /// Authoritative PitchAI tenant/user identity for managed skill resolution.
+    ///
+    /// This selects immutable catalog profiles; it never contains credentials
+    /// or client-supplied filesystem paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pitchai_principal: Option<PitchAiSkillPrincipal>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PitchAiSkillPrincipal {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub user_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
