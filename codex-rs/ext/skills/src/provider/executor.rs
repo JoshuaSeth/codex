@@ -82,6 +82,7 @@ impl SkillProvider for ExecutorSkillProvider {
                         file_system: Arc::clone(&file_system),
                         plugin_id: None,
                         plugin_root: None,
+                        allowed_source_root: None,
                     }])
                     .await,
                     self.restriction_product,

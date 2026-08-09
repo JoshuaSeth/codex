@@ -269,6 +269,7 @@ export type { PermissionProfileListResponse } from "./PermissionProfileListRespo
 export type { PermissionProfileSummary } from "./PermissionProfileSummary";
 export type { PermissionsRequestApprovalParams } from "./PermissionsRequestApprovalParams";
 export type { PermissionsRequestApprovalResponse } from "./PermissionsRequestApprovalResponse";
+export type { PitchAiSkillPrincipal } from "./PitchAiSkillPrincipal";
 export type { PlanDeltaNotification } from "./PlanDeltaNotification";
 export type { PluginAuthPolicy } from "./PluginAuthPolicy";
 export type { PluginAvailability } from "./PluginAvailability";

@@ -134,6 +134,7 @@ pub use requirements_exec_policy::RequirementsExecPolicyToml;
 pub use requirements_layers::RequirementsLayerEntry;
 pub use requirements_layers::compose_requirements;
 pub use skills_config::BundledSkillsConfig;
+pub use skills_config::PitchAiSkillPrincipal;
 pub use skills_config::SkillConfig;
 pub use skills_config::SkillsConfig;
 pub use state::ConfigLayerEntry;

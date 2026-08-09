@@ -1824,6 +1824,7 @@ mod tests {
             params: v2::SkillsListParams {
                 cwds: Vec::new(),
                 force_reload: false,
+                pitchai_principal: None,
             },
         };
         assert_eq!(

@@ -716,6 +716,7 @@ pub(super) async fn fetch_skills_list(
             params: SkillsListParams {
                 cwds: vec![cwd],
                 force_reload: true,
+                pitchai_principal: None,
             },
         })
         .await

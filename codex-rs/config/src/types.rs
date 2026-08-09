@@ -819,6 +819,7 @@ pub struct Notice {
 }
 
 pub use crate::skills_config::BundledSkillsConfig;
+pub use crate::skills_config::PitchAiSkillPrincipal;
 pub use crate::skills_config::SkillConfig;
 pub use crate::skills_config::SkillsConfig;
 

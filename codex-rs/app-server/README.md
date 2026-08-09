@@ -1598,13 +1598,23 @@ $skill-creator Add a new skill for triaging flaky CI and include step-by-step us
 
 Use `skills/list` to fetch the available skills (optionally scoped by `cwds`, with `forceReload`).
 `skills/list` might reuse a cached skills result per `cwd`; setting `forceReload` to `true` refreshes the result from disk.
+Managed PitchAI clients may also pass `pitchaiPrincipal` with `schemaVersion`, `tenantId`, and `userId`.
+When `PITCHAI_SKILL_CATALOG_RELEASE` enables a managed catalog, the principal is required and is
+used to resolve immutable system, tenant, user, and repository skill roots. Invalid, incomplete, or
+conflicting principals fail closed in the corresponding `data[].errors` entry; the server does not
+fall back to process-user, home-directory, or working-directory identity.
 The server also emits `skills/changed` notifications when watched local skill files change. Treat this as an invalidation signal and re-run `skills/list` with your current params when needed.
 Use `skills/extraRoots/set` to replace additional standalone skill roots for the current app-server process. These roots use the same layout as other standalone skill roots: each root contains skill directories, and each skill directory contains `SKILL.md`. Missing roots are accepted and load no skills until they exist. This setting is lost when app-server exits.
 
 ```json
 { "method": "skills/list", "id": 25, "params": {
     "cwds": ["/Users/me/project", "/Users/me/other-project"],
-    "forceReload": true
+    "forceReload": true,
+    "pitchaiPrincipal": {
+        "schemaVersion": 1,
+        "tenantId": "11111111-1111-4111-8111-111111111111",
+        "userId": "22222222-2222-4222-8222-222222222222"
+    }
 } }
 { "id": 25, "result": {
     "data": [{

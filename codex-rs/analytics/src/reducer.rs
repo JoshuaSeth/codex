@@ -682,6 +682,7 @@ impl AnalyticsReducer {
         for invocation in invocations {
             let skill_scope = match invocation.skill_scope {
                 SkillScope::User => "user",
+                SkillScope::Tenant => "tenant",
                 SkillScope::Repo => "repo",
                 SkillScope::System => "system",
                 SkillScope::Admin => "admin",

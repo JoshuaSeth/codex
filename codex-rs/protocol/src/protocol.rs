@@ -3491,6 +3491,7 @@ impl Product {
 #[ts(rename_all = "snake_case")]
 pub enum SkillScope {
     User,
+    Tenant,
     Repo,
     System,
     Admin,

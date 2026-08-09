@@ -2219,6 +2219,28 @@
       ],
       "type": "string"
     },
+    "PitchAiSkillPrincipal": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "user_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "tenant_id",
+        "user_id"
+      ],
+      "type": "object"
+    },
     "PluginConfig": {
       "additionalProperties": false,
       "properties": {
@@ -2692,6 +2714,14 @@
         "include_instructions": {
           "description": "Whether turns receive the automatic skills instructions block.",
           "type": "boolean"
+        },
+        "pitchai_principal": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PitchAiSkillPrincipal"
+            }
+          ],
+          "description": "Authoritative PitchAI tenant/user identity for managed skill resolution.\n\nThis selects immutable catalog profiles; it never contains credentials or client-supplied filesystem paths."
         }
       },
       "type": "object"

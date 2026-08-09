@@ -851,6 +851,7 @@ interface:
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some("twilio-developer-kit@test".to_string()),
         plugin_root: Some(plugin_root_abs.clone()),
+        allowed_source_root: None,
     }])
     .await;
 
@@ -908,6 +909,7 @@ interface:
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some("twilio-developer-kit@test".to_string()),
         plugin_root: Some(plugin_root.abs()),
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1054,6 +1056,7 @@ async fn loads_skills_via_symlinked_subdir_for_admin_scope() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: None,
         plugin_root: None,
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1136,6 +1139,7 @@ async fn system_scope_ignores_symlinked_subdir() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: None,
         plugin_root: None,
+        allowed_source_root: None,
     }])
     .await;
     assert!(
@@ -1170,6 +1174,7 @@ async fn respects_max_scan_depth_for_user_scope() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: None,
         plugin_root: None,
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1277,6 +1282,7 @@ async fn namespaces_plugin_skills_using_plugin_name() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some("sample@test".to_string()),
         plugin_root: Some(plugin_root.abs()),
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1322,6 +1328,7 @@ async fn plugin_skill_name_length_limit_allows_max_qualified_name() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some("sample@test".to_string()),
         plugin_root: Some(plugin_root.abs()),
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1367,6 +1374,7 @@ async fn plugin_skill_name_length_limit_rejects_overlong_qualified_name() {
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some("sample@test".to_string()),
         plugin_root: Some(plugin_root.abs()),
+        allowed_source_root: None,
     }])
     .await;
 
@@ -1678,6 +1686,7 @@ async fn deduplicates_by_path_preferring_first_root() {
             file_system: Arc::clone(&LOCAL_FS),
             plugin_id: None,
             plugin_root: None,
+            allowed_source_root: None,
         },
         SkillRoot {
             path: root.path().abs(),
@@ -1685,6 +1694,7 @@ async fn deduplicates_by_path_preferring_first_root() {
             file_system: Arc::clone(&LOCAL_FS),
             plugin_id: None,
             plugin_root: None,
+            allowed_source_root: None,
         },
     ])
     .await;
@@ -1707,6 +1717,50 @@ async fn deduplicates_by_path_preferring_first_root() {
             scope: SkillScope::Repo,
             plugin_id: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn managed_name_precedence_is_deterministic_within_one_root() {
+    let root = tempfile::tempdir().expect("tempdir");
+
+    let lexical_winner = write_skill_at(
+        root.path(),
+        "a-first",
+        "same-logical-name",
+        "lexical winner",
+    );
+    write_skill_at(
+        root.path(),
+        "z-last",
+        "same-logical-name",
+        "must be shadowed",
+    );
+
+    let outcome = load_skills_from_roots_with_name_precedence(
+        [SkillRoot {
+            path: root.path().abs(),
+            scope: SkillScope::Tenant,
+            file_system: Arc::clone(&LOCAL_FS),
+            plugin_id: None,
+            plugin_root: None,
+            allowed_source_root: Some(root.path().abs()),
+        }],
+        true,
+    )
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "unexpected errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(outcome.skills.len(), 1);
+    assert_eq!(outcome.skills[0].name, "same-logical-name");
+    assert_eq!(outcome.skills[0].description, "lexical winner");
+    assert_eq!(
+        outcome.skills[0].path_to_skills_md,
+        normalized(&lexical_winner)
     );
 }
 
@@ -1801,16 +1855,15 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
         "unexpected errors: {:?}",
         outcome.errors
     );
-    let root_path = normalized(&root_skill_path);
-    let nested_path = normalized(&nested_skill_path);
-    let (first_path, second_path, first_description, second_description) =
-        if root_path <= nested_path {
-            (root_path, nested_path, "from root", "from nested")
-        } else {
-            (nested_path, root_path, "from nested", "from root")
-        };
-    assert_eq!(
-        outcome.skills,
+    assert_eq!(outcome.skills, {
+        let root_path = normalized(&root_skill_path);
+        let nested_path = normalized(&nested_skill_path);
+        let (first_path, second_path, first_description, second_description) =
+            if root_path <= nested_path {
+                (root_path, nested_path, "from root", "from nested")
+            } else {
+                (nested_path, root_path, "from nested", "from root")
+            };
         vec![
             SkillMetadata {
                 name: "dupe-skill".to_string(),
@@ -1835,7 +1888,7 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
                 plugin_id: None,
             },
         ]
-    );
+    });
 }
 
 #[tokio::test]

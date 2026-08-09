@@ -6,10 +6,13 @@ use crate::model::SkillLoadOutcome;
 use crate::model::SkillMetadata;
 use crate::model::SkillPolicy;
 use crate::model::SkillToolDependency;
+use crate::pitchai_principal::PitchAiSkillResolution;
+use crate::pitchai_principal::resolve_pitchai_skill_profile;
 use crate::system::system_cache_root_dir;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
+use codex_config::PitchAiSkillPrincipal;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
@@ -158,9 +161,21 @@ pub struct SkillRoot {
     pub file_system: Arc<dyn ExecutorFileSystem>,
     pub plugin_id: Option<String>,
     pub plugin_root: Option<AbsolutePathBuf>,
+    /// Canonical source boundary enforced for managed roots and symlinks.
+    pub allowed_source_root: Option<AbsolutePathBuf>,
 }
 
 pub async fn load_skills_from_roots<I>(roots: I) -> SkillLoadOutcome
+where
+    I: IntoIterator<Item = SkillRoot>,
+{
+    load_skills_from_roots_with_name_precedence(roots, false).await
+}
+
+pub(crate) async fn load_skills_from_roots_with_name_precedence<I>(
+    roots: I,
+    enforce_name_precedence: bool,
+) -> SkillLoadOutcome
 where
     I: IntoIterator<Item = SkillRoot>,
 {
@@ -170,8 +185,25 @@ where
     let mut file_systems_by_skill_path: HashMap<AbsolutePathBuf, Arc<dyn ExecutorFileSystem>> =
         HashMap::new();
     for root in roots {
+        let allowed_source_root = match root.allowed_source_root.as_ref() {
+            Some(path) => {
+                Some(canonicalize_for_skill_identity(root.file_system.as_ref(), path).await)
+            }
+            None => None,
+        };
         let fs = root.file_system;
         let root_path = canonicalize_for_skill_identity(fs.as_ref(), &root.path).await;
+        if allowed_source_root
+            .as_ref()
+            .is_some_and(|allowed| !root_path.as_path().starts_with(allowed.as_path()))
+        {
+            outcome.errors.push(SkillError {
+                path: root.path,
+                message: "Managed skill root resolves outside its approved source boundary."
+                    .to_string(),
+            });
+            continue;
+        }
         let skills_before_root = outcome.skills.len();
         discover_skills_under_root(
             fs.as_ref(),
@@ -179,6 +211,7 @@ where
             root.scope,
             root.plugin_id.as_deref(),
             root.plugin_root.as_ref(),
+            allowed_source_root.as_ref(),
             &mut outcome,
         )
         .await;
@@ -195,6 +228,12 @@ where
         }
     }
 
+    if enforce_name_precedence {
+        let mut seen_names: HashSet<String> = HashSet::new();
+        outcome
+            .skills
+            .retain(|skill| seen_names.insert(skill.name.clone()));
+    }
     let mut seen: HashSet<AbsolutePathBuf> = HashSet::new();
     outcome
         .skills
@@ -217,8 +256,9 @@ where
         match scope {
             SkillScope::Repo => 0,
             SkillScope::User => 1,
-            SkillScope::System => 2,
-            SkillScope::Admin => 3,
+            SkillScope::Tenant => 2,
+            SkillScope::System => 3,
+            SkillScope::Admin => 4,
         }
     }
 
@@ -252,6 +292,91 @@ pub(crate) async fn skill_roots(
     .await
 }
 
+pub(crate) struct SkillRootsResolution {
+    pub roots: Vec<SkillRoot>,
+    pub errors: Vec<SkillError>,
+}
+
+pub(crate) async fn skill_roots_with_diagnostics(
+    fs: Option<Arc<dyn ExecutorFileSystem>>,
+    config_layer_stack: &ConfigLayerStack,
+    cwd: &AbsolutePathBuf,
+    plugin_skill_roots: Vec<PluginSkillRoot>,
+    extra_skill_roots: Vec<AbsolutePathBuf>,
+    explicit_principal: Option<&PitchAiSkillPrincipal>,
+) -> SkillRootsResolution {
+    match resolve_pitchai_skill_profile(config_layer_stack, explicit_principal, cwd) {
+        PitchAiSkillResolution::Legacy => SkillRootsResolution {
+            roots: skill_roots(
+                fs,
+                config_layer_stack,
+                cwd,
+                plugin_skill_roots,
+                extra_skill_roots,
+            )
+            .await,
+            errors: Vec::new(),
+        },
+        PitchAiSkillResolution::Invalid { path, message } => SkillRootsResolution {
+            roots: Vec::new(),
+            errors: vec![SkillError { path, message }],
+        },
+        PitchAiSkillResolution::Managed(profile) => {
+            let repo_boundary = match fs.as_ref() {
+                Some(repo_fs) => {
+                    let project_root_markers = project_root_markers_from_stack(config_layer_stack);
+                    Some(find_project_root(repo_fs.as_ref(), cwd, &project_root_markers).await)
+                }
+                None => None,
+            };
+            let mut roots = skill_roots_from_layer_stack_inner(
+                config_layer_stack,
+                /*home_dir*/ None,
+                fs.clone(),
+            );
+            roots.retain(|root| root.scope == SkillScope::Repo);
+            for root in &mut roots {
+                root.allowed_source_root = repo_boundary.clone();
+            }
+            let mut repo_roots = repo_agents_skill_roots(fs, config_layer_stack, cwd).await;
+            for root in &mut repo_roots {
+                root.allowed_source_root = repo_boundary.clone();
+            }
+            repo_roots.reverse();
+            roots.extend(repo_roots);
+            roots.push(SkillRoot {
+                path: profile.user_root,
+                scope: SkillScope::User,
+                file_system: Arc::clone(&LOCAL_FS),
+                plugin_id: None,
+                plugin_root: None,
+                allowed_source_root: Some(profile.catalog_root.clone()),
+            });
+            roots.push(SkillRoot {
+                path: profile.tenant_root,
+                scope: SkillScope::Tenant,
+                file_system: Arc::clone(&LOCAL_FS),
+                plugin_id: None,
+                plugin_root: None,
+                allowed_source_root: Some(profile.catalog_root.clone()),
+            });
+            roots.push(SkillRoot {
+                path: profile.system_root,
+                scope: SkillScope::System,
+                file_system: Arc::clone(&LOCAL_FS),
+                plugin_id: None,
+                plugin_root: None,
+                allowed_source_root: Some(profile.catalog_root),
+            });
+            dedupe_skill_roots_by_path(&mut roots);
+            SkillRootsResolution {
+                roots,
+                errors: Vec::new(),
+            }
+        }
+    }
+}
+
 async fn skill_roots_with_home_dir(
     fs: Option<Arc<dyn ExecutorFileSystem>>,
     config_layer_stack: &ConfigLayerStack,
@@ -267,6 +392,7 @@ async fn skill_roots_with_home_dir(
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: Some(root.plugin_id),
         plugin_root: Some(root.plugin_root),
+        allowed_source_root: None,
     }));
     roots.extend(extra_skill_roots.into_iter().map(|path| SkillRoot {
         path,
@@ -274,6 +400,7 @@ async fn skill_roots_with_home_dir(
         file_system: Arc::clone(&LOCAL_FS),
         plugin_id: None,
         plugin_root: None,
+        allowed_source_root: None,
     }));
     roots.extend(repo_agents_skill_roots(fs, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
@@ -304,6 +431,7 @@ fn skill_roots_from_layer_stack_inner(
                         file_system: Arc::clone(repo_fs),
                         plugin_id: None,
                         plugin_root: None,
+                        allowed_source_root: None,
                     });
                 }
             }
@@ -316,6 +444,7 @@ fn skill_roots_from_layer_stack_inner(
                     file_system: Arc::clone(&LOCAL_FS),
                     plugin_id: None,
                     plugin_root: None,
+                    allowed_source_root: None,
                 });
 
                 // `$HOME/.agents/skills` (user-installed skills).
@@ -326,6 +455,7 @@ fn skill_roots_from_layer_stack_inner(
                         file_system: Arc::clone(&LOCAL_FS),
                         plugin_id: None,
                         plugin_root: None,
+                        allowed_source_root: None,
                     });
                 }
 
@@ -337,6 +467,7 @@ fn skill_roots_from_layer_stack_inner(
                     file_system: Arc::clone(&LOCAL_FS),
                     plugin_id: None,
                     plugin_root: None,
+                    allowed_source_root: None,
                 });
             }
             ConfigLayerSource::System { .. } => {
@@ -348,6 +479,7 @@ fn skill_roots_from_layer_stack_inner(
                     file_system: Arc::clone(&LOCAL_FS),
                     plugin_id: None,
                     plugin_root: None,
+                    allowed_source_root: None,
                 });
             }
             ConfigLayerSource::Mdm { .. }
@@ -383,6 +515,7 @@ async fn repo_agents_skill_roots(
                 file_system: Arc::clone(&fs),
                 plugin_id: None,
                 plugin_root: None,
+                allowed_source_root: None,
             }),
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -491,6 +624,7 @@ async fn discover_skills_under_root(
     scope: SkillScope,
     plugin_id: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
+    allowed_source_root: Option<&AbsolutePathBuf>,
     outcome: &mut SkillLoadOutcome,
 ) {
     let root = root.clone();
@@ -532,7 +666,7 @@ async fn discover_skills_under_root(
     // Follow symlinked directories for user, admin, and repo skills. System skills are written by Codex itself.
     let follow_symlinks = matches!(
         scope,
-        SkillScope::Repo | SkillScope::User | SkillScope::Admin
+        SkillScope::Repo | SkillScope::User | SkillScope::Tenant | SkillScope::Admin
     );
 
     let mut visited_dirs: HashSet<AbsolutePathBuf> = HashSet::new();
@@ -543,13 +677,16 @@ async fn discover_skills_under_root(
 
     while let Some((dir, depth)) = queue.pop_front() {
         let dir_uri = PathUri::from_abs_path(&dir);
-        let entries = match fs.read_directory(&dir_uri, /*sandbox*/ None).await {
+        let mut entries = match fs.read_directory(&dir_uri, /*sandbox*/ None).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("failed to read skills dir {}: {e:#}", dir.display());
                 continue;
             }
         };
+        // Filesystem enumeration order is not a contract. Stable lexical traversal makes
+        // same-root logical-name collisions deterministic before first-win deduplication.
+        entries.sort_unstable_by(|left, right| left.file_name.cmp(&right.file_name));
 
         for entry in entries {
             let file_name = entry.file_name;
@@ -574,6 +711,17 @@ async fn discover_skills_under_root(
                 match fs.read_directory(&path_uri, /*sandbox*/ None).await {
                     Ok(_) => {
                         let resolved_dir = canonicalize_for_skill_identity(fs, &path).await;
+                        if allowed_source_root.is_some_and(|allowed| {
+                            !resolved_dir.as_path().starts_with(allowed.as_path())
+                        }) {
+                            outcome.errors.push(SkillError {
+                                path: path.clone(),
+                                message:
+                                    "Managed skill link resolves outside its approved source boundary."
+                                        .to_string(),
+                            });
+                            continue;
+                        }
                         enqueue_dir(
                             &mut queue,
                             &mut visited_dirs,
@@ -599,6 +747,17 @@ async fn discover_skills_under_root(
 
             if metadata.is_directory {
                 let resolved_dir = canonicalize_for_skill_identity(fs, &path).await;
+                if allowed_source_root
+                    .is_some_and(|allowed| !resolved_dir.as_path().starts_with(allowed.as_path()))
+                {
+                    outcome.errors.push(SkillError {
+                        path: path.clone(),
+                        message:
+                            "Managed skill directory resolves outside its approved source boundary."
+                                .to_string(),
+                    });
+                    continue;
+                }
                 enqueue_dir(
                     &mut queue,
                     &mut visited_dirs,

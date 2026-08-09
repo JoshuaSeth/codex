@@ -9036,6 +9036,27 @@
       ],
       "type": "string"
     },
+    "PitchAiSkillPrincipal": {
+      "properties": {
+        "schemaVersion": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tenantId": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "tenantId",
+        "userId"
+      ],
+      "type": "object"
+    },
     "PlanDeltaNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "EXPERIMENTAL - proposed plan streaming deltas for plan items. Clients should not assume concatenated deltas match the completed plan item content.",
@@ -13451,6 +13472,7 @@
     "SkillScope": {
       "enum": [
         "user",
+        "tenant",
         "repo",
         "system",
         "admin"
@@ -13650,6 +13672,17 @@
         "forceReload": {
           "description": "When true, bypass the skills cache and re-scan skills from disk.",
           "type": "boolean"
+        },
+        "pitchaiPrincipal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PitchAiSkillPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative tenant/user identity for a managed PitchAI skill profile."
         }
       },
       "title": "SkillsListParams",

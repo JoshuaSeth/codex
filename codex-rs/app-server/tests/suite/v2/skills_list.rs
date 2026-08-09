@@ -9,9 +9,11 @@ use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::PitchAiSkillPrincipal;
 use codex_app_server_protocol::PluginListParams;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SkillScope;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsExtraRootsSetResponse;
@@ -41,6 +43,255 @@ fn write_skill(root: &TempDir, name: &str) -> Result<()> {
     let content = format!("---\nname: {name}\ndescription: {name} description\n---\n\n# Body\n");
     std::fs::write(skill_dir.join("SKILL.md"), content)?;
     Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_resolves_pitchai_tenant_and_user_profiles_without_root_leakage() -> Result<()>
+{
+    const SETH_ID: &str = "3a41af79-9fab-5ea0-bb83-a121ee0498a0";
+    const THOMAS_ID: &str = "baef2f0b-181b-571d-b66b-7a52d79eb963";
+    const JEF_ID: &str = "340fb61c-ed7b-57c4-b2f2-c1cd8e7986fd";
+    const TENANT_ID: &str = "9bc52e7e-79df-5a9b-a4c7-d4eb29d24f12";
+
+    let codex_home = TempDir::new()?;
+    let catalog = TempDir::new()?;
+    let repo = TempDir::new()?;
+    let wrong_cwd = TempDir::new()?;
+    std::fs::write(
+        catalog.path().join(".pitchai-principal-catalog-v1"),
+        "pitchai-codex-home-skills/principal-v1\n",
+    )?;
+    let system_root = catalog.path().join(".system");
+    let tenant_root = catalog
+        .path()
+        .join("profiles/tenants")
+        .join(TENANT_ID)
+        .join("skills");
+    let seth_root = catalog
+        .path()
+        .join("profiles/users")
+        .join(SETH_ID)
+        .join("skills");
+    let thomas_root = catalog
+        .path()
+        .join("profiles/users")
+        .join(THOMAS_ID)
+        .join("skills");
+    let jef_root = catalog
+        .path()
+        .join("profiles/users")
+        .join(JEF_ID)
+        .join("skills");
+    for root in [
+        &system_root,
+        &tenant_root,
+        &seth_root,
+        &thomas_root,
+        &jef_root,
+    ] {
+        std::fs::create_dir_all(root)?;
+    }
+
+    write_skill_at(&system_root, "system-shared", "system-shared", "system")?;
+    write_skill_at(&system_root, "duplicate", "duplicate", "system duplicate")?;
+    write_skill_at(&tenant_root, "tenant-shared", "tenant-shared", "tenant")?;
+    write_skill_at(&tenant_root, "duplicate", "duplicate", "tenant duplicate")?;
+    write_skill_at(&seth_root, "m365", "m365", "Seth private")?;
+    write_skill_at(
+        &seth_root,
+        "saulo-mailbox",
+        "saulo-mailbox",
+        "explicitly Seth-bound mailbox code",
+    )?;
+    write_skill_at(
+        &thomas_root,
+        "pitchai-thomas-m365",
+        "pitchai-thomas-m365",
+        "Thomas private",
+    )?;
+    write_skill_at(&thomas_root, "duplicate", "duplicate", "Thomas duplicate")?;
+    write_skill_at(
+        &jef_root,
+        "pitchai-jeff-m365-azure",
+        "pitchai-jeff-m365-azure",
+        "Jef private",
+    )?;
+    write_skill_at(
+        &codex_home.path().join("skills"),
+        "root-private",
+        "root-private",
+        "must never load",
+    )?;
+    write_skill_at(
+        &codex_home.path().join("skills"),
+        "seth-tracking-data-query",
+        "seth-tracking-data-query",
+        "root-only and never inferred",
+    )?;
+    write_skill_at(
+        catalog.path(),
+        "catalog-backed",
+        "catalog-backed",
+        "approved immutable link",
+    )?;
+    std::os::unix::fs::symlink(
+        catalog.path().join("catalog-backed"),
+        thomas_root.join("catalog-backed"),
+    )?;
+    std::fs::create_dir_all(repo.path().join(".git"))?;
+    let repo_root = repo.path().join(".agents/skills");
+    write_skill_at(&repo_root, "duplicate", "duplicate", "repo duplicate")?;
+    std::os::unix::fs::symlink(
+        codex_home.path().join("skills/root-private"),
+        repo_root.join("forbidden-link"),
+    )?;
+
+    let catalog_path = catalog
+        .path()
+        .to_str()
+        .context("catalog path must be UTF-8")?;
+    let mut mcp = TestAppServer::new_with_env(
+        codex_home.path(),
+        &[("PITCHAI_SKILL_CATALOG_RELEASE", Some(catalog_path))],
+    )
+    .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let project_response = request_skills(&mut mcp, repo.path(), false, THOMAS_ID).await?;
+    let project_entry = &project_response.data[0];
+    assert_eq!(project_entry.errors.len(), 1);
+    assert!(
+        project_entry.errors[0]
+            .path
+            .ends_with(".agents/skills/forbidden-link")
+    );
+    assert!(
+        project_entry.errors[0]
+            .message
+            .contains("outside its approved source boundary")
+    );
+    assert!(
+        !project_entry.errors[0]
+            .message
+            .contains(codex_home.path().to_string_lossy().as_ref())
+    );
+    let duplicate = project_entry
+        .skills
+        .iter()
+        .find(|skill| skill.name == "duplicate")
+        .context("repo duplicate should win")?;
+    assert_eq!(duplicate.description, "repo duplicate");
+    assert_eq!(duplicate.scope, SkillScope::Repo);
+    let project_names = project_entry
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        project_names
+            .iter()
+            .filter(|name| **name == "duplicate")
+            .count(),
+        1
+    );
+    assert!(project_names.contains(&"pitchai-thomas-m365"));
+    assert!(project_names.contains(&"catalog-backed"));
+    assert!(project_names.contains(&"tenant-shared"));
+    assert!(project_names.contains(&"system-shared"));
+    assert!(!project_names.contains(&"m365"));
+    assert!(!project_names.contains(&"pitchai-jeff-m365-azure"));
+    assert!(!project_names.contains(&"saulo-mailbox"));
+    assert!(!project_names.contains(&"seth-tracking-data-query"));
+    assert!(!project_names.contains(&"root-private"));
+
+    let wrong_response = request_skills(&mut mcp, wrong_cwd.path(), false, THOMAS_ID).await?;
+    let wrong_entry = &wrong_response.data[0];
+    let duplicate = wrong_entry
+        .skills
+        .iter()
+        .find(|skill| skill.name == "duplicate")
+        .context("user duplicate should win outside a repo")?;
+    assert_eq!(duplicate.description, "Thomas duplicate");
+    assert_eq!(duplicate.scope, SkillScope::User);
+
+    let seth_response = request_skills(&mut mcp, wrong_cwd.path(), false, SETH_ID).await?;
+    let seth_names = seth_response.data[0]
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(seth_names.contains(&"m365"));
+    assert!(seth_names.contains(&"saulo-mailbox"));
+    assert!(!seth_names.contains(&"seth-tracking-data-query"));
+    assert!(!seth_names.contains(&"pitchai-thomas-m365"));
+    assert!(!seth_names.contains(&"pitchai-jeff-m365-azure"));
+
+    let jef_response = request_skills(&mut mcp, wrong_cwd.path(), false, JEF_ID).await?;
+    let jef_names = jef_response.data[0]
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(jef_names.contains(&"pitchai-jeff-m365-azure"));
+    assert!(!jef_names.contains(&"m365"));
+    assert!(!jef_names.contains(&"saulo-mailbox"));
+    assert!(!jef_names.contains(&"seth-tracking-data-query"));
+    assert!(!jef_names.contains(&"pitchai-thomas-m365"));
+
+    write_skill_at(&tenant_root, "late-tenant", "late-tenant", "force reloaded")?;
+    let cached_response = request_skills(&mut mcp, wrong_cwd.path(), false, THOMAS_ID).await?;
+    assert!(
+        cached_response.data[0]
+            .skills
+            .iter()
+            .all(|skill| skill.name != "late-tenant")
+    );
+    let reloaded_response = request_skills(&mut mcp, wrong_cwd.path(), true, THOMAS_ID).await?;
+    assert!(
+        reloaded_response.data[0]
+            .skills
+            .iter()
+            .any(|skill| skill.name == "late-tenant")
+    );
+    Ok(())
+}
+
+fn write_skill_at(
+    root: &std::path::Path,
+    directory: &str,
+    name: &str,
+    description: &str,
+) -> Result<()> {
+    let skill_dir = root.join(directory);
+    std::fs::create_dir_all(&skill_dir)?;
+    let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
+    std::fs::write(skill_dir.join("SKILL.md"), content)?;
+    Ok(())
+}
+
+async fn request_skills(
+    mcp: &mut TestAppServer,
+    cwd: &std::path::Path,
+    force_reload: bool,
+    user_id: &str,
+) -> Result<SkillsListResponse> {
+    let request_id = mcp
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![cwd.to_path_buf()],
+            force_reload,
+            pitchai_principal: Some(PitchAiSkillPrincipal {
+                schema_version: 1,
+                tenant_id: "9bc52e7e-79df-5a9b-a4c7-d4eb29d24f12".to_string(),
+                user_id: user_id.to_string(),
+            }),
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    to_response(response)
 }
 
 async fn expect_skills_changed_notification(
@@ -249,6 +500,7 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
     let stale_skills_list_response: JSONRPCResponse = timeout(
@@ -299,6 +551,7 @@ async fn skills_list_loads_remote_installed_plugin_skills_from_cache() -> Result
                 .send_skills_list_request(SkillsListParams {
                     cwds: vec![cwd.path().to_path_buf()],
                     force_reload: false,
+                    pitchai_principal: None,
                 })
                 .await?;
             let skills_list_response: JSONRPCResponse = timeout(
@@ -373,6 +626,7 @@ async fn skills_list_excludes_plugin_skills_when_workspace_codex_plugins_disable
         .send_skills_list_request(SkillsListParams {
             cwds: vec![repo_root.path().to_path_buf()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
 
@@ -423,6 +677,7 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
 
@@ -463,6 +718,7 @@ async fn skills_list_accepts_relative_cwds() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![relative_cwd.clone()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
 
@@ -494,6 +750,7 @@ async fn skills_list_preserves_requested_cwd_order() -> Result<()> {
                 second_cwd.path().to_path_buf(),
             ],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
 
@@ -528,6 +785,7 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let first_response: JSONRPCResponse = timeout(
@@ -555,6 +813,7 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let second_response: JSONRPCResponse = timeout(
@@ -575,6 +834,7 @@ async fn skills_list_uses_cached_result_until_force_reload() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
     let third_response: JSONRPCResponse = timeout(
@@ -626,6 +886,7 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let skills_response: JSONRPCResponse = timeout(
@@ -661,6 +922,7 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let skills_response: JSONRPCResponse = timeout(
@@ -694,6 +956,7 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let skills_response: JSONRPCResponse = timeout(
@@ -718,6 +981,7 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let skills_response: JSONRPCResponse = timeout(
@@ -756,6 +1020,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
         .send_skills_list_request(SkillsListParams {
             cwds: vec![codex_home.path().to_path_buf()],
             force_reload: true,
+            pitchai_principal: None,
         })
         .await?;
     let initial_skills_response: JSONRPCResponse = timeout(
@@ -829,6 +1094,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
         .send_skills_list_request(SkillsListParams {
             cwds: vec![codex_home.path().to_path_buf()],
             force_reload: false,
+            pitchai_principal: None,
         })
         .await?;
     let updated_skills_response: JSONRPCResponse = timeout(
