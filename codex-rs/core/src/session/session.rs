@@ -4,6 +4,7 @@ use crate::agents_md::LoadedAgentsMd;
 use crate::config::ConstraintError;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
+use codex_config::PitchAiSkillPrincipal;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::SessionId;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -37,6 +38,11 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Immutable tenant/user identity used for managed skill selection.
+    ///
+    /// Legacy threads may bind it once when they are first authoritatively
+    /// resumed. A loaded thread can never switch to another principal.
+    pub(crate) pitchai_skill_principal: Mutex<Option<PitchAiSkillPrincipal>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -494,6 +500,9 @@ impl Session {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
+        let pitchai_skill_principal =
+            codex_core_skills::pitchai_skill_principal_from_stack(&config.config_layer_stack)
+                .map_err(anyhow::Error::msg)?;
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration.collaboration_mode.model(),
@@ -1056,6 +1065,7 @@ impl Session {
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
+                pitchai_skill_principal: Mutex::new(pitchai_skill_principal),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,

@@ -963,6 +963,7 @@ impl ThreadRequestProcessor {
             thread_source,
             environments,
         } = params;
+        required_pitchai_principal_from_config(config.as_ref())?;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
@@ -2693,6 +2694,7 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
     ) -> Result<(), JSONRPCErrorError> {
         let resume_started_at = std::time::Instant::now();
+        required_pitchai_principal_from_config(params.config.as_ref())?;
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -3096,6 +3098,9 @@ impl ThreadRequestProcessor {
                     active_path.display()
                 )));
             }
+            let requested_principal =
+                required_pitchai_principal_from_config(params.config.as_ref())?;
+            bind_required_pitchai_principal(existing_thread.as_ref(), requested_principal).await?;
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
             if !mismatch_details.is_empty() {
@@ -3493,6 +3498,7 @@ impl ThreadRequestProcessor {
             thread_source,
             exclude_turns,
         } = params;
+        required_pitchai_principal_from_config(cli_overrides.as_ref())?;
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(

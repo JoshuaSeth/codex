@@ -36,7 +36,7 @@ pub(crate) fn resolve_pitchai_skill_profile(
     explicit_principal: Option<&PitchAiSkillPrincipal>,
     cwd: &AbsolutePathBuf,
 ) -> PitchAiSkillResolution {
-    let configured_principal = match principal_from_stack(config_layer_stack) {
+    let configured_principal = match pitchai_skill_principal_from_stack(config_layer_stack) {
         Ok(principal) => principal,
         Err(message) => {
             return PitchAiSkillResolution::Invalid {
@@ -74,7 +74,7 @@ pub(crate) fn resolve_pitchai_skill_profile(
     }
 }
 
-fn principal_from_stack(
+pub fn pitchai_skill_principal_from_stack(
     config_layer_stack: &ConfigLayerStack,
 ) -> Result<Option<PitchAiSkillPrincipal>, String> {
     let effective_config = config_layer_stack.effective_config();

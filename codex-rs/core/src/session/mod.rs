@@ -1526,6 +1526,30 @@ impl Session {
             .clone()
     }
 
+    pub(crate) async fn bind_pitchai_skill_principal(
+        &self,
+        principal: codex_config::PitchAiSkillPrincipal,
+    ) -> CodexResult<()> {
+        let mut bound_principal = self.pitchai_skill_principal.lock().await;
+        match bound_principal.as_ref() {
+            Some(existing) if existing != &principal => Err(CodexErr::InvalidRequest(
+                "PitchAI skill principal does not match the identity already bound to this thread."
+                    .to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *bound_principal = Some(principal);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn pitchai_skill_principal(
+        &self,
+    ) -> Option<codex_config::PitchAiSkillPrincipal> {
+        self.pitchai_skill_principal.lock().await.clone()
+    }
+
     pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::UserInstructions> {
         let state = self.state.lock().await;
         state
