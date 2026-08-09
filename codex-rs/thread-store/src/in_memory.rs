@@ -119,6 +119,7 @@ mod tests {
                     base_instructions: BaseInstructions::default(),
                     dynamic_tools: Vec::new(),
                     multi_agent_version: None,
+                    pitchai_principal: None,
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
                         model_provider: "test-provider".to_string(),
@@ -245,6 +246,7 @@ impl InMemoryThreadStore {
             dynamic_tools: (!params.dynamic_tools.is_empty()).then(|| params.dynamic_tools.clone()),
             memory_mode: matches!(params.metadata.memory_mode, ThreadMemoryMode::Disabled)
                 .then_some("disabled".to_string()),
+            pitchai_principal: params.pitchai_principal.clone(),
             multi_agent_version: params.multi_agent_version,
             ..SessionMeta::default()
         };

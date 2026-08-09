@@ -1603,6 +1603,20 @@ When `PITCHAI_SKILL_CATALOG_RELEASE` enables a managed catalog, the principal is
 used to resolve immutable system, tenant, user, and repository skill roots. Invalid, incomplete, or
 conflicting principals fail closed in the corresponding `data[].errors` entry; the server does not
 fall back to process-user, home-directory, or working-directory identity.
+Managed thread creation persists the same identifier-only principal in the rollout's canonical first
+`session_meta` record. Resume and fork compare that immutable binding before skill discovery, including
+after an app-server restart; a different tenant/user pair fails closed without echoing either identifier.
+The stored identifiers are a continuity assertion, not a bearer credential: every identity-bound resume
+or fork under the managed catalog must also supply the current authoritative principal. If the catalog
+environment is absent, an identity-bound thread stays unavailable rather than falling back to process-home
+skills; a caller-supplied principal cannot re-enable managed identity outside that catalog boundary.
+Core session creation enforces the same catalog/principal pair for internal as well as app-server routes.
+A loaded unbound session cannot gain a memory-only identity that would disappear on restart.
+Legacy local rollouts bind once during a canonical same-user resume through a locked, flushed, atomic
+metadata replacement before the live writer opens. A legacy source must be resumed this way before it
+can be forked. Managed clients must select resume/fork sources by thread id: client-supplied history and
+rollout paths are rejected as non-authoritative identity sources. The persisted principal contains no
+tokens or credentials; those remain in the separately authorized identity-scoped provider boundary.
 The server also emits `skills/changed` notifications when watched local skill files change. Treat this as an invalidation signal and re-run `skills/list` with your current params when needed.
 Use `skills/extraRoots/set` to replace additional standalone skill roots for the current app-server process. These roots use the same layout as other standalone skill roots: each root contains skill directories, and each skill directory contains `SKILL.md`. Missing roots are accepted and load no skills until they exist. This setting is lost when app-server exits.
 

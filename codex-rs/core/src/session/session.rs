@@ -1,4 +1,5 @@
 use super::input_queue::InputQueue;
+use super::pitchai_principal::resolve_and_bind_pitchai_principal;
 use super::*;
 use crate::agents_md::LoadedAgentsMd;
 use crate::config::ConstraintError;
@@ -485,7 +486,7 @@ impl Session {
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
-        initial_history: InitialHistory,
+        mut initial_history: InitialHistory,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
         plugins_manager: Arc<PluginsManager>,
@@ -501,8 +502,8 @@ impl Session {
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
         let pitchai_skill_principal =
-            codex_core_skills::pitchai_skill_principal_from_stack(&config.config_layer_stack)
-                .map_err(anyhow::Error::msg)?;
+            resolve_and_bind_pitchai_principal(config.as_ref(), &mut initial_history).await?;
+        let persisted_principal_for_create = pitchai_skill_principal.clone();
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration.collaboration_mode.model(),
@@ -553,6 +554,7 @@ impl Session {
                             },
                             dynamic_tools: session_configuration.dynamic_tools.clone(),
                             multi_agent_version: initial_multi_agent_version,
+                            pitchai_principal: persisted_principal_for_create.clone(),
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),

@@ -1,15 +1,18 @@
 use codex_config::ConfigLayerStack;
 use codex_config::PitchAiSkillPrincipal;
 use codex_config::SkillsConfig;
+use codex_protocol::protocol::validate_pitchai_skill_principal;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::path::Path;
+
+#[cfg(test)]
+use codex_protocol::protocol::PITCHAI_SKILL_PRINCIPAL_SCHEMA_VERSION;
 
 const CATALOG_RELEASE_ENV: &str = "PITCHAI_SKILL_CATALOG_RELEASE";
 const CATALOG_MARKER: &str = ".pitchai-principal-catalog-v1";
 const CATALOG_MARKER_TEXT: &str = "pitchai-codex-home-skills/principal-v1";
-const PRINCIPAL_SCHEMA_VERSION: u8 = 1;
 
-pub(crate) fn managed_pitchai_catalog_enabled() -> bool {
+pub fn managed_pitchai_catalog_enabled() -> bool {
     std::env::var_os(CATALOG_RELEASE_ENV).is_some()
 }
 
@@ -96,10 +99,7 @@ fn profile_from_release(
     principal: &PitchAiSkillPrincipal,
     error_path: &AbsolutePathBuf,
 ) -> PitchAiSkillResolution {
-    if principal.schema_version != PRINCIPAL_SCHEMA_VERSION
-        || !is_canonical_uuid(&principal.tenant_id)
-        || !is_canonical_uuid(&principal.user_id)
-    {
+    if validate_pitchai_skill_principal(principal).is_err() {
         return PitchAiSkillResolution::Invalid {
             path: error_path.clone(),
             message: "Managed PitchAI skill principal is malformed or uses an unsupported schema version."
@@ -167,16 +167,6 @@ fn profile_from_release(
     })
 }
 
-fn is_canonical_uuid(value: &str) -> bool {
-    if value.len() != 36 {
-        return false;
-    }
-    value.bytes().enumerate().all(|(index, byte)| match index {
-        8 | 13 | 18 | 23 => byte == b'-',
-        _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +180,7 @@ mod tests {
 
     fn valid_principal() -> PitchAiSkillPrincipal {
         PitchAiSkillPrincipal {
-            schema_version: PRINCIPAL_SCHEMA_VERSION,
+            schema_version: PITCHAI_SKILL_PRINCIPAL_SCHEMA_VERSION,
             tenant_id: TENANT_ID.to_string(),
             user_id: USER_ID.to_string(),
         }
@@ -253,7 +243,7 @@ mod tests {
         let release = tempfile::tempdir().expect("catalog tempdir");
         let secret_like_value = "not-a-uuid-secret-identity-value";
         let principal = PitchAiSkillPrincipal {
-            schema_version: PRINCIPAL_SCHEMA_VERSION,
+            schema_version: PITCHAI_SKILL_PRINCIPAL_SCHEMA_VERSION,
             tenant_id: TENANT_ID.to_string(),
             user_id: secret_like_value.to_string(),
         };

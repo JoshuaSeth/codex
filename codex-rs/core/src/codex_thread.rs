@@ -581,18 +581,18 @@ impl CodexThread {
         self.codex.session.get_config().await
     }
 
-    /// Binds a managed PitchAI tenant/user identity to this thread.
+    /// Requires this thread's durable managed identity to match `principal`.
     ///
-    /// A legacy thread may bind once. Rebinding to a different identity is a
-    /// hard error because skill visibility is part of the thread's security
-    /// boundary.
-    pub async fn bind_pitchai_skill_principal(
+    /// Legacy identity migration occurs only during cold resume, before the
+    /// live rollout writer opens. A loaded unbound thread cannot be rebound in
+    /// memory because that would be lost at restart.
+    pub async fn require_pitchai_skill_principal(
         &self,
         principal: codex_config::PitchAiSkillPrincipal,
     ) -> CodexResult<()> {
         self.codex
             .session
-            .bind_pitchai_skill_principal(principal)
+            .require_pitchai_skill_principal(principal)
             .await
     }
 

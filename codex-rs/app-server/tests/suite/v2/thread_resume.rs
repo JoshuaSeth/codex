@@ -2216,6 +2216,7 @@ stream_max_retries = 0
         base_instructions: None,
         dynamic_tools: None,
         memory_mode: None,
+        pitchai_principal: None,
         multi_agent_version: None,
     };
     std::fs::write(

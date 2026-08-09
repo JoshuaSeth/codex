@@ -190,6 +190,7 @@ impl ExternalAgentSessionImporter {
             },
             dynamic_tools: Vec::new(),
             multi_agent_version: Some(MultiAgentVersion::V1),
+            pitchai_principal: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(cwd.clone()),
                 model_provider: model_provider.clone(),

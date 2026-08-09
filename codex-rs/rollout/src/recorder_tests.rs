@@ -8,6 +8,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::PitchAiSkillPrincipal;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
@@ -98,6 +99,115 @@ async fn resumed_rollout_allows_only_one_live_writer() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn legacy_rollout_principal_binding_is_durable_idempotent_and_conflict_safe()
+-> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::new_v4();
+    let thread_id =
+        ThreadId::from_string(&uuid.to_string()).expect("generated UUID must be a valid thread id");
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+
+    // Preserve an unknown metadata field to prove the migration patches the
+    // canonical line instead of round-tripping it through a lossy Rust type.
+    let original = fs::read_to_string(&rollout_path)?;
+    let mut lines = original.lines();
+    let mut first: serde_json::Value = serde_json::from_str(
+        lines
+            .next()
+            .expect("test rollout must contain session metadata"),
+    )?;
+    first["payload"]["future_metadata"] = serde_json::json!({"keep": true});
+    let remainder = lines.collect::<Vec<_>>().join("\n");
+    fs::write(&rollout_path, format!("{first}\n{remainder}\n"))?;
+    let before_binding = fs::read_to_string(&rollout_path)?;
+
+    let thomas = PitchAiSkillPrincipal {
+        schema_version: 1,
+        tenant_id: "9bc52e7e-79df-5a9b-a4c7-d4eb29d24f12".to_string(),
+        user_id: "baef2f0b-181b-571d-b66b-7a52d79eb963".to_string(),
+    };
+
+    #[cfg(unix)]
+    {
+        let binding_lock_path = pitchai_principal_binding_lock_path(&rollout_path);
+        let binding_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&binding_lock_path)?;
+        lock_rollout_writer(&binding_lock, &binding_lock_path)?;
+        let error =
+            bind_pitchai_principal_to_rollout_path(&rollout_path, thread_id, thomas.clone())
+                .await
+                .expect_err("a stable migration lock must serialize atomic replacements");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read_to_string(&rollout_path)?, before_binding);
+    }
+
+    let materialized_path =
+        bind_pitchai_principal_to_rollout_path(&rollout_path, thread_id, thomas.clone()).await?;
+    assert_eq!(materialized_path, rollout_path);
+
+    let after_binding = fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        after_binding.lines().count(),
+        before_binding.lines().count(),
+        "binding must not append duplicate metadata or drop history"
+    );
+    let first: serde_json::Value = serde_json::from_str(
+        after_binding
+            .lines()
+            .next()
+            .expect("bound rollout must retain session metadata"),
+    )?;
+    assert_eq!(
+        first["payload"]["future_metadata"],
+        serde_json::json!({"keep": true})
+    );
+    assert_eq!(
+        first["payload"]["pitchai_principal"],
+        serde_json::to_value(&thomas)?
+    );
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(
+        codex_protocol::protocol::pitchai_skill_principal_from_rollout_items(
+            items.as_slice(),
+            thread_id,
+        )
+        .expect("bound identity metadata must be consistent"),
+        Some(thomas.clone())
+    );
+
+    bind_pitchai_principal_to_rollout_path(&rollout_path, thread_id, thomas.clone()).await?;
+    assert_eq!(
+        fs::read_to_string(&rollout_path)?,
+        after_binding,
+        "equal rebinding must be byte-for-byte idempotent"
+    );
+
+    let jef = PitchAiSkillPrincipal {
+        schema_version: 1,
+        tenant_id: thomas.tenant_id.clone(),
+        user_id: "340fb61c-ed7b-57c4-b2f2-c1cd8e7986fd".to_string(),
+    };
+    let error = bind_pitchai_principal_to_rollout_path(&rollout_path, thread_id, jef)
+        .await
+        .expect_err("conflicting rebinding must fail closed");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!error.to_string().contains(thomas.tenant_id.as_str()));
+    assert!(!error.to_string().contains(thomas.user_id.as_str()));
+    assert_eq!(
+        fs::read_to_string(&rollout_path)?,
+        after_binding,
+        "conflicting rebinding must not mutate the canonical rollout"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::new_v4();
@@ -128,6 +238,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             base_instructions: None,
             dynamic_tools: None,
             memory_mode: None,
+            pitchai_principal: None,
             multi_agent_version: None,
         },
         git: None,

@@ -5,6 +5,7 @@ use std::fs;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader as StdBufReader;
+use std::io::BufWriter as StdBufWriter;
 use std::io::Error as IoError;
 use std::io::Read;
 use std::io::Seek;
@@ -58,6 +59,7 @@ use codex_git_utils::get_git_repo_root;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::PitchAiSkillPrincipal;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -93,6 +95,7 @@ pub enum RolloutRecorderParams {
         thread_source: Option<ThreadSource>,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
+        pitchai_principal: Option<PitchAiSkillPrincipal>,
         multi_agent_version: Option<MultiAgentVersion>,
     },
     Resume {
@@ -179,8 +182,23 @@ impl RolloutRecorderParams {
             thread_source,
             base_instructions,
             dynamic_tools,
+            pitchai_principal: None,
             multi_agent_version: None,
         }
+    }
+
+    pub fn with_pitchai_principal(
+        mut self,
+        pitchai_principal: Option<PitchAiSkillPrincipal>,
+    ) -> Self {
+        if let Self::Create {
+            pitchai_principal: principal,
+            ..
+        } = &mut self
+        {
+            *principal = pitchai_principal;
+        }
+        self
     }
 
     pub fn with_multi_agent_version(
@@ -690,6 +708,7 @@ impl RolloutRecorder {
                 thread_source,
                 base_instructions,
                 dynamic_tools,
+                pitchai_principal,
                 multi_agent_version,
             } => {
                 let log_file_info = precompute_log_file_info(config, conversation_id)?;
@@ -726,6 +745,7 @@ impl RolloutRecorder {
                         Some(dynamic_tools)
                     },
                     memory_mode: (!config.generate_memories()).then_some("disabled".to_string()),
+                    pitchai_principal,
                     multi_agent_version,
                 };
 
@@ -1896,6 +1916,174 @@ pub async fn append_rollout_item_to_path(
     lock_rollout_writer(&file, rollout_path.as_path())?;
     let mut writer = JsonlWriter { file };
     writer.write_rollout_item(item).await
+}
+
+/// Atomically bind a legacy rollout's canonical `session_meta` to a managed
+/// PitchAI principal before a live writer is opened.
+///
+/// The first metadata line remains the authoritative source used by fast
+/// resume. Existing equal bindings are idempotent; conflicting bindings fail
+/// closed. The original file is retained unless the complete replacement has
+/// been flushed successfully.
+pub async fn bind_pitchai_principal_to_rollout_path(
+    rollout_path: &Path,
+    thread_id: ThreadId,
+    principal: PitchAiSkillPrincipal,
+) -> std::io::Result<PathBuf> {
+    let rollout_path = compression::materialize_rollout_for_append(rollout_path).await?;
+    let rewrite_path = rollout_path.clone();
+    tokio::task::spawn_blocking(move || {
+        bind_pitchai_principal_to_plain_rollout(rewrite_path.as_path(), thread_id, &principal)
+    })
+    .await
+    .map_err(IoError::other)??;
+    Ok(rollout_path)
+}
+
+fn bind_pitchai_principal_to_plain_rollout(
+    rollout_path: &Path,
+    thread_id: ThreadId,
+    principal: &PitchAiSkillPrincipal,
+) -> std::io::Result<()> {
+    // Atomic replacement changes the rollout inode, so its advisory lock alone
+    // cannot serialize two concurrent migrations. Hold a stable sibling lock
+    // before opening the current rollout path, then also lock that rollout to
+    // exclude an already-running writer.
+    let binding_lock_path = pitchai_principal_binding_lock_path(rollout_path);
+    let binding_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&binding_lock_path)?;
+    lock_rollout_writer(&binding_lock, &binding_lock_path)?;
+    let mut input = std::fs::OpenOptions::new().read(true).open(rollout_path)?;
+    lock_rollout_writer(&input, rollout_path)?;
+
+    let mut saw_thread_meta = false;
+    let mut existing_principal = None;
+    for line in StdBufReader::new(input.try_clone()?).lines() {
+        let line = line?;
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
+            continue;
+        };
+        let RolloutItem::SessionMeta(meta_line) = rollout_line.item else {
+            continue;
+        };
+        if meta_line.meta.id != thread_id {
+            continue;
+        }
+        saw_thread_meta = true;
+        let Some(candidate) = meta_line.meta.pitchai_principal else {
+            continue;
+        };
+        match existing_principal.as_ref() {
+            Some(existing) if existing != &candidate => {
+                return Err(IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persisted PitchAI thread identity metadata is internally inconsistent",
+                ));
+            }
+            Some(_) => {}
+            None => existing_principal = Some(candidate),
+        }
+    }
+    if !saw_thread_meta {
+        return Err(IoError::new(
+            std::io::ErrorKind::InvalidData,
+            "rollout does not contain canonical thread metadata",
+        ));
+    }
+    if let Some(existing) = existing_principal {
+        if existing == *principal {
+            return Ok(());
+        }
+        return Err(IoError::new(
+            std::io::ErrorKind::PermissionDenied,
+            "persisted PitchAI thread identity does not match the requested principal",
+        ));
+    }
+
+    // `File::try_clone` shares the underlying cursor. Rewind after the
+    // validation scan so the replacement is always built from byte zero.
+    input.seek(SeekFrom::Start(0))?;
+
+    let parent = rollout_path.parent().ok_or_else(|| {
+        IoError::new(
+            std::io::ErrorKind::InvalidInput,
+            "rollout path does not have a parent directory",
+        )
+    })?;
+    let permissions = input.metadata()?.permissions();
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+    replacement.as_file().set_permissions(permissions)?;
+    let mut reader = StdBufReader::new(input.try_clone()?);
+    let mut writer = StdBufWriter::new(replacement.as_file_mut());
+    let mut line = Vec::new();
+    let mut updated = false;
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        if !updated
+            && rewrite_session_meta_principal_line(&line, thread_id, principal, &mut writer)?
+        {
+            updated = true;
+        } else {
+            std::io::Write::write_all(&mut writer, &line)?;
+        }
+        line.clear();
+    }
+    if !updated {
+        return Err(IoError::new(
+            std::io::ErrorKind::InvalidData,
+            "canonical thread metadata changed during identity binding",
+        ));
+    }
+    std::io::Write::flush(&mut writer)?;
+    drop(writer);
+    replacement.as_file().sync_all()?;
+    replacement
+        .persist(rollout_path)
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn pitchai_principal_binding_lock_path(rollout_path: &Path) -> PathBuf {
+    let mut lock_path = rollout_path.as_os_str().to_os_string();
+    lock_path.push(".pitchai-principal.lock");
+    PathBuf::from(lock_path)
+}
+
+fn rewrite_session_meta_principal_line(
+    line: &[u8],
+    thread_id: ThreadId,
+    principal: &PitchAiSkillPrincipal,
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    let without_newline = line.strip_suffix(b"\n").unwrap_or(line);
+    let without_newline = without_newline
+        .strip_suffix(b"\r")
+        .unwrap_or(without_newline);
+    let Ok(mut value) = serde_json::from_slice::<Value>(without_newline) else {
+        return Ok(false);
+    };
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(false);
+    }
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+    let thread_id = thread_id.to_string();
+    if payload.get("id").and_then(Value::as_str) != Some(thread_id.as_str()) {
+        return Ok(false);
+    }
+    payload.insert(
+        "pitchai_principal".to_string(),
+        serde_json::to_value(principal).map_err(IoError::other)?,
+    );
+    serde_json::to_writer(&mut *writer, &value).map_err(IoError::other)?;
+    std::io::Write::write_all(writer, b"\n")?;
+    Ok(true)
 }
 
 struct JsonlWriter {
