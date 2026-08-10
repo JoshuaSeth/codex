@@ -145,6 +145,11 @@ pub(crate) async fn run_turn(
 ) -> Option<String> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    // Managed catalogs can change independently of persisted TurnContext metadata. Refresh the
+    // append-only contextual catalog before compaction or sampling so resumed threads cannot use
+    // stale cross-principal skill instructions.
+    sess.sync_managed_skills_context(turn_context.as_ref())
+        .await;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively

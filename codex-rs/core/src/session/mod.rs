@@ -208,6 +208,7 @@ mod config_lock;
 mod handlers;
 mod inject;
 mod input_queue;
+mod managed_skills_context;
 mod mcp;
 pub(crate) mod multi_agents;
 mod pitchai_principal;
@@ -3236,13 +3237,17 @@ impl Session {
             state.reference_context_item()
         };
         let should_inject_full_context = reference_context_item.is_none();
-        let context_items = if should_inject_full_context {
+        let mut context_items = if should_inject_full_context {
             self.build_initial_context(turn_context).await
         } else {
             // Steady-state path: append only context diffs to minimize token overhead.
             self.build_settings_update_items(reference_context_item.as_ref(), turn_context)
                 .await
         };
+        if should_inject_full_context {
+            self.remove_duplicate_managed_skills_context(&mut context_items)
+                .await;
+        }
         let turn_context_item = turn_context.to_turn_context_item();
         if !context_items.is_empty() {
             self.record_conversation_items(turn_context, &context_items)

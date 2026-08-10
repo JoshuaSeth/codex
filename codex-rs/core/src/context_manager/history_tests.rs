@@ -117,6 +117,123 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
     }
 }
 
+#[test]
+fn for_prompt_keeps_only_latest_skills_context_without_rewriting_history() {
+    let stale_skills = "<skills_instructions>\n- pitchai-thomas-m365: stale\n- seth-private: stale\n</skills_instructions>";
+    let current_skills =
+        "<skills_instructions>\n- pitchai-jeff-m365-azure: current\n</skills_instructions>";
+    let mixed_developer = developer_msg_with_fragments(&[
+        "persistent developer policy",
+        stale_skills,
+        "<permissions instructions>current permissions</permissions instructions>",
+    ]);
+    let current_developer = developer_msg(current_skills);
+    let user = user_input_text_msg("keep the user turn");
+    let assistant = assistant_msg("keep the assistant turn");
+    let history = create_history_with_items(vec![
+        mixed_developer.clone(),
+        user.clone(),
+        assistant.clone(),
+        current_developer.clone(),
+    ]);
+
+    assert_eq!(history.latest_skills_instructions(), Some(current_skills));
+    assert_eq!(
+        history.raw_items(),
+        &[
+            mixed_developer,
+            user.clone(),
+            assistant.clone(),
+            current_developer
+        ]
+    );
+
+    let prompt = history.for_prompt(&default_input_modalities());
+    assert_eq!(
+        prompt,
+        vec![
+            developer_msg_with_fragments(&[
+                "persistent developer policy",
+                "<permissions instructions>current permissions</permissions instructions>",
+            ]),
+            user,
+            assistant,
+            developer_msg(current_skills),
+        ]
+    );
+    let prompt_text = serde_json::to_string(&prompt).expect("prompt should serialize");
+    assert!(!prompt_text.contains("pitchai-thomas-m365"));
+    assert!(!prompt_text.contains("seth-private"));
+    assert_eq!(prompt_text.matches("pitchai-jeff-m365-azure").count(), 1);
+}
+
+#[test]
+fn for_prompt_drops_superseded_skills_only_developer_messages() {
+    let stale = developer_msg("<skills_instructions>stale</skills_instructions>");
+    let current = developer_msg("<skills_instructions>current</skills_instructions>");
+    let user = user_input_text_msg("hello");
+    let history = create_history_with_items(vec![stale, user.clone(), current.clone()]);
+
+    assert_eq!(
+        history.for_prompt(&default_input_modalities()),
+        vec![user, current]
+    );
+}
+
+#[test]
+fn matching_skills_context_is_removed_without_dropping_other_developer_fragments() {
+    let current = "<skills_instructions>current</skills_instructions>";
+    let mut items = vec![
+        developer_msg_with_fragments(&["persistent developer policy", current]),
+        developer_msg("<skills_instructions>different</skills_instructions>"),
+        user_input_text_msg("hello"),
+    ];
+
+    remove_matching_skills_instructions(&mut items, current);
+
+    assert_eq!(
+        items,
+        vec![
+            developer_msg("persistent developer policy"),
+            developer_msg("<skills_instructions>different</skills_instructions>"),
+            user_input_text_msg("hello"),
+        ]
+    );
+}
+
+#[test]
+fn token_estimate_matches_the_latest_skills_prompt_projection() {
+    let stale_skills = format!(
+        "<skills_instructions>{}</skills_instructions>",
+        "stale cross-principal catalog ".repeat(1_000)
+    );
+    let current_skills = "<skills_instructions>current catalog</skills_instructions>";
+    let user = user_input_text_msg("hello");
+    let history = create_history_with_items(vec![
+        developer_msg_with_fragments(&["persistent developer policy", &stale_skills]),
+        user.clone(),
+        developer_msg(current_skills),
+    ]);
+    let projected = create_history_with_items(vec![
+        developer_msg("persistent developer policy"),
+        user,
+        developer_msg(current_skills),
+    ]);
+    let base_instructions = BaseInstructions {
+        text: "base instructions".to_string(),
+    };
+
+    assert_eq!(
+        history.estimate_token_count_with_base_instructions(&base_instructions),
+        projected.estimate_token_count_with_base_instructions(&base_instructions)
+    );
+    assert!(
+        serde_json::to_string(history.raw_items())
+            .expect("stored history should serialize")
+            .contains("stale cross-principal catalog")
+    );
+}
+
 fn reference_context_item() -> TurnContextItem {
     TurnContextItem {
         turn_id: Some("reference-turn".to_string()),
