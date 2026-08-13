@@ -147,7 +147,10 @@ impl AuthBrokerClient {
         self.expect_success(response).await
     }
 
-    pub(crate) async fn heartbeat(&self, lease_id: &str) -> Result<(), AuthBrokerError> {
+    pub(crate) async fn heartbeat(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<BrokerFreezeSignal>, AuthBrokerError> {
         let response = self
             .http
             .post(format!(
@@ -158,7 +161,8 @@ impl AuthBrokerClient {
             .send()
             .await?;
 
-        self.expect_success(response).await
+        let payload: HeartbeatResponse = self.decode_json_response(response).await?;
+        Ok(payload.freeze.filter(|freeze| freeze.active))
     }
 
     pub(crate) async fn sync_lease(
@@ -228,6 +232,38 @@ struct LeaseResponse {
     lease_id: String,
     account_id: String,
     auth_json_b64: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct BrokerFreezeSignal {
+    #[serde(default)]
+    pub(crate) active: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) message: Option<String>,
+}
+
+impl BrokerFreezeSignal {
+    pub(crate) fn display_message(&self) -> String {
+        self.message
+            .as_ref()
+            .map(|message| message.trim())
+            .filter(|message| !message.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let reason = self
+                    .reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or("broker_freeze");
+                format!("auth broker requested freeze: {reason}")
+            })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatResponse {
+    freeze: Option<BrokerFreezeSignal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -427,7 +463,15 @@ fn format_percent(value: &Value) -> Option<String> {
 mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::time::Duration;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
+    use super::AuthBrokerClient;
+    use super::AuthBrokerConfig;
     use super::format_broker_detail;
 
     #[test]
@@ -478,6 +522,44 @@ mod tests {
              Accounts:\n\
              - root-codex (acc-a): available; leased until 2026-05-16T15:53:05+00:00; 5h 0% used, weekly 21% used\n\
              - privaterelay-codex (acc-b): rate_limited; cooling down until 2026-05-16T18:22:48+00:00; rate_limited: no credits remaining (balance 0); 5h 100% used, weekly 100% used"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_returns_active_freeze_signal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases/lease-1/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "lease_id": "lease-1",
+                "account_id": "account-1",
+                "expires_at": "2026-06-10T12:00:00+00:00",
+                "freeze": {
+                    "active": true,
+                    "reason": "low_five_hour_headroom",
+                    "message": "FROZEN due to 5h quota headroom: 9% remaining <= 10% threshold."
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AuthBrokerClient {
+            config: AuthBrokerConfig {
+                url: server.uri(),
+                token: "client-token".to_string(),
+                client_name: "codex-dev".to_string(),
+                lease_reason: "run".to_string(),
+                heartbeat_interval: Duration::from_secs(30),
+            },
+            http: reqwest::Client::new(),
+        };
+
+        let freeze = client.heartbeat("lease-1").await.unwrap().unwrap();
+
+        assert_eq!(freeze.reason.as_deref(), Some("low_five_hour_headroom"));
+        assert_eq!(
+            freeze.display_message(),
+            "FROZEN due to 5h quota headroom: 9% remaining <= 10% threshold."
         );
     }
 }
