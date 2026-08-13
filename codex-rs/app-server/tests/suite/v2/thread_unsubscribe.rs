@@ -6,10 +6,8 @@ use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -20,7 +18,6 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
-use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::ThreadUnsubscribeStatus;
@@ -33,14 +30,19 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RESIDENCY_SOFT_BYTES: &str = "CODEX_APP_SERVER_RESIDENCY_SOFT_BYTES";
+const RESIDENCY_HARD_BYTES: &str = "CODEX_APP_SERVER_RESIDENCY_HARD_BYTES";
+const RESIDENCY_IDLE_MIN_TTL_SECS: &str = "CODEX_APP_SERVER_RESIDENCY_IDLE_MIN_TTL_SECS";
+const RESIDENCY_EVICTION_POLL_SECS: &str = "CODEX_APP_SERVER_RESIDENCY_EVICTION_POLL_SECS";
+const U64_MAX: &str = "18446744073709551615";
 
 #[tokio::test]
-async fn thread_unsubscribe_unloads_thread_and_emits_thread_closed_notification() -> Result<()> {
+async fn thread_unsubscribe_keeps_thread_loaded_below_soft_cap() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = new_below_soft_cap_mcp(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
@@ -58,39 +60,14 @@ async fn thread_unsubscribe_unloads_thread_and_emits_thread_closed_notification(
     let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
 
-    let closed_notif: JSONRPCNotification = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-    let parsed: ServerNotification = closed_notif.try_into()?;
-    let ServerNotification::ThreadClosed(payload) = parsed else {
-        anyhow::bail!("expected thread/closed notification");
-    };
-    assert_eq!(payload.thread_id, thread_id);
-
-    let status_changed = wait_for_thread_status_not_loaded(&mut mcp, &payload.thread_id).await?;
-    assert_eq!(status_changed.thread_id, payload.thread_id);
-    assert_eq!(status_changed.status, ThreadStatus::NotLoaded);
-
-    let list_id = mcp
-        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
-        .await?;
-    let list_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
-    )
-    .await??;
-    let ThreadLoadedListResponse { data, next_cursor } =
-        to_response::<ThreadLoadedListResponse>(list_resp)?;
-    assert_eq!(data, Vec::<String>::new());
-    assert_eq!(next_cursor, None);
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(loaded_threads(&mut mcp).await?, vec![thread_id]);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed() -> Result<()> {
+async fn thread_unsubscribe_keeps_active_thread_loaded_under_pressure() -> Result<()> {
     #[cfg(target_os = "windows")]
     let shell_command = vec![
         "powershell".to_string(),
@@ -115,7 +92,16 @@ async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed(
     .await;
     create_config_toml(&codex_home, &server.uri())?;
 
-    let mut mcp = McpProcess::new(&codex_home).await?;
+    let mut mcp = McpProcess::new_with_env(
+        &codex_home,
+        &[
+            (RESIDENCY_SOFT_BYTES, Some("0")),
+            (RESIDENCY_HARD_BYTES, Some("0")),
+            (RESIDENCY_IDLE_MIN_TTL_SECS, Some("0")),
+            (RESIDENCY_EVICTION_POLL_SECS, Some("1")),
+        ],
+    )
+    .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
@@ -157,22 +143,14 @@ async fn thread_unsubscribe_during_turn_interrupts_turn_and_emits_thread_closed(
     let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
 
-    let closed_notif: JSONRPCNotification = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-    let parsed: ServerNotification = closed_notif.try_into()?;
-    let ServerNotification::ThreadClosed(payload) = parsed else {
-        anyhow::bail!("expected thread/closed notification");
-    };
-    assert_eq!(payload.thread_id, thread_id);
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(loaded_threads(&mut mcp).await?, vec![thread_id]);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
+async fn thread_unsubscribe_preserves_cached_status_when_resuming_resident_thread() -> Result<()> {
     let server = responses::start_mock_server().await;
     let _response_mock = responses::mount_sse_once(
         &server,
@@ -182,7 +160,7 @@ async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = new_below_soft_cap_mcp(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
@@ -235,12 +213,6 @@ async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
     .await??;
     let unsubscribe = to_response::<ThreadUnsubscribeResponse>(unsubscribe_resp)?;
     assert_eq!(unsubscribe.status, ThreadUnsubscribeStatus::Unsubscribed);
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id,
@@ -253,18 +225,18 @@ async fn thread_unsubscribe_clears_cached_status_before_resume() -> Result<()> {
     )
     .await??;
     let resume: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
-    assert_eq!(resume.thread.status, ThreadStatus::Idle);
+    assert_eq!(resume.thread.status, ThreadStatus::SystemError);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_unsubscribe_reports_not_loaded_after_thread_is_unloaded() -> Result<()> {
+async fn thread_unsubscribe_reports_not_subscribed_when_thread_remains_loaded() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = new_below_soft_cap_mcp(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_id = start_thread(&mut mcp).await?;
@@ -285,12 +257,6 @@ async fn thread_unsubscribe_reports_not_loaded_after_thread_is_unloaded() -> Res
         ThreadUnsubscribeStatus::Unsubscribed
     );
 
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("thread/closed"),
-    )
-    .await??;
-
     let second_unsubscribe_id = mcp
         .send_thread_unsubscribe_request(ThreadUnsubscribeParams { thread_id })
         .await?;
@@ -302,10 +268,35 @@ async fn thread_unsubscribe_reports_not_loaded_after_thread_is_unloaded() -> Res
     let second_unsubscribe = to_response::<ThreadUnsubscribeResponse>(second_unsubscribe_resp)?;
     assert_eq!(
         second_unsubscribe.status,
-        ThreadUnsubscribeStatus::NotLoaded
+        ThreadUnsubscribeStatus::NotSubscribed
     );
 
     Ok(())
+}
+
+async fn new_below_soft_cap_mcp(codex_home: &std::path::Path) -> Result<McpProcess> {
+    McpProcess::new_with_env(
+        codex_home,
+        &[
+            (RESIDENCY_SOFT_BYTES, Some(U64_MAX)),
+            (RESIDENCY_HARD_BYTES, Some(U64_MAX)),
+            (RESIDENCY_IDLE_MIN_TTL_SECS, Some("0")),
+            (RESIDENCY_EVICTION_POLL_SECS, Some("1")),
+        ],
+    )
+    .await
+}
+
+async fn loaded_threads(mcp: &mut McpProcess) -> Result<Vec<String>> {
+    let request_id = mcp
+        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    Ok(to_response::<ThreadLoadedListResponse>(response)?.data)
 }
 
 async fn wait_for_command_execution_item_started(mcp: &mut McpProcess) -> Result<()> {
@@ -317,28 +308,6 @@ async fn wait_for_command_execution_item_started(mcp: &mut McpProcess) -> Result
         let started: ItemStartedNotification = serde_json::from_value(started_params)?;
         if let ThreadItem::CommandExecution { .. } = started.item {
             return Ok(());
-        }
-    }
-}
-
-async fn wait_for_thread_status_not_loaded(
-    mcp: &mut McpProcess,
-    thread_id: &str,
-) -> Result<ThreadStatusChangedNotification> {
-    loop {
-        let status_changed_notif: JSONRPCNotification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("thread/status/changed"),
-        )
-        .await??;
-        let status_changed_params = status_changed_notif
-            .params
-            .context("thread/status/changed params must be present")?;
-        let status_changed: ThreadStatusChangedNotification =
-            serde_json::from_value(status_changed_params)?;
-        if status_changed.thread_id == thread_id && status_changed.status == ThreadStatus::NotLoaded
-        {
-            return Ok(status_changed);
         }
     }
 }
