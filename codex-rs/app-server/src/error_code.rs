@@ -11,6 +11,15 @@ pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     error(INVALID_REQUEST_ERROR_CODE, message)
 }
 
+pub(crate) fn invalid_request_before_effect(message: impl Into<String>) -> JSONRPCErrorError {
+    before_effect(invalid_request(message))
+}
+
+pub(crate) fn before_effect(mut error: JSONRPCErrorError) -> JSONRPCErrorError {
+    error.data = Some(serde_json::json!({"effect": "notStarted"}));
+    error
+}
+
 pub(crate) fn method_not_found(message: impl Into<String>) -> JSONRPCErrorError {
     error(METHOD_NOT_FOUND_ERROR_CODE, message)
 }

@@ -234,6 +234,7 @@ enum ThreadListRepairMode {
 
 const RESUME_REVERSE_CHUNK_BYTES: u64 = 1024 * 1024;
 const RESUME_SESSION_META_SCAN_LINE_LIMIT: usize = 128;
+const FORK_HISTORY_MAX_BYTES: u64 = 8 * RESUME_REVERSE_CHUNK_BYTES;
 
 impl RolloutRecorder {
     /// List threads (rollout files) under the provided Codex home directory.
@@ -998,6 +999,93 @@ impl RolloutRecorder {
         }))
     }
 
+    /// Load a bounded, semantically useful source history for a new fork.
+    ///
+    /// Unlike resume, fork continuity must never require replaying an unbounded
+    /// historical prefix. A modern replacement-history compaction is preferred;
+    /// otherwise only complete JSONL records from the recent bounded suffix are
+    /// retained. Compressed rollouts fail explicitly because they cannot support
+    /// bounded random access.
+    pub async fn load_rollout_items_for_fork(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let Some(resolved_path) = compression::existing_rollout_path(path).await else {
+            return Err(IoError::new(
+                std::io::ErrorKind::NotFound,
+                format!("rollout does not exist: {}", path.display()),
+            ));
+        };
+        let plain_path = compression::plain_rollout_path(resolved_path.as_path());
+        if plain_path != resolved_path {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "compact fork history requires an uncompressed rollout: {}",
+                    resolved_path.display()
+                ),
+            ));
+        }
+
+        let (session_meta_item, thread_id, head_parse_errors) =
+            first_session_meta_for_resume(plain_path.as_path())?.ok_or_else(|| {
+                IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "compact fork history could not find session metadata in {}",
+                        plain_path.display()
+                    ),
+                )
+            })?;
+        let offset = match latest_fork_checkpoint_offset(plain_path.as_path())? {
+            Some(checkpoint_offset) => checkpoint_offset,
+            None => recent_rollout_suffix_offset(plain_path.as_path())?,
+        };
+        let (mut tail_items, tail_thread_id, tail_parse_errors) =
+            load_plain_rollout_items_from_offset(plain_path.as_path(), offset)?;
+        let thread_id = thread_id.or(tail_thread_id);
+        let parse_errors = head_parse_errors.saturating_add(tail_parse_errors);
+        if parse_errors > 0 {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compact fork history found {parse_errors} malformed JSONL record(s) in {}",
+                    plain_path.display()
+                ),
+            ));
+        }
+        let mut items = Vec::with_capacity(tail_items.len().saturating_add(1));
+        items.push(session_meta_item);
+        items.extend(
+            tail_items
+                .drain(..)
+                .filter(|item| !matches!(item, RolloutItem::SessionMeta(_))),
+        );
+
+        tracing::debug!(
+            "Loaded bounded fork history with {} items, thread ID: {:?}, bytes: <= {}, parse errors: {}",
+            items.len(),
+            thread_id,
+            FORK_HISTORY_MAX_BYTES,
+            parse_errors,
+        );
+        Ok((items, thread_id, parse_errors))
+    }
+
+    pub async fn get_rollout_fork_history(path: &Path) -> std::io::Result<InitialHistory> {
+        let (items, thread_id, _parse_errors) = Self::load_rollout_items_for_fork(path).await?;
+        let conversation_id = thread_id
+            .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
+        if items.is_empty() {
+            return Ok(InitialHistory::New);
+        }
+        info!("Loaded bounded fork history successfully from {path:?}");
+        Ok(InitialHistory::Resumed(ResumedHistory {
+            conversation_id,
+            history: items,
+            rollout_path: Some(compression::plain_rollout_path(path)),
+        }))
+    }
+
     /// Drain pending items before stopping the writer task.
     ///
     /// If draining fails, the writer stays alive so callers can continue retrying flush/shutdown.
@@ -1035,12 +1123,23 @@ fn rollout_item_from_json_line(line: &str) -> Result<Option<RolloutItem>, serde_
 }
 
 fn latest_resume_checkpoint_offset(path: &Path) -> std::io::Result<Option<u64>> {
+    latest_checkpoint_offset(path, 0)
+}
+
+fn latest_fork_checkpoint_offset(path: &Path) -> std::io::Result<Option<u64>> {
+    let file_len = File::open(path)?.metadata()?.len();
+    latest_checkpoint_offset(path, file_len.saturating_sub(FORK_HISTORY_MAX_BYTES))
+}
+
+fn latest_checkpoint_offset(path: &Path, lower_bound: u64) -> std::io::Result<Option<u64>> {
     let mut file = File::open(path)?;
     let mut end = file.seek(SeekFrom::End(0))?;
     let mut suffix = Vec::new();
 
-    while end > 0 {
-        let chunk_len_u64 = end.min(RESUME_REVERSE_CHUNK_BYTES);
+    while end > lower_bound {
+        let chunk_len_u64 = end
+            .saturating_sub(lower_bound)
+            .min(RESUME_REVERSE_CHUNK_BYTES);
         let chunk_len =
             usize::try_from(chunk_len_u64).map_err(|err| IoError::other(err.to_string()))?;
         let start = end.saturating_sub(chunk_len_u64);
@@ -1072,6 +1171,33 @@ fn latest_resume_checkpoint_offset(path: &Path) -> std::io::Result<Option<u64>> 
     }
 
     Ok(None)
+}
+
+fn recent_rollout_suffix_offset(path: &Path) -> std::io::Result<u64> {
+    let mut file = File::open(path)?;
+    let file_len = file.seek(SeekFrom::End(0))?;
+    if file_len <= FORK_HISTORY_MAX_BYTES {
+        return Ok(0);
+    }
+    let start = file_len.saturating_sub(FORK_HISTORY_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let probe_len = usize::try_from(RESUME_REVERSE_CHUNK_BYTES)
+        .map_err(|err| IoError::other(err.to_string()))?;
+    let mut probe = vec![0_u8; probe_len];
+    let read = file.read(&mut probe)?;
+    let newline = probe[..read]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "compact fork history found no complete JSONL boundary within {} bytes of its bounded suffix",
+                    RESUME_REVERSE_CHUNK_BYTES
+                ),
+            )
+        })?;
+    Ok(start.saturating_add(u64::try_from(newline.saturating_add(1)).unwrap_or(u64::MAX)))
 }
 
 fn find_resume_checkpoint_in_complete_region(
