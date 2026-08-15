@@ -12,6 +12,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadForkHistoryMode;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadItem;
@@ -346,6 +347,50 @@ async fn thread_fork_can_load_source_by_path() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = TestAppServer::new_with_env(
+        codex_home.path(),
+        &[("PITCHAI_SKILL_CATALOG_RELEASE", None)],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            history_mode: ThreadForkHistoryMode::Compact,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
+    assert_eq!(thread.preview, "Saved user message");
+    assert!(thread.turns.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -541,6 +586,10 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
             .contains("no rollout found for thread id"),
         "unexpected fork error: {}",
         fork_err.error.message
+    );
+    assert_eq!(
+        fork_err.error.data,
+        Some(serde_json::json!({"effect": "notStarted"}))
     );
 
     Ok(())

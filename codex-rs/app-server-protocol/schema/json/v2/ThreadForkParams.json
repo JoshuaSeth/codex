@@ -72,6 +72,13 @@
       ],
       "type": "string"
     },
+    "ThreadForkHistoryMode": {
+      "enum": [
+        "full",
+        "compact"
+      ],
+      "type": "string"
+    },
     "ThreadSource": {
       "type": "string"
     }

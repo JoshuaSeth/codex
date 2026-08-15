@@ -14,6 +14,7 @@ use codex_app_server_protocol::PitchAiSkillPrincipal as AppServerPitchAiSkillPri
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadForkHistoryMode;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -238,6 +239,7 @@ async fn cold_restart_rejects_cross_principal_fork_and_persists_same_principal()
         .send_thread_fork_request(ThreadForkParams {
             thread_id: source_thread_id.clone(),
             config: Some(principal_config(THOMAS_ID)),
+            history_mode: ThreadForkHistoryMode::Compact,
             ..Default::default()
         })
         .await?;

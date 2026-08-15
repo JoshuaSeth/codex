@@ -791,6 +791,205 @@ async fn load_rollout_items_for_resume_without_checkpoint_falls_back_to_full_his
 }
 
 #[tokio::test]
+async fn load_rollout_items_for_fork_reads_bounded_latest_compaction_tail() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "old prompt", "kind": "plain"},
+        })
+    )?;
+    let filler = serde_json::json!({
+        "timestamp": ts,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "historical filler"}],
+        },
+    })
+    .to_string();
+    while file.metadata()?.len() < FORK_HISTORY_MAX_BYTES.saturating_mul(2) {
+        writeln!(file, "{filler}")?;
+    }
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "compacted",
+            "payload": {
+                "message": "latest compact context",
+                "replacement_history": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "bounded base"}],
+                }],
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "recent prompt", "kind": "plain"},
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_for_fork(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    assert!(matches!(items[0], RolloutItem::SessionMeta(_)));
+    assert!(matches!(items[1], RolloutItem::Compacted(_)));
+    let RolloutItem::EventMsg(EventMsg::UserMessage(message)) = &items[2] else {
+        panic!("expected recent user message");
+    };
+    assert_eq!(message.message, "recent prompt");
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_for_fork_without_checkpoint_keeps_only_bounded_suffix()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "must be trimmed", "kind": "plain"},
+        })
+    )?;
+    let filler = serde_json::json!({
+        "timestamp": ts,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "recent rolling filler"}],
+        },
+    })
+    .to_string();
+    while file.metadata()?.len()
+        < FORK_HISTORY_MAX_BYTES.saturating_add(2 * RESUME_REVERSE_CHUNK_BYTES)
+    {
+        writeln!(file, "{filler}")?;
+    }
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "must be retained", "kind": "plain"},
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items_for_fork(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert!(matches!(items.first(), Some(RolloutItem::SessionMeta(_))));
+    let messages = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::UserMessage(message)) => Some(message.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!messages.contains(&"must be trimmed"));
+    assert!(messages.contains(&"must be retained"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_for_fork_rejects_malformed_bounded_tail() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let mut file = File::create(&rollout_path)?;
+    let thread_id = ThreadId::new();
+    let ts = "2025-01-03T12:00:00Z";
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": ts,
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+            },
+        })
+    )?;
+    writeln!(file, "{{malformed-tail")?;
+
+    let error = RolloutRecorder::load_rollout_items_for_fork(&rollout_path)
+        .await
+        .expect_err("malformed bounded history must fail");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("1 malformed JSONL record"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());

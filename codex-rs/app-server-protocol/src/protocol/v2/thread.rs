@@ -542,12 +542,29 @@ pub struct ThreadForkParams {
     /// Optional client-supplied analytics source classification for this forked thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
+    /// Select how much persisted source history is copied into the fork.
+    ///
+    /// `full` preserves the generic Codex behavior. `compact` copies the latest
+    /// self-contained compaction checkpoint plus its bounded tail, or a bounded
+    /// recent suffix when no checkpoint is available.
+    #[experimental("thread/fork.historyMode")]
+    #[serde(default)]
+    pub history_mode: ThreadForkHistoryMode,
     /// When true, return only thread metadata and live fork state without
     /// populating `thread.turns`. This is useful when the client plans to call
     /// `thread/turns/list` immediately after forking.
     #[experimental("thread/fork.excludeTurns")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclude_turns: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadForkHistoryMode {
+    #[default]
+    Full,
+    Compact,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
