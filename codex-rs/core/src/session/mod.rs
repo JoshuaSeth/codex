@@ -2708,6 +2708,10 @@ impl Session {
     ) -> Cow<'a, [ResponseItem]> {
         let mut items = Cow::Borrowed(items);
         prepare_response_items(items.to_mut());
+        // Most response items get their passthrough turn ID at the durable history boundary.
+        for item in items.to_mut() {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
+        }
         if turn_context.config.features.enabled(Feature::ItemIds) {
             Self::assign_missing_response_item_ids(items)
         } else {
@@ -2799,8 +2803,9 @@ impl Session {
     pub(crate) async fn record_inter_agent_communication(
         &self,
         turn_context: &TurnContext,
-        communication: InterAgentCommunication,
+        mut communication: InterAgentCommunication,
     ) {
+        communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
         let items = self.prepare_conversation_items_for_history(
             turn_context,
@@ -3391,6 +3396,10 @@ impl Session {
                 ])
         {
             items.push(guardian_developer_message);
+        }
+        // New context windows and compaction install these items directly into replacement history.
+        for item in &mut items {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
         }
         items
     }
