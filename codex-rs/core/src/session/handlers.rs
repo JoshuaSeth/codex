@@ -123,7 +123,6 @@ async fn thread_settings_update(
         summary,
         service_tier,
         collaboration_mode,
-        multi_agent_mode,
         personality,
     } = thread_settings;
     let collaboration_mode = match collaboration_mode {
@@ -149,7 +148,6 @@ async fn thread_settings_update(
         active_permission_profile,
         windows_sandbox_level,
         collaboration_mode: Some(collaboration_mode),
-        multi_agent_mode,
         reasoning_summary: summary,
         service_tier,
         personality,
@@ -177,7 +175,6 @@ async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
             reasoning_summary: snapshot.reasoning_summary,
             personality: snapshot.personality,
             collaboration_mode: snapshot.collaboration_mode,
-            multi_agent_mode: snapshot.multi_agent_mode,
         },
     })
 }
