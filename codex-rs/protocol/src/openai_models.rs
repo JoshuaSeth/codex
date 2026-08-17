@@ -703,8 +703,8 @@ mod tests {
 
     #[test]
     fn reasoning_effort_accepts_known_and_custom_values() {
-        let custom = ReasoningEffort::Custom("max".to_string());
-        let deserialized = from_str::<ReasoningEffort>(r#""max""#)
+        let custom = ReasoningEffort::Custom("custom-effort".to_string());
+        let deserialized = from_str::<ReasoningEffort>(r#""custom-effort""#)
             .expect("custom reasoning effort should deserialize");
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
 
@@ -712,16 +712,18 @@ mod tests {
             (
                 "high".parse(),
                 "max".parse(),
+                "custom-effort".parse(),
                 deserialized,
                 serialized,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
+                Ok(ReasoningEffort::Max),
                 Ok(custom.clone()),
-                custom,
-                r#""max""#.to_string(),
-                "max".to_string(),
+                custom.clone(),
+                r#""custom-effort""#.to_string(),
+                "custom-effort".to_string(),
             )
         );
     }

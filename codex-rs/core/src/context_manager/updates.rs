@@ -2,7 +2,6 @@ use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::EnvironmentContext;
 use crate::context::ModelSwitchInstructions;
-use crate::context::MultiAgentMode;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
@@ -14,6 +13,7 @@ use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use codex_execpolicy::Policy;
 use codex_features::Feature;
+use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -65,8 +65,12 @@ fn build_permissions_update_item(
             exec_policy,
             #[allow(deprecated)]
             &next.cwd,
-            next.features.enabled(Feature::ExecPermissionApprovals),
-            next.features.enabled(Feature::RequestPermissionsTool),
+            next.config
+                .features
+                .enabled(Feature::ExecPermissionApprovals),
+            next.config
+                .features
+                .enabled(Feature::RequestPermissionsTool),
         )
         .render(),
     )
@@ -97,20 +101,24 @@ fn build_multi_agent_mode_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
 ) -> Option<String> {
-    let previous = previous?;
-    let previous_multi_agent_version = previous.multi_agent_version?;
-    let previous_mode = crate::session::multi_agents::mode_for_reasoning_effort(
-        previous_multi_agent_version,
-        previous.effort.as_ref(),
+    let reasoning_effort = next.effective_reasoning_effort();
+    let effective_multi_agent_mode = crate::session::multi_agents::effective_multi_agent_mode(
+        next.multi_agent_version,
+        &next.session_source,
+        next.multi_agent_mode,
+        reasoning_effort.as_ref(),
     );
-    let next_mode = crate::session::multi_agents::effective_multi_agent_mode(next);
-    if previous_mode == next_mode {
+    let previous = previous?;
+    if previous.multi_agent_mode == effective_multi_agent_mode {
         return None;
     }
 
-    match next_mode {
+    match effective_multi_agent_mode {
+        Some(MultiAgentMode::None) => {
+            Some(MultiAgentModeInstructions::new(MultiAgentMode::None).render())
+        }
         Some(multi_agent_mode) => Some(MultiAgentModeInstructions::new(multi_agent_mode).render()),
-        None if previous_mode == Some(MultiAgentMode::Proactive) => {
+        None if previous.multi_agent_mode == Some(MultiAgentMode::Proactive) => {
             Some(MultiAgentModeInstructions::new(MultiAgentMode::ExplicitRequestOnly).render())
         }
         None => None,
@@ -229,7 +237,7 @@ fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<Response
         role: role.to_string(),
         content,
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     })
 }
 

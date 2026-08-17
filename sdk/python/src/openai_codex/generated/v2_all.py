@@ -4656,7 +4656,7 @@ class ChatgptAccount(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    email: str
+    email: str | None
     plan_type: Annotated[PlanType, Field(alias="planType")]
     type: Annotated[Literal["chatgpt"], Field(title="ChatgptAccountType")]
 

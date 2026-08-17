@@ -130,7 +130,7 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
 }
 
 #[tokio::test]
-async fn worker_compresses_old_archived_rollouts_only() -> anyhow::Result<()> {
+async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let active_uuid = Uuid::from_u128(3);
     let active_id = ThreadId::from_string(&active_uuid.to_string())?;
@@ -158,8 +158,8 @@ async fn worker_compresses_old_archived_rollouts_only() -> anyhow::Result<()> {
 
     worker::run(home.path().to_path_buf()).await?;
 
-    assert!(active_path.exists());
-    assert!(!compressed_rollout_path(&active_path).exists());
+    assert!(!active_path.exists());
+    assert!(compressed_rollout_path(&active_path).exists());
     assert!(!archived_path.exists());
     assert!(compressed_rollout_path(&archived_path).exists());
     assert!(fresh_path.exists());
@@ -172,6 +172,48 @@ async fn worker_compresses_old_archived_rollouts_only() -> anyhow::Result<()> {
             .join("rollout-compression.lock")
             .exists()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_skips_old_active_rollout_owned_by_live_recorder() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(16);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-06T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "live writer owns this rollout")?;
+    let config = RolloutConfig {
+        codex_home: home.path().to_path_buf(),
+        sqlite_home: home.path().to_path_buf(),
+        cwd: home.path().to_path_buf(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: true,
+    };
+    let recorder =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
+    set_old_mtime(&rollout_path)?;
+
+    worker::run(home.path().to_path_buf()).await?;
+
+    assert!(rollout_path.exists());
+    assert!(!compressed_rollout_path(&rollout_path).exists());
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+            UserMessageEvent {
+                message: "writer remains usable after compression scan".to_string(),
+                ..Default::default()
+            },
+        ))])
+        .await?;
+    recorder.flush().await?;
+    recorder.shutdown().await?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
     Ok(())
 }
 
@@ -456,6 +498,7 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
     fs::create_dir_all(parent)?;
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
             parent_thread_id: None,

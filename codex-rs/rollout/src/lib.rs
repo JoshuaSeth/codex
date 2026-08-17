@@ -6,6 +6,7 @@ use codex_protocol::protocol::SessionSource;
 
 pub(crate) mod compression;
 pub(crate) mod config;
+mod file_lock;
 pub(crate) mod list;
 pub(crate) mod metadata;
 pub(crate) mod policy;

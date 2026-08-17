@@ -106,6 +106,7 @@ impl PrivacyFilter {
                 self.de_anonymize_response_item(item);
             }
             codex_api::ResponseEvent::Created
+            | codex_api::ResponseEvent::SafetyBuffering(_)
             | codex_api::ResponseEvent::ServerModel(_)
             | codex_api::ResponseEvent::ModelVerifications(_)
             | codex_api::ResponseEvent::TurnModerationMetadata(_)
