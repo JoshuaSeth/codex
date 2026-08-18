@@ -702,6 +702,8 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_permission_profile,
         workspace_roots,
         reasoning_effort,
+        thread_source,
+        originator,
         ..
     } = config_snapshot;
     let instruction_sources = pending.instruction_sources;
@@ -710,6 +712,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_response_active_permission_profile(active_permission_profile);
     let session_id = conversation.session_configured().session_id.to_string();
     thread.session_id = session_id;
+    thread.thread_source = thread_source.map(Into::into);
 
     let response = ThreadResumeResponse {
         thread,
@@ -727,7 +730,9 @@ pub(super) async fn handle_pending_thread_resume_request(
         multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         initial_turns_page,
     };
-    outgoing.send_response(request_id, response).await;
+    outgoing
+        .send_response_with_thread_originator(request_id, response, originator)
+        .await;
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
     if let Some(token_usage_thread) = token_usage_thread {
