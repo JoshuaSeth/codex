@@ -160,7 +160,11 @@ impl PrivacyFilter {
                     }
                 }
             }
-            ResponseItem::Reasoning { .. }
+            // `AdditionalTools` is the Responses Lite carrier for the same structural tool
+            // definitions that otherwise travel outside the prompt-item list. Rewriting arbitrary
+            // strings inside those JSON schemas would corrupt tool names and contracts.
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
             | ResponseItem::ToolSearchCall { .. }
@@ -497,6 +501,26 @@ print(json.dumps({{"spans": spans}}))
         };
         assert_eq!(filter.anonymize_text("Jane Smith").unwrap(), "Jane Smith");
         assert_eq!(filter.de_anonymize_text("Jane Smith"), "Jane Smith");
+    }
+
+    #[test]
+    fn additional_tools_payload_is_preserved() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let original = ResponseItem::AdditionalTools {
+            id: Some("at_test".to_string()),
+            role: "developer".to_string(),
+            tools: vec![serde_json::json!({
+                "name": "lookup_jane_smith",
+                "description": "Look up Jane Smith",
+            })],
+        };
+        let mut items = vec![original.clone()];
+
+        filter.anonymize_items(&mut items).unwrap();
+
+        assert_eq!(items, vec![original]);
     }
 
     #[test]
