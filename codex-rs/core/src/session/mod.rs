@@ -158,15 +158,9 @@ use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::prelude::*;
-use rmcp::model::ElicitationCapability;
-use rmcp::model::FormElicitationCapability;
-use rmcp::model::ListResourceTemplatesResult;
-use rmcp::model::ListResourcesResult;
-use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
-use rmcp::model::UrlElicitationCapability;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -215,6 +209,7 @@ mod handlers;
 mod inject;
 mod input_queue;
 mod mcp;
+mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod review;
 mod rollout_budget;
@@ -236,6 +231,7 @@ use self::handlers::submission_loop;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
+pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
@@ -342,7 +338,7 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_mcp::McpConfig;
 use codex_mcp::compute_auth_statuses;
-use codex_mcp::effective_mcp_servers_from_configured;
+use codex_mcp::effective_mcp_servers;
 use codex_otel::SessionTelemetry;
 use codex_otel::THREAD_STARTED_METRIC;
 use codex_otel::TelemetryAuthMode;
@@ -843,8 +839,11 @@ impl Codex {
                 ..Default::default()
             })
             .await?;
-        let mcp_connection_manager = self.session.services.mcp_connection_manager.load_full();
-        mcp_connection_manager.set_elicitations_auto_deny(mcp_elicitations_auto_deny);
+        self.session
+            .services
+            .latest_mcp_runtime()
+            .manager()
+            .set_elicitations_auto_deny(mcp_elicitations_auto_deny);
         Ok(())
     }
 
@@ -2867,10 +2866,12 @@ impl Session {
                 &environments.captured_environments(),
             )
             .await;
+        let mcp = self.services.latest_mcp_runtime();
         Arc::new(StepContext::new(
             turn_context,
             environments,
             selected_capability_roots,
+            mcp,
             loaded_agents_md,
         ))
     }
@@ -3166,6 +3167,17 @@ impl Session {
         turn_context: &TurnContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
+        let mcp = self.services.latest_mcp_runtime();
+        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp)
+            .await
+    }
+
+    async fn build_initial_context_with_world_state_and_mcp(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        mcp: &McpRuntimeSnapshot,
+    ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut separate_developer_sections = Vec::<String>::new();
@@ -3258,10 +3270,9 @@ impl Session {
             }
         }
         if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
-            let mcp_connection_manager = self.services.mcp_connection_manager.load_full();
             let accessible_and_enabled_connectors =
                 connectors::list_accessible_and_enabled_connectors_from_manager(
-                    &mcp_connection_manager,
+                    mcp.manager(),
                     &turn_context.config,
                 )
                 .await;
@@ -3360,7 +3371,8 @@ impl Session {
         if turn_context.config.features.enabled(Feature::TokenBudget)
             && turn_context.model_context_window().is_some()
         {
-            let mcp_result = self
+            let mcp_result = mcp
+                .manager()
                 .call_tool(
                     "notes",
                     "thread_hint",
@@ -3575,7 +3587,11 @@ impl Session {
         // Full initial context resets the baseline; later turns persist only its changes.
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let context_items = self
-                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+                .build_initial_context_with_world_state_and_mcp(
+                    turn_context,
+                    world_state.as_ref(),
+                    step_context.mcp.as_ref(),
+                )
                 .await;
             let snapshot = world_state.snapshot();
             self.state
