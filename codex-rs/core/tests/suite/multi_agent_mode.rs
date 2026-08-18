@@ -140,8 +140,10 @@ async fn omitted_ultra_root_is_proactive_and_switching_effort_revokes_it() -> Re
     submit_turn_with_effort(&test.codex, "no longer ultra", ReasoningEffort::Max).await?;
 
     let requests = responses.requests();
-    let first = developer_texts(requests[0].input());
-    let second = developer_texts(requests[1].input());
+    let first_input = requests[0].input();
+    let second_input = requests[1].input();
+    let first = developer_texts(&first_input);
+    let second = developer_texts(&second_input);
     assert_eq!(
         (
             count_containing(&first, MULTI_AGENT_MODE_OPEN_TAG),
