@@ -164,7 +164,9 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
 
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+    // Keep the exact model-visible state used by this turn and its inline compactions.
+    let mut world_state = sess
+        .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 
     let Some((injection_items, explicitly_enabled_connectors)) =
@@ -257,11 +259,13 @@ pub(crate) async fn run_turn(
                 let step_context = StepContext {
                     environments: sess.services.turn_environments.snapshot().await,
                 };
-                sess.record_step_environment_context_if_changed(
-                    turn_context.as_ref(),
-                    &step_context,
-                )
-                .await;
+                world_state = sess
+                    .record_step_environment_context_if_changed(
+                        turn_context.as_ref(),
+                        &world_state,
+                        &step_context,
+                    )
+                    .await;
             }
 
             // Construct the input that we will send to the model.
@@ -348,7 +352,7 @@ pub(crate) async fn run_turn(
                 .await;
 
                 let started_new_context_window = sess
-                    .maybe_start_new_context_window(turn_context.as_ref())
+                    .maybe_start_new_context_window(turn_context.as_ref(), Arc::clone(&world_state))
                     .await
                     .is_some();
                 if started_new_context_window && needs_follow_up {
@@ -368,7 +372,7 @@ pub(crate) async fn run_turn(
                         &sess,
                         &turn_context,
                         &mut client_session,
-                        InitialContextInjection::BeforeLastUserMessage,
+                        InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state)),
                         current_goal_context.clone(),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
