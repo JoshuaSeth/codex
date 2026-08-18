@@ -28,6 +28,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
+use codex_utils_plugins::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 use codex_utils_plugins::PluginSkillRoot;
 use codex_utils_plugins::plugin_namespace_for_skill_path;
 use dirs::home_dir;
@@ -148,6 +149,8 @@ enum SymlinkPolicy {
 
 struct SkillFileDiscovery {
     skill_files: Vec<PathUri>,
+    plugin_roots: HashSet<PathUri>,
+    namespace_roots: HashSet<PathUri>,
     warnings: Vec<String>,
     boundary_errors: Vec<SkillBoundaryError>,
 }
@@ -654,6 +657,8 @@ async fn discover_skills_under_root_with_boundary(
     let root = root.clone();
     let mut discovery = SkillFileDiscovery {
         skill_files: Vec::new(),
+        plugin_roots: HashSet::new(),
+        namespace_roots: HashSet::from([root.clone()]),
         warnings: Vec::new(),
         boundary_errors: Vec::new(),
     };
@@ -711,6 +716,12 @@ async fn discover_skills_under_root_with_boundary(
             .into_iter()
             .filter_map(|entry| {
                 let file_name = entry.file_name;
+                if DISCOVERABLE_PLUGIN_MANIFEST_PATHS
+                    .iter()
+                    .any(|path| path.split('/').next() == Some(file_name.as_str()))
+                {
+                    discovery.plugin_roots.insert(dir.clone());
+                }
                 if file_name.starts_with('.') {
                     return None;
                 }
@@ -750,6 +761,7 @@ async fn discover_skills_under_root_with_boundary(
                 match fs.read_directory(&path, /*sandbox*/ None).await {
                     Ok(_) => {
                         let resolved_dir = canonicalize_uri_for_skill_identity(fs, &path).await;
+                        discovery.namespace_roots.insert(resolved_dir.clone());
                         if allowed_source_root
                             .is_some_and(|allowed| !resolved_dir.starts_with(allowed))
                         {
@@ -856,6 +868,7 @@ async fn load_skills_under_root(
         skill_files,
         warnings,
         boundary_errors,
+        ..
     } = discover_skills_under_root_with_boundary(
         fs,
         &PathUri::from_abs_path(root),
