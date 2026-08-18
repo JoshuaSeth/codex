@@ -259,6 +259,7 @@ fn sample_turn_steer_request() -> ClientRequest {
             expected_turn_id: "turn-1".to_string(),
             client_user_message_id: None,
             completion_work_id: None,
+            completion_callback_metadata: None,
             input: Vec::new(),
             responsesapi_client_metadata: None,
             additional_context: None,
