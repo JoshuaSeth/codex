@@ -1212,7 +1212,7 @@ impl MessageProcessor {
             }
             ClientRequest::ThreadRollback { params, .. } => {
                 self.thread_processor
-                    .thread_rollback(&request_id, params)
+                    .thread_rollback(&request_id, params, app_server_client_name.as_deref())
                     .await
             }
             ClientRequest::ThreadList { params, .. } => {
