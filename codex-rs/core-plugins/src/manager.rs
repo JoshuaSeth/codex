@@ -393,15 +393,15 @@ struct LoadedPluginsCache {
 struct PluginLoadCacheKey {
     configured_plugins: HashMap<String, PluginConfig>,
     skill_config_rules: SkillConfigRules,
-    remote_plugin_enabled: bool,
+    remote_global_catalog_active: bool,
 }
 
 impl PluginLoadCacheKey {
-    fn from_config(config: &PluginsConfigInput) -> Self {
+    fn from_config(config: &PluginsConfigInput, remote_global_catalog_active: bool) -> Self {
         Self {
             configured_plugins: configured_plugins_from_stack(&config.config_layer_stack),
             skill_config_rules: skill_config_rules_from_stack(&config.config_layer_stack),
-            remote_plugin_enabled: config.remote_plugin_enabled,
+            remote_global_catalog_active,
         }
     }
 }
@@ -468,6 +468,10 @@ impl PluginsManager {
         }
     }
 
+    fn remote_global_catalog_active(&self, config: &PluginsConfigInput) -> bool {
+        config.remote_plugin_enabled && self.auth_mode().is_some_and(AuthMode::uses_codex_backend)
+    }
+
     pub fn set_analytics_events_client(&self, analytics_events_client: AnalyticsEventsClient) {
         let mut stored_client = match self.analytics_events_client.write() {
             Ok(client_guard) => client_guard,
@@ -499,7 +503,8 @@ impl PluginsManager {
         if !config.plugins_enabled {
             return None;
         }
-        let key = PluginLoadCacheKey::from_config(config);
+        let key =
+            PluginLoadCacheKey::from_config(config, self.remote_global_catalog_active(config));
         self.loaded_plugins_cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -528,7 +533,8 @@ impl PluginsManager {
             return PluginLoadOutcome::default();
         }
 
-        let cache_key = PluginLoadCacheKey::from_config(config);
+        let remote_global_catalog_active = self.remote_global_catalog_active(config);
+        let cache_key = PluginLoadCacheKey::from_config(config, remote_global_catalog_active);
         if !force_reload && let Some(plugins) = self.cached_loaded_plugins(&cache_key) {
             return self.resolve_loaded_plugins_for_auth(plugins);
         }
@@ -548,7 +554,7 @@ impl PluginsManager {
             &self.store,
             Some(&plugin_skill_snapshots),
             self.restriction_product,
-            config.remote_plugin_enabled,
+            remote_global_catalog_active,
         )
         .await;
         log_plugin_load_errors(&plugins);
@@ -633,7 +639,7 @@ impl PluginsManager {
             &self.store,
             /*plugin_skill_snapshots*/ None,
             self.restriction_product,
-            config.remote_plugin_enabled,
+            self.remote_global_catalog_active(config),
         )
         .await;
         self.resolve_loaded_plugins_for_auth(plugins)
@@ -652,7 +658,7 @@ impl PluginsManager {
             config_layer_stack,
             self.remote_installed_plugin_configs(),
             &self.store,
-            config.remote_plugin_enabled,
+            self.remote_global_catalog_active(config),
         )
         .await
     }
