@@ -14,7 +14,7 @@ use crate::model::SkillToolDependency;
 use crate::pitchai_principal::PitchAiSkillResolution;
 use crate::pitchai_principal::resolve_pitchai_skill_profile;
 use crate::system::system_cache_root_dir;
-use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::PitchAiSkillPrincipal;
