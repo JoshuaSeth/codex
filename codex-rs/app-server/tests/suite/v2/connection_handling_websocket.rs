@@ -834,9 +834,7 @@ pub(super) async fn assert_no_notification_for_method(
     let deadline = Instant::now() + wait_for;
     loop {
         match tokio::time::timeout_at(deadline, read_jsonrpc_message(stream)).await {
-            Ok(Ok(JSONRPCMessage::Notification(notification)))
-                if notification.method == method =>
-            {
+            Ok(Ok(JSONRPCMessage::Notification(notification))) if notification.method == method => {
                 bail!("received unexpected duplicate notification for method `{method}`")
             }
             Ok(Ok(_)) => {}

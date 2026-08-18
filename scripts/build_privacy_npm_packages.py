@@ -116,9 +116,13 @@ def main() -> int:
             platform = PLATFORM_PACKAGES.get(target)
             if platform is None:
                 supported = ", ".join(sorted(PLATFORM_PACKAGES))
-                raise RuntimeError(f"Unsupported package target {target!r}; supported: {supported}")
+                raise RuntimeError(
+                    f"Unsupported package target {target!r}; supported: {supported}"
+                )
             stage_dir = out_dir / f"{package_basename(platform['name'])}-{args.version}"
-            stage_platform_package(stage_dir, package_dir, args.version, target, platform)
+            stage_platform_package(
+                stage_dir, package_dir, args.version, target, platform
+            )
             tgz = pack(stage_dir, out_dir) if args.pack else None
             staged_platforms.append((target, platform, stage_dir, tgz))
             manifest["platform_packages"].append(
@@ -129,7 +133,9 @@ def main() -> int:
         main_stage = out_dir / f"codex-privacy-{args.version}"
         stage_main_package(main_stage, args.version)
         main_tgz = pack(main_stage, out_dir) if args.pack else None
-        manifest["main"] = package_manifest(main_stage, "any", {"name": MAIN_PACKAGE_NAME}, main_tgz)
+        manifest["main"] = package_manifest(
+            main_stage, "any", {"name": MAIN_PACKAGE_NAME}, main_tgz
+        )
 
     manifest_path = out_dir / "privacy-npm-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -152,7 +158,9 @@ def stage_main_package(stage_dir: Path, version: str) -> None:
     prepare_stage(stage_dir)
     bin_dir = stage_dir / "bin"
     bin_dir.mkdir()
-    shutil.copy2(ROOT / "codex-cli" / "bin" / "codex-privacy.js", bin_dir / "codex-privacy.js")
+    shutil.copy2(
+        ROOT / "codex-cli" / "bin" / "codex-privacy.js", bin_dir / "codex-privacy.js"
+    )
     write_json(
         stage_dir / "package.json",
         {
@@ -185,7 +193,9 @@ def stage_platform_package(
     vendor_dir = stage_dir / "vendor" / target
     privacy_dir = vendor_dir / "codex-resources" / "privacy"
     bin_dir.mkdir(parents=True)
-    shutil.copy2(ROOT / "codex-cli" / "bin" / "codex-privacy.js", bin_dir / "codex-privacy.js")
+    shutil.copy2(
+        ROOT / "codex-cli" / "bin" / "codex-privacy.js", bin_dir / "codex-privacy.js"
+    )
     shutil.copytree(package_dir, vendor_dir, ignore=privacy_payload_ignore)
     privacy_dir.mkdir(parents=True, exist_ok=True)
     for script in PRIVACY_SCRIPTS:
@@ -195,7 +205,8 @@ def stage_platform_package(
         {
             "name": platform["name"],
             "version": version_for_platform(version, platform),
-            "description": "PitchAI Codex Privacy native package for " + platform["tag"],
+            "description": "PitchAI Codex Privacy native package for "
+            + platform["tag"],
             "license": "UNLICENSED",
             "type": "module",
             "os": [platform["os"]],
@@ -311,7 +322,9 @@ def sha256(path: Path) -> str:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":
