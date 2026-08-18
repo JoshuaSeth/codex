@@ -38,10 +38,18 @@ fn configured_usage_hint_text_for_source<'a>(
     }
 }
 
-pub(crate) fn effective_multi_agent_mode(
+pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<MultiAgentMode> {
+    let reasoning_effort = turn_context.effective_reasoning_effort();
+    effective_multi_agent_mode_for(
+        turn_context.multi_agent_version,
+        &turn_context.session_source,
+        reasoning_effort.as_ref(),
+    )
+}
+
+fn effective_multi_agent_mode_for(
     multi_agent_version: MultiAgentVersion,
     session_source: &SessionSource,
-    selected_multi_agent_mode: Option<MultiAgentMode>,
     reasoning_effort: Option<&ReasoningEffort>,
 ) -> Option<MultiAgentMode> {
     if multi_agent_version != MultiAgentVersion::V2 {
@@ -49,8 +57,9 @@ pub(crate) fn effective_multi_agent_mode(
     }
 
     match session_source {
-        // A child may inherit its parent's selected mode, but it must never
-        // become another proactive manager.
+        // Ultra is a root-only orchestration mode. A spawned child always
+        // receives explicit-request-only instructions, even when its inherited
+        // reasoning effort remains Ultra.
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => {
             Some(MultiAgentMode::ExplicitRequestOnly)
         }
@@ -59,13 +68,11 @@ pub(crate) fn effective_multi_agent_mode(
         | SessionSource::Exec
         | SessionSource::Mcp
         | SessionSource::Custom(_)
-        | SessionSource::Unknown => Some(selected_multi_agent_mode.unwrap_or_else(|| {
-            if reasoning_effort == Some(&ReasoningEffort::Ultra) {
-                MultiAgentMode::Proactive
-            } else {
-                MultiAgentMode::ExplicitRequestOnly
-            }
-        })),
+        | SessionSource::Unknown => Some(if reasoning_effort == Some(&ReasoningEffort::Ultra) {
+            MultiAgentMode::Proactive
+        } else {
+            MultiAgentMode::ExplicitRequestOnly
+        }),
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
     }
 }
@@ -75,12 +82,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn omitted_ultra_enables_proactive_root_behavior() {
+    fn ultra_enables_proactive_root_behavior() {
         assert_eq!(
-            effective_multi_agent_mode(
+            effective_multi_agent_mode_for(
                 MultiAgentVersion::V2,
                 &SessionSource::Exec,
-                /*selected_multi_agent_mode*/ None,
                 Some(&ReasoningEffort::Ultra),
             ),
             Some(MultiAgentMode::Proactive)
@@ -88,22 +94,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_root_modes_win_over_ultra_derivation() {
-        for mode in [
-            MultiAgentMode::None,
-            MultiAgentMode::ExplicitRequestOnly,
-            MultiAgentMode::Proactive,
-        ] {
-            assert_eq!(
-                effective_multi_agent_mode(
-                    MultiAgentVersion::V2,
-                    &SessionSource::Exec,
-                    Some(mode),
-                    Some(&ReasoningEffort::Ultra),
-                ),
-                Some(mode)
-            );
-        }
+    fn non_ultra_roots_are_explicit_request_only() {
+        assert_eq!(
+            effective_multi_agent_mode_for(
+                MultiAgentVersion::V2,
+                &SessionSource::Exec,
+                Some(&ReasoningEffort::Max),
+            ),
+            Some(MultiAgentMode::ExplicitRequestOnly)
+        );
     }
 
     #[test]
@@ -116,37 +115,32 @@ mod tests {
             agent_role: None,
         });
 
-        for mode in [MultiAgentMode::None, MultiAgentMode::Proactive] {
-            assert_eq!(
-                effective_multi_agent_mode(
-                    MultiAgentVersion::V2,
-                    &child_source,
-                    Some(mode),
-                    Some(&ReasoningEffort::Ultra),
-                ),
-                Some(MultiAgentMode::ExplicitRequestOnly)
-            );
-        }
+        assert_eq!(
+            effective_multi_agent_mode_for(
+                MultiAgentVersion::V2,
+                &child_source,
+                Some(&ReasoningEffort::Ultra),
+            ),
+            Some(MultiAgentMode::ExplicitRequestOnly)
+        );
     }
 
     #[test]
     fn unsupported_versions_and_sources_receive_no_mode() {
         assert_eq!(
-            effective_multi_agent_mode(
+            effective_multi_agent_mode_for(
                 MultiAgentVersion::V1,
                 &SessionSource::Exec,
-                None,
                 Some(&ReasoningEffort::Ultra),
             ),
             None
         );
         assert_eq!(
-            effective_multi_agent_mode(
+            effective_multi_agent_mode_for(
                 MultiAgentVersion::V2,
                 &SessionSource::Internal(
                     codex_protocol::protocol::InternalSessionSource::MemoryConsolidation,
                 ),
-                Some(MultiAgentMode::Proactive),
                 Some(&ReasoningEffort::Ultra),
             ),
             None

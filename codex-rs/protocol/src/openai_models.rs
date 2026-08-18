@@ -707,22 +707,27 @@ mod tests {
         let deserialized = from_str::<ReasoningEffort>(r#""custom-effort""#)
             .expect("custom reasoning effort should deserialize");
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
+        let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
+                "ultra".parse(),
                 "max".parse(),
                 "custom-effort".parse(),
                 deserialized,
                 serialized,
+                serialized_ultra,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
+                Ok(ReasoningEffort::Ultra),
                 Ok(ReasoningEffort::Max),
                 Ok(custom.clone()),
                 custom.clone(),
                 r#""custom-effort""#.to_string(),
+                r#""ultra""#.to_string(),
                 "custom-effort".to_string(),
             )
         );

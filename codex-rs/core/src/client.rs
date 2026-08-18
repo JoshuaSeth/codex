@@ -113,7 +113,6 @@ use crate::privacy::PrivacyFilter;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
-use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
@@ -587,7 +586,7 @@ impl ModelClient {
                 turn_state.as_deref(),
             )
             .await
-            .map_err(map_api_error);
+            .map_err(|error| self.state.provider.map_api_error(error));
         trace_attempt.record_result(result.as_deref());
         result
     }
@@ -614,7 +613,7 @@ impl ModelClient {
         let response = ApiRealtimeCallClient::new(transport, api_provider, client_setup.api_auth)
             .create_with_session_and_headers(sdp, session_config, extra_headers)
             .await
-            .map_err(map_api_error)?;
+            .map_err(|error| self.state.provider.map_api_error(error))?;
         Ok(RealtimeWebrtcCallStart {
             sdp: response.sdp,
             call_id: response.call_id,
@@ -670,7 +669,7 @@ impl ModelClient {
         client
             .summarize_input(&payload, self.build_subagent_headers())
             .await
-            .map_err(map_api_error)
+            .map_err(|error| self.state.provider.map_api_error(error))
     }
 
     fn build_subagent_headers(&self) -> ApiHeaderMap {
@@ -1358,6 +1357,7 @@ impl ModelClientSession {
                         Arc::clone(&self.client.state.privacy_filter),
                         session_telemetry.clone(),
                         inference_trace_attempt,
+                        Arc::clone(&self.client.state.provider),
                     );
                     return Ok(stream);
                 }
@@ -1376,6 +1376,7 @@ impl ModelClientSession {
                             unauthorized_transport,
                             &mut auth_recovery,
                             session_telemetry,
+                            &self.client.state.provider,
                         )
                         .await?,
                     );
@@ -1384,7 +1385,7 @@ impl ModelClientSession {
                 Err(err) => {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
-                    let err = map_api_error(err);
+                    let err = self.client.state.provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),
@@ -1490,12 +1491,13 @@ impl ModelClientSession {
                             unauthorized_transport,
                             &mut auth_recovery,
                             session_telemetry,
+                            &self.client.state.provider,
                         )
                         .await?,
                     );
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => return Err(self.client.state.provider.map_api_error(err)),
             }
 
             let (mut ws_request, previous_response_id_from_untraced_warmup) =
@@ -1524,7 +1526,7 @@ impl ModelClientSession {
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
-                    map_api_error(ApiError::Stream(
+                    self.client.state.provider.map_api_error(ApiError::Stream(
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
@@ -1538,7 +1540,7 @@ impl ModelClientSession {
                 .map_err(|err| {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
-                    let err = map_api_error(err);
+                    let err = self.client.state.provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &err,
                         response_debug_context.request_id.as_deref(),
@@ -1551,6 +1553,7 @@ impl ModelClientSession {
                 Arc::clone(&self.client.state.privacy_filter),
                 session_telemetry.clone(),
                 inference_trace_attempt,
+                Arc::clone(&self.client.state.provider),
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -1784,6 +1787,7 @@ fn map_response_stream(
     privacy_filter: Arc<StdMutex<PrivacyFilter>>,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
+    provider: SharedModelProvider,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -1799,6 +1803,7 @@ fn map_response_stream(
         privacy_filter,
         session_telemetry,
         inference_trace_attempt,
+        provider,
     )
 }
 
@@ -1808,6 +1813,7 @@ fn map_response_events<S>(
     privacy_filter: Arc<StdMutex<PrivacyFilter>>,
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
+    provider: SharedModelProvider,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1954,7 +1960,7 @@ where
                     if let Some(upstream_request_id) = upstream_request_id {
                         feedback_tags!(last_model_request_id = upstream_request_id);
                     }
-                    let mapped = map_api_error(err);
+                    let mapped = provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &mapped,
                         upstream_request_id,
@@ -2060,6 +2066,7 @@ async fn handle_unauthorized(
     transport: TransportError,
     auth_recovery: &mut Option<UnauthorizedRecovery>,
     session_telemetry: &SessionTelemetry,
+    provider: &SharedModelProvider,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);
     if let Some(recovery) = auth_recovery
@@ -2169,7 +2176,7 @@ async fn handle_unauthorized(
         debug.auth_error_code.as_deref(),
     );
 
-    Err(map_api_error(ApiError::Transport(transport)))
+    Err(provider.map_api_error(ApiError::Transport(transport)))
 }
 
 fn api_error_http_status(error: &ApiError) -> Option<u16> {
