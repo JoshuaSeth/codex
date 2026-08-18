@@ -2177,7 +2177,6 @@ async fn spawn_thread_subagents_persist_parent_originator_across_new_and_truncat
             thread_source: None,
             dynamic_tools: Vec::new(),
             metrics_service_name: Some("codex_work_desktop".to_string()),
-            multi_agent_mode: None,
             parent_trace: None,
             environments: Vec::new(),
             thread_extension_init: ExtensionDataInit::default(),
