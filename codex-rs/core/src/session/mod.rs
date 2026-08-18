@@ -250,7 +250,6 @@ use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
 use self::world_state::build_world_state_from_environment_snapshot;
-use self::world_state::build_world_state_from_turn_context_item;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
@@ -1388,6 +1387,7 @@ impl Session {
             mut history,
             previous_turn_settings,
             reference_context_item,
+            world_state_baseline,
             window_number,
             first_window_id,
             previous_window_id,
@@ -1401,10 +1401,6 @@ impl Session {
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
         repair_interrupted_call_outputs(&mut history);
-        let world_state_baseline = reference_context_item
-            .as_ref()
-            .map(build_world_state_from_turn_context_item)
-            .map(|world_state| world_state.snapshot());
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
