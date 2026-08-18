@@ -86,6 +86,7 @@ const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local da
 mod analytics_utils;
 mod app_server_tracing;
 mod attestation;
+mod auth_mode;
 mod bespoke_event_handling;
 mod command_exec;
 mod completion_callback_metadata;
