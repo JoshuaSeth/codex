@@ -162,6 +162,7 @@ pub async fn load_environment_skills_from_root(
                 plugin_roots,
                 namespace_roots: HashSet::from([root.clone()]),
                 warnings,
+                boundary_errors: Vec::new(),
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => SkillFileDiscovery {
@@ -169,12 +170,14 @@ pub async fn load_environment_skills_from_root(
             plugin_roots: HashSet::new(),
             namespace_roots: HashSet::new(),
             warnings: Vec::new(),
+            boundary_errors: Vec::new(),
         },
         Err(error) => SkillFileDiscovery {
             skill_files: Vec::new(),
             plugin_roots: HashSet::new(),
             namespace_roots: HashSet::new(),
             warnings: vec![format!("failed to walk skills root {root}: {error:#}")],
+            boundary_errors: Vec::new(),
         },
     };
     outcome.warnings.extend(discovery.warnings);
