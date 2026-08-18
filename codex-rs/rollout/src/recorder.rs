@@ -1022,7 +1022,7 @@ impl RolloutRecorder {
         info!("Fast-resumed rollout successfully from {path:?}");
         Ok(InitialHistory::Resumed(ResumedHistory {
             conversation_id,
-            history: items,
+            history: Arc::new(items),
             rollout_path: Some(compression::plain_rollout_path(path)),
         }))
     }
