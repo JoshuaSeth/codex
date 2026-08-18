@@ -621,11 +621,11 @@ current_time_reminder = true
             r#"
 [features.current_time_reminder]
 enabled = true
-reminder_interval_model_requests = 4
+reminder_interval_seconds = 4
 clock_source = "external"
 "#,
             CurrentTimeReminderConfig {
-                reminder_interval_model_requests: 4,
+                reminder_interval_seconds: 4,
                 clock_source: CurrentTimeSource::External,
             },
         ),
@@ -643,7 +643,7 @@ async fn load_config_rejects_zero_current_time_reminder_interval() -> std::io::R
         r#"
 [features.current_time_reminder]
 enabled = true
-reminder_interval_model_requests = 0
+reminder_interval_seconds = 0
 "#,
     )
     .await
@@ -652,7 +652,7 @@ reminder_interval_model_requests = 0
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         error.to_string(),
-        "features.current_time_reminder.reminder_interval_model_requests must be positive"
+        "features.current_time_reminder.reminder_interval_seconds must be positive"
     );
     Ok(())
 }
