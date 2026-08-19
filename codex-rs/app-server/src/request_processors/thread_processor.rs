@@ -5,6 +5,7 @@ use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::protocol::ThreadHistoryMode;
 use futures::future::join_all;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
@@ -1018,6 +1019,7 @@ impl ThreadRequestProcessor {
             personality,
             multi_agent_mode: _multi_agent_mode,
             ephemeral,
+            history_mode,
             session_start_source,
             thread_source,
             environments,
@@ -1073,6 +1075,7 @@ impl ThreadRequestProcessor {
                 typesafe_overrides,
                 dynamic_tools,
                 selected_capability_roots.unwrap_or_default(),
+                history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
                 environment_selections,
@@ -1153,6 +1156,7 @@ impl ThreadRequestProcessor {
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<DynamicToolSpec>>,
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
+        history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
@@ -1271,6 +1275,7 @@ impl ThreadRequestProcessor {
                     codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
                     codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
                 },
+                history_mode,
                 session_source: None,
                 thread_source,
                 dynamic_tools,
@@ -1288,6 +1293,7 @@ impl ThreadRequestProcessor {
             .await
             .map_err(|err| match err {
                 CodexErr::InvalidRequest(message) => invalid_request(message),
+                CodexErr::UnsupportedOperation(message) => method_not_found(message),
                 err => internal_error(format!("error creating thread: {err}")),
             })?;
         let session_telemetry = thread.session_telemetry();
@@ -2497,6 +2503,9 @@ impl ThreadRequestProcessor {
             Err(ThreadStoreError::InvalidRequest { message }) => {
                 Err(ThreadReadViewError::InvalidRequest(message))
             }
+            Err(ThreadStoreError::Unsupported { operation }) => {
+                Err(ThreadReadViewError::Unsupported(operation))
+            }
             Err(err) => Err(ThreadReadViewError::Internal(format!(
                 "failed to read thread: {err}"
             ))),
@@ -2698,6 +2707,9 @@ impl ThreadRequestProcessor {
             }) if missing_thread_id == thread_id => {}
             Err(ThreadStoreError::InvalidRequest { message }) => {
                 return Err(ThreadReadViewError::InvalidRequest(message));
+            }
+            Err(ThreadStoreError::Unsupported { operation }) => {
+                return Err(ThreadReadViewError::Unsupported(operation));
             }
             Err(err) => {
                 return Err(ThreadReadViewError::Internal(format!(
@@ -4491,6 +4503,7 @@ pub(crate) fn thread_from_stored_thread(
         parent_thread_id: thread.parent_thread_id.map(|id| id.to_string()),
         preview: thread.preview,
         ephemeral: false,
+        history_mode: thread.history_mode.into(),
         model_provider: if thread.model_provider.is_empty() {
             fallback_provider.to_string()
         } else {
@@ -4702,6 +4715,7 @@ fn build_thread_from_snapshot(
         parent_thread_id: config_snapshot.parent_thread_id.map(|id| id.to_string()),
         preview: String::new(),
         ephemeral: config_snapshot.ephemeral,
+        history_mode: config_snapshot.history_mode.into(),
         model_provider: config_snapshot.model_provider_id.clone(),
         created_at: now,
         updated_at: now,

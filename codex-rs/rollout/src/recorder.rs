@@ -66,6 +66,7 @@ use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_state::StateRuntime;
 use codex_utils_path as path_utils;
@@ -99,6 +100,7 @@ pub enum RolloutRecorderParams {
         dynamic_tools: Vec<DynamicToolSpec>,
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
         multi_agent_version: Option<MultiAgentVersion>,
+        history_mode: ThreadHistoryMode,
         initial_window_id: Option<String>,
     },
     Resume {
@@ -191,6 +193,7 @@ impl RolloutRecorderParams {
             dynamic_tools,
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            history_mode: Default::default(),
             initial_window_id: None,
         }
     }
@@ -226,6 +229,16 @@ impl RolloutRecorderParams {
         } = &mut self
         {
             *version = multi_agent_version;
+        }
+        self
+    }
+
+    pub fn with_history_mode(mut self, history_mode: ThreadHistoryMode) -> Self {
+        if let Self::Create {
+            history_mode: mode, ..
+        } = &mut self
+        {
+            *mode = history_mode;
         }
         self
     }
@@ -759,6 +772,7 @@ impl RolloutRecorder {
                 dynamic_tools,
                 selected_capability_roots,
                 multi_agent_version,
+                history_mode,
                 initial_window_id,
             } => {
                 let log_file_info = precompute_log_file_info(config, conversation_id)?;
@@ -797,6 +811,7 @@ impl RolloutRecorder {
                     },
                     selected_capability_roots,
                     memory_mode: (!config.generate_memories()).then_some("disabled".to_string()),
+                    history_mode,
                     multi_agent_version,
                     context_window: initial_window_id.map(SessionContextWindow::new),
                 };
@@ -947,6 +962,14 @@ impl RolloutRecorder {
                     trace!("skipping legacy ghost_snapshot rollout line");
                 }
                 Err(e) => {
+                    if thread_id.is_none() {
+                        // The first SessionMeta belongs to this rollout. Later SessionMeta lines
+                        // can be copied from fork history, so only validate unknown history modes
+                        // before we have parsed the rollout's own SessionMeta.
+                        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                            reject_unknown_thread_history_mode(&value)?;
+                        }
+                    }
                     warn!("failed to parse rollout line: {line:?}, error: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                 }
@@ -1235,6 +1258,21 @@ fn load_plain_rollout_items_from_offset(
     Ok((items, thread_id, parse_errors))
 }
 
+pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Result<()> {
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(());
+    }
+    let Some(history_mode) = value
+        .get("payload")
+        .and_then(|payload| payload.get("history_mode"))
+    else {
+        return Ok(());
+    };
+    serde_json::from_value::<ThreadHistoryMode>(history_mode.clone())
+        .map(|_| ())
+        .map_err(|err| IoError::other(format!("invalid session metadata history_mode: {err}")))
+}
+
 fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
     match value.get("type").and_then(Value::as_str) {
         Some("response_item") => value
@@ -1338,6 +1376,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         git_sha,
         git_origin_url,
         source,
+        history_mode: _,
         parent_thread_id,
         agent_nickname,
         agent_role,
@@ -2075,6 +2114,7 @@ fn thread_item_from_state_metadata(
                 .or_else(|_| serde_json::from_value(Value::String(item.source)))
                 .unwrap_or(SessionSource::Unknown),
         ),
+        history_mode: item.history_mode,
         parent_thread_id,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,

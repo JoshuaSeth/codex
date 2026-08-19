@@ -17775,6 +17775,13 @@
         "title": "ThreadGoalUpdatedNotification",
         "type": "object"
       },
+      "ThreadHistoryMode": {
+        "enum": [
+          "legacy",
+          "paginated"
+        ],
+        "type": "string"
+      },
       "ThreadId": {
         "type": "string"
       },
