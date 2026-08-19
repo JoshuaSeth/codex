@@ -5230,6 +5230,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         skills_service,
         plugins_manager,
         mcp_manager,
+        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -5443,7 +5444,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
             /*attestation_provider*/ None,
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
     };
@@ -5607,6 +5610,7 @@ async fn make_session_with_config_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
+        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -5713,6 +5717,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
+        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -7518,7 +7523,9 @@ where
             /*item_ids_enabled*/ config.features.enabled(Feature::ItemIds),
             /*attestation_provider*/ None,
         ),
-        code_mode_service: crate::tools::code_mode::CodeModeService::new(),
+        code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
     };
