@@ -44,6 +44,11 @@ pub(crate) fn effective_multi_agent_mode(turn_context: &TurnContext) -> Option<M
         turn_context.multi_agent_version,
         &turn_context.session_source,
         reasoning_effort.as_ref(),
+        turn_context
+            .config
+            .multi_agent_v2
+            .multi_agent_mode_hint_text
+            .as_deref(),
     )
 }
 
@@ -51,15 +56,16 @@ fn effective_multi_agent_mode_for(
     multi_agent_version: MultiAgentVersion,
     session_source: &SessionSource,
     reasoning_effort: Option<&ReasoningEffort>,
+    multi_agent_mode_hint_text: Option<&str>,
 ) -> Option<MultiAgentMode> {
     if multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
 
     match session_source {
-        // Ultra is a root-only orchestration mode. A spawned child always
-        // receives explicit-request-only instructions, even when its inherited
-        // reasoning effort remains Ultra.
+        // Delegation policy is root-owned. A spawned child always receives
+        // explicit-request-only instructions, even when it inherits Ultra or
+        // a configured custom hint.
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => {
             Some(MultiAgentMode::ExplicitRequestOnly)
         }
@@ -68,10 +74,12 @@ fn effective_multi_agent_mode_for(
         | SessionSource::Exec
         | SessionSource::Mcp
         | SessionSource::Custom(_)
-        | SessionSource::Unknown => Some(if reasoning_effort == Some(&ReasoningEffort::Ultra) {
-            MultiAgentMode::Proactive
-        } else {
-            MultiAgentMode::ExplicitRequestOnly
+        | SessionSource::Unknown => Some(match multi_agent_mode_hint_text {
+            // A configured hint, including an empty string, defines a custom
+            // policy instead of an effort-derived built-in policy.
+            Some(hint_text) => MultiAgentMode::Custom(hint_text.to_string()),
+            None if reasoning_effort == Some(&ReasoningEffort::Ultra) => MultiAgentMode::Proactive,
+            None => MultiAgentMode::ExplicitRequestOnly,
         }),
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
     }
@@ -88,6 +96,7 @@ mod tests {
                 MultiAgentVersion::V2,
                 &SessionSource::Exec,
                 Some(&ReasoningEffort::Ultra),
+                None,
             ),
             Some(MultiAgentMode::Proactive)
         );
@@ -100,6 +109,7 @@ mod tests {
                 MultiAgentVersion::V2,
                 &SessionSource::Exec,
                 Some(&ReasoningEffort::Max),
+                None,
             ),
             Some(MultiAgentMode::ExplicitRequestOnly)
         );
@@ -120,6 +130,7 @@ mod tests {
                 MultiAgentVersion::V2,
                 &child_source,
                 Some(&ReasoningEffort::Ultra),
+                None,
             ),
             Some(MultiAgentMode::ExplicitRequestOnly)
         );
@@ -132,6 +143,7 @@ mod tests {
                 MultiAgentVersion::V1,
                 &SessionSource::Exec,
                 Some(&ReasoningEffort::Ultra),
+                None,
             ),
             None
         );
@@ -142,8 +154,54 @@ mod tests {
                     codex_protocol::protocol::InternalSessionSource::MemoryConsolidation,
                 ),
                 Some(&ReasoningEffort::Ultra),
+                None,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn configured_hint_overrides_effort_for_roots() {
+        assert_eq!(
+            effective_multi_agent_mode_for(
+                MultiAgentVersion::V2,
+                &SessionSource::Exec,
+                Some(&ReasoningEffort::Ultra),
+                Some("Use the configured delegation policy."),
+            ),
+            Some(MultiAgentMode::Custom(
+                "Use the configured delegation policy.".to_string()
+            ))
+        );
+        assert_eq!(
+            effective_multi_agent_mode_for(
+                MultiAgentVersion::V2,
+                &SessionSource::Exec,
+                Some(&ReasoningEffort::Max),
+                Some(""),
+            ),
+            Some(MultiAgentMode::Custom(String::new()))
+        );
+    }
+
+    #[test]
+    fn configured_hint_does_not_enable_spawned_children() {
+        let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        });
+
+        assert_eq!(
+            effective_multi_agent_mode_for(
+                MultiAgentVersion::V2,
+                &child_source,
+                Some(&ReasoningEffort::Ultra),
+                Some("Delegate proactively."),
+            ),
+            Some(MultiAgentMode::ExplicitRequestOnly)
         );
     }
 }
