@@ -989,10 +989,57 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     harness.sink.clear();
 
     let update_tool = tool_by_name(&tools, "update_goal");
+    let missing_receipt_error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-update-goal-missing-receipt",
+            json!({ "status": "blocked" }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("blocked terminal status must require a semantic receipt"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked without blocked_receipt: provide a scoped blocker fingerprint, fresh evidence fingerprint and summary, meaningful attempted_actions, affected_resources, blocked_on, retry_condition, and an empty remaining_independent_work list"
+                .to_string()
+        ),
+        missing_receipt_error
+    );
+
+    let mut unfinished_receipt = blocked_receipt("condition-a", "evidence-preflight");
+    unfinished_receipt["remaining_independent_work"] =
+        json!(["Complete the authorized documentation update."]);
+    let unfinished_work_error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-update-goal-unfinished-work",
+            json!({
+                "status": "blocked",
+                "blocked_receipt": unfinished_receipt,
+            }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("remaining independent work must prevent blocked status"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked while remaining_independent_work is non-empty; complete that authorized work first"
+                .to_string()
+        ),
+        unfinished_work_error
+    );
+
     let first_invocation = tool_call(
         "update_goal",
         "call-update-goal-1",
-        json!({ "status": "blocked" }),
+        json!({
+            "status": "blocked",
+            "blocked_receipt": blocked_receipt("condition-a", "evidence-1"),
+        }),
     );
     let first_error = match update_tool.handle(first_invocation).await {
         Ok(_) => panic!("first blocked turn should keep the goal active"),
@@ -1000,7 +1047,7 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     };
     assert_eq!(
         FunctionCallError::RespondToModel(
-            "cannot mark this goal blocked yet: blocked audit 1/3. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
+            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
                 .to_string()
         ),
         first_error
@@ -1014,10 +1061,33 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
 
     harness.stop_turn("turn-1").await;
     harness.start_turn("turn-2", &TokenUsage::default()).await;
+    let mut stale_invocation = tool_call(
+        "update_goal",
+        "call-update-goal-stale-evidence",
+        json!({
+            "status": "blocked",
+            "blocked_receipt": blocked_receipt("condition-a", "evidence-1"),
+        }),
+    );
+    stale_invocation.turn_id = "turn-2".to_string();
+    let stale_evidence_error = match update_tool.handle(stale_invocation).await {
+        Ok(_) => panic!("stale evidence must not advance the blocked audit"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "cannot advance the blocked audit with stale evidence: it remains 1/3. Re-check the real external condition, try another authorized approach, and use a new evidence_fingerprint only for genuinely fresh evidence."
+                .to_string()
+        ),
+        stale_evidence_error
+    );
     let mut second_invocation = tool_call(
         "update_goal",
         "call-update-goal-2",
-        json!({ "status": "blocked" }),
+        json!({
+            "status": "blocked",
+            "blocked_receipt": blocked_receipt("condition-a", "evidence-2"),
+        }),
     );
     second_invocation.turn_id = "turn-2".to_string();
     let second_error = match update_tool.handle(second_invocation).await {
@@ -1026,7 +1096,7 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     };
     assert_eq!(
         FunctionCallError::RespondToModel(
-            "cannot mark this goal blocked yet: blocked audit 2/3. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
+            "cannot mark this goal blocked yet: blocked audit 2/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
                 .to_string()
         ),
         second_error
@@ -1047,7 +1117,10 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     let mut invocation = tool_call(
         "update_goal",
         "call-update-goal-3",
-        json!({ "status": "blocked" }),
+        json!({
+            "status": "blocked",
+            "blocked_receipt": blocked_receipt("condition-a", "evidence-3"),
+        }),
     );
     invocation.turn_id = "turn-3".to_string();
     let output = update_tool.handle(invocation.clone()).await?;
@@ -1125,6 +1198,7 @@ async fn stale_update_goal_cannot_terminalize_external_objective_replacement() -
                 status: Some(ThreadGoalStatus::Active),
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 completion_work_id: None,
+                completion_callback_metadata_json: None,
             },
         )
         .await?;
@@ -1279,6 +1353,7 @@ async fn goal_service_external_set_active_resets_baseline_without_live_thread() 
                 status: Some(ThreadGoalStatus::Active),
                 token_budget: GoalTokenBudgetUpdate::Keep,
                 completion_work_id: None,
+                completion_callback_metadata_json: None,
             },
         )
         .await?;
@@ -1419,6 +1494,7 @@ async fn goal_service_sets_gets_and_clears_thread_goal() -> anyhow::Result<()> {
                 status: None,
                 token_budget: GoalTokenBudgetUpdate::Set(Some(123)),
                 completion_work_id: None,
+                completion_callback_metadata_json: None,
             },
         )
         .await?;
@@ -1713,6 +1789,20 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
             arguments: arguments.to_string(),
         },
     }
+}
+
+fn blocked_receipt(blocker_fingerprint: &str, evidence_fingerprint: &str) -> serde_json::Value {
+    json!({
+        "blocker_fingerprint": blocker_fingerprint,
+        "summary": "The external service remains unavailable after safe checks.",
+        "blocked_on": "external service recovery",
+        "affected_resources": ["goal delivery"],
+        "evidence_fingerprint": evidence_fingerprint,
+        "evidence_summary": "A fresh status check still reports the external outage.",
+        "attempted_actions": ["Checked current service status and attempted the safe retry path."],
+        "remaining_independent_work": [],
+        "retry_condition": "The external service reports healthy again.",
+    })
 }
 
 async fn test_runtime() -> anyhow::Result<Arc<codex_state::StateRuntime>> {

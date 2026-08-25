@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::accounting::BlockedGoalDecision;
+use crate::accounting::BlockedGoalReceipt;
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
 use crate::accounting::REQUIRED_CONSECUTIVE_BLOCKED_TURNS;
@@ -60,6 +61,21 @@ pub struct CreateGoalRequest {
 #[serde(rename_all = "snake_case")]
 struct UpdateGoalArgs {
     status: ThreadGoalStatus,
+    blocked_receipt: Option<BlockedGoalReceiptArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct BlockedGoalReceiptArgs {
+    blocker_fingerprint: String,
+    summary: String,
+    blocked_on: String,
+    affected_resources: Vec<String>,
+    evidence_fingerprint: String,
+    evidence_summary: String,
+    attempted_actions: Vec<String>,
+    remaining_independent_work: Vec<String>,
+    retry_condition: String,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -257,18 +273,57 @@ impl GoalToolExecutor {
                 FunctionCallError::RespondToModel(EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string())
             })?;
         if args.status == ThreadGoalStatus::Blocked {
+            let receipt = args
+                .blocked_receipt
+                .as_ref()
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "cannot mark this goal blocked without blocked_receipt: provide a scoped blocker fingerprint, fresh evidence fingerprint and summary, meaningful attempted_actions, affected_resources, blocked_on, retry_condition, and an empty remaining_independent_work list"
+                            .to_string(),
+                    )
+                })?;
+            validate_blocked_goal_receipt(receipt).map_err(FunctionCallError::RespondToModel)?;
+            let accounting_receipt = BlockedGoalReceipt {
+                condition_fingerprint: receipt.blocker_fingerprint.clone(),
+                evidence_fingerprint: receipt.evidence_fingerprint.clone(),
+            };
             let decision = self
                 .accounting_state
-                .record_blocked_goal_attempt(invocation.turn_id.as_str(), expected_goal_id.as_str())
+                .record_blocked_goal_attempt(
+                    invocation.turn_id.as_str(),
+                    expected_goal_id.as_str(),
+                    &accounting_receipt,
+                )
                 .ok_or_else(|| {
                     FunctionCallError::RespondToModel(
                         EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR.to_string(),
                     )
                 })?;
-            if let BlockedGoalDecision::Continue { blocked_turns } = decision {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "cannot mark this goal blocked yet: blocked audit {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}. The same blocking condition must remain after meaningful attempts in three distinct consecutive goal turns. Keep the goal active, continue making progress or try another approach, and only call update_goal with blocked in a later goal turn if that same external blocker still makes progress impossible. Repeating update_goal in this turn does not advance the audit."
-                )));
+            match decision {
+                BlockedGoalDecision::Continue {
+                    blocked_turns,
+                    audit_restarted,
+                } => {
+                    let restart_notice = if audit_restarted {
+                        " The blocker fingerprint changed, so the audit restarted at 1/3."
+                    } else {
+                        ""
+                    };
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "cannot mark this goal blocked yet: blocked audit {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}.{restart_notice} Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+                    )));
+                }
+                BlockedGoalDecision::AlreadyRecorded { blocked_turns } => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "cannot advance the blocked audit twice in one turn: it remains {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}. Continue working; a repeated or rewritten receipt in this turn does not count."
+                    )));
+                }
+                BlockedGoalDecision::StaleEvidence { blocked_turns } => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "cannot advance the blocked audit with stale evidence: it remains {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}. Re-check the real external condition, try another authorized approach, and use a new evidence_fingerprint only for genuinely fresh evidence."
+                    )));
+                }
+                BlockedGoalDecision::Allow => {}
             }
         }
 
@@ -424,6 +479,79 @@ impl GoalToolExecutor {
                 .then_some(goal.status)
         }))
     }
+}
+
+fn validate_blocked_goal_receipt(receipt: &BlockedGoalReceiptArgs) -> Result<(), String> {
+    validate_fingerprint("blocker_fingerprint", &receipt.blocker_fingerprint)?;
+    validate_fingerprint("evidence_fingerprint", &receipt.evidence_fingerprint)?;
+    validate_receipt_text("summary", &receipt.summary, 12, 512)?;
+    validate_receipt_text("blocked_on", &receipt.blocked_on, 3, 256)?;
+    validate_receipt_text("evidence_summary", &receipt.evidence_summary, 8, 512)?;
+    validate_receipt_text("retry_condition", &receipt.retry_condition, 8, 512)?;
+    validate_receipt_list("affected_resources", &receipt.affected_resources, 1, 8, 256)?;
+    validate_receipt_list("attempted_actions", &receipt.attempted_actions, 1, 8, 512)?;
+    if !receipt.remaining_independent_work.is_empty() {
+        return Err(
+            "cannot mark this goal blocked while remaining_independent_work is non-empty; complete that authorized work first"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(field: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if !(8..=160).contains(&value.len()) {
+        return Err(format!(
+            "blocked_receipt.{field} must contain 8-160 characters"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    {
+        return Err(format!(
+            "blocked_receipt.{field} may contain only ASCII letters, digits, hyphen, underscore, colon, and period"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_text(
+    field: &str,
+    value: &str,
+    min_len: usize,
+    max_len: usize,
+) -> Result<(), String> {
+    let value = value.trim();
+    if !(min_len..=max_len).contains(&value.len()) {
+        return Err(format!(
+            "blocked_receipt.{field} must contain {min_len}-{max_len} characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_list(
+    field: &str,
+    values: &[String],
+    min_items: usize,
+    max_items: usize,
+    max_item_len: usize,
+) -> Result<(), String> {
+    if !(min_items..=max_items).contains(&values.len()) {
+        return Err(format!(
+            "blocked_receipt.{field} must contain {min_items}-{max_items} items"
+        ));
+    }
+    for value in values {
+        if value.trim().is_empty() || value.trim().len() > max_item_len {
+            return Err(format!(
+                "each blocked_receipt.{field} item must contain 1-{max_item_len} characters"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
