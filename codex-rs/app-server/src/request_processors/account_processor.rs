@@ -778,7 +778,7 @@ impl AccountRequestProcessor {
             .ok()
             .map(|response| AccountUpdatedNotification {
                 auth_mode: response.auth_mode,
-                plan_type: response.plan_type.clone(),
+                plan_type: response.plan_type,
             });
         self.outgoing.send_result(request_id, result).await;
 
@@ -949,9 +949,11 @@ impl AccountRequestProcessor {
         let client = BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
             .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))?;
 
-        let response = client
-            .get_rate_limits_with_reset_credits()
-            .await
+        let (response, detailed_rate_limit_reset_credits) = tokio::join!(
+            client.get_rate_limits_with_reset_credits(),
+            Self::detailed_rate_limit_reset_credits(&client),
+        );
+        let response = response
             .map_err(|err| internal_error(format!("failed to fetch codex rate limits: {err}")))?;
         if response.rate_limits.is_empty() {
             return Err(internal_error(
@@ -978,6 +980,15 @@ impl AccountRequestProcessor {
             .cloned()
             .unwrap_or_else(|| response.rate_limits[0].clone());
 
+        let rate_limit_reset_credits = detailed_rate_limit_reset_credits.or_else(|| {
+            response
+                .rate_limit_reset_credits
+                .map(|summary| RateLimitResetCreditsSummary {
+                    available_count: summary.available_count,
+                    credits: None,
+                })
+        });
+
         Ok(GetAccountRateLimitsResponse {
             rate_limits: rate_limits.into(),
             rate_limits_by_limit_id: Some(
@@ -986,11 +997,7 @@ impl AccountRequestProcessor {
                     .map(|(limit_id, snapshot)| (limit_id, snapshot.into()))
                     .collect(),
             ),
-            rate_limit_reset_credits: response.rate_limit_reset_credits.map(|summary| {
-                RateLimitResetCreditsSummary {
-                    available_count: summary.available_count,
-                }
-            }),
+            rate_limit_reset_credits,
         })
     }
 
