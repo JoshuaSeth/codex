@@ -1047,7 +1047,7 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     };
     assert_eq!(
         FunctionCallError::RespondToModel(
-            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition, try a different concrete authorized resolution or route-around action, and submit a new evidence_fingerprint from that fresh observation. Passive rechecks, symbolic permission waits, and stale evidence do not qualify."
                 .to_string()
         ),
         first_error
@@ -1096,7 +1096,7 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
     };
     assert_eq!(
         FunctionCallError::RespondToModel(
-            "cannot mark this goal blocked yet: blocked audit 2/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+            "cannot mark this goal blocked yet: blocked audit 2/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition, try a different concrete authorized resolution or route-around action, and submit a new evidence_fingerprint from that fresh observation. Passive rechecks, symbolic permission waits, and stale evidence do not qualify."
                 .to_string()
         ),
         second_error
@@ -1279,10 +1279,167 @@ async fn update_goal_rejects_threshold_only_storage_blockers() -> anyhow::Result
     assert_eq!(
         first_audit_error,
         FunctionCallError::RespondToModel(
-            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition, try a different concrete authorized resolution or route-around action, and submit a new evidence_fingerprint from that fresh observation. Passive rechecks, symbolic permission waits, and stale evidence do not qualify."
                 .to_string()
         )
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_rejects_passive_internal_lock_waits() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-lock-goal",
+            json!({ "objective": "install and verify SeaweedFS-backed Git LFS" }),
+        ))
+        .await?;
+    let update_tool = tool_by_name(&tools, "update_goal");
+
+    let mut passive_receipt = blocked_receipt("seaweed-backup-lock", "lock-reading-1");
+    passive_receipt["summary"] =
+        json!("The SeaweedFS Git LFS install is waiting on the backup lock.");
+    passive_receipt["blocked_on"] = json!("backup lock release");
+    passive_receipt["evidence_summary"] = json!("A fresh read shows the backup lock remains held.");
+    passive_receipt["attempted_actions"] =
+        json!(["Checked that the backup lock is still present."]);
+    passive_receipt["retry_condition"] = json!("The backup lock becomes free.");
+    let error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-passive-lock-block",
+            json!({ "status": "blocked", "blocked_receipt": passive_receipt }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("passively waiting on an internal lock must not start the blocked audit"),
+        Err(error) => error,
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("passive lock validation should return a model-facing error");
+    };
+    assert!(
+        message
+            .contains("cannot mark this goal blocked by passively waiting on an internal backup")
+    );
+    assert!(message.contains("SeaweedFS-backed Git LFS"));
+
+    let mut exhausted_receipt = blocked_receipt("seaweed-backup-lock", "lock-reading-2");
+    exhausted_receipt["summary"] =
+        json!("A vendor-managed backup lock still prevents the exact SeaweedFS Git LFS install.");
+    exhausted_receipt["blocked_on"] =
+        json!("vendor-managed backup appliance releases its backup lock");
+    exhausted_receipt["evidence_summary"] = json!(
+        "The appliance reports an immutable backup phase and exposes no authorized pause control."
+    );
+    exhausted_receipt["attempted_actions"] = json!([
+        "Identified the exact backup executor and lock owner, then requested a coordinated handoff.",
+        "Tried a bounded retry and verified that the authorized surface cannot pause or release the appliance lock."
+    ]);
+    exhausted_receipt["retry_condition"] =
+        json!("The appliance completes its immutable backup phase.");
+    let error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-exhausted-lock-block",
+            json!({ "status": "blocked", "blocked_receipt": exhausted_receipt }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("a genuine externalized lock condition still needs three qualifying turns"),
+        Err(error) => error,
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("first qualifying lock receipt should return the audit progress error");
+    };
+    assert!(message.starts_with("cannot mark this goal blocked yet: blocked audit 1/3."));
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_rejects_unscoped_ci_infrastructure_stops() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime, thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-ci-goal",
+            json!({ "objective": "finish, prove, and land the implementation" }),
+        ))
+        .await?;
+    let update_tool = tool_by_name(&tools, "update_goal");
+
+    let mut universal_receipt = blocked_receipt("ci-budget", "ci-reading-1");
+    universal_receipt["summary"] =
+        json!("The whole goal is blocked because the CI budget is exhausted.");
+    universal_receipt["blocked_on"] = json!("GitHub Actions budget renewal");
+    universal_receipt["evidence_summary"] =
+        json!("Workflow runs cannot start because hosted minutes are exhausted.");
+    universal_receipt["attempted_actions"] = json!(["Re-ran the hosted workflow."]);
+    universal_receipt["retry_condition"] = json!("The GitHub Actions budget renews.");
+    let error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-universal-ci-block",
+            json!({ "status": "blocked", "blocked_receipt": universal_receipt }),
+        ))
+        .await
+    {
+        Ok(_) => {
+            panic!("CI infrastructure must not become a universal stop without equivalent proof")
+        }
+        Err(error) => error,
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("CI validation should return a model-facing error");
+    };
+    assert!(
+        message.contains("cannot mark this goal universally blocked from CI budget exhaustion")
+    );
+    assert!(message.contains("exact-SHA local-equivalent proof"));
+
+    let mut scoped_receipt = blocked_receipt("ci-required-check", "ci-reading-2");
+    scoped_receipt["summary"] = json!(
+        "Only the merge remains unavailable because branch protection requires a hosted required check."
+    );
+    scoped_receipt["blocked_on"] =
+        json!("GitHub Actions hosted runner recovers for the required check");
+    scoped_receipt["affected_resources"] =
+        json!(["exact pull request merge protected by repository policy"]);
+    scoped_receipt["evidence_summary"] =
+        json!("The required check has no runner while every exact-SHA local equivalent passes.");
+    scoped_receipt["attempted_actions"] = json!([
+        "Ran the repository harness as authorized exact-SHA local-equivalent proof; all checks passed.",
+        "Checked an alternate runner and smaller proof-store route; neither can satisfy the hosted attestation required by branch protection."
+    ]);
+    scoped_receipt["retry_condition"] =
+        json!("The required check starts or repository policy changes.");
+    let error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-scoped-ci-block",
+            json!({ "status": "blocked", "blocked_receipt": scoped_receipt }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("a genuine required-check condition still needs three qualifying turns"),
+        Err(error) => error,
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("first qualifying CI receipt should return the audit progress error");
+    };
+    assert!(message.starts_with("cannot mark this goal blocked yet: blocked audit 1/3."));
     Ok(())
 }
 

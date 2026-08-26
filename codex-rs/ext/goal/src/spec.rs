@@ -109,7 +109,7 @@ pub fn create_update_goal_tool() -> ToolSpec {
             JsonSchema::array(
                 JsonSchema::string(None),
                 Some(
-                    "One to eight meaningful, authorized actions or safe checks performed in this turn to resolve or route around the blocker."
+                    "One to eight meaningful, authorized actions or safe checks performed in this turn to resolve or route around the blocker. Internal locks and CI infrastructure require concrete self-unblocking attempts, not passive rechecks."
                         .to_string(),
                 ),
             ),
@@ -172,9 +172,11 @@ Set status to `complete` only when the objective has actually been achieved and 
 Set status to `blocked` only when the same scoped external condition has repeated for at least three qualifying goal turns, the agent cannot make meaningful progress without user input or an external-state change, and no authorized independent work remains.
 For `blocked`, blocked_receipt is required. Each qualifying turn needs the same blocker_fingerprint, a genuinely fresh evidence_fingerprint, fresh evidence, and at least one meaningful attempted action. A changed blocker fingerprint restarts the audit; stale evidence and repeated calls in one turn do not advance it.
 Disk cleanup targets, free-space thresholds, desired headroom, and low-root-space observations are not blockers for existing bounded work. Continue in low-footprint mode, reuse existing worktrees and artifacts, clean only owned disposable material through guarded paths, and coordinate with server operations. A storage blocker is valid only after a concrete operation-level ENOSPC, EDQUOT, inode-exhaustion, or read-only-filesystem failure affects every remaining work item and safe continuation paths were attempted.
-If the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three qualifying resumed goal turns, set status to `blocked` again.
+Internal backup, maintenance, deploy, install, migration, and service locks are coordination mechanisms, not passive waits. Inspect ownership, coordinate a safe handoff or pause, use bounded retries, acquire and release the exact lock when authorized, verify the work, and restore the prior operation. For SeaweedFS-backed Git LFS waiting on a backup lock, safely coordinate or temporarily pause the exact backup executor, obtain the lock, install and verify LFS, then release the lock and restore backup operation.
+CI budget exhaustion, unavailable runners, workflow quota, and broken check infrastructure do not block unrelated work. Use exact-SHA local-equivalent proof where already authorized and try an authorized alternate runner or smaller proof route. Only an exact merge or deployment action may remain blocked when an immutable required-check, branch-protection, hosted-attestation, or repository-policy boundary truly requires it.
+If the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same scoped external condition then repeats for at least three qualifying resumed goal turns, set status to `blocked` again.
 Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.
-Do not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
+Do not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification. Three passive rechecks of a manageable internal condition are not three qualifying blocker turns.
 Do not use `blocked` for symbolic permission, deployment discomfort, a verification ritual, production fear, or stale instructions when the current objective already authorizes safe action. Continue safely: inspect current state, take reversible or scoped implementation steps, validate, and use the normal review/deployment gates.
 Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
 You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
