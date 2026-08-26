@@ -33,6 +33,8 @@ use crate::spec::create_update_goal_tool;
 const EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR: &str = "cannot update goal because the active goal was set or replaced externally during this turn; continue working on the updated objective and let a later goal turn mark it complete or blocked";
 const STORAGE_THRESHOLD_BLOCKER_ERROR: &str = "cannot mark this goal blocked from a disk-space target, free-space threshold, or desired headroom alone. Cleanup reserve targets are not work-stopping safety floors. Keep the goal active: continue bounded low-footprint work, reuse the existing worktree and artifacts, clean only owned disposable material through guarded paths, and coordinate with server operations as needed. A storage blocker requires a concrete operation-level ENOSPC, EDQUOT, inode-exhaustion, or read-only-filesystem failure that affects every remaining work item.";
 const STORAGE_MITIGATION_BLOCKER_ERROR: &str = "cannot mark this goal blocked from a storage failure before attempting a safe continuation path. Record at least one meaningful low-footprint, existing-worktree/artifact, owned-disposable-cleanup, alternate-storage, or server-operations action in blocked_receipt.attempted_actions, and continue every independent work item.";
+const INTERNAL_LOCK_BLOCKER_ERROR: &str = "cannot mark this goal blocked by passively waiting on an internal backup, maintenance, deploy, install, migration, or service lock. Inspect the exact owner and protected invariant, then try at least two concrete safe resolution actions such as a bounded retry, coordinated handoff, safe owner pause, exact lock acquisition/release, or restoration of the prior operation. For a SeaweedFS-backed Git LFS install, safely coordinate or temporarily pause the exact backup executor, obtain the lock, install and verify LFS, then release the lock and restore backup operation.";
+const CI_INFRASTRUCTURE_BLOCKER_ERROR: &str = "cannot mark this goal universally blocked from CI budget exhaustion, runner unavailability, workflow quota, or broken check infrastructure. Finish independent work and record exact-SHA local-equivalent proof where already authorized, plus an authorized alternate runner or proof-route check. Only the exact merge or deployment action may remain blocked, and the receipt must name the immutable required-check, branch-protection, hosted-attestation, or repository-policy boundary that truly requires it.";
 
 #[derive(Clone)]
 pub(crate) struct GoalToolExecutor {
@@ -312,7 +314,7 @@ impl GoalToolExecutor {
                         ""
                     };
                     return Err(FunctionCallError::RespondToModel(format!(
-                        "cannot mark this goal blocked yet: blocked audit {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}.{restart_notice} Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+                        "cannot mark this goal blocked yet: blocked audit {blocked_turns}/{REQUIRED_CONSECUTIVE_BLOCKED_TURNS}.{restart_notice} Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition, try a different concrete authorized resolution or route-around action, and submit a new evidence_fingerprint from that fresh observation. Passive rechecks, symbolic permission waits, and stale evidence do not qualify."
                     )));
                 }
                 BlockedGoalDecision::AlreadyRecorded { blocked_turns } => {
@@ -499,6 +501,8 @@ fn validate_blocked_goal_receipt(receipt: &BlockedGoalReceiptArgs) -> Result<(),
         );
     }
     validate_storage_capacity_blocker(receipt)?;
+    validate_internal_coordination_lock_blocker(receipt)?;
+    validate_ci_infrastructure_blocker(receipt)?;
     Ok(())
 }
 
@@ -591,6 +595,156 @@ fn validate_storage_capacity_blocker(receipt: &BlockedGoalReceiptArgs) -> Result
         return Err(STORAGE_MITIGATION_BLOCKER_ERROR.to_string());
     }
     Ok(())
+}
+
+fn validate_internal_coordination_lock_blocker(
+    receipt: &BlockedGoalReceiptArgs,
+) -> Result<(), String> {
+    let blocker_text = blocker_receipt_text(receipt);
+    let names_internal_lock = contains_any(
+        &blocker_text,
+        &[
+            "backup lock",
+            "backup-lock",
+            "maintenance lock",
+            "maintenance-lock",
+            "deploy lock",
+            "deploy-lock",
+            "deployment lock",
+            "deployment-lock",
+            "install lock",
+            "install-lock",
+            "migration lock",
+            "migration-lock",
+            "service lock",
+            "service-lock",
+            "writer lock",
+            "writer-lock",
+            "lockfile",
+            "lock file",
+            "flock",
+        ],
+    );
+    if !names_internal_lock {
+        return Ok(());
+    }
+
+    let attempted_actions = receipt.attempted_actions.join(" ").to_ascii_lowercase();
+    let inspected_owner = contains_any(
+        &attempted_actions,
+        &[
+            "owner",
+            "executor",
+            "process",
+            "coordinat",
+            "handoff",
+            "hand-off",
+        ],
+    );
+    let tried_lifecycle_action = contains_any(
+        &attempted_actions,
+        &[
+            "bounded retry",
+            "acquire",
+            "release",
+            "pause",
+            "resume",
+            "restore",
+            "terminate",
+        ],
+    );
+    if receipt.attempted_actions.len() < 2 || !inspected_owner || !tried_lifecycle_action {
+        return Err(INTERNAL_LOCK_BLOCKER_ERROR.to_string());
+    }
+    Ok(())
+}
+
+fn validate_ci_infrastructure_blocker(receipt: &BlockedGoalReceiptArgs) -> Result<(), String> {
+    let blocker_text = blocker_receipt_text(receipt);
+    let names_ci_infrastructure = contains_any(
+        &blocker_text,
+        &[
+            "ci budget",
+            "ci-budget",
+            "github actions budget",
+            "actions budget",
+            "github actions quota",
+            "ci infrastructure",
+            "check infrastructure",
+            "workflow quota",
+            "hosted minutes",
+            "minutes exhausted",
+            "runner quota",
+            "runner shortage",
+            "runner unavailable",
+            "runner unavailability",
+            "no runner",
+            "zero runner",
+            "hosted runner",
+            "artifact service",
+            "workflow rejected",
+            "workflow cannot start",
+            "workflow could not start",
+        ],
+    );
+    if !names_ci_infrastructure {
+        return Ok(());
+    }
+
+    let attempted_actions = receipt.attempted_actions.join(" ").to_ascii_lowercase();
+    let tried_equivalent_proof = contains_any(
+        &attempted_actions,
+        &[
+            "exact-sha",
+            "exact sha",
+            "local equivalent",
+            "local-equivalent",
+            "repository harness",
+            "repo harness",
+            "integrated-sha proof",
+        ],
+    );
+    let tried_alternate_route = contains_any(
+        &attempted_actions,
+        &[
+            "alternate runner",
+            "self-hosted runner",
+            "alternate proof",
+            "proof route",
+            "proof store",
+            "smaller proof",
+            "local check",
+        ],
+    );
+    let names_mandatory_scope = contains_any(
+        &blocker_text,
+        &[
+            "required check",
+            "branch protection",
+            "repository policy",
+            "merge policy",
+            "hosted attestation",
+            "immutable policy",
+        ],
+    );
+    if !tried_equivalent_proof || !tried_alternate_route || !names_mandatory_scope {
+        return Err(CI_INFRASTRUCTURE_BLOCKER_ERROR.to_string());
+    }
+    Ok(())
+}
+
+fn blocker_receipt_text(receipt: &BlockedGoalReceiptArgs) -> String {
+    [
+        receipt.summary.as_str(),
+        receipt.blocked_on.as_str(),
+        receipt.evidence_summary.as_str(),
+        receipt.retry_condition.as_str(),
+    ]
+    .into_iter()
+    .chain(receipt.affected_resources.iter().map(String::as_str))
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
