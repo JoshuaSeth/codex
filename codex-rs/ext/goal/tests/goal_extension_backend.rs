@@ -1172,6 +1172,121 @@ async fn update_goal_blocks_only_after_three_consecutive_blocked_turns() -> anyh
 }
 
 #[tokio::test]
+async fn update_goal_rejects_threshold_only_storage_blockers() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "finish bounded dashboard work" }),
+        ))
+        .await?;
+    let update_tool = tool_by_name(&tools, "update_goal");
+
+    let mut threshold_receipt = blocked_receipt("disk-threshold", "disk-reading-1");
+    threshold_receipt["summary"] =
+        json!("Root free space remains below the desired 12 GiB hard floor.");
+    threshold_receipt["blocked_on"] = json!("durable disk headroom above 12 GiB");
+    threshold_receipt["evidence_summary"] =
+        json!("A fresh disk-space reading remains below the cleanup target.");
+    threshold_receipt["retry_condition"] = json!(
+        "Root free space rises above the desired threshold so ENOSPC is no longer anticipated."
+    );
+    let threshold_error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-threshold-block",
+            json!({
+                "status": "blocked",
+                "blocked_receipt": threshold_receipt,
+            }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("a desired disk threshold must not block existing bounded work"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        threshold_error,
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked from a disk-space target, free-space threshold, or desired headroom alone. Cleanup reserve targets are not work-stopping safety floors. Keep the goal active: continue bounded low-footprint work, reuse the existing worktree and artifacts, clean only owned disposable material through guarded paths, and coordinate with server operations as needed. A storage blocker requires a concrete operation-level ENOSPC, EDQUOT, inode-exhaustion, or read-only-filesystem failure that affects every remaining work item."
+                .to_string()
+        )
+    );
+
+    let mut unmitigated_receipt = blocked_receipt("disk-enospc", "disk-reading-2");
+    unmitigated_receipt["summary"] =
+        json!("The required write failed with ENOSPC on the root filesystem.");
+    unmitigated_receipt["blocked_on"] = json!("root filesystem capacity");
+    unmitigated_receipt["evidence_summary"] =
+        json!("The operation returned no space left on device.");
+    unmitigated_receipt["attempted_actions"] =
+        json!(["Retried the exact write and confirmed ENOSPC again."]);
+    unmitigated_receipt["retry_condition"] = json!("The failed write completes without ENOSPC.");
+    let mitigation_error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-unmitigated-block",
+            json!({
+                "status": "blocked",
+                "blocked_receipt": unmitigated_receipt,
+            }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("a storage blocker must require a safe continuation attempt"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        mitigation_error,
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked from a storage failure before attempting a safe continuation path. Record at least one meaningful low-footprint, existing-worktree/artifact, owned-disposable-cleanup, alternate-storage, or server-operations action in blocked_receipt.attempted_actions, and continue every independent work item."
+                .to_string()
+        )
+    );
+
+    let mut mitigated_receipt = blocked_receipt("disk-enospc", "disk-reading-3");
+    mitigated_receipt["summary"] =
+        json!("The required write failed with ENOSPC on the root filesystem.");
+    mitigated_receipt["blocked_on"] = json!("root filesystem capacity");
+    mitigated_receipt["evidence_summary"] =
+        json!("The operation returned no space left on device.");
+    mitigated_receipt["attempted_actions"] = json!([
+        "Switched to low-footprint mode and reused the existing worktree and artifacts.",
+        "Checked task-owned disposable material through the guarded cleanup path."
+    ]);
+    mitigated_receipt["retry_condition"] = json!("The failed write completes without ENOSPC.");
+    let first_audit_error = match update_tool
+        .handle(tool_call(
+            "update_goal",
+            "call-mitigated-block",
+            json!({
+                "status": "blocked",
+                "blocked_receipt": mitigated_receipt,
+            }),
+        ))
+        .await
+    {
+        Ok(_) => panic!("a genuine storage failure still needs the three-turn audit"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        first_audit_error,
+        FunctionCallError::RespondToModel(
+            "cannot mark this goal blocked yet: blocked audit 1/3. Keep the goal active and continue authorized independent work. On a later goal turn, re-check the same scoped external condition and submit a new evidence_fingerprint from that fresh observation after a meaningful attempt. Do not wait for symbolic permission or repeat stale evidence."
+                .to_string()
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_update_goal_cannot_terminalize_external_objective_replacement() -> anyhow::Result<()>
 {
     let runtime = test_runtime().await?;

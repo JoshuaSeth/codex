@@ -31,6 +31,8 @@ use crate::spec::create_get_goal_tool;
 use crate::spec::create_update_goal_tool;
 
 const EXTERNALLY_REPLACED_GOAL_UPDATE_ERROR: &str = "cannot update goal because the active goal was set or replaced externally during this turn; continue working on the updated objective and let a later goal turn mark it complete or blocked";
+const STORAGE_THRESHOLD_BLOCKER_ERROR: &str = "cannot mark this goal blocked from a disk-space target, free-space threshold, or desired headroom alone. Cleanup reserve targets are not work-stopping safety floors. Keep the goal active: continue bounded low-footprint work, reuse the existing worktree and artifacts, clean only owned disposable material through guarded paths, and coordinate with server operations as needed. A storage blocker requires a concrete operation-level ENOSPC, EDQUOT, inode-exhaustion, or read-only-filesystem failure that affects every remaining work item.";
+const STORAGE_MITIGATION_BLOCKER_ERROR: &str = "cannot mark this goal blocked from a storage failure before attempting a safe continuation path. Record at least one meaningful low-footprint, existing-worktree/artifact, owned-disposable-cleanup, alternate-storage, or server-operations action in blocked_receipt.attempted_actions, and continue every independent work item.";
 
 #[derive(Clone)]
 pub(crate) struct GoalToolExecutor {
@@ -496,7 +498,103 @@ fn validate_blocked_goal_receipt(receipt: &BlockedGoalReceiptArgs) -> Result<(),
                 .to_string(),
         );
     }
+    validate_storage_capacity_blocker(receipt)?;
     Ok(())
+}
+
+fn validate_storage_capacity_blocker(receipt: &BlockedGoalReceiptArgs) -> Result<(), String> {
+    let blocker_text = [
+        receipt.summary.as_str(),
+        receipt.blocked_on.as_str(),
+        receipt.evidence_summary.as_str(),
+        receipt.retry_condition.as_str(),
+    ]
+    .into_iter()
+    .chain(receipt.affected_resources.iter().map(String::as_str))
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    if !contains_any(
+        &blocker_text,
+        &[
+            "disk space",
+            "disk-space",
+            "disk capacity",
+            "disk usage",
+            "filesystem space",
+            "filesystem usage",
+            "free space",
+            "free-space",
+            "root space",
+            "root-space",
+            "root filesystem",
+            "storage capacity",
+            "headroom",
+            "inode",
+            "enospc",
+            "edquot",
+            "disk quota",
+            "read-only file system",
+            "read-only filesystem",
+        ],
+    ) {
+        return Ok(());
+    }
+    let failure_evidence_text = [receipt.summary.as_str(), receipt.evidence_summary.as_str()]
+        .join(" ")
+        .to_ascii_lowercase();
+    if !contains_any(
+        &failure_evidence_text,
+        &[
+            "enospc",
+            "no space left on device",
+            "edquot",
+            "disk quota exceeded",
+            "no free inodes",
+            "inode exhaustion",
+            "inode exhausted",
+            "read-only file system",
+            "read-only filesystem",
+            "available_bytes=0",
+            "available bytes=0",
+            "available bytes: 0",
+            "zero writable bytes",
+            "zero bytes available",
+            "0 bytes available",
+            "0 bytes free",
+        ],
+    ) {
+        return Err(STORAGE_THRESHOLD_BLOCKER_ERROR.to_string());
+    }
+    let attempted_actions = receipt.attempted_actions.join(" ").to_ascii_lowercase();
+    if !contains_any(
+        &attempted_actions,
+        &[
+            "low-footprint",
+            "low footprint",
+            "bounded read",
+            "materialization-free",
+            "existing worktree",
+            "existing artifact",
+            "existing source",
+            "owned disposable",
+            "task-owned",
+            "guarded cleanup",
+            "alternate filesystem",
+            "alternate storage",
+            "off-root",
+            "server ops",
+            "server-ops",
+            "server operations",
+        ],
+    ) {
+        return Err(STORAGE_MITIGATION_BLOCKER_ERROR.to_string());
+    }
+    Ok(())
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
 }
 
 fn validate_fingerprint(field: &str, value: &str) -> Result<(), String> {
