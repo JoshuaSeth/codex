@@ -102,6 +102,7 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
+use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -197,22 +198,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
             let mut turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
-            if !turn_failed
-                && let Some(state_db) = conversation.state_db()
-                && state_db
-                    .completions()
-                    .turn_is_tracked_in_process(conversation_id, &turn_complete_event.turn_id)
-                    .await
-            {
-                let terminal_at_ms = turn_complete_event
-                    .completed_at
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-                    .unwrap_or_else(now_unix_timestamp_ms);
-                let final_text = turn_complete_event
-                    .last_agent_message
-                    .as_deref()
-                    .unwrap_or_default();
-                if let Err(err) = persist_turn_completion(
+            let terminal_at_ms = turn_complete_event
+                .completed_at
+                .and_then(|seconds| seconds.checked_mul(1_000))
+                .unwrap_or_else(now_unix_timestamp_ms);
+            let final_text = turn_complete_event
+                .last_agent_message
+                .as_deref()
+                .unwrap_or_default();
+            if let Some(state_db) = conversation.state_db()
+                && let Err(err) = persist_terminal_goal_final(
                     state_db.completions(),
                     conversation_id,
                     &turn_complete_event.turn_id,
@@ -220,32 +215,53 @@ pub(crate) async fn apply_bespoke_event_handling(
                     terminal_at_ms,
                 )
                 .await
-                {
-                    let message = format!(
-                        "turn finished but its completion callback state could not be persisted: {err}"
-                    );
-                    let turn_error = TurnError {
-                        message: message.clone(),
-                        codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
-                        additional_details: None,
-                    };
-                    handle_error(conversation_id, turn_error.clone(), &thread_state).await;
-                    outgoing
-                        .send_server_notification(ServerNotification::Error(ErrorNotification {
-                            error: turn_error,
-                            will_retry: false,
-                            thread_id: conversation_id.to_string(),
-                            turn_id: turn_complete_event.turn_id.clone(),
-                        }))
-                        .await;
-                    turn_failed = true;
-                    error!(
-                        thread_id = %conversation_id,
-                        turn_id = %turn_complete_event.turn_id,
-                        error = %err,
-                        "failed to persist turn completion callback event"
-                    );
-                }
+            {
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id = %turn_complete_event.turn_id,
+                    error = %err,
+                    "failed to attach the terminal assistant message to goal completion"
+                );
+            }
+            if !turn_failed
+                && let Some(state_db) = conversation.state_db()
+                && state_db
+                    .completions()
+                    .turn_is_tracked_in_process(conversation_id, &turn_complete_event.turn_id)
+                    .await
+                && let Err(err) = persist_turn_completion(
+                    state_db.completions(),
+                    conversation_id,
+                    &turn_complete_event.turn_id,
+                    final_text,
+                    terminal_at_ms,
+                )
+                .await
+            {
+                let message = format!(
+                    "turn finished but its completion callback state could not be persisted: {err}"
+                );
+                let turn_error = TurnError {
+                    message: message.clone(),
+                    codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
+                    additional_details: None,
+                };
+                handle_error(conversation_id, turn_error.clone(), &thread_state).await;
+                outgoing
+                    .send_server_notification(ServerNotification::Error(ErrorNotification {
+                        error: turn_error,
+                        will_retry: false,
+                        thread_id: conversation_id.to_string(),
+                        turn_id: turn_complete_event.turn_id.clone(),
+                    }))
+                    .await;
+                turn_failed = true;
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id = %turn_complete_event.turn_id,
+                    error = %err,
+                    "failed to persist turn completion callback event"
+                );
             }
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -1286,6 +1302,40 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
         }
         EventMsg::ThreadGoalUpdated(thread_goal_event) => {
+            if matches!(
+                thread_goal_event.goal.status,
+                ThreadGoalStatus::Complete
+                    | ThreadGoalStatus::Blocked
+                    | ThreadGoalStatus::UsageLimited
+                    | ThreadGoalStatus::BudgetLimited
+            ) {
+                let terminal_status = match thread_goal_event.goal.status {
+                    ThreadGoalStatus::Complete => "complete",
+                    ThreadGoalStatus::Blocked => "blocked",
+                    ThreadGoalStatus::UsageLimited => "usageLimited",
+                    ThreadGoalStatus::BudgetLimited => "budgetLimited",
+                    ThreadGoalStatus::Active | ThreadGoalStatus::Paused => unreachable!(),
+                };
+                if let (Some(turn_id), Some(state_db)) = (
+                    thread_goal_event.turn_id.as_deref(),
+                    conversation.state_db(),
+                ) && let Err(err) = persist_terminal_goal_turn_association(
+                    state_db.completions(),
+                    conversation_id,
+                    terminal_status,
+                    thread_goal_event.goal.updated_at,
+                    turn_id,
+                )
+                .await
+                {
+                    error!(
+                        thread_id = %conversation_id,
+                        turn_id,
+                        error = %err,
+                        "failed to associate terminal goal state with its active turn"
+                    );
+                }
+            }
             let notification = ThreadGoalUpdatedNotification {
                 thread_id: thread_goal_event.thread_id.to_string(),
                 turn_id: thread_goal_event.turn_id,
@@ -1357,7 +1407,67 @@ async fn persist_turn_completion(
             Err(err) => last_error = Some(err),
         }
     }
-    Err(last_error.expect("completion persistence loop always executes"))
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("turn completion has no persistence attempts"),
+    }
+}
+
+pub(crate) async fn persist_terminal_goal_turn_association(
+    completions: &codex_state::CompletionStore,
+    thread_id: ThreadId,
+    terminal_status: &str,
+    terminal_updated_at_seconds: i64,
+    turn_id: &str,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for delay_ms in COMPLETION_PERSIST_RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match completions
+            .associate_terminal_goal_turn(
+                thread_id,
+                terminal_status,
+                terminal_updated_at_seconds,
+                turn_id,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("terminal goal turn association has no persistence attempts"),
+    }
+}
+
+async fn persist_terminal_goal_final(
+    completions: &codex_state::CompletionStore,
+    thread_id: ThreadId,
+    turn_id: &str,
+    final_text: &str,
+    completed_at_ms: i64,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for delay_ms in COMPLETION_PERSIST_RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match completions
+            .complete_terminal_goal_turn(thread_id, turn_id, final_text, completed_at_ms)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("terminal goal final capture has no persistence attempts"),
+    }
 }
 
 async fn handle_turn_diff(

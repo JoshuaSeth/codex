@@ -500,6 +500,33 @@ pub(super) async fn handle_thread_listener_command(
             .await;
         }
         ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, goal } => {
+            let terminal_status = match goal.status {
+                ThreadGoalStatus::Complete => Some("complete"),
+                ThreadGoalStatus::Blocked => Some("blocked"),
+                ThreadGoalStatus::UsageLimited => Some("usageLimited"),
+                ThreadGoalStatus::BudgetLimited => Some("budgetLimited"),
+                ThreadGoalStatus::Active | ThreadGoalStatus::Paused => None,
+            };
+            if let Some(terminal_status) = terminal_status
+                && let (Some(turn_id), Some(state_db)) =
+                    (turn_id.as_deref(), conversation.state_db())
+                && let Err(err) =
+                    crate::bespoke_event_handling::persist_terminal_goal_turn_association(
+                        state_db.completions(),
+                        conversation_id,
+                        terminal_status,
+                        goal.updated_at,
+                        turn_id,
+                    )
+                    .await
+            {
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id,
+                    error = %err,
+                    "failed to associate terminal goal state with its active turn"
+                );
+            }
             outgoing
                 .send_server_notification(ServerNotification::ThreadGoalUpdated(
                     ThreadGoalUpdatedNotification {

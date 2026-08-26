@@ -11,6 +11,7 @@ use uuid::Uuid;
 const MAX_COMPLETION_FINAL_TEXT_CHARS: usize = 1_048_576;
 const COMPLETION_FINAL_TEXT_TRUNCATION_NOTICE: &str =
     "\n\n[PitchAI callback final output truncated at the durable transport limit.]";
+const TERMINAL_GOAL_FINAL_CAPTURE_GRACE_MS: i64 = 60_000;
 
 #[derive(Clone)]
 pub struct CompletionStore {
@@ -387,6 +388,140 @@ WHERE thread_id = ?
             self.notify_sender();
         }
         Ok(inserted)
+    }
+
+    pub async fn associate_terminal_goal_turn(
+        &self,
+        thread_id: ThreadId,
+        terminal_status: &str,
+        terminal_updated_at_seconds: i64,
+        turn_id: &str,
+    ) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            matches!(
+                terminal_status,
+                "complete" | "blocked" | "usageLimited" | "budgetLimited"
+            ),
+            "unsupported terminal goal completion status"
+        );
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let terminal_second_start_ms = terminal_updated_at_seconds.saturating_mul(1_000);
+        let terminal_second_end_ms = terminal_second_start_ms.saturating_add(1_000);
+        let mut transaction = self.pool.begin().await?;
+        let associated = sqlx::query(
+            r#"
+UPDATE completion_outbox
+SET terminal_turn_id = ?, updated_at_ms = ?
+WHERE event_id = (
+    SELECT event_id
+    FROM completion_outbox
+    WHERE thread_id = ?
+      AND execution_kind = 'goal'
+      AND state = 'pending'
+      AND terminal_turn_id IS NULL
+      AND terminal_status = ?
+      AND terminal_at_ms >= ?
+      AND terminal_at_ms < ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM completion_outbox AS already_associated
+          WHERE already_associated.thread_id = ?
+            AND already_associated.execution_kind = 'goal'
+            AND already_associated.terminal_turn_id = ?
+      )
+    ORDER BY terminal_at_ms, created_at_ms, event_id
+    LIMIT 1
+)
+            "#,
+        )
+        .bind(turn_id)
+        .bind(now_ms)
+        .bind(thread_id.to_string())
+        .bind(terminal_status)
+        .bind(terminal_second_start_ms)
+        .bind(terminal_second_end_ms)
+        .bind(thread_id.to_string())
+        .bind(turn_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            r#"
+UPDATE completion_webhook_outbox
+SET terminal_turn_id = ?, updated_at_ms = ?
+WHERE event_id IN (
+    SELECT event_id
+    FROM completion_outbox
+    WHERE thread_id = ?
+      AND execution_kind = 'goal'
+      AND terminal_turn_id = ?
+)
+            "#,
+        )
+        .bind(turn_id)
+        .bind(now_ms)
+        .bind(thread_id.to_string())
+        .bind(turn_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(associated)
+    }
+
+    pub async fn complete_terminal_goal_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        final_text: &str,
+        completed_at_ms: i64,
+    ) -> anyhow::Result<u64> {
+        if final_text.trim().is_empty() {
+            return Ok(0);
+        }
+        let final_text = bounded_completion_final_text(final_text);
+        let mut transaction = self.pool.begin().await?;
+        let completed = sqlx::query(
+            r#"
+UPDATE completion_outbox
+SET final_text = ?, available_at_ms = ?, updated_at_ms = ?
+WHERE thread_id = ?
+  AND execution_kind = 'goal'
+  AND state = 'pending'
+  AND terminal_turn_id = ?
+  AND final_text = ''
+            "#,
+        )
+        .bind(final_text.as_ref())
+        .bind(completed_at_ms)
+        .bind(completed_at_ms)
+        .bind(thread_id.to_string())
+        .bind(turn_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        sqlx::query(
+            r#"
+UPDATE completion_webhook_outbox
+SET final_text = ?, available_at_ms = ?, updated_at_ms = ?
+WHERE thread_id = ?
+  AND execution_kind = 'goal'
+  AND state = 'pending'
+  AND terminal_turn_id = ?
+  AND final_text = ''
+            "#,
+        )
+        .bind(final_text.as_ref())
+        .bind(completed_at_ms)
+        .bind(completed_at_ms)
+        .bind(thread_id.to_string())
+        .bind(turn_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        if completed > 0 {
+            self.notify_sender();
+        }
+        Ok(completed)
     }
 
     pub async fn claim_outbox(
@@ -1243,6 +1378,7 @@ INSERT OR IGNORE INTO completion_outbox (
     terminal_at_ms,
     state,
     available_at_ms,
+    terminal_turn_id,
     created_at_ms,
     updated_at_ms
 )
@@ -1261,7 +1397,8 @@ SELECT
     '',
     goal.updated_at_ms,
     'pending',
-    goal.updated_at_ms,
+    goal.updated_at_ms + ?,
+    NULL,
     ?,
     ?
 FROM completion_bindings AS binding
@@ -1274,6 +1411,7 @@ WHERE binding.completion_work_id = ?
   AND goal.status IN ('complete', 'blocked', 'usage_limited', 'budget_limited')
         "#,
     )
+    .bind(TERMINAL_GOAL_FINAL_CAPTURE_GRACE_MS)
     .bind(now_ms)
     .bind(now_ms)
     .bind(completion_work_id)
@@ -1614,7 +1752,7 @@ mod tests {
                 .expect("active goal should not emit completion")
         );
 
-        runtime
+        let completed_goal = runtime
             .thread_goals()
             .update_thread_goal(
                 thread_id,
@@ -1629,6 +1767,61 @@ mod tests {
             .expect("goal completion should persist")
             .expect("goal should still exist");
 
+        assert_eq!(
+            Vec::<CompletionOutboxEvent>::new(),
+            runtime
+                .completions()
+                .claim_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                .await
+                .expect("terminal goal should wait for the assistant final")
+        );
+        assert_eq!(
+            0,
+            runtime
+                .completions()
+                .associate_terminal_goal_turn(
+                    thread_id,
+                    "blocked",
+                    completed_goal.updated_at.timestamp(),
+                    "turn-goal-final",
+                )
+                .await
+                .expect("an unrelated terminal transition should not bind")
+        );
+        runtime
+            .completions()
+            .associate_terminal_goal_turn(
+                thread_id,
+                "complete",
+                completed_goal.updated_at.timestamp(),
+                "turn-goal-final",
+            )
+            .await
+            .expect("terminal goal should bind to its emitting turn");
+        assert_eq!(
+            0,
+            runtime
+                .completions()
+                .associate_terminal_goal_turn(
+                    thread_id,
+                    "complete",
+                    completed_goal.updated_at.timestamp(),
+                    "turn-goal-final",
+                )
+                .await
+                .expect("an exact goal update replay should be idempotent")
+        );
+        runtime
+            .completions()
+            .complete_terminal_goal_turn(
+                thread_id,
+                "turn-goal-final",
+                "The tracked goal is complete.",
+                datetime_to_epoch_millis(Utc::now()),
+            )
+            .await
+            .expect("assistant final should complete the goal event");
+
         let claimed = runtime
             .completions()
             .claim_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
@@ -1639,6 +1832,7 @@ mod tests {
         assert_eq!("goal", claimed[0].execution_kind);
         assert_eq!(goal.goal_id, claimed[0].execution_id);
         assert_eq!("complete", claimed[0].terminal_status);
+        assert_eq!("The tracked goal is complete.", claimed[0].final_text);
         assert_eq!(callback_metadata_json, claimed[0].callback_metadata_json);
         let webhook_claim = runtime
             .completions()
@@ -1681,7 +1875,7 @@ mod tests {
                 .await
                 .expect("tracked goal should persist");
 
-            runtime
+            let terminal_goal = runtime
                 .thread_goals()
                 .update_thread_goal(
                     thread_id,
@@ -1689,12 +1883,34 @@ mod tests {
                         objective: None,
                         status: Some(status),
                         token_budget: None,
-                        expected_goal_id: Some(goal.goal_id),
+                        expected_goal_id: Some(goal.goal_id.clone()),
                     },
                 )
                 .await
                 .expect("terminal goal status should persist")
                 .expect("goal should still exist");
+
+            let turn_id = format!("turn-terminal-{index}");
+            runtime
+                .completions()
+                .associate_terminal_goal_turn(
+                    thread_id,
+                    expected_status,
+                    terminal_goal.updated_at.timestamp(),
+                    &turn_id,
+                )
+                .await
+                .expect("terminal goal should bind to its emitting turn");
+            runtime
+                .completions()
+                .complete_terminal_goal_turn(
+                    thread_id,
+                    &turn_id,
+                    "Terminal goal final.",
+                    datetime_to_epoch_millis(Utc::now()),
+                )
+                .await
+                .expect("terminal goal final should become deliverable");
 
             let webhook_events = runtime
                 .completions()
@@ -1733,6 +1949,20 @@ mod tests {
             .await
             .expect("immediately terminal goal and binding should commit together");
         assert_eq!(crate::ThreadGoalStatus::BudgetLimited, goal.status);
+
+        assert_eq!(
+            Vec::<CompletionOutboxEvent>::new(),
+            runtime
+                .completions()
+                .claim_outbox(/*limit*/ 10, /*lease_duration_ms*/ 60_000)
+                .await
+                .expect("immediately terminal goal should honor final capture grace")
+        );
+        sqlx::query("UPDATE completion_outbox SET available_at_ms = 0 WHERE event_id = ?")
+            .bind(completion_work_id)
+            .execute(runtime.completions().pool.as_ref())
+            .await
+            .expect("test should advance the fallback delivery clock");
 
         let claimed = runtime
             .completions()
