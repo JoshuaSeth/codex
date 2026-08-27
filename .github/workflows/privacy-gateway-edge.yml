@@ -42,7 +42,7 @@ jobs:
   release-artifact:
     name: Build deployable Linux release artifact
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     defaults:
       run:
         working-directory: codex-rs
