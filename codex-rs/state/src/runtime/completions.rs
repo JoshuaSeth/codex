@@ -30,6 +30,7 @@ pub struct CompletionOutboxEvent {
     pub thread_id: String,
     pub execution_kind: String,
     pub execution_id: String,
+    pub terminal_turn_id: Option<String>,
     pub callback_metadata_json: String,
     pub terminal_status: String,
     pub final_text: String,
@@ -320,6 +321,7 @@ INSERT OR IGNORE INTO completion_outbox (
     thread_id,
     execution_kind,
     execution_id,
+    terminal_turn_id,
     callback_metadata_json,
     terminal_status,
     final_text,
@@ -334,6 +336,7 @@ SELECT
     binding.completion_work_id,
     binding.thread_id,
     binding.execution_kind,
+    binding.execution_id,
     binding.execution_id,
     binding.callback_metadata_json,
     'completed',
@@ -575,6 +578,7 @@ RETURNING
     thread_id,
     execution_kind,
     execution_id,
+    terminal_turn_id,
     callback_metadata_json,
     terminal_status,
     final_text,
@@ -597,6 +601,7 @@ RETURNING
                     thread_id: row.try_get("thread_id")?,
                     execution_kind: row.try_get("execution_kind")?,
                     execution_id: row.try_get("execution_id")?,
+                    terminal_turn_id: row.try_get("terminal_turn_id")?,
                     callback_metadata_json: row.try_get("callback_metadata_json")?,
                     terminal_status: row.try_get("terminal_status")?,
                     final_text: row.try_get("final_text")?,
@@ -707,6 +712,7 @@ RETURNING
     thread_id,
     execution_kind,
     execution_id,
+    terminal_turn_id,
     callback_metadata_json,
     terminal_status,
     final_text,
@@ -729,6 +735,7 @@ RETURNING
                     thread_id: row.try_get("thread_id")?,
                     execution_kind: row.try_get("execution_kind")?,
                     execution_id: row.try_get("execution_id")?,
+                    terminal_turn_id: row.try_get("terminal_turn_id")?,
                     callback_metadata_json: row.try_get("callback_metadata_json")?,
                     terminal_status: row.try_get("terminal_status")?,
                     final_text: row.try_get("final_text")?,
@@ -1511,6 +1518,7 @@ mod tests {
         assert_eq!(completion_work_id, first_event.event_id);
         assert_eq!("normal", first_event.execution_kind);
         assert_eq!("turn-1", first_event.execution_id);
+        assert_eq!(Some("turn-1"), first_event.terminal_turn_id.as_deref());
         assert_eq!("completed", first_event.terminal_status);
         assert_eq!("finished", first_event.final_text);
         assert_eq!(callback_metadata_json, first_event.callback_metadata_json);
@@ -1566,6 +1574,7 @@ mod tests {
             .await
             .expect("callback completion should have an independent webhook event");
         assert_eq!(1, webhook_claim.len());
+        assert_eq!(Some("turn-1"), webhook_claim[0].terminal_turn_id.as_deref());
         assert_eq!(
             callback_metadata_json,
             webhook_claim[0].callback_metadata_json
@@ -1831,6 +1840,10 @@ mod tests {
         assert_eq!(completion_work_id, claimed[0].event_id);
         assert_eq!("goal", claimed[0].execution_kind);
         assert_eq!(goal.goal_id, claimed[0].execution_id);
+        assert_eq!(
+            Some("turn-goal-final"),
+            claimed[0].terminal_turn_id.as_deref()
+        );
         assert_eq!("complete", claimed[0].terminal_status);
         assert_eq!("The tracked goal is complete.", claimed[0].final_text);
         assert_eq!(callback_metadata_json, claimed[0].callback_metadata_json);
@@ -1841,6 +1854,10 @@ mod tests {
             .expect("terminal goal should emit a webhook event");
         assert_eq!(1, webhook_claim.len());
         assert_eq!("goal", webhook_claim[0].execution_kind);
+        assert_eq!(
+            Some("turn-goal-final"),
+            webhook_claim[0].terminal_turn_id.as_deref()
+        );
         assert_eq!(
             callback_metadata_json,
             webhook_claim[0].callback_metadata_json
