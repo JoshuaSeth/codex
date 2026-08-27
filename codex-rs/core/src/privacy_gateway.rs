@@ -41,6 +41,7 @@ const DEFAULT_TTL_SECONDS: u64 = 900;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_GATEWAY_TEXT_CHARS: usize = 20_000;
 const MAX_FRAME_COUNT: usize = 5_000;
+const PREFERRED_SPLIT_WINDOW_CHARS: usize = 2_048;
 const RESTORE_CHUNK_CHARS: usize = 16_000;
 const PURGE_TEXT: &str = "privacy mapping purge";
 
@@ -152,6 +153,18 @@ struct TextLocation {
     text: String,
 }
 
+#[derive(Debug)]
+struct TextFragment {
+    field_index: usize,
+    text: String,
+}
+
+#[derive(Debug)]
+struct PreparedTextBatches {
+    batches: Vec<Vec<TextFragment>>,
+    field_paths: Vec<Vec<PathPart>>,
+}
+
 #[derive(Debug, Serialize)]
 struct PseudonymizePayload<'a> {
     text: &'a str,
@@ -251,7 +264,11 @@ impl PrivacyGateway {
             });
         }
 
-        let batches = build_batches(locations)?;
+        let PreparedTextBatches {
+            batches,
+            field_paths,
+        } = build_batches(locations)?;
+        let mut protected_fields = vec![String::new(); field_paths.len()];
         let mut mappings = Vec::new();
         let mut fingerprints: HashMap<String, String> = HashMap::new();
         let mut all_match_values = Vec::new();
@@ -286,12 +303,13 @@ impl PrivacyGateway {
                 purge_mappings_best_effort(config, &mut mappings).await;
                 bail!("privacy gateway returned the wrong protected field count");
             }
-            for (location, transformed_text) in batch.iter().zip(transformed) {
-                if let Err(error) = set_text_at_path(&mut body, &location.path, transformed_text) {
+            for (fragment, transformed_text) in batch.iter().zip(transformed) {
+                let Some(field) = protected_fields.get_mut(fragment.field_index) else {
                     purge_mapping_best_effort(config, &mut mapping).await;
                     purge_mappings_best_effort(config, &mut mappings).await;
-                    return Err(error);
-                }
+                    bail!("privacy gateway field reconstruction index is invalid");
+                };
+                field.push_str(&transformed_text);
             }
 
             for item in &response.streaming_restoration_matches {
@@ -319,6 +337,13 @@ impl PrivacyGateway {
                 purge_mapping(config, &mut mapping).await?;
             } else {
                 mappings.push(mapping);
+            }
+        }
+
+        for (path, transformed_text) in field_paths.iter().zip(protected_fields) {
+            if let Err(error) = set_text_at_path(&mut body, path, transformed_text) {
+                purge_mappings_best_effort(config, &mut mappings).await;
+                return Err(error);
             }
         }
 
@@ -1096,34 +1121,106 @@ fn collect_descriptions(value: &Value, path: &mut Vec<PathPart>, output: &mut Ve
     }
 }
 
-fn build_batches(locations: Vec<TextLocation>) -> Result<Vec<Vec<TextLocation>>> {
-    let mut batches: Vec<Vec<TextLocation>> = Vec::new();
+fn build_batches(locations: Vec<TextLocation>) -> Result<PreparedTextBatches> {
+    let fragment_limit = MAX_GATEWAY_TEXT_CHARS
+        .checked_sub(frame_marker_char_count())
+        .context("privacy gateway frame markers exceed the request bound")?;
+    let mut field_paths = Vec::with_capacity(locations.len());
+    let mut fragments = Vec::new();
+    for (field_index, location) in locations.into_iter().enumerate() {
+        field_paths.push(location.path);
+        fragments.extend(
+            split_text_fragments(&location.text, fragment_limit)
+                .into_iter()
+                .map(|text| TextFragment { field_index, text }),
+        );
+    }
+
+    let mut batches: Vec<Vec<TextFragment>> = Vec::new();
     let mut current = Vec::new();
-    for location in locations {
-        let single_size = framed_char_count(&location.text, 0);
+    for fragment in fragments {
+        let single_size = framed_char_count(&fragment.text, 0);
         if single_size > MAX_GATEWAY_TEXT_CHARS {
             bail!(
-                "one protected Responses field exceeds the privacy gateway 20,000-character bound"
+                "one protected Responses fragment exceeds the privacy gateway 20,000-character bound"
             );
         }
         let prospective = current
             .iter()
             .enumerate()
-            .map(|(index, item): (usize, &TextLocation)| framed_char_count(&item.text, index))
+            .map(|(index, item): (usize, &TextFragment)| framed_char_count(&item.text, index))
             .sum::<usize>()
-            + framed_char_count(&location.text, current.len());
+            + framed_char_count(&fragment.text, current.len());
         if prospective > MAX_GATEWAY_TEXT_CHARS && !current.is_empty() {
             batches.push(std::mem::take(&mut current));
         }
-        current.push(location);
+        current.push(fragment);
     }
     if !current.is_empty() {
         batches.push(current);
     }
-    Ok(batches)
+    Ok(PreparedTextBatches {
+        batches,
+        field_paths,
+    })
 }
 
-fn frame_batch(batch: &[TextLocation]) -> Result<String> {
+fn split_text_fragments(text: &str, maximum_chars: usize) -> Vec<String> {
+    if text.chars().count() <= maximum_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut remaining = text;
+    let mut fragments = Vec::new();
+    while remaining.chars().count() > maximum_chars {
+        let hard_end = remaining
+            .char_indices()
+            .nth(maximum_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let candidate = &remaining[..hard_end];
+        let preferred_window_start = candidate
+            .char_indices()
+            .nth(maximum_chars.saturating_sub(PREFERRED_SPLIT_WINDOW_CHARS))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        let split_at =
+            preferred_fragment_boundary(candidate, preferred_window_start).unwrap_or(hard_end);
+        fragments.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+    }
+    if !remaining.is_empty() {
+        fragments.push(remaining.to_string());
+    }
+    fragments
+}
+
+fn preferred_fragment_boundary(text: &str, minimum: usize) -> Option<usize> {
+    let boundary_after = |index: usize, character: char| index + character.len_utf8();
+    if let Some(index) = text.rfind("\n\n")
+        && index + 2 >= minimum
+    {
+        return Some(index + 2);
+    }
+    if let Some(index) = text.rfind('\n')
+        && index + 1 >= minimum
+    {
+        return Some(index + 1);
+    }
+    if let Some((index, character)) = text
+        .char_indices()
+        .rev()
+        .find(|(index, character)| *index >= minimum && matches!(*character, '.' | '?' | '!' | ';'))
+    {
+        return Some(boundary_after(index, character));
+    }
+    text.char_indices()
+        .rev()
+        .find(|(index, character)| *index >= minimum && character.is_whitespace())
+        .map(|(index, character)| boundary_after(index, character))
+}
+
+fn frame_batch(batch: &[TextFragment]) -> Result<String> {
     if batch.len() > MAX_FRAME_COUNT {
         bail!("privacy gateway request contains too many protected text fields");
     }
@@ -1178,11 +1275,15 @@ fn frame_markers(index: usize) -> Result<(String, String)> {
 
 fn framed_char_count(text: &str, index: usize) -> usize {
     let marker_chars = if index < MAX_FRAME_COUNT {
-        8
+        frame_marker_char_count()
     } else {
         usize::MAX
     };
     text.chars().count().saturating_add(marker_chars)
+}
+
+const fn frame_marker_char_count() -> usize {
+    8
 }
 
 fn text_at_path<'a>(value: &'a Value, path: &[PathPart]) -> Result<&'a str> {
@@ -1453,12 +1554,12 @@ mod tests {
     #[test]
     fn frames_round_trip_multiple_fields_without_text_changes() {
         let batch = vec![
-            TextLocation {
-                path: Vec::new(),
+            TextFragment {
+                field_index: 0,
                 text: "Alice Stone".to_string(),
             },
-            TextLocation {
-                path: Vec::new(),
+            TextFragment {
+                field_index: 1,
                 text: "alice@example.invalid".to_string(),
             },
         ];
@@ -1467,6 +1568,68 @@ mod tests {
             unframe_batch(&framed, 2).unwrap(),
             vec!["Alice Stone", "alice@example.invalid"]
         );
+    }
+
+    #[test]
+    fn oversized_fields_are_segmented_and_reconstructed_losslessly() {
+        let source = format!("{}\n\n{}", "A".repeat(19_500), "B".repeat(2_000));
+        let prepared = build_batches(vec![TextLocation {
+            path: vec![PathPart::Key("instructions".to_string())],
+            text: source.clone(),
+        }])
+        .unwrap();
+        let fragments = prepared.batches.iter().flatten().collect::<Vec<_>>();
+        let reconstructed = fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<String>();
+
+        assert!(prepared.batches.len() >= 2);
+        assert_eq!(reconstructed, source);
+        assert!(fragments[0].text.ends_with("\n\n"));
+        assert!(
+            prepared
+                .batches
+                .iter()
+                .all(|batch| frame_batch(batch).unwrap().chars().count() <= MAX_GATEWAY_TEXT_CHARS)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_field_round_trips_through_bounded_gateway_calls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let source = format!(
+            "{}\n\nAlice Stone uses alice@example.invalid. {}",
+            "A".repeat(19_500),
+            "B".repeat(2_000)
+        );
+
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": source.clone()}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.body["instructions"].as_str().unwrap(),
+            source
+                .replace("Alice Stone", "Ava Woods")
+                .replace("alice@example.invalid", "ava@example.invalid")
+        );
+        let mut session = prepared.session.unwrap();
+        session.abort().await;
     }
 
     #[tokio::test]
