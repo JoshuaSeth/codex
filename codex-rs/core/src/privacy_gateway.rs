@@ -847,7 +847,7 @@ async fn pseudonymize(
             locale: &config.locale,
             context_id,
             ttl_seconds: config.ttl_seconds,
-            date_policy: "shift",
+            date_policy: "plausible_keyed_shift",
         })
         .send()
         .await
@@ -1448,6 +1448,10 @@ mod tests {
 
     fn pseudonymize_response(request: &wiremock::Request) -> ResponseTemplate {
         let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            request_body["date_policy"],
+            Value::String("plausible_keyed_shift".to_string())
+        );
         let source = request_body["text"].as_str().unwrap();
         let pseudonymized = source
             .replace("Alice Stone", "Ava Woods")
