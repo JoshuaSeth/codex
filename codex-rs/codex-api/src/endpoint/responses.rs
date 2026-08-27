@@ -72,6 +72,23 @@ impl<T: HttpTransport> ResponsesClient<T> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
+        let body = serde_json::to_value(&request)
+            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        self.stream_value_request(body, request.store, &request.input, options)
+            .await
+    }
+
+    /// Stream an already serialized Responses payload after an edge transform.
+    ///
+    /// Callers must derive `store` and `input` from the same typed request used to
+    /// create `body`; they remain necessary for Azure item-id compatibility.
+    pub async fn stream_value_request(
+        &self,
+        mut body: Value,
+        store: bool,
+        input: &[codex_protocol::models::ResponseItem],
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
             thread_id,
@@ -81,10 +98,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
             turn_state,
         } = options;
 
-        let mut body = serde_json::to_value(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
-        if request.store && self.session.provider().is_azure_responses_endpoint() {
-            attach_item_ids(&mut body, &request.input);
+        if store && self.session.provider().is_azure_responses_endpoint() {
+            attach_item_ids(&mut body, input);
         }
 
         let mut headers = extra_headers;

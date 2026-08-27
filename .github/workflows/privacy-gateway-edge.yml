@@ -1,0 +1,69 @@
+name: Privacy Gateway edge
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/privacy-gateway-edge.yml"
+      - "codex-rs/codex-api/src/endpoint/responses.rs"
+      - "codex-rs/codex-api/tests/clients.rs"
+      - "codex-rs/core/src/client.rs"
+      - "codex-rs/core/src/client_tests.rs"
+      - "codex-rs/core/src/lib.rs"
+      - "codex-rs/core/src/privacy_gateway.rs"
+      - "codex-rs/core/src/realtime_conversation.rs"
+  workflow_dispatch:
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  PRIVACY_GATEWAY_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  focused-proof:
+    name: Focused compile and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ env.PRIVACY_GATEWAY_SOURCE_SHA }}
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Test Privacy Gateway edge behavior
+        run: cargo test --locked -p codex-core privacy_gateway::tests --lib
+      - name: Test serialized response transport equivalence
+        run: cargo test --locked -p codex-api --test clients serialized_edge_path_is_transport_equivalent_to_typed_request -- --exact
+
+  release-artifact:
+    name: Build deployable Linux release artifact
+    # The shared PitchAI host runs glibc 2.35. Build on the matching Ubuntu
+    # generation so the artifact cannot acquire a newer glibc ABI.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ env.PRIVACY_GATEWAY_SOURCE_SHA }}
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Build and strip Codex release binary
+        run: |
+          cargo build --locked -p codex-cli --release --target-dir target/privacy-gateway-release
+          strip target/privacy-gateway-release/release/codex
+          target/privacy-gateway-release/release/codex --version
+          getconf GNU_LIBC_VERSION
+      - name: Upload exact-SHA deployable binary
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.6.2
+        with:
+          name: privacy-gateway-codex-linux-x64-${{ env.PRIVACY_GATEWAY_SOURCE_SHA }}
+          path: codex-rs/target/privacy-gateway-release/release/codex
+          if-no-files-found: error
+          retention-days: 3

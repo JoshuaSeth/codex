@@ -295,6 +295,7 @@ impl RealtimeConversationManager {
             model_client,
             sdp,
         } = start;
+        model_client.ensure_realtime_privacy_edge_supported()?;
         let event_parser = session_config.event_parser;
         let session_kind = match event_parser {
             RealtimeEventParser::V1 => RealtimeSessionKind::V1,
