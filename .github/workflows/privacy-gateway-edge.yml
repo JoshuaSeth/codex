@@ -41,7 +41,9 @@ jobs:
 
   release-artifact:
     name: Build deployable Linux release artifact
-    runs-on: ubuntu-24.04
+    # The shared PitchAI host runs glibc 2.35. Build on the matching Ubuntu
+    # generation so the artifact cannot acquire a newer glibc ABI.
+    runs-on: ubuntu-22.04
     timeout-minutes: 75
     defaults:
       run:
@@ -56,6 +58,8 @@ jobs:
         run: |
           cargo build --locked -p codex-cli --release --target-dir target/privacy-gateway-release
           strip target/privacy-gateway-release/release/codex
+          target/privacy-gateway-release/release/codex --version
+          getconf GNU_LIBC_VERSION
       - name: Upload exact-SHA deployable binary
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.6.2
         with:
