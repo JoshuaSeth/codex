@@ -391,6 +391,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         Arc::new(Mutex::new(crate::privacy::PrivacyFilter::disabled())),
         test_session_telemetry(),
         attempt,
+        /*gateway_session*/ None,
     );
 
     let observed = stream
@@ -441,6 +442,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         Arc::new(Mutex::new(crate::privacy::PrivacyFilter::disabled())),
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
+        /*gateway_session*/ None,
     );
 
     while stream.next().await.is_some() {}
@@ -483,6 +485,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         Arc::new(Mutex::new(crate::privacy::PrivacyFilter::disabled())),
         test_session_telemetry(),
         attempt,
+        /*gateway_session*/ None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output
