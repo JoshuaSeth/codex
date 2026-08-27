@@ -26,7 +26,8 @@ use uuid::Uuid;
 const CENTRAL_URL_ENV: &str = "PITCHAI_PLATFORM_CENTRAL_URL";
 const CELL_TOKEN_ENV: &str = "PITCHAI_PLATFORM_CELL_TOKEN";
 const COMPLETION_EVENT_PATH: &str = "/internal/cell-api/v2/completion-events";
-const COMPLETION_PROTOCOL_VERSION: &str = "pitchai-completion/v1";
+const COMPLETION_PROTOCOL_V1: &str = "pitchai-completion/v1";
+const COMPLETION_PROTOCOL_V2: &str = "pitchai-completion/v2";
 const CLAIM_BATCH_SIZE: i64 = 8;
 const CLAIM_LEASE_MS: i64 = 60_000;
 const MAX_IDLE_SCAN_MS: i64 = 30_000;
@@ -51,6 +52,7 @@ struct CompletionEventPayload<'a> {
     source_thread_id: &'a str,
     execution_kind: &'a str,
     execution_id: &'a str,
+    terminal_turn_id: Option<&'a str>,
     terminal_status: &'a str,
     final_text: &'a str,
     terminal_at: String,
@@ -284,14 +286,20 @@ async fn post_event(
     let terminal_at = DateTime::<Utc>::from_timestamp_millis(event.terminal_at_ms)
         .ok_or_else(|| "completion event has an invalid terminal timestamp".to_string())?
         .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let terminal_turn_id = terminal_turn_id(event)?;
     let payload = CompletionEventPayload {
-        protocol_version: COMPLETION_PROTOCOL_VERSION,
+        protocol_version: if terminal_turn_id.is_some() {
+            COMPLETION_PROTOCOL_V2
+        } else {
+            COMPLETION_PROTOCOL_V1
+        },
         boot_id,
         event_id: &event.event_id,
         completion_work_id: &event.completion_work_id,
         source_thread_id: &event.thread_id,
         execution_kind: &event.execution_kind,
         execution_id: &event.execution_id,
+        terminal_turn_id,
         terminal_status: &event.terminal_status,
         final_text: &event.final_text,
         terminal_at,
@@ -330,6 +338,32 @@ async fn post_event(
     }
     match receipt.outcome {
         CompletionEventOutcome::Accepted | CompletionEventOutcome::Duplicate => Ok(()),
+    }
+}
+
+fn terminal_turn_id(event: &CompletionOutboxEvent) -> Result<Option<&str>, String> {
+    match event.execution_kind.as_str() {
+        "normal" => {
+            if event
+                .terminal_turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_id != event.execution_id)
+            {
+                return Err(
+                    "normal completion terminal turn does not match its execution id".to_string(),
+                );
+            }
+            Ok(Some(event.execution_id.as_str()))
+        }
+        "goal" => {
+            if event.terminal_turn_id.is_none() && !event.final_text.trim().is_empty() {
+                return Err(
+                    "goal completion with final text has no terminal turn identity".to_string(),
+                );
+            }
+            Ok(event.terminal_turn_id.as_deref())
+        }
+        _ => Err("completion event has an unsupported execution kind".to_string()),
     }
 }
 
@@ -475,6 +509,7 @@ mod tests {
             thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
             execution_kind: "normal".to_string(),
             execution_id: "turn-1".to_string(),
+            terminal_turn_id: None,
             callback_metadata_json: String::new(),
             terminal_status: "completed".to_string(),
             final_text: "done".to_string(),
@@ -492,6 +527,65 @@ mod tests {
             ..event
         };
         assert!(retry_delay_ms(&delayed_event) <= RETRY_CAP_MS);
+    }
+
+    #[test]
+    fn terminal_turn_protocol_preserves_goal_fallback_compatibility() {
+        let normal = CompletionOutboxEvent {
+            event_id: "10000000-0000-0000-0000-000000000001".to_string(),
+            completion_work_id: "10000000-0000-0000-0000-000000000001".to_string(),
+            thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
+            execution_kind: "normal".to_string(),
+            execution_id: "turn-1".to_string(),
+            terminal_turn_id: None,
+            callback_metadata_json: String::new(),
+            terminal_status: "completed".to_string(),
+            final_text: "done".to_string(),
+            terminal_at_ms: 1_000,
+            attempt: 1,
+            lease_id: "lease-1".to_string(),
+        };
+        let terminal_goal = CompletionOutboxEvent {
+            execution_kind: "goal".to_string(),
+            execution_id: "goal-1".to_string(),
+            terminal_turn_id: Some("turn-1".to_string()),
+            terminal_status: "complete".to_string(),
+            ..normal.clone()
+        };
+        let empty_fallback = CompletionOutboxEvent {
+            terminal_turn_id: None,
+            final_text: String::new(),
+            ..terminal_goal.clone()
+        };
+        let missing_goal_turn = CompletionOutboxEvent {
+            terminal_turn_id: None,
+            ..terminal_goal.clone()
+        };
+        let mismatched_normal_turn = CompletionOutboxEvent {
+            terminal_turn_id: Some("another-turn".to_string()),
+            ..normal.clone()
+        };
+
+        assert_eq!(
+            Some("turn-1"),
+            terminal_turn_id(&normal).expect("normal turn")
+        );
+        assert_eq!(
+            Some("turn-1"),
+            terminal_turn_id(&terminal_goal).expect("goal terminal turn")
+        );
+        assert_eq!(
+            None,
+            terminal_turn_id(&empty_fallback).expect("legacy empty goal fallback")
+        );
+        assert_eq!(
+            Err("goal completion with final text has no terminal turn identity".to_string()),
+            terminal_turn_id(&missing_goal_turn)
+        );
+        assert_eq!(
+            Err("normal completion terminal turn does not match its execution id".to_string()),
+            terminal_turn_id(&mismatched_normal_turn)
+        );
     }
 
     #[tokio::test]
@@ -727,6 +821,11 @@ mod tests {
         else {
             return AxumStatusCode::BAD_REQUEST.into_response();
         };
+        if payload.get("protocol_version").and_then(Value::as_str) != Some(COMPLETION_PROTOCOL_V2)
+            || payload.get("terminal_turn_id") != payload.get("execution_id")
+        {
+            return AxumStatusCode::BAD_REQUEST.into_response();
+        }
         (
             AxumStatusCode::OK,
             Json(json!({
