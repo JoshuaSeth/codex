@@ -588,11 +588,11 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
+    let _ = sess.conversation.shutdown().await;
     // Shutdown must leave trigger-turn mailbox work queued for the next
     // session. Restarting it here races persistence teardown and can leave an
     // orphan task writing through a recorder that shutdown already removed.
     sess.abort_all_tasks_for_shutdown().await;
-    let _ = sess.conversation.shutdown().await;
     sess.services
         .unified_exec_manager
         .terminate_all_processes()
