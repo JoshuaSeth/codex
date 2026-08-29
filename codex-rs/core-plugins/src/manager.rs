@@ -1223,19 +1223,7 @@ impl PluginsManager {
             .iter()
             .map(|plugin| plugin.config_name.as_str())
             .collect::<HashSet<_>>();
-        let installed_remote_plugin_ids = {
-            let cache = match self.remote_installed_plugins_cache.read() {
-                Ok(cache) => cache,
-                Err(err) => err.into_inner(),
-            };
-            cache
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .filter(|plugin| plugin.marketplace_name == REMOTE_GLOBAL_MARKETPLACE_NAME)
-                .map(|plugin| plugin.id.clone())
-                .collect::<HashSet<_>>()
-        };
+        let installed_remote_plugin_ids = self.installed_global_remote_plugin_ids();
         let disabled_plugin_ids = input
             .disabled_tools
             .iter()
@@ -1266,6 +1254,39 @@ impl PluginsManager {
             candidates,
             input.app_server_client_name,
         ))
+    }
+
+    /// Removes endpoint recommendations that became installed after the turn's
+    /// recommendation snapshot was created.
+    pub fn filter_remote_installed_plugin_candidates(
+        &self,
+        candidates: Vec<DiscoverableTool>,
+    ) -> Vec<DiscoverableTool> {
+        let installed_remote_plugin_ids = self.installed_global_remote_plugin_ids();
+        candidates
+            .into_iter()
+            .filter(|candidate| match candidate {
+                DiscoverableTool::Plugin(plugin) => plugin
+                    .remote_plugin_id
+                    .as_deref()
+                    .is_none_or(|id| !installed_remote_plugin_ids.contains(id)),
+                DiscoverableTool::Connector(_) => true,
+            })
+            .collect()
+    }
+
+    fn installed_global_remote_plugin_ids(&self) -> HashSet<String> {
+        let cache = match self.remote_installed_plugins_cache.read() {
+            Ok(cache) => cache,
+            Err(err) => err.into_inner(),
+        };
+        cache
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|plugin| plugin.marketplace_name == REMOTE_GLOBAL_MARKETPLACE_NAME)
+            .map(|plugin| plugin.id.clone())
+            .collect()
     }
 
     fn cached_recommended_plugins_mode(

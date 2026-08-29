@@ -21,9 +21,7 @@ use crate::build_available_skills;
 use crate::compact;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
-use crate::connectors;
 use crate::context::ApprovedCommandPrefixSaved;
-use crate::context::AppsInstructions;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
@@ -3095,7 +3093,7 @@ impl Session {
         loaded_plugins: &PluginLoadOutcome,
         auth: Option<&CodexAuth>,
     ) -> Option<Vec<DiscoverableTool>> {
-        turn_context
+        let candidates = turn_context
             .recommended_plugin_candidates
             .get_or_init(|| async {
                 if !crate::tools::spec_plan::tool_suggest_enabled(turn_context) {
@@ -3114,7 +3112,12 @@ impl Session {
                     .await
             })
             .await
-            .clone()
+            .clone();
+        candidates.map(|candidates| {
+            self.services
+                .plugins_manager
+                .filter_remote_installed_plugin_candidates(candidates)
+        })
     }
 
     async fn build_turn_context_contribution_items(
@@ -3273,19 +3276,6 @@ impl Session {
             {
                 developer_sections
                     .push(PersonalitySpecInstructions::new(personality_message).render());
-            }
-        }
-        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
-            let accessible_and_enabled_connectors =
-                connectors::list_accessible_and_enabled_connectors_from_manager(
-                    mcp.manager(),
-                    &turn_context.config,
-                )
-                .await;
-            if let Some(apps_instructions) =
-                AppsInstructions::from_connectors(&accessible_and_enabled_connectors)
-            {
-                developer_sections.push(apps_instructions.render());
             }
         }
         if turn_context.config.include_skill_instructions {
