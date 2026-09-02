@@ -1000,6 +1000,35 @@ WHERE event_id = ? AND state = 'sending' AND lease_id = ?
         Ok(updated == 1)
     }
 
+    pub async fn mark_undeliverable(
+        &self,
+        event_id: &str,
+        lease_id: &str,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let now_ms = datetime_to_epoch_millis(Utc::now());
+        let updated = sqlx::query(
+            r#"
+UPDATE completion_outbox
+SET
+    state = 'sent',
+    lease_id = NULL,
+    lease_expires_at_ms = NULL,
+    last_error = ?,
+    updated_at_ms = ?
+WHERE event_id = ? AND state = 'sending' AND lease_id = ?
+            "#,
+        )
+        .bind(error)
+        .bind(now_ms)
+        .bind(event_id)
+        .bind(lease_id)
+        .execute(self.pool.as_ref())
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
     pub async fn mark_webhook_attempted(
         &self,
         event_id: &str,
