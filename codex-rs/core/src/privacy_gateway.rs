@@ -1064,7 +1064,7 @@ fn gateway_request_error(operation: &str, timeout_ms: u64, error: reqwest::Error
     if error.is_timeout() {
         anyhow::anyhow!("privacy gateway {operation} timed out after {timeout_ms} ms")
     } else {
-        error.context(format!("privacy gateway {operation} request failed"))
+        anyhow::Error::new(error).context(format!("privacy gateway {operation} request failed"))
     }
 }
 
