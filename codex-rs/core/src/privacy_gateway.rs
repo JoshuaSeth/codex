@@ -25,10 +25,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
 const ENABLE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_ENABLED";
+const MODE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_MODE";
 const URL_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_URL";
 const TOKEN_FILE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TOKEN_FILE";
 const CLASSIFICATION_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_DATA_CLASSIFICATION";
@@ -37,8 +39,8 @@ const LOCALE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_LOCALE";
 const TTL_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TTL_SECONDS";
 const TIMEOUT_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TIMEOUT_MS";
 const LEGACY_ENABLE_ENV: &str = "PITCHAI_CODEX_PRIVACY_MIDDLEWARE";
-const DEFAULT_TTL_SECONDS: u64 = 900;
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 10_000;
 const MAX_GATEWAY_TEXT_CHARS: usize = 20_000;
 const MAX_FRAME_COUNT: usize = 5_000;
 const PREFERRED_SPLIT_WINDOW_CHARS: usize = 2_048;
@@ -58,6 +60,7 @@ enum GatewayState {
 }
 
 struct GatewayConfig {
+    mode: GatewayMode,
     base_url: Url,
     bearer_token: String,
     data_classification: String,
@@ -67,10 +70,76 @@ struct GatewayConfig {
     client: reqwest::Client,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayMode {
+    Pseudonymize,
+    DeepPseudonymize,
+}
+
+impl GatewayMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim).unwrap_or("pseudonymize") {
+            "pseudonymize" => Ok(Self::Pseudonymize),
+            "deep-pseudonymize" => Ok(Self::DeepPseudonymize),
+            _ => bail!("{MODE_ENV} must be pseudonymize or deep-pseudonymize"),
+        }
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "v1/pseudonymize",
+            Self::DeepPseudonymize => "v1/deep-pseudonymize",
+        }
+    }
+
+    const fn schema_version(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "reversible-pseudonymization-v3",
+            Self::DeepPseudonymize => "deep-pseudonymization-v1",
+        }
+    }
+
+    const fn date_policy(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "plausible_keyed_shift",
+            Self::DeepPseudonymize => "irreversible_placeholder",
+        }
+    }
+
+    const fn restore_match_mode(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "exact_and_registered_aliases",
+            Self::DeepPseudonymize => "exact_values",
+        }
+    }
+
+    const fn default_ttl_seconds(self) -> u64 {
+        match self {
+            Self::Pseudonymize => 900,
+            Self::DeepPseudonymize => 300,
+        }
+    }
+
+    const fn maximum_ttl_seconds(self) -> u64 {
+        match self {
+            Self::Pseudonymize => 3_600,
+            Self::DeepPseudonymize => 300,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "pseudonymize",
+            Self::DeepPseudonymize => "deep-pseudonymize",
+        }
+    }
+}
+
 impl fmt::Debug for GatewayConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GatewayConfig")
+            .field("mode", &self.mode)
             .field("base_url", &self.base_url)
             .field("data_classification", &self.data_classification)
             .field("language", &self.language)
@@ -96,6 +165,7 @@ impl fmt::Debug for GatewayState {
             Self::Disabled => formatter.write_str("Disabled"),
             Self::Enabled(config) => formatter
                 .debug_struct("Enabled")
+                .field("mode", &config.mode)
                 .field("base_url", &config.base_url)
                 .field("data_classification", &config.data_classification)
                 .field("language", &config.language)
@@ -256,6 +326,7 @@ impl PrivacyGateway {
         mut body: Value,
     ) -> Result<PreparedGatewayRequest> {
         let config = self.config()?;
+        let started_at = Instant::now();
         let locations = request_text_locations(&body)?;
         if locations.is_empty() {
             return Ok(PreparedGatewayRequest {
@@ -263,11 +334,17 @@ impl PrivacyGateway {
                 session: None,
             });
         }
+        let field_count = locations.len();
+        let protected_text_chars = locations
+            .iter()
+            .map(|location| location.text.chars().count())
+            .sum::<usize>();
 
         let PreparedTextBatches {
             batches,
             field_paths,
         } = build_batches(locations)?;
+        let batch_count = batches.len();
         let mut protected_fields = vec![String::new(); field_paths.len()];
         let mut mappings = Vec::new();
         let mut fingerprints: HashMap<String, String> = HashMap::new();
@@ -346,6 +423,16 @@ impl PrivacyGateway {
                 return Err(error);
             }
         }
+
+        tracing::info!(
+            privacy_mode = config.mode.label(),
+            field_count,
+            protected_text_chars,
+            batch_count,
+            mapping_count = mappings.len(),
+            duration_ms = started_at.elapsed().as_millis(),
+            "privacy gateway prepared outbound OpenAI request"
+        );
 
         Ok(PreparedGatewayRequest {
             body,
@@ -722,13 +809,20 @@ fn load_config() -> Result<GatewayConfig> {
     let language = std::env::var(LANGUAGE_ENV).unwrap_or_else(|_| "en".to_string());
     let locale = std::env::var(LOCALE_ENV).unwrap_or_else(|_| "en_GB".to_string());
     validate_language_locale(&language, &locale)?;
-    let ttl_seconds = parse_bounded_env(TTL_ENV, DEFAULT_TTL_SECONDS, 60, 3_600)?;
-    let timeout_ms = parse_bounded_env(TIMEOUT_ENV, DEFAULT_TIMEOUT_MS, 100, 120_000)?;
+    let mode = GatewayMode::parse(std::env::var(MODE_ENV).ok().as_deref())?;
+    let ttl_seconds = parse_bounded_env(
+        TTL_ENV,
+        mode.default_ttl_seconds(),
+        60,
+        mode.maximum_ttl_seconds(),
+    )?;
+    let timeout_ms = parse_bounded_env(TIMEOUT_ENV, DEFAULT_TIMEOUT_MS, 100, MAX_TIMEOUT_MS)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
         .context("failed to build privacy gateway HTTP client")?;
     Ok(GatewayConfig {
+        mode,
         base_url,
         bearer_token,
         data_classification,
@@ -838,7 +932,7 @@ async fn pseudonymize(
 ) -> Result<PseudonymizeResponse> {
     let response = config
         .client
-        .post(endpoint(&config.base_url, "v1/pseudonymize")?)
+        .post(endpoint(&config.base_url, config.mode.path())?)
         .bearer_auth(&config.bearer_token)
         .json(&PseudonymizePayload {
             text,
@@ -847,7 +941,7 @@ async fn pseudonymize(
             locale: &config.locale,
             context_id,
             ttl_seconds: config.ttl_seconds,
-            date_policy: "plausible_keyed_shift",
+            date_policy: config.mode.date_policy(),
         })
         .send()
         .await
@@ -874,7 +968,7 @@ async fn restore_mapping(
             data_classification: &config.data_classification,
             mapping_id: mapping.mapping_id,
             restoration_capability: &mapping.restoration_capability,
-            match_mode: "exact_and_registered_aliases",
+            match_mode: config.mode.restore_match_mode(),
             purge_after_restore,
         })
         .send()
@@ -937,8 +1031,8 @@ fn mapping_from_response(
     config: &GatewayConfig,
     response: &PseudonymizeResponse,
 ) -> Result<GatewayMapping> {
-    if response.schema_version != "reversible-pseudonymization-v3"
-        || response.data_classification != "synthetic_demo"
+    if response.schema_version != config.mode.schema_version()
+        || response.data_classification != config.data_classification
     {
         bail!("privacy gateway returned an incompatible pseudonymization contract");
     }
@@ -1021,15 +1115,6 @@ fn request_text_locations(body: &Value) -> Result<Vec<TextLocation>> {
             &mut result,
         );
     }
-    if let Some(Value::Array(tools)) = object.get("tools") {
-        for (index, tool) in tools.iter().enumerate() {
-            collect_descriptions(
-                tool,
-                &mut vec![PathPart::Key("tools".to_string()), PathPart::Index(index)],
-                &mut result,
-            );
-        }
-    }
     Ok(result)
 }
 
@@ -1056,7 +1141,9 @@ fn collect_dynamic_strings(
         }
         Value::Object(values) => {
             for (key, value) in values {
-                if excluded_dynamic_key(key) {
+                if excluded_dynamic_key(key)
+                    || (key == "result" && is_top_level_input_item_path(path))
+                {
                     continue;
                 }
                 path.push(PathPart::Key(key.clone()));
@@ -1066,6 +1153,13 @@ fn collect_dynamic_strings(
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+fn is_top_level_input_item_path(path: &[PathPart]) -> bool {
+    matches!(
+        path,
+        [PathPart::Key(input), PathPart::Index(_)] if input == "input"
+    )
 }
 
 fn excluded_dynamic_key(key: &str) -> bool {
@@ -1084,41 +1178,10 @@ fn excluded_dynamic_key(key: &str) -> bool {
             | "encrypted_content"
             | "image_url"
             | "detail"
-            | "result"
             | "schema"
             | "parameters"
             | "input_schema"
     )
-}
-
-fn collect_descriptions(value: &Value, path: &mut Vec<PathPart>, output: &mut Vec<TextLocation>) {
-    match value {
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push(PathPart::Index(index));
-                collect_descriptions(value, path, output);
-                path.pop();
-            }
-        }
-        Value::Object(values) => {
-            for (key, value) in values {
-                path.push(PathPart::Key(key.clone()));
-                if key == "description"
-                    && let Value::String(text) = value
-                    && !text.trim().is_empty()
-                {
-                    output.push(TextLocation {
-                        path: path.clone(),
-                        text: text.clone(),
-                    });
-                } else {
-                    collect_descriptions(value, path, output);
-                }
-                path.pop();
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
 }
 
 fn build_batches(locations: Vec<TextLocation>) -> Result<PreparedTextBatches> {
@@ -1431,9 +1494,18 @@ mod tests {
     const TEST_CAPABILITY: &str = "abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE";
 
     fn test_gateway(base_url: &str, timeout: Duration) -> PrivacyGateway {
+        test_gateway_with_mode(base_url, timeout, GatewayMode::Pseudonymize)
+    }
+
+    fn test_gateway_with_mode(
+        base_url: &str,
+        timeout: Duration,
+        mode: GatewayMode,
+    ) -> PrivacyGateway {
         let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
         PrivacyGateway {
             state: Arc::new(GatewayState::Enabled(Arc::new(GatewayConfig {
+                mode,
                 base_url: Url::parse(base_url).unwrap(),
                 bearer_token: "test-token".to_string(),
                 data_classification: "synthetic_demo".to_string(),
@@ -1470,6 +1542,27 @@ mod tests {
         }))
     }
 
+    fn deep_pseudonymize_response(request: &wiremock::Request) -> ResponseTemplate {
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            request_body["date_policy"],
+            Value::String("irreversible_placeholder".to_string())
+        );
+        let source = request_body["text"].as_str().unwrap();
+        let pseudonymized = source.replace("Alice Stone", "Ava Woods");
+        ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": "deep-pseudonymization-v1",
+            "data_classification": "synthetic_demo",
+            "pseudonymized_text": pseudonymized,
+            "mapping_id": TEST_MAPPING_ID,
+            "restoration_capability": TEST_CAPABILITY,
+            "expires_at": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
+            "streaming_restoration_matches": [
+                {"value": "Ava Woods", "source_fingerprint": "a".repeat(64)}
+            ]
+        }))
+    }
+
     fn restore_response(request: &wiremock::Request) -> ResponseTemplate {
         let request_body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(
@@ -1481,6 +1574,26 @@ mod tests {
             .unwrap()
             .replace("Ava Woods", "Alice Stone")
             .replace("ava@example.invalid", "alice@example.invalid");
+        let purge = request_body["purge_after_restore"].as_bool().unwrap();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": "authorized-restoration-v2",
+            "data_classification": "synthetic_demo",
+            "restored_text": restored,
+            "mapping_id": TEST_MAPPING_ID,
+            "mapping_purged": purge
+        }))
+    }
+
+    fn deep_restore_response(request: &wiremock::Request) -> ResponseTemplate {
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            request_body["match_mode"],
+            Value::String("exact_values".to_string())
+        );
+        let restored = request_body["text"]
+            .as_str()
+            .unwrap()
+            .replace("Ava Woods", "Alice Stone");
         let purge = request_body["purge_after_restore"].as_bool().unwrap();
         ResponseTemplate::new(200).set_body_json(json!({
             "schema_version": "authorized-restoration-v2",
@@ -1506,6 +1619,19 @@ mod tests {
         assert!(!parse_enable_value(Some("false")).unwrap());
         assert!(parse_enable_value(Some("ON")).unwrap());
         assert!(parse_enable_value(Some("enabled")).is_err());
+    }
+
+    #[test]
+    fn protection_mode_defaults_to_normal_and_bounds_deep_ttl() {
+        assert_eq!(GatewayMode::parse(None).unwrap(), GatewayMode::Pseudonymize);
+        assert_eq!(
+            GatewayMode::parse(Some("deep-pseudonymize")).unwrap(),
+            GatewayMode::DeepPseudonymize
+        );
+        assert!(GatewayMode::parse(Some("deep")).is_err());
+        assert_eq!(GatewayMode::Pseudonymize.maximum_ttl_seconds(), 3_600);
+        assert_eq!(GatewayMode::DeepPseudonymize.maximum_ttl_seconds(), 300);
+        assert_eq!(GatewayMode::DeepPseudonymize.default_ttl_seconds(), 300);
     }
 
     #[test]
@@ -1535,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn request_collection_excludes_structural_and_encrypted_values() {
+    fn request_collection_excludes_structural_encrypted_and_static_tool_values() {
         let body = serde_json::json!({
             "instructions": "Ask Alice Stone",
             "input": [{
@@ -1554,9 +1680,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(values.contains(&"Ask Alice Stone"));
         assert!(values.contains(&"{\"email\":\"alice@example.invalid\"}"));
-        assert!(values.contains(&"Find Alice Stone"));
+        assert!(!values.contains(&"Find Alice Stone"));
         assert!(!values.contains(&"lookup_student"));
         assert!(!values.contains(&"call-Alice-Stone"));
+    }
+
+    #[test]
+    fn request_collection_protects_dynamic_nested_result_text_but_not_image_bytes() {
+        let body = serde_json::json!({
+            "input": [
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call-1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "name": "lookup",
+                        "description": "Lookup Alice Stone",
+                        "metadata": {"result": "alice@example.invalid"}
+                    }]
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "image-1",
+                    "status": "completed",
+                    "revised_prompt": "Portrait of Alice Stone",
+                    "result": "base64-image-bytes"
+                }
+            ]
+        });
+        let locations = request_text_locations(&body).unwrap();
+        let values = locations
+            .iter()
+            .map(|location| location.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"Lookup Alice Stone"));
+        assert!(values.contains(&"alice@example.invalid"));
+        assert!(values.contains(&"Portrait of Alice Stone"));
+        assert!(!values.contains(&"base64-image-bytes"));
     }
 
     #[test]
@@ -1669,11 +1831,12 @@ mod tests {
             }))
             .await
             .unwrap();
-        let outbound = prepared.body.to_string();
-        assert!(!outbound.contains("Alice Stone"));
-        assert!(!outbound.contains("alice@example.invalid"));
-        assert!(outbound.contains("Ava Woods"));
-        assert!(outbound.contains("ava@example.invalid"));
+        assert_eq!(prepared.body["instructions"], "Help Ava Woods");
+        assert_eq!(
+            prepared.body["input"][0]["content"][0]["text"],
+            "Email ava@example.invalid"
+        );
+        assert_eq!(prepared.body["tools"][0]["description"], "Find Alice Stone");
 
         let mut session = prepared.session.unwrap();
         let first = session
@@ -1732,6 +1895,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deep_mode_uses_deep_route_and_exact_stream_restoration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/deep-pseudonymize"))
+            .respond_with(deep_pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(deep_restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway_with_mode(
+            &server.uri(),
+            Duration::from_secs(1),
+            GatewayMode::DeepPseudonymize,
+        );
+
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared.body["instructions"], "Help Ava Woods");
+        let mut session = prepared.session.unwrap();
+        let restored = session
+            .transform_event(ResponseEvent::OutputTextDelta("Ava Woods".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.as_slice(),
+            [ResponseEvent::OutputTextDelta(delta)] if delta == "Alice Stone"
+        ));
+        session
+            .transform_event(ResponseEvent::Completed {
+                response_id: "response-deep-test".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn gateway_failure_and_timeout_block_before_provider_transport() {
         let failure_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1767,6 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn expired_mapping_never_releases_a_provider_alias() {
         let config = Arc::new(GatewayConfig {
+            mode: GatewayMode::Pseudonymize,
             base_url: Url::parse("http://127.0.0.1:9").unwrap(),
             bearer_token: "test-token".to_string(),
             data_classification: "synthetic_demo".to_string(),
