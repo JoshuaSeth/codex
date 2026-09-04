@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::config::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION;
+use crate::config::DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT;
+use crate::config::DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT;
+use crate::config::default_multi_agent_v2_usage_hint_text;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -1257,6 +1262,9 @@ fn is_trusted_platform_context(root: &Value, path: &[PathPart], text: &str) -> b
         .and_then(|items| items.get(*item_index))
         .and_then(|item| item.get("role"))
         .and_then(Value::as_str);
+    if role == Some("developer") && is_default_multi_agent_usage_hint(text) {
+        return true;
+    }
     let envelopes: &[(&str, &str)] = match role {
         Some("developer") => &[
             ("<permissions instructions>", "</permissions instructions>"),
@@ -1267,6 +1275,7 @@ fn is_trusted_platform_context(root: &Value, path: &[PathPart], text: &str) -> b
                 PLUGINS_INSTRUCTIONS_CLOSE_TAG,
             ),
             (COLLABORATION_MODE_OPEN_TAG, COLLABORATION_MODE_CLOSE_TAG),
+            (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG),
             (
                 REALTIME_CONVERSATION_OPEN_TAG,
                 REALTIME_CONVERSATION_CLOSE_TAG,
@@ -1285,6 +1294,33 @@ fn is_trusted_platform_context(root: &Value, path: &[PathPart], text: &str) -> b
     envelopes
         .iter()
         .any(|(open, close)| trimmed.starts_with(open) && trimmed.ends_with(close))
+}
+
+fn is_default_multi_agent_usage_hint(text: &str) -> bool {
+    [
+        DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+    ]
+    .into_iter()
+    .any(|base| {
+        let Some(count_text) = text
+            .strip_prefix(base)
+            .and_then(|suffix| suffix.strip_prefix("\nThere are "))
+            .and_then(|suffix| {
+                suffix
+                    .split_once(" available concurrency slots,")
+                    .map(|item| item.0)
+            })
+        else {
+            return false;
+        };
+        let Ok(count) = count_text.parse::<usize>() else {
+            return false;
+        };
+        count > 0
+            && count_text == count.to_string()
+            && text == default_multi_agent_v2_usage_hint_text(base, count)
+    })
 }
 
 fn trusted_platform_context_metrics(root: &Value) -> (usize, usize) {
@@ -1945,6 +1981,16 @@ mod tests {
             "</skills_instructions>"
         );
         let environment = "<environment_context><cwd>/Alice Stone</cwd></environment_context>";
+        let multi_agent = "<multi_agent_mode>Do not spawn sub-agents.</multi_agent_mode>";
+        let root_agent_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        );
+        let configured_concurrency_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            6,
+        );
+        let configured_agent_hint = format!("{root_agent_hint}\nCustom Alice Stone guidance.");
         let body = json!({
             "input": [
                 {
@@ -1952,6 +1998,10 @@ mod tests {
                     "role": "developer",
                     "content": [
                         {"type": "input_text", "text": skills},
+                        {"type": "input_text", "text": multi_agent},
+                        {"type": "input_text", "text": root_agent_hint},
+                        {"type": "input_text", "text": configured_concurrency_hint},
+                        {"type": "input_text", "text": configured_agent_hint.clone()},
                         {"type": "input_text", "text": "Custom policy for Alice Stone"}
                     ]
                 },
@@ -1976,13 +2026,21 @@ mod tests {
             .map(|location| location.text)
             .collect::<Vec<_>>();
 
-        assert_eq!(values.len(), 3);
+        assert_eq!(values.len(), 4);
         assert!(values.contains(&"Custom policy for Alice Stone".to_string()));
+        assert!(values.contains(&configured_agent_hint));
         assert!(values.contains(&skills.to_string()));
         assert!(values.contains(&"Email alice@example.invalid".to_string()));
         assert_eq!(
             trusted_platform_context_metrics(&body),
-            (2, skills.chars().count() + environment.chars().count())
+            (
+                5,
+                skills.chars().count()
+                    + multi_agent.chars().count()
+                    + root_agent_hint.chars().count()
+                    + configured_concurrency_hint.chars().count()
+                    + environment.chars().count()
+            )
         );
     }
 
@@ -2239,6 +2297,11 @@ mod tests {
             "Alice Stone can use alice@example.invalid\n",
             "</skills_instructions>"
         );
+        let multi_agent = "<multi_agent_mode>Do not spawn sub-agents.</multi_agent_mode>";
+        let root_agent_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        );
         let prepared = gateway
             .prepare_json_body(json!({
                 "input": [
@@ -2247,6 +2310,8 @@ mod tests {
                         "role": "developer",
                         "content": [
                             {"type": "input_text", "text": skills},
+                            {"type": "input_text", "text": multi_agent},
+                            {"type": "input_text", "text": root_agent_hint},
                             {"type": "input_text", "text": "Custom policy for Alice Stone"}
                         ]
                     },
@@ -2264,8 +2329,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(prepared.body["input"][0]["content"][0]["text"], skills);
+        assert_eq!(prepared.body["input"][0]["content"][1]["text"], multi_agent);
         assert_eq!(
-            prepared.body["input"][0]["content"][1]["text"],
+            prepared.body["input"][0]["content"][2]["text"],
+            root_agent_hint
+        );
+        assert_eq!(
+            prepared.body["input"][0]["content"][3]["text"],
             "Custom policy for Ava Woods"
         );
         assert_eq!(
