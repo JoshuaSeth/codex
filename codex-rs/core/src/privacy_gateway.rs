@@ -14,6 +14,20 @@ use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
+use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::REALTIME_CONVERSATION_CLOSE_TAG;
+use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -365,6 +379,8 @@ impl PrivacyGateway {
             .iter()
             .map(|location| location.text.chars().count())
             .sum::<usize>();
+        let (trusted_platform_field_count, trusted_platform_text_chars) =
+            trusted_platform_context_metrics(&body);
 
         let PreparedTextBatches {
             batches,
@@ -375,6 +391,8 @@ impl PrivacyGateway {
             privacy_mode = config.mode.label(),
             field_count,
             protected_text_chars,
+            trusted_platform_field_count,
+            trusted_platform_text_chars,
             batch_count,
             "privacy gateway preparing outbound OpenAI request"
         );
@@ -461,6 +479,8 @@ impl PrivacyGateway {
             privacy_mode = config.mode.label(),
             field_count,
             protected_text_chars,
+            trusted_platform_field_count,
+            trusted_platform_text_chars,
             batch_count,
             mapping_count = mappings.len(),
             duration_ms = started_at.elapsed().as_millis(),
@@ -1167,6 +1187,7 @@ fn request_text_locations_with_trusted_instructions(
     }
     if let Some(input) = object.get("input") {
         collect_dynamic_strings(
+            body,
             input,
             &mut vec![PathPart::Key("input".to_string())],
             &mut result,
@@ -1176,13 +1197,14 @@ fn request_text_locations_with_trusted_instructions(
 }
 
 fn collect_dynamic_strings(
+    root: &Value,
     value: &Value,
     path: &mut Vec<PathPart>,
     output: &mut Vec<TextLocation>,
 ) {
     match value {
         Value::String(text) => {
-            if !text.trim().is_empty() {
+            if !text.trim().is_empty() && !is_trusted_platform_context(root, path, text) {
                 output.push(TextLocation {
                     path: path.clone(),
                     text: text.clone(),
@@ -1192,7 +1214,7 @@ fn collect_dynamic_strings(
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 path.push(PathPart::Index(index));
-                collect_dynamic_strings(value, path, output);
+                collect_dynamic_strings(root, value, path, output);
                 path.pop();
             }
         }
@@ -1204,12 +1226,95 @@ fn collect_dynamic_strings(
                     continue;
                 }
                 path.push(PathPart::Key(key.clone()));
-                collect_dynamic_strings(value, path, output);
+                collect_dynamic_strings(root, value, path, output);
                 path.pop();
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+fn is_trusted_platform_context(root: &Value, path: &[PathPart], text: &str) -> bool {
+    // These complete, role-scoped envelopes carry Codex control-plane identifiers and
+    // syntax that must remain byte-exact. User prompts, custom instructions, and nested
+    // tool data still take the pseudonymization path.
+    let [
+        PathPart::Key(input),
+        PathPart::Index(item_index),
+        PathPart::Key(content),
+        PathPart::Index(_),
+        PathPart::Key(text_key),
+    ] = path
+    else {
+        return false;
+    };
+    if input != "input" || content != "content" || text_key != "text" {
+        return false;
+    }
+    let role = root
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(*item_index))
+        .and_then(|item| item.get("role"))
+        .and_then(Value::as_str);
+    let envelopes: &[(&str, &str)] = match role {
+        Some("developer") => &[
+            ("<permissions instructions>", "</permissions instructions>"),
+            (APPS_INSTRUCTIONS_OPEN_TAG, APPS_INSTRUCTIONS_CLOSE_TAG),
+            (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
+            (
+                PLUGINS_INSTRUCTIONS_OPEN_TAG,
+                PLUGINS_INSTRUCTIONS_CLOSE_TAG,
+            ),
+            (COLLABORATION_MODE_OPEN_TAG, COLLABORATION_MODE_CLOSE_TAG),
+            (
+                REALTIME_CONVERSATION_OPEN_TAG,
+                REALTIME_CONVERSATION_CLOSE_TAG,
+            ),
+            ("<model_switch>", "</model_switch>"),
+            ("<personality_spec>", "</personality_spec>"),
+            ("<token_budget>", "</token_budget>"),
+        ],
+        Some("user") => &[
+            (ENVIRONMENT_CONTEXT_OPEN_TAG, ENVIRONMENT_CONTEXT_CLOSE_TAG),
+            (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG),
+        ],
+        _ => return false,
+    };
+    let trimmed = text.trim();
+    envelopes
+        .iter()
+        .any(|(open, close)| trimmed.starts_with(open) && trimmed.ends_with(close))
+}
+
+fn trusted_platform_context_metrics(root: &Value) -> (usize, usize) {
+    let mut field_count = 0usize;
+    let mut text_chars = 0usize;
+    let Some(items) = root.get("input").and_then(Value::as_array) else {
+        return (field_count, text_chars);
+    };
+    for (item_index, item) in items.iter().enumerate() {
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (content_index, content_item) in content.iter().enumerate() {
+            let Some(text) = content_item.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = [
+                PathPart::Key("input".to_string()),
+                PathPart::Index(item_index),
+                PathPart::Key("content".to_string()),
+                PathPart::Index(content_index),
+                PathPart::Key("text".to_string()),
+            ];
+            if is_trusted_platform_context(root, &path, text) {
+                field_count = field_count.saturating_add(1);
+                text_chars = text_chars.saturating_add(text.chars().count());
+            }
+        }
+    }
+    (field_count, text_chars)
 }
 
 fn is_top_level_input_item_path(path: &[PathPart]) -> bool {
@@ -1833,6 +1938,55 @@ mod tests {
     }
 
     #[test]
+    fn request_collection_preserves_platform_context_but_not_user_lookalikes() {
+        let skills = concat!(
+            "<skills_instructions>\n",
+            "Alice Stone can use alice@example.invalid\n",
+            "</skills_instructions>"
+        );
+        let environment = "<environment_context><cwd>/Alice Stone</cwd></environment_context>";
+        let body = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": skills},
+                        {"type": "input_text", "text": "Custom policy for Alice Stone"}
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": environment
+                        },
+                        {"type": "input_text", "text": skills},
+                        {"type": "input_text", "text": "Email alice@example.invalid"}
+                    ]
+                }
+            ]
+        });
+
+        let values = request_text_locations(&body)
+            .unwrap()
+            .into_iter()
+            .map(|location| location.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&"Custom policy for Alice Stone".to_string()));
+        assert!(values.contains(&skills.to_string()));
+        assert!(values.contains(&"Email alice@example.invalid".to_string()));
+        assert_eq!(
+            trusted_platform_context_metrics(&body),
+            (2, skills.chars().count() + environment.chars().count())
+        );
+    }
+
+    #[test]
     fn frames_round_trip_multiple_fields_without_text_changes() {
         let batch = vec![
             TextFragment {
@@ -2060,6 +2214,63 @@ mod tests {
         assert_eq!(
             prepared.body["instructions"],
             "Custom instructions for Ava Woods"
+        );
+        prepared.session.unwrap().abort().await;
+    }
+
+    #[tokio::test]
+    async fn platform_context_is_byte_preserved_while_dynamic_messages_are_protected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let skills = concat!(
+            "<skills_instructions>\n",
+            "Alice Stone can use alice@example.invalid\n",
+            "</skills_instructions>"
+        );
+        let prepared = gateway
+            .prepare_json_body(json!({
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {"type": "input_text", "text": skills},
+                            {"type": "input_text", "text": "Custom policy for Alice Stone"}
+                        ]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Email alice@example.invalid"
+                        }]
+                    }
+                ]
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.body["input"][0]["content"][0]["text"], skills);
+        assert_eq!(
+            prepared.body["input"][0]["content"][1]["text"],
+            "Custom policy for Ava Woods"
+        );
+        assert_eq!(
+            prepared.body["input"][1]["content"][0]["text"],
+            "Email ava@example.invalid"
         );
         prepared.session.unwrap().abort().await;
     }
