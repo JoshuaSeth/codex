@@ -1141,7 +1141,7 @@ fn collect_dynamic_strings(
         }
         Value::Object(values) => {
             for (key, value) in values {
-                if excluded_dynamic_key(key)
+                if excluded_dynamic_key(path, key)
                     || (key == "result" && is_top_level_input_item_path(path))
                 {
                     continue;
@@ -1162,12 +1162,23 @@ fn is_top_level_input_item_path(path: &[PathPart]) -> bool {
     )
 }
 
-fn excluded_dynamic_key(key: &str) -> bool {
-    matches!(
+fn excluded_dynamic_key(path: &[PathPart], key: &str) -> bool {
+    if matches!(
         key,
         "type"
-            | "id"
-            | "call_id"
+            | "encrypted_content"
+            | "image_url"
+            | "detail"
+            | "schema"
+            | "parameters"
+            | "input_schema"
+    ) {
+        return true;
+    }
+
+    let protocol_envelope_key = matches!(
+        key,
+        "id" | "call_id"
             | "name"
             | "namespace"
             | "role"
@@ -1175,12 +1186,19 @@ fn excluded_dynamic_key(key: &str) -> bool {
             | "phase"
             | "author"
             | "recipient"
-            | "encrypted_content"
-            | "image_url"
-            | "detail"
-            | "schema"
-            | "parameters"
-            | "input_schema"
+    );
+    protocol_envelope_key && (is_top_level_input_item_path(path) || is_tool_search_tool_path(path))
+}
+
+fn is_tool_search_tool_path(path: &[PathPart]) -> bool {
+    matches!(
+        path,
+        [
+            PathPart::Key(input),
+            PathPart::Index(_),
+            PathPart::Key(tools),
+            PathPart::Index(_)
+        ] if input == "input" && tools == "tools"
     )
 }
 
@@ -1719,6 +1737,38 @@ mod tests {
         assert!(values.contains(&"alice@example.invalid"));
         assert!(values.contains(&"Portrait of Alice Stone"));
         assert!(!values.contains(&"base64-image-bytes"));
+    }
+
+    #[test]
+    fn request_collection_protects_identity_named_fields_inside_dynamic_metadata() {
+        let body = serde_json::json!({
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call-1",
+                "status": "completed",
+                "tools": [{
+                    "name": "lookup",
+                    "description": "Lookup directory entry",
+                    "metadata": {
+                        "id": "student-alice@example.invalid",
+                        "name": "Alice Stone",
+                        "author": "Alice Stone",
+                        "recipient": "Bob Stone"
+                    }
+                }]
+            }]
+        });
+        let locations = request_text_locations(&body).unwrap();
+        let values = locations
+            .iter()
+            .map(|location| location.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!values.contains(&"call-1"));
+        assert!(!values.contains(&"lookup"));
+        assert!(values.contains(&"student-alice@example.invalid"));
+        assert!(values.contains(&"Alice Stone"));
+        assert!(values.contains(&"Bob Stone"));
     }
 
     #[test]
