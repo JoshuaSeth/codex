@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::config::DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION;
+use crate::config::DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT;
+use crate::config::DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT;
+use crate::config::default_multi_agent_v2_usage_hint_text;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -14,6 +19,20 @@ use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
+use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
+use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::REALTIME_CONVERSATION_CLOSE_TAG;
+use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -25,10 +44,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
 const ENABLE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_ENABLED";
+const MODE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_MODE";
 const URL_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_URL";
 const TOKEN_FILE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TOKEN_FILE";
 const CLASSIFICATION_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_DATA_CLASSIFICATION";
@@ -37,8 +58,8 @@ const LOCALE_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_LOCALE";
 const TTL_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TTL_SECONDS";
 const TIMEOUT_ENV: &str = "PITCHAI_CODEX_PRIVACY_GATEWAY_TIMEOUT_MS";
 const LEGACY_ENABLE_ENV: &str = "PITCHAI_CODEX_PRIVACY_MIDDLEWARE";
-const DEFAULT_TTL_SECONDS: u64 = 900;
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 10_000;
 const MAX_GATEWAY_TEXT_CHARS: usize = 20_000;
 const MAX_FRAME_COUNT: usize = 5_000;
 const PREFERRED_SPLIT_WINDOW_CHARS: usize = 2_048;
@@ -58,24 +79,93 @@ enum GatewayState {
 }
 
 struct GatewayConfig {
+    mode: GatewayMode,
     base_url: Url,
     bearer_token: String,
     data_classification: String,
     language: String,
     locale: String,
     ttl_seconds: u64,
+    timeout_ms: u64,
     client: reqwest::Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayMode {
+    Pseudonymize,
+    DeepPseudonymize,
+}
+
+impl GatewayMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim).unwrap_or("pseudonymize") {
+            "pseudonymize" => Ok(Self::Pseudonymize),
+            "deep-pseudonymize" => Ok(Self::DeepPseudonymize),
+            _ => bail!("{MODE_ENV} must be pseudonymize or deep-pseudonymize"),
+        }
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "v1/pseudonymize",
+            Self::DeepPseudonymize => "v1/deep-pseudonymize",
+        }
+    }
+
+    const fn schema_version(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "reversible-pseudonymization-v3",
+            Self::DeepPseudonymize => "deep-pseudonymization-v1",
+        }
+    }
+
+    const fn date_policy(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "plausible_keyed_shift",
+            Self::DeepPseudonymize => "irreversible_placeholder",
+        }
+    }
+
+    const fn restore_match_mode(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "exact_and_registered_aliases",
+            Self::DeepPseudonymize => "exact_values",
+        }
+    }
+
+    const fn default_ttl_seconds(self) -> u64 {
+        match self {
+            Self::Pseudonymize => 900,
+            Self::DeepPseudonymize => 300,
+        }
+    }
+
+    const fn maximum_ttl_seconds(self) -> u64 {
+        match self {
+            Self::Pseudonymize => 3_600,
+            Self::DeepPseudonymize => 300,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pseudonymize => "pseudonymize",
+            Self::DeepPseudonymize => "deep-pseudonymize",
+        }
+    }
 }
 
 impl fmt::Debug for GatewayConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GatewayConfig")
+            .field("mode", &self.mode)
             .field("base_url", &self.base_url)
             .field("data_classification", &self.data_classification)
             .field("language", &self.language)
             .field("locale", &self.locale)
             .field("ttl_seconds", &self.ttl_seconds)
+            .field("timeout_ms", &self.timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -96,6 +186,7 @@ impl fmt::Debug for GatewayState {
             Self::Disabled => formatter.write_str("Disabled"),
             Self::Enabled(config) => formatter
                 .debug_struct("Enabled")
+                .field("mode", &config.mode)
                 .field("base_url", &config.base_url)
                 .field("data_classification", &config.data_classification)
                 .field("language", &config.language)
@@ -245,29 +336,71 @@ impl PrivacyGateway {
     pub(crate) async fn prepare_responses_request(
         &self,
         request: &ResponsesApiRequest,
+        trusted_catalog_instructions: &str,
     ) -> Result<PreparedGatewayRequest> {
         let body = serde_json::to_value(request)
             .context("failed to encode Responses request before privacy gateway")?;
-        self.prepare_json_body(body).await
+        self.prepare_json_body_with_trusted_instructions(body, trusted_catalog_instructions)
+            .await
     }
 
-    pub(crate) async fn prepare_json_body(
+    pub(crate) async fn prepare_json_body(&self, body: Value) -> Result<PreparedGatewayRequest> {
+        self.prepare_json_body_inner(body, /*trusted_catalog_instructions*/ None)
+            .await
+    }
+
+    pub(crate) async fn prepare_json_body_with_trusted_instructions(
+        &self,
+        body: Value,
+        trusted_catalog_instructions: &str,
+    ) -> Result<PreparedGatewayRequest> {
+        // Only the byte-identical model-catalog rendering is trusted. A configured/custom base
+        // instruction string still flows through the gateway with the dynamic request content.
+        self.prepare_json_body_inner(body, Some(trusted_catalog_instructions))
+            .await
+    }
+
+    async fn prepare_json_body_inner(
         &self,
         mut body: Value,
+        trusted_catalog_instructions: Option<&str>,
     ) -> Result<PreparedGatewayRequest> {
         let config = self.config()?;
-        let locations = request_text_locations(&body)?;
+        let started_at = Instant::now();
+        let locations = match trusted_catalog_instructions {
+            Some(instructions) => {
+                request_text_locations_with_trusted_instructions(&body, Some(instructions))?
+            }
+            None => request_text_locations(&body)?,
+        };
         if locations.is_empty() {
             return Ok(PreparedGatewayRequest {
                 body,
                 session: None,
             });
         }
+        let field_count = locations.len();
+        let protected_text_chars = locations
+            .iter()
+            .map(|location| location.text.chars().count())
+            .sum::<usize>();
+        let (trusted_platform_field_count, trusted_platform_text_chars) =
+            trusted_platform_context_metrics(&body);
 
         let PreparedTextBatches {
             batches,
             field_paths,
         } = build_batches(locations)?;
+        let batch_count = batches.len();
+        tracing::info!(
+            privacy_mode = config.mode.label(),
+            field_count,
+            protected_text_chars,
+            trusted_platform_field_count,
+            trusted_platform_text_chars,
+            batch_count,
+            "privacy gateway preparing outbound OpenAI request"
+        );
         let mut protected_fields = vec![String::new(); field_paths.len()];
         let mut mappings = Vec::new();
         let mut fingerprints: HashMap<String, String> = HashMap::new();
@@ -346,6 +479,18 @@ impl PrivacyGateway {
                 return Err(error);
             }
         }
+
+        tracing::info!(
+            privacy_mode = config.mode.label(),
+            field_count,
+            protected_text_chars,
+            trusted_platform_field_count,
+            trusted_platform_text_chars,
+            batch_count,
+            mapping_count = mappings.len(),
+            duration_ms = started_at.elapsed().as_millis(),
+            "privacy gateway prepared outbound OpenAI request"
+        );
 
         Ok(PreparedGatewayRequest {
             body,
@@ -722,19 +867,32 @@ fn load_config() -> Result<GatewayConfig> {
     let language = std::env::var(LANGUAGE_ENV).unwrap_or_else(|_| "en".to_string());
     let locale = std::env::var(LOCALE_ENV).unwrap_or_else(|_| "en_GB".to_string());
     validate_language_locale(&language, &locale)?;
-    let ttl_seconds = parse_bounded_env(TTL_ENV, DEFAULT_TTL_SECONDS, 60, 3_600)?;
-    let timeout_ms = parse_bounded_env(TIMEOUT_ENV, DEFAULT_TIMEOUT_MS, 100, 120_000)?;
+    let mode = GatewayMode::parse(std::env::var(MODE_ENV).ok().as_deref())?;
+    let ttl_seconds = parse_bounded_env(
+        TTL_ENV,
+        mode.default_ttl_seconds(),
+        /*minimum*/ 60,
+        mode.maximum_ttl_seconds(),
+    )?;
+    let timeout_ms = parse_bounded_env(
+        TIMEOUT_ENV,
+        DEFAULT_TIMEOUT_MS,
+        /*minimum*/ 100,
+        MAX_TIMEOUT_MS,
+    )?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
         .context("failed to build privacy gateway HTTP client")?;
     Ok(GatewayConfig {
+        mode,
         base_url,
         bearer_token,
         data_classification,
         language,
         locale,
         ttl_seconds,
+        timeout_ms,
         client,
     })
 }
@@ -838,7 +996,7 @@ async fn pseudonymize(
 ) -> Result<PseudonymizeResponse> {
     let response = config
         .client
-        .post(endpoint(&config.base_url, "v1/pseudonymize")?)
+        .post(endpoint(&config.base_url, config.mode.path())?)
         .bearer_auth(&config.bearer_token)
         .json(&PseudonymizePayload {
             text,
@@ -847,11 +1005,11 @@ async fn pseudonymize(
             locale: &config.locale,
             context_id,
             ttl_seconds: config.ttl_seconds,
-            date_policy: "plausible_keyed_shift",
+            date_policy: config.mode.date_policy(),
         })
         .send()
         .await
-        .context("privacy gateway pseudonymization request failed")?;
+        .map_err(|error| gateway_request_error("pseudonymization", config.timeout_ms, error))?;
     require_success(response.status(), "pseudonymization")?;
     response
         .json()
@@ -874,12 +1032,12 @@ async fn restore_mapping(
             data_classification: &config.data_classification,
             mapping_id: mapping.mapping_id,
             restoration_capability: &mapping.restoration_capability,
-            match_mode: "exact_and_registered_aliases",
+            match_mode: config.mode.restore_match_mode(),
             purge_after_restore,
         })
         .send()
         .await
-        .context("privacy gateway restoration request failed")?;
+        .map_err(|error| gateway_request_error("restoration", config.timeout_ms, error))?;
     require_success(response.status(), "restoration")?;
     let response: RestoreResponse = response
         .json()
@@ -933,12 +1091,20 @@ fn require_success(status: StatusCode, operation: &str) -> Result<()> {
     bail!("privacy gateway {operation} failed with HTTP {status}")
 }
 
+fn gateway_request_error(operation: &str, timeout_ms: u64, error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::anyhow!("privacy gateway {operation} timed out after {timeout_ms} ms")
+    } else {
+        anyhow::Error::new(error).context(format!("privacy gateway {operation} request failed"))
+    }
+}
+
 fn mapping_from_response(
     config: &GatewayConfig,
     response: &PseudonymizeResponse,
 ) -> Result<GatewayMapping> {
-    if response.schema_version != "reversible-pseudonymization-v3"
-        || response.data_classification != "synthetic_demo"
+    if response.schema_version != config.mode.schema_version()
+        || response.data_classification != config.data_classification
     {
         bail!("privacy gateway returned an incompatible pseudonymization contract");
     }
@@ -1002,12 +1168,22 @@ fn validate_match(item: &StreamingRestorationMatch) -> Result<()> {
 }
 
 fn request_text_locations(body: &Value) -> Result<Vec<TextLocation>> {
+    request_text_locations_with_trusted_instructions(
+        body, /*trusted_catalog_instructions*/ None,
+    )
+}
+
+fn request_text_locations_with_trusted_instructions(
+    body: &Value,
+    trusted_catalog_instructions: Option<&str>,
+) -> Result<Vec<TextLocation>> {
     let object = body
         .as_object()
         .context("Responses request did not serialize as an object")?;
     let mut result = Vec::new();
     if let Some(Value::String(instructions)) = object.get("instructions")
         && !instructions.trim().is_empty()
+        && trusted_catalog_instructions != Some(instructions.as_str())
     {
         result.push(TextLocation {
             path: vec![PathPart::Key("instructions".to_string())],
@@ -1016,31 +1192,24 @@ fn request_text_locations(body: &Value) -> Result<Vec<TextLocation>> {
     }
     if let Some(input) = object.get("input") {
         collect_dynamic_strings(
+            body,
             input,
             &mut vec![PathPart::Key("input".to_string())],
             &mut result,
         );
     }
-    if let Some(Value::Array(tools)) = object.get("tools") {
-        for (index, tool) in tools.iter().enumerate() {
-            collect_descriptions(
-                tool,
-                &mut vec![PathPart::Key("tools".to_string()), PathPart::Index(index)],
-                &mut result,
-            );
-        }
-    }
     Ok(result)
 }
 
 fn collect_dynamic_strings(
+    root: &Value,
     value: &Value,
     path: &mut Vec<PathPart>,
     output: &mut Vec<TextLocation>,
 ) {
     match value {
         Value::String(text) => {
-            if !text.trim().is_empty() {
+            if !text.trim().is_empty() && !is_trusted_platform_context(root, path, text) {
                 output.push(TextLocation {
                     path: path.clone(),
                     text: text.clone(),
@@ -1050,17 +1219,19 @@ fn collect_dynamic_strings(
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 path.push(PathPart::Index(index));
-                collect_dynamic_strings(value, path, output);
+                collect_dynamic_strings(root, value, path, output);
                 path.pop();
             }
         }
         Value::Object(values) => {
             for (key, value) in values {
-                if excluded_dynamic_key(key) {
+                if excluded_dynamic_key(path, key)
+                    || (key == "result" && is_top_level_input_item_path(path))
+                {
                     continue;
                 }
                 path.push(PathPart::Key(key.clone()));
-                collect_dynamic_strings(value, path, output);
+                collect_dynamic_strings(root, value, path, output);
                 path.pop();
             }
         }
@@ -1068,12 +1239,144 @@ fn collect_dynamic_strings(
     }
 }
 
-fn excluded_dynamic_key(key: &str) -> bool {
+fn is_trusted_platform_context(root: &Value, path: &[PathPart], text: &str) -> bool {
+    // These complete, role-scoped envelopes carry Codex control-plane identifiers and
+    // syntax that must remain byte-exact. User prompts, custom instructions, and nested
+    // tool data still take the pseudonymization path.
+    let [
+        PathPart::Key(input),
+        PathPart::Index(item_index),
+        PathPart::Key(content),
+        PathPart::Index(_),
+        PathPart::Key(text_key),
+    ] = path
+    else {
+        return false;
+    };
+    if input != "input" || content != "content" || text_key != "text" {
+        return false;
+    }
+    let role = root
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(*item_index))
+        .and_then(|item| item.get("role"))
+        .and_then(Value::as_str);
+    if role == Some("developer") && is_default_multi_agent_usage_hint(text) {
+        return true;
+    }
+    let envelopes: &[(&str, &str)] = match role {
+        Some("developer") => &[
+            ("<permissions instructions>", "</permissions instructions>"),
+            (APPS_INSTRUCTIONS_OPEN_TAG, APPS_INSTRUCTIONS_CLOSE_TAG),
+            (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
+            (
+                PLUGINS_INSTRUCTIONS_OPEN_TAG,
+                PLUGINS_INSTRUCTIONS_CLOSE_TAG,
+            ),
+            (COLLABORATION_MODE_OPEN_TAG, COLLABORATION_MODE_CLOSE_TAG),
+            (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG),
+            (
+                REALTIME_CONVERSATION_OPEN_TAG,
+                REALTIME_CONVERSATION_CLOSE_TAG,
+            ),
+            ("<model_switch>", "</model_switch>"),
+            ("<personality_spec>", "</personality_spec>"),
+            ("<token_budget>", "</token_budget>"),
+        ],
+        Some("user") => &[
+            (ENVIRONMENT_CONTEXT_OPEN_TAG, ENVIRONMENT_CONTEXT_CLOSE_TAG),
+            (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG),
+        ],
+        _ => return false,
+    };
+    let trimmed = text.trim();
+    envelopes
+        .iter()
+        .any(|(open, close)| trimmed.starts_with(open) && trimmed.ends_with(close))
+}
+
+fn is_default_multi_agent_usage_hint(text: &str) -> bool {
+    [
+        DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+    ]
+    .into_iter()
+    .any(|base| {
+        let Some(count_text) = text
+            .strip_prefix(base)
+            .and_then(|suffix| suffix.strip_prefix("\nThere are "))
+            .and_then(|suffix| {
+                suffix
+                    .split_once(" available concurrency slots,")
+                    .map(|item| item.0)
+            })
+        else {
+            return false;
+        };
+        let Ok(count) = count_text.parse::<usize>() else {
+            return false;
+        };
+        count > 0
+            && count_text == count.to_string()
+            && text == default_multi_agent_v2_usage_hint_text(base, count)
+    })
+}
+
+fn trusted_platform_context_metrics(root: &Value) -> (usize, usize) {
+    let mut field_count = 0usize;
+    let mut text_chars = 0usize;
+    let Some(items) = root.get("input").and_then(Value::as_array) else {
+        return (field_count, text_chars);
+    };
+    for (item_index, item) in items.iter().enumerate() {
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (content_index, content_item) in content.iter().enumerate() {
+            let Some(text) = content_item.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = [
+                PathPart::Key("input".to_string()),
+                PathPart::Index(item_index),
+                PathPart::Key("content".to_string()),
+                PathPart::Index(content_index),
+                PathPart::Key("text".to_string()),
+            ];
+            if is_trusted_platform_context(root, &path, text) {
+                field_count = field_count.saturating_add(1);
+                text_chars = text_chars.saturating_add(text.chars().count());
+            }
+        }
+    }
+    (field_count, text_chars)
+}
+
+fn is_top_level_input_item_path(path: &[PathPart]) -> bool {
     matches!(
+        path,
+        [PathPart::Key(input), PathPart::Index(_)] if input == "input"
+    )
+}
+
+fn excluded_dynamic_key(path: &[PathPart], key: &str) -> bool {
+    if matches!(
         key,
         "type"
-            | "id"
-            | "call_id"
+            | "encrypted_content"
+            | "image_url"
+            | "detail"
+            | "schema"
+            | "parameters"
+            | "input_schema"
+    ) {
+        return true;
+    }
+
+    let protocol_envelope_key = matches!(
+        key,
+        "id" | "call_id"
             | "name"
             | "namespace"
             | "role"
@@ -1081,44 +1384,20 @@ fn excluded_dynamic_key(key: &str) -> bool {
             | "phase"
             | "author"
             | "recipient"
-            | "encrypted_content"
-            | "image_url"
-            | "detail"
-            | "result"
-            | "schema"
-            | "parameters"
-            | "input_schema"
-    )
+    );
+    protocol_envelope_key && (is_top_level_input_item_path(path) || is_tool_search_tool_path(path))
 }
 
-fn collect_descriptions(value: &Value, path: &mut Vec<PathPart>, output: &mut Vec<TextLocation>) {
-    match value {
-        Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                path.push(PathPart::Index(index));
-                collect_descriptions(value, path, output);
-                path.pop();
-            }
-        }
-        Value::Object(values) => {
-            for (key, value) in values {
-                path.push(PathPart::Key(key.clone()));
-                if key == "description"
-                    && let Value::String(text) = value
-                    && !text.trim().is_empty()
-                {
-                    output.push(TextLocation {
-                        path: path.clone(),
-                        text: text.clone(),
-                    });
-                } else {
-                    collect_descriptions(value, path, output);
-                }
-                path.pop();
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
+fn is_tool_search_tool_path(path: &[PathPart]) -> bool {
+    matches!(
+        path,
+        [
+            PathPart::Key(input),
+            PathPart::Index(_),
+            PathPart::Key(tools),
+            PathPart::Index(_)
+        ] if input == "input" && tools == "tools"
+    )
 }
 
 fn build_batches(locations: Vec<TextLocation>) -> Result<PreparedTextBatches> {
@@ -1431,15 +1710,25 @@ mod tests {
     const TEST_CAPABILITY: &str = "abcdefghijklmnopqrstuvwxyz0123456789_-ABCDE";
 
     fn test_gateway(base_url: &str, timeout: Duration) -> PrivacyGateway {
+        test_gateway_with_mode(base_url, timeout, GatewayMode::Pseudonymize)
+    }
+
+    fn test_gateway_with_mode(
+        base_url: &str,
+        timeout: Duration,
+        mode: GatewayMode,
+    ) -> PrivacyGateway {
         let client = reqwest::Client::builder().timeout(timeout).build().unwrap();
         PrivacyGateway {
             state: Arc::new(GatewayState::Enabled(Arc::new(GatewayConfig {
+                mode,
                 base_url: Url::parse(base_url).unwrap(),
                 bearer_token: "test-token".to_string(),
                 data_classification: "synthetic_demo".to_string(),
                 language: "en".to_string(),
                 locale: "en_GB".to_string(),
                 ttl_seconds: 300,
+                timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
                 client,
             }))),
             context_id: "synthetic-test-context".to_string(),
@@ -1470,6 +1759,27 @@ mod tests {
         }))
     }
 
+    fn deep_pseudonymize_response(request: &wiremock::Request) -> ResponseTemplate {
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            request_body["date_policy"],
+            Value::String("irreversible_placeholder".to_string())
+        );
+        let source = request_body["text"].as_str().unwrap();
+        let pseudonymized = source.replace("Alice Stone", "Ava Woods");
+        ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": "deep-pseudonymization-v1",
+            "data_classification": "synthetic_demo",
+            "pseudonymized_text": pseudonymized,
+            "mapping_id": TEST_MAPPING_ID,
+            "restoration_capability": TEST_CAPABILITY,
+            "expires_at": (Utc::now() + TimeDelta::minutes(5)).to_rfc3339(),
+            "streaming_restoration_matches": [
+                {"value": "Ava Woods", "source_fingerprint": "a".repeat(64)}
+            ]
+        }))
+    }
+
     fn restore_response(request: &wiremock::Request) -> ResponseTemplate {
         let request_body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(
@@ -1481,6 +1791,26 @@ mod tests {
             .unwrap()
             .replace("Ava Woods", "Alice Stone")
             .replace("ava@example.invalid", "alice@example.invalid");
+        let purge = request_body["purge_after_restore"].as_bool().unwrap();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "schema_version": "authorized-restoration-v2",
+            "data_classification": "synthetic_demo",
+            "restored_text": restored,
+            "mapping_id": TEST_MAPPING_ID,
+            "mapping_purged": purge
+        }))
+    }
+
+    fn deep_restore_response(request: &wiremock::Request) -> ResponseTemplate {
+        let request_body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            request_body["match_mode"],
+            Value::String("exact_values".to_string())
+        );
+        let restored = request_body["text"]
+            .as_str()
+            .unwrap()
+            .replace("Ava Woods", "Alice Stone");
         let purge = request_body["purge_after_restore"].as_bool().unwrap();
         ResponseTemplate::new(200).set_body_json(json!({
             "schema_version": "authorized-restoration-v2",
@@ -1506,6 +1836,22 @@ mod tests {
         assert!(!parse_enable_value(Some("false")).unwrap());
         assert!(parse_enable_value(Some("ON")).unwrap());
         assert!(parse_enable_value(Some("enabled")).is_err());
+    }
+
+    #[test]
+    fn protection_mode_defaults_to_normal_and_bounds_deep_ttl() {
+        assert_eq!(
+            GatewayMode::parse(/*value*/ None).unwrap(),
+            GatewayMode::Pseudonymize
+        );
+        assert_eq!(
+            GatewayMode::parse(Some("deep-pseudonymize")).unwrap(),
+            GatewayMode::DeepPseudonymize
+        );
+        assert!(GatewayMode::parse(Some("deep")).is_err());
+        assert_eq!(GatewayMode::Pseudonymize.maximum_ttl_seconds(), 3_600);
+        assert_eq!(GatewayMode::DeepPseudonymize.maximum_ttl_seconds(), 300);
+        assert_eq!(GatewayMode::DeepPseudonymize.default_ttl_seconds(), 300);
     }
 
     #[test]
@@ -1535,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn request_collection_excludes_structural_and_encrypted_values() {
+    fn request_collection_excludes_structural_encrypted_and_static_tool_values() {
         let body = serde_json::json!({
             "instructions": "Ask Alice Stone",
             "input": [{
@@ -1554,9 +1900,148 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(values.contains(&"Ask Alice Stone"));
         assert!(values.contains(&"{\"email\":\"alice@example.invalid\"}"));
-        assert!(values.contains(&"Find Alice Stone"));
+        assert!(!values.contains(&"Find Alice Stone"));
         assert!(!values.contains(&"lookup_student"));
         assert!(!values.contains(&"call-Alice-Stone"));
+    }
+
+    #[test]
+    fn request_collection_protects_dynamic_nested_result_text_but_not_image_bytes() {
+        let body = serde_json::json!({
+            "input": [
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call-1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "name": "lookup",
+                        "description": "Lookup Alice Stone",
+                        "metadata": {"result": "alice@example.invalid"}
+                    }]
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "image-1",
+                    "status": "completed",
+                    "revised_prompt": "Portrait of Alice Stone",
+                    "result": "base64-image-bytes"
+                }
+            ]
+        });
+        let locations = request_text_locations(&body).unwrap();
+        let values = locations
+            .iter()
+            .map(|location| location.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"Lookup Alice Stone"));
+        assert!(values.contains(&"alice@example.invalid"));
+        assert!(values.contains(&"Portrait of Alice Stone"));
+        assert!(!values.contains(&"base64-image-bytes"));
+    }
+
+    #[test]
+    fn request_collection_protects_identity_named_fields_inside_dynamic_metadata() {
+        let body = serde_json::json!({
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "call-1",
+                "status": "completed",
+                "tools": [{
+                    "name": "lookup",
+                    "description": "Lookup directory entry",
+                    "metadata": {
+                        "id": "student-alice@example.invalid",
+                        "name": "Alice Stone",
+                        "author": "Alice Stone",
+                        "recipient": "Bob Stone"
+                    }
+                }]
+            }]
+        });
+        let locations = request_text_locations(&body).unwrap();
+        let values = locations
+            .iter()
+            .map(|location| location.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!values.contains(&"call-1"));
+        assert!(!values.contains(&"lookup"));
+        assert!(values.contains(&"student-alice@example.invalid"));
+        assert!(values.contains(&"Alice Stone"));
+        assert!(values.contains(&"Bob Stone"));
+    }
+
+    #[test]
+    fn request_collection_preserves_platform_context_but_not_user_lookalikes() {
+        let skills = concat!(
+            "<skills_instructions>\n",
+            "Alice Stone can use alice@example.invalid\n",
+            "</skills_instructions>"
+        );
+        let environment = "<environment_context><cwd>/Alice Stone</cwd></environment_context>";
+        let multi_agent = "<multi_agent_mode>Do not spawn sub-agents.</multi_agent_mode>";
+        let root_agent_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        );
+        let configured_concurrency_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            6,
+        );
+        let configured_agent_hint = format!("{root_agent_hint}\nCustom Alice Stone guidance.");
+        let body = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": skills},
+                        {"type": "input_text", "text": multi_agent},
+                        {"type": "input_text", "text": root_agent_hint},
+                        {"type": "input_text", "text": configured_concurrency_hint},
+                        {"type": "input_text", "text": configured_agent_hint.clone()},
+                        {"type": "input_text", "text": "Custom policy for Alice Stone"}
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": environment
+                        },
+                        {"type": "input_text", "text": skills},
+                        {"type": "input_text", "text": "Email alice@example.invalid"}
+                    ]
+                }
+            ]
+        });
+
+        let values = request_text_locations(&body)
+            .unwrap()
+            .into_iter()
+            .map(|location| location.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 4);
+        assert!(values.contains(&"Custom policy for Alice Stone".to_string()));
+        assert!(values.contains(&configured_agent_hint));
+        assert!(values.contains(&skills.to_string()));
+        assert!(values.contains(&"Email alice@example.invalid".to_string()));
+        assert_eq!(
+            trusted_platform_context_metrics(&body),
+            (
+                5,
+                skills.chars().count()
+                    + multi_agent.chars().count()
+                    + root_agent_hint.chars().count()
+                    + configured_concurrency_hint.chars().count()
+                    + environment.chars().count()
+            )
+        );
     }
 
     #[test]
@@ -1669,11 +2154,12 @@ mod tests {
             }))
             .await
             .unwrap();
-        let outbound = prepared.body.to_string();
-        assert!(!outbound.contains("Alice Stone"));
-        assert!(!outbound.contains("alice@example.invalid"));
-        assert!(outbound.contains("Ava Woods"));
-        assert!(outbound.contains("ava@example.invalid"));
+        assert_eq!(prepared.body["instructions"], "Help Ava Woods");
+        assert_eq!(
+            prepared.body["input"][0]["content"][0]["text"],
+            "Email ava@example.invalid"
+        );
+        assert_eq!(prepared.body["tools"][0]["description"], "Find Alice Stone");
 
         let mut session = prepared.session.unwrap();
         let first = session
@@ -1732,6 +2218,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_catalog_instructions_are_skipped_but_dynamic_and_custom_text_is_protected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let trusted_catalog_instructions = "Catalog defaults for Alice Stone";
+
+        let prepared = gateway
+            .prepare_json_body_with_trusted_instructions(
+                json!({
+                    "instructions": trusted_catalog_instructions,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Email alice@example.invalid"
+                        }]
+                    }]
+                }),
+                trusted_catalog_instructions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.body["instructions"],
+            Value::String(trusted_catalog_instructions.to_string())
+        );
+        assert_eq!(
+            prepared.body["input"][0]["content"][0]["text"],
+            "Email ava@example.invalid"
+        );
+        prepared.session.unwrap().abort().await;
+
+        let prepared = gateway
+            .prepare_json_body_with_trusted_instructions(
+                json!({"instructions": "Custom instructions for Alice Stone"}),
+                trusted_catalog_instructions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.body["instructions"],
+            "Custom instructions for Ava Woods"
+        );
+        prepared.session.unwrap().abort().await;
+    }
+
+    #[tokio::test]
+    async fn platform_context_is_byte_preserved_while_dynamic_messages_are_protected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let skills = concat!(
+            "<skills_instructions>\n",
+            "Alice Stone can use alice@example.invalid\n",
+            "</skills_instructions>"
+        );
+        let multi_agent = "<multi_agent_mode>Do not spawn sub-agents.</multi_agent_mode>";
+        let root_agent_hint = default_multi_agent_v2_usage_hint_text(
+            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+        );
+        let prepared = gateway
+            .prepare_json_body(json!({
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {"type": "input_text", "text": skills},
+                            {"type": "input_text", "text": multi_agent},
+                            {"type": "input_text", "text": root_agent_hint},
+                            {"type": "input_text", "text": "Custom policy for Alice Stone"}
+                        ]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Email alice@example.invalid"
+                        }]
+                    }
+                ]
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.body["input"][0]["content"][0]["text"], skills);
+        assert_eq!(prepared.body["input"][0]["content"][1]["text"], multi_agent);
+        assert_eq!(
+            prepared.body["input"][0]["content"][2]["text"],
+            root_agent_hint
+        );
+        assert_eq!(
+            prepared.body["input"][0]["content"][3]["text"],
+            "Custom policy for Ava Woods"
+        );
+        assert_eq!(
+            prepared.body["input"][1]["content"][0]["text"],
+            "Email ava@example.invalid"
+        );
+        prepared.session.unwrap().abort().await;
+    }
+
+    #[tokio::test]
+    async fn deep_mode_uses_deep_route_and_exact_stream_restoration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/deep-pseudonymize"))
+            .respond_with(deep_pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(deep_restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway_with_mode(
+            &server.uri(),
+            Duration::from_secs(1),
+            GatewayMode::DeepPseudonymize,
+        );
+
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        assert_eq!(prepared.body["instructions"], "Help Ava Woods");
+        let mut session = prepared.session.unwrap();
+        let restored = session
+            .transform_event(ResponseEvent::OutputTextDelta("Ava Woods".to_string()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.as_slice(),
+            [ResponseEvent::OutputTextDelta(delta)] if delta == "Alice Stone"
+        ));
+        session
+            .transform_event(ResponseEvent::Completed {
+                response_id: "response-deep-test".to_string(),
+                token_usage: None,
+                end_turn: Some(true),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn gateway_failure_and_timeout_block_before_provider_transport() {
         let failure_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1761,18 +2420,20 @@ mod tests {
             .prepare_json_body(json!({"instructions": "Alice Stone"}))
             .await
             .unwrap_err();
-        assert!(timeout.to_string().contains("request failed"));
+        assert!(timeout.to_string().contains("timed out after 20 ms"));
     }
 
     #[tokio::test]
     async fn expired_mapping_never_releases_a_provider_alias() {
         let config = Arc::new(GatewayConfig {
+            mode: GatewayMode::Pseudonymize,
             base_url: Url::parse("http://127.0.0.1:9").unwrap(),
             bearer_token: "test-token".to_string(),
             data_classification: "synthetic_demo".to_string(),
             language: "en".to_string(),
             locale: "en_GB".to_string(),
             ttl_seconds: 60,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
             client: reqwest::Client::new(),
         });
         let mut session = GatewayRequestSession {
