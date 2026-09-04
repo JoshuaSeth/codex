@@ -67,6 +67,7 @@ struct GatewayConfig {
     language: String,
     locale: String,
     ttl_seconds: u64,
+    timeout_ms: u64,
     client: reqwest::Client,
 }
 
@@ -145,6 +146,7 @@ impl fmt::Debug for GatewayConfig {
             .field("language", &self.language)
             .field("locale", &self.locale)
             .field("ttl_seconds", &self.ttl_seconds)
+            .field("timeout_ms", &self.timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -315,19 +317,42 @@ impl PrivacyGateway {
     pub(crate) async fn prepare_responses_request(
         &self,
         request: &ResponsesApiRequest,
+        trusted_catalog_instructions: &str,
     ) -> Result<PreparedGatewayRequest> {
         let body = serde_json::to_value(request)
             .context("failed to encode Responses request before privacy gateway")?;
-        self.prepare_json_body(body).await
+        self.prepare_json_body_with_trusted_instructions(body, trusted_catalog_instructions)
+            .await
     }
 
-    pub(crate) async fn prepare_json_body(
+    pub(crate) async fn prepare_json_body(&self, body: Value) -> Result<PreparedGatewayRequest> {
+        self.prepare_json_body_inner(body, None).await
+    }
+
+    pub(crate) async fn prepare_json_body_with_trusted_instructions(
+        &self,
+        body: Value,
+        trusted_catalog_instructions: &str,
+    ) -> Result<PreparedGatewayRequest> {
+        // Only the byte-identical model-catalog rendering is trusted. A configured/custom base
+        // instruction string still flows through the gateway with the dynamic request content.
+        self.prepare_json_body_inner(body, Some(trusted_catalog_instructions))
+            .await
+    }
+
+    async fn prepare_json_body_inner(
         &self,
         mut body: Value,
+        trusted_catalog_instructions: Option<&str>,
     ) -> Result<PreparedGatewayRequest> {
         let config = self.config()?;
         let started_at = Instant::now();
-        let locations = request_text_locations(&body)?;
+        let locations = match trusted_catalog_instructions {
+            Some(instructions) => {
+                request_text_locations_with_trusted_instructions(&body, Some(instructions))?
+            }
+            None => request_text_locations(&body)?,
+        };
         if locations.is_empty() {
             return Ok(PreparedGatewayRequest {
                 body,
@@ -345,6 +370,13 @@ impl PrivacyGateway {
             field_paths,
         } = build_batches(locations)?;
         let batch_count = batches.len();
+        tracing::info!(
+            privacy_mode = config.mode.label(),
+            field_count,
+            protected_text_chars,
+            batch_count,
+            "privacy gateway preparing outbound OpenAI request"
+        );
         let mut protected_fields = vec![String::new(); field_paths.len()];
         let mut mappings = Vec::new();
         let mut fingerprints: HashMap<String, String> = HashMap::new();
@@ -829,6 +861,7 @@ fn load_config() -> Result<GatewayConfig> {
         language,
         locale,
         ttl_seconds,
+        timeout_ms,
         client,
     })
 }
@@ -945,7 +978,7 @@ async fn pseudonymize(
         })
         .send()
         .await
-        .context("privacy gateway pseudonymization request failed")?;
+        .map_err(|error| gateway_request_error("pseudonymization", config.timeout_ms, error))?;
     require_success(response.status(), "pseudonymization")?;
     response
         .json()
@@ -973,7 +1006,7 @@ async fn restore_mapping(
         })
         .send()
         .await
-        .context("privacy gateway restoration request failed")?;
+        .map_err(|error| gateway_request_error("restoration", config.timeout_ms, error))?;
     require_success(response.status(), "restoration")?;
     let response: RestoreResponse = response
         .json()
@@ -1025,6 +1058,14 @@ fn require_success(status: StatusCode, operation: &str) -> Result<()> {
         return Ok(());
     }
     bail!("privacy gateway {operation} failed with HTTP {status}")
+}
+
+fn gateway_request_error(operation: &str, timeout_ms: u64, error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::anyhow!("privacy gateway {operation} timed out after {timeout_ms} ms")
+    } else {
+        error.context(format!("privacy gateway {operation} request failed"))
+    }
 }
 
 fn mapping_from_response(
@@ -1096,12 +1137,20 @@ fn validate_match(item: &StreamingRestorationMatch) -> Result<()> {
 }
 
 fn request_text_locations(body: &Value) -> Result<Vec<TextLocation>> {
+    request_text_locations_with_trusted_instructions(body, None)
+}
+
+fn request_text_locations_with_trusted_instructions(
+    body: &Value,
+    trusted_catalog_instructions: Option<&str>,
+) -> Result<Vec<TextLocation>> {
     let object = body
         .as_object()
         .context("Responses request did not serialize as an object")?;
     let mut result = Vec::new();
     if let Some(Value::String(instructions)) = object.get("instructions")
         && !instructions.trim().is_empty()
+        && trusted_catalog_instructions != Some(instructions.as_str())
     {
         result.push(TextLocation {
             path: vec![PathPart::Key("instructions".to_string())],
@@ -1530,6 +1579,7 @@ mod tests {
                 language: "en".to_string(),
                 locale: "en_GB".to_string(),
                 ttl_seconds: 300,
+                timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
                 client,
             }))),
             context_id: "synthetic-test-context".to_string(),
@@ -1945,6 +1995,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_catalog_instructions_are_skipped_but_dynamic_and_custom_text_is_protected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let trusted_catalog_instructions = "Catalog defaults for Alice Stone";
+
+        let prepared = gateway
+            .prepare_json_body_with_trusted_instructions(
+                json!({
+                    "instructions": trusted_catalog_instructions,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Email alice@example.invalid"
+                        }]
+                    }]
+                }),
+                trusted_catalog_instructions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.body["instructions"],
+            Value::String(trusted_catalog_instructions.to_string())
+        );
+        assert_eq!(
+            prepared.body["input"][0]["content"][0]["text"],
+            "Email ava@example.invalid"
+        );
+        prepared.session.unwrap().abort().await;
+
+        let prepared = gateway
+            .prepare_json_body_with_trusted_instructions(
+                json!({"instructions": "Custom instructions for Alice Stone"}),
+                trusted_catalog_instructions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.body["instructions"],
+            "Custom instructions for Ava Woods"
+        );
+        prepared.session.unwrap().abort().await;
+    }
+
+    #[tokio::test]
     async fn deep_mode_uses_deep_route_and_exact_stream_restoration() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2019,7 +2128,7 @@ mod tests {
             .prepare_json_body(json!({"instructions": "Alice Stone"}))
             .await
             .unwrap_err();
-        assert!(timeout.to_string().contains("request failed"));
+        assert!(timeout.to_string().contains("timed out after 20 ms"));
     }
 
     #[tokio::test]
@@ -2032,6 +2141,7 @@ mod tests {
             language: "en".to_string(),
             locale: "en_GB".to_string(),
             ttl_seconds: 60,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
             client: reqwest::Client::new(),
         });
         let mut session = GatewayRequestSession {

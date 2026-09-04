@@ -507,10 +507,15 @@ impl ModelClient {
                     "failed to encode compact request before privacy gateway: {error}"
                 ))
             })?;
+            let trusted_catalog_instructions =
+                model_info.get_model_instructions(prompt.personality);
             Some(
                 self.state
                     .privacy_gateway
-                    .prepare_json_body(body)
+                    .prepare_json_body_with_trusted_instructions(
+                        body,
+                        &trusted_catalog_instructions,
+                    )
                     .await
                     .map_err(|error| {
                         CodexErr::InvalidRequest(format!(
@@ -1340,11 +1345,13 @@ impl ModelClientSession {
                 responses_metadata,
             )?;
             let prepared_gateway_request = if self.client.state.privacy_gateway.enabled() {
+                let trusted_catalog_instructions =
+                    model_info.get_model_instructions(prompt.personality);
                 Some(
                     self.client
                         .state
                         .privacy_gateway
-                        .prepare_responses_request(&request)
+                        .prepare_responses_request(&request, &trusted_catalog_instructions)
                         .await
                         .map_err(|error| {
                             CodexErr::InvalidRequest(format!(
