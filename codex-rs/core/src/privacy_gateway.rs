@@ -326,7 +326,8 @@ impl PrivacyGateway {
     }
 
     pub(crate) async fn prepare_json_body(&self, body: Value) -> Result<PreparedGatewayRequest> {
-        self.prepare_json_body_inner(body, None).await
+        self.prepare_json_body_inner(body, /*trusted_catalog_instructions*/ None)
+            .await
     }
 
     pub(crate) async fn prepare_json_body_with_trusted_instructions(
@@ -845,10 +846,15 @@ fn load_config() -> Result<GatewayConfig> {
     let ttl_seconds = parse_bounded_env(
         TTL_ENV,
         mode.default_ttl_seconds(),
-        60,
+        /*minimum*/ 60,
         mode.maximum_ttl_seconds(),
     )?;
-    let timeout_ms = parse_bounded_env(TIMEOUT_ENV, DEFAULT_TIMEOUT_MS, 100, MAX_TIMEOUT_MS)?;
+    let timeout_ms = parse_bounded_env(
+        TIMEOUT_ENV,
+        DEFAULT_TIMEOUT_MS,
+        /*minimum*/ 100,
+        MAX_TIMEOUT_MS,
+    )?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()
@@ -1137,7 +1143,9 @@ fn validate_match(item: &StreamingRestorationMatch) -> Result<()> {
 }
 
 fn request_text_locations(body: &Value) -> Result<Vec<TextLocation>> {
-    request_text_locations_with_trusted_instructions(body, None)
+    request_text_locations_with_trusted_instructions(
+        body, /*trusted_catalog_instructions*/ None,
+    )
 }
 
 fn request_text_locations_with_trusted_instructions(
@@ -1691,7 +1699,10 @@ mod tests {
 
     #[test]
     fn protection_mode_defaults_to_normal_and_bounds_deep_ttl() {
-        assert_eq!(GatewayMode::parse(None).unwrap(), GatewayMode::Pseudonymize);
+        assert_eq!(
+            GatewayMode::parse(/*value*/ None).unwrap(),
+            GatewayMode::Pseudonymize
+        );
         assert_eq!(
             GatewayMode::parse(Some("deep-pseudonymize")).unwrap(),
             GatewayMode::DeepPseudonymize
