@@ -6,6 +6,8 @@ use crate::config::default_multi_agent_v2_usage_hint_text;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
@@ -64,6 +66,7 @@ const MAX_GATEWAY_TEXT_CHARS: usize = 20_000;
 const MAX_FRAME_COUNT: usize = 5_000;
 const PREFERRED_SPLIT_WINDOW_CHARS: usize = 2_048;
 const RESTORE_CHUNK_CHARS: usize = 16_000;
+const TOKEN_SEED_BYTES: usize = 32;
 const PURGE_TEXT: &str = "privacy mapping purge";
 
 #[derive(Clone)]
@@ -956,17 +959,16 @@ fn read_token_file(path: &Path) -> Result<String> {
             bail!("privacy gateway token file must not be accessible by group or other users");
         }
     }
-    let token = fs::read_to_string(path).with_context(|| {
+    let token_seed = fs::read(path).with_context(|| {
         format!(
             "failed to read privacy gateway token file {}",
             path.display()
         )
     })?;
-    let token = token.trim().to_string();
-    if token.is_empty() || token.chars().any(char::is_whitespace) {
-        bail!("privacy gateway token file must contain one non-empty bearer token");
+    if token_seed.len() != TOKEN_SEED_BYTES {
+        bail!("privacy gateway token file must contain exactly 32 raw seed bytes");
     }
-    Ok(token)
+    Ok(URL_SAFE_NO_PAD.encode(token_seed))
 }
 
 fn validate_language_locale(language: &str, locale: &str) -> Result<()> {
@@ -1836,6 +1838,32 @@ mod tests {
         assert!(!parse_enable_value(Some("false")).unwrap());
         assert!(parse_enable_value(Some("ON")).unwrap());
         assert!(parse_enable_value(Some("enabled")).is_err());
+    }
+
+    #[test]
+    fn token_file_derives_the_gateway_bearer_from_raw_seed_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("api-auth.key");
+        let seed = [0xff; TOKEN_SEED_BYTES];
+        fs::write(&path, seed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert_eq!(
+            read_token_file(&path).unwrap(),
+            URL_SAFE_NO_PAD.encode(seed)
+        );
+
+        fs::write(&path, [0xff; TOKEN_SEED_BYTES - 1]).unwrap();
+        assert!(
+            read_token_file(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly 32 raw seed bytes")
+        );
     }
 
     #[test]
