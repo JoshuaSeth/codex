@@ -632,6 +632,34 @@ fn active_profile_selection_uses_profile_id_only() {
 }
 
 #[tokio::test]
+async fn thread_lifecycle_params_preserve_first_response_override() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    assert_eq!(thread_config_overrides_from_config(&config), None);
+    config.disable_reasoning_on_first_response = true;
+    config.bypass_hook_trust = true;
+    let expected = Some(HashMap::from([
+        (
+            "disable_reasoning_on_first_response".to_string(),
+            Value::Bool(true),
+        ),
+        ("bypass_hook_trust".to_string(), Value::Bool(true)),
+    ]));
+
+    assert_eq!(thread_start_params_from_config(&config).config, expected);
+    assert_eq!(
+        thread_resume_params_from_config(&config, "thread-id".to_string()).config,
+        expected
+    );
+}
+
+#[tokio::test]
 async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");

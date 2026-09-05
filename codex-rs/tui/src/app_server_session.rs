@@ -1319,6 +1319,12 @@ fn config_request_overrides_from_config(
     if config.bypass_hook_trust {
         overrides.insert("bypass_hook_trust".to_string(), true.into());
     }
+    if config.disable_reasoning_on_first_response {
+        overrides.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            true.into(),
+        );
+    }
     Some(overrides)
 }
 
@@ -2242,6 +2248,47 @@ mod tests {
             explicit_overrides.get("personality"),
             Some(&serde_json::Value::String("none".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn thread_lifecycle_params_forward_first_response_override_to_remote_and_embedded() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let mut expected = config_request_overrides_from_config(&config).expect("config overrides");
+        assert!(!expected.contains_key("disable_reasoning_on_first_response"));
+        config.disable_reasoning_on_first_response = true;
+        expected.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            true.into(),
+        );
+
+        for mode in [ThreadParamsMode::Embedded, ThreadParamsMode::Remote] {
+            let thread_id = ThreadId::new();
+            let configs = [
+                thread_start_params_from_config(
+                    &config, mode, /*remote_cwd_override*/ None,
+                    /*session_start_source*/ None,
+                )
+                .config,
+                thread_resume_params_from_config(
+                    config.clone(),
+                    thread_id,
+                    mode,
+                    /*remote_cwd_override*/ None,
+                )
+                .config,
+                thread_fork_params_from_config(
+                    config.clone(),
+                    thread_id,
+                    mode,
+                    /*remote_cwd_override*/ None,
+                )
+                .config,
+            ];
+            for actual in configs {
+                assert_eq!(actual, Some(expected.clone()));
+            }
+        }
     }
 
     #[tokio::test]

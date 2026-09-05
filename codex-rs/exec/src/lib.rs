@@ -1106,9 +1106,17 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
 }
 
 fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
-    config
-        .bypass_hook_trust
-        .then(|| HashMap::from([("bypass_hook_trust".to_string(), Value::Bool(true))]))
+    let mut overrides = HashMap::new();
+    if config.bypass_hook_trust {
+        overrides.insert("bypass_hook_trust".to_string(), Value::Bool(true));
+    }
+    if config.disable_reasoning_on_first_response {
+        overrides.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            Value::Bool(true),
+        );
+    }
+    (!overrides.is_empty()).then_some(overrides)
 }
 
 fn permissions_selection_from_config(config: &Config) -> Option<String> {
