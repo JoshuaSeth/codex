@@ -37,6 +37,13 @@ pub struct CliConfigOverrides {
 }
 
 impl CliConfigOverrides {
+    /// Enable first-response no-thinking mode through the app-server config path.
+    /// An explicit CLI switch takes precedence over earlier `-c` overrides.
+    pub fn disable_reasoning_on_first_response(&mut self) {
+        self.raw_overrides
+            .push("disable_reasoning_on_first_response=true".to_string());
+    }
+
     /// Prepend root-level config flags so they have lower precedence than
     /// command-specific flags parsed after a subcommand.
     pub fn prepend_root_overrides(&mut self, root_overrides: Self) {
@@ -212,6 +219,29 @@ mod tests {
                 r#"model="gpt-5.1""#.to_string(),
                 r#"model="gpt-5.2""#.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn first_response_override_preserves_other_settings_and_wins_precedence() {
+        let mut overrides = CliConfigOverrides {
+            raw_overrides: vec![
+                "disable_reasoning_on_first_response=false".to_string(),
+                "model_reasoning_effort=high".to_string(),
+            ],
+        };
+        overrides.disable_reasoning_on_first_response();
+        let mut config = Value::Table(Default::default());
+        overrides
+            .apply_on_value(&mut config)
+            .expect("apply overrides");
+
+        assert_eq!(
+            config,
+            Value::Table(toml::toml! {
+                disable_reasoning_on_first_response = true
+                model_reasoning_effort = "high"
+            })
         );
     }
 

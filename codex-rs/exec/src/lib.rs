@@ -249,6 +249,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let Cli {
         command,
         strict_config,
+        no_thinking_first_response,
         shared,
         skip_git_repo_check,
         ephemeral,
@@ -260,7 +261,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
-        config_overrides,
+        mut config_overrides,
     } = cli;
     let shared = shared.into_inner();
     let SharedCliOptions {
@@ -298,6 +299,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
+    if no_thinking_first_response {
+        config_overrides.disable_reasoning_on_first_response();
+    }
     let cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]

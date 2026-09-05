@@ -864,6 +864,10 @@ pub async fn run_main(
         )
     };
 
+    if cli.no_thinking_first_response {
+        cli.config_overrides.disable_reasoning_on_first_response();
+    }
+
     // Map the legacy --search flag to the canonical web_search mode.
     if cli.web_search {
         cli.config_overrides

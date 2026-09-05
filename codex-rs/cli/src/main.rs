@@ -1009,6 +1009,7 @@ async fn cli_main(
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
             exec_cli.strict_config |= root_strict_config;
+            exec_cli.no_thinking_first_response |= interactive.no_thinking_first_response;
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
@@ -2455,6 +2456,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     let TuiCli {
         shared,
         strict_config,
+        no_thinking_first_response,
         approval_policy,
         web_search,
         prompt,
@@ -2473,6 +2475,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if strict_config {
         interactive.strict_config = true;
     }
+    interactive.no_thinking_first_response |= no_thinking_first_response;
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -3223,6 +3226,40 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_preserves_no_thinking_first_response_from_root_or_subcommand() {
+        for args in [
+            ["codex", "--no-thinking-first-response", "resume", "sid"],
+            ["codex", "resume", "sid", "--no-thinking-first-response"],
+            [
+                "codex",
+                "resume",
+                "sid",
+                "--disable-reasoning-on-first-response",
+            ],
+        ] {
+            assert!(finalize_resume_from_args(&args).no_thinking_first_response);
+        }
+        assert!(!finalize_resume_from_args(&["codex", "resume", "sid"]).no_thinking_first_response);
+    }
+
+    #[test]
+    fn fork_preserves_no_thinking_first_response_from_root_or_subcommand() {
+        for args in [
+            ["codex", "--no-thinking-first-response", "fork", "sid"],
+            ["codex", "fork", "sid", "--no-thinking-first-response"],
+            [
+                "codex",
+                "fork",
+                "sid",
+                "--disable-reasoning-on-first-response",
+            ],
+        ] {
+            assert!(finalize_fork_from_args(&args).no_thinking_first_response);
+        }
+        assert!(!finalize_fork_from_args(&["codex", "fork", "sid"]).no_thinking_first_response);
     }
 
     #[test]
