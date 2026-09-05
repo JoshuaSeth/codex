@@ -177,6 +177,14 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     })
     .await;
 
+    // Another manager must not acquire the rollout while its original writer
+    // is still alive. Shutdown flushes the history and releases ownership.
+    started.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
     let mut resume_builder = test_codex().with_config(|config| {
         config
             .features

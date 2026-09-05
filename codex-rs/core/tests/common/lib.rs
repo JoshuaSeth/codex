@@ -2,7 +2,9 @@
 
 use anyhow::Context as _;
 use anyhow::ensure;
-use codex_arg0::Arg0PathEntryGuard;
+use codex_test_binary_support::TestBinaryDispatchGuard;
+use codex_test_binary_support::TestBinaryDispatchMode;
+use codex_test_binary_support::configure_test_binary_dispatch;
 use codex_utils_cargo_bin::CargoBinError;
 use ctor::ctor;
 use std::sync::OnceLock;
@@ -46,7 +48,7 @@ pub use test_environment::test_docker_container_name;
 pub(crate) use test_environment::test_environment;
 pub use test_environment::test_target_os;
 
-static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
+static TEST_ARG0_PATH_ENTRY: OnceLock<Option<TestBinaryDispatchGuard>> = OnceLock::new();
 
 #[ctor]
 fn enable_deterministic_unified_exec_process_ids_for_tests() {
@@ -56,7 +58,13 @@ fn enable_deterministic_unified_exec_process_ids_for_tests() {
 
 #[ctor]
 fn configure_arg0_dispatch_for_test_binaries() {
-    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
+    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(|| {
+        // Keep aliases out of the developer's home and reachable by sandboxed
+        // children, even when this support crate initializes before the binary.
+        configure_test_binary_dispatch("core-test-support", |_, _| {
+            TestBinaryDispatchMode::InstallAliases
+        })
+    });
 }
 
 #[ctor]
