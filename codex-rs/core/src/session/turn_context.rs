@@ -735,6 +735,10 @@ impl Session {
             .plugin_skill_snapshots_for_config(&plugins_input);
         let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots)
             .with_plugin_skill_snapshots(plugin_skill_snapshots);
+        let skills_input = match self.pitchai_skill_principal().await {
+            Some(principal) => skills_input.with_pitchai_principal(principal),
+            None => skills_input,
+        };
         let fs = primary_turn_environment
             .map(|turn_environment| turn_environment.environment.get_filesystem());
         let skills_snapshot = self

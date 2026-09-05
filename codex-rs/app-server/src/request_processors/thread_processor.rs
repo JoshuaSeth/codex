@@ -1,4 +1,6 @@
 use super::*;
+use crate::error_code::before_effect;
+use crate::error_code::invalid_request_before_effect;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_extension_api::ExtensionDataInit;
@@ -1027,6 +1029,7 @@ impl ThreadRequestProcessor {
             thread_source,
             environments,
         } = params;
+        required_pitchai_principal_from_config(config.as_ref())?;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
@@ -2840,6 +2843,13 @@ impl ThreadRequestProcessor {
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let resume_started_at = std::time::Instant::now();
+        let requested_principal = required_pitchai_principal_from_config(params.config.as_ref())?;
+        if managed_pitchai_catalog_enabled() && (params.history.is_some() || params.path.is_some())
+        {
+            return Err(invalid_request(
+                "Managed PitchAI thread resume requires canonical stored history selected by thread id; client-supplied history and paths are not authoritative identity sources.",
+            ));
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -2937,6 +2947,14 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        if let InitialHistory::Resumed(resumed) = &thread_history {
+            validate_requested_principal_against_rollout(
+                resumed.history.as_slice(),
+                resumed.conversation_id,
+                requested_principal.as_ref(),
+                /*require_persisted*/ false,
+            )?;
+        }
 
         let history_cwd = thread_history.session_cwd();
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
@@ -3153,7 +3171,10 @@ impl ThreadRequestProcessor {
                     .await;
             }
             Err(err) => {
-                let error = internal_error(format!("error resuming thread: {err}"));
+                let error = match err {
+                    CodexErr::InvalidRequest(message) => invalid_request(message),
+                    err => internal_error(format!("error resuming thread: {err}")),
+                };
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -3248,6 +3269,10 @@ impl ThreadRequestProcessor {
                     active_path.display()
                 )));
             }
+            let requested_principal =
+                required_pitchai_principal_from_config(params.config.as_ref())?;
+            require_matching_pitchai_principal(existing_thread.as_ref(), requested_principal)
+                .await?;
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
             if !mismatch_details.is_empty() {
@@ -3643,38 +3668,95 @@ impl ThreadRequestProcessor {
             developer_instructions,
             ephemeral,
             thread_source,
+            history_mode,
             exclude_turns,
         } = params;
+        let requested_principal = required_pitchai_principal_from_config(cli_overrides.as_ref())
+            .map_err(before_effect)?;
+        if managed_pitchai_catalog_enabled() && path.is_some() {
+            return Err(invalid_request_before_effect(
+                "Managed PitchAI thread fork requires canonical stored history selected by thread id; a client-supplied path is not an authoritative identity source.",
+            ));
+        }
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
-            return Err(invalid_request(
+            return Err(invalid_request_before_effect(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
+        let include_full_history = matches!(
+            history_mode,
+            codex_app_server_protocol::ThreadForkHistoryMode::Full
+        );
         let mut source_thread = self
-            .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
-            .await?;
+            .read_stored_thread_for_resume(
+                &thread_id,
+                path.as_ref(),
+                /*include_history*/ include_full_history,
+            )
+            .await
+            .map_err(before_effect)?;
         let source_thread_id = source_thread.thread_id;
         let source_thread_name = source_thread
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let history_items = source_thread
-            .history
-            .take()
-            .map(|history| history.items)
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "thread {source_thread_id} did not include persisted history"
-                ))
-            })?;
+        let history_items = match history_mode {
+            codex_app_server_protocol::ThreadForkHistoryMode::Full => source_thread
+                .history
+                .take()
+                .map(|history| Arc::new(history.items))
+                .ok_or_else(|| {
+                    before_effect(internal_error(format!(
+                        "thread {source_thread_id} did not include persisted history"
+                    )))
+                })?,
+            codex_app_server_protocol::ThreadForkHistoryMode::Compact => {
+                let rollout_path = source_thread.rollout_path.as_ref().ok_or_else(|| {
+                    before_effect(internal_error(format!(
+                        "rollout path missing for thread {source_thread_id}"
+                    )))
+                })?;
+                let history = codex_rollout::RolloutRecorder::get_rollout_fork_history(
+                    rollout_path.as_path(),
+                )
+                .await
+                .map_err(|err| {
+                    invalid_request_before_effect(format!(
+                        "failed to load compact fork history for thread {source_thread_id}: {err}"
+                    ))
+                })?;
+                let InitialHistory::Resumed(resumed) = history else {
+                    return Err(invalid_request_before_effect(format!(
+                        "thread {source_thread_id} has no persisted history to fork"
+                    )));
+                };
+                if resumed.conversation_id != source_thread_id {
+                    return Err(invalid_request_before_effect(format!(
+                        "rollout `{}` belongs to thread {}, not {}",
+                        rollout_path.display(),
+                        resumed.conversation_id,
+                        source_thread_id
+                    )));
+                }
+                resumed.history
+            }
+        };
+        validate_requested_principal_against_rollout(
+            history_items.as_slice(),
+            source_thread_id,
+            requested_principal.as_ref(),
+            /*require_persisted*/ true,
+        )
+        .map_err(before_effect)?;
         let history_items = if let Some(last_turn_id) = last_turn_id.as_deref() {
             Arc::new(
-                truncate_rollout_after_turn_id(&history_items, last_turn_id)
-                    .map_err(|err| core_thread_write_error("truncate thread for fork", err))?,
+                truncate_rollout_after_turn_id(&history_items, last_turn_id).map_err(|err| {
+                    before_effect(core_thread_write_error("truncate thread for fork", err))
+                })?,
             )
         } else {
-            Arc::new(history_items)
+            history_items
         };
         let history_cwd = Some(source_thread.cwd.clone());
 
@@ -3721,7 +3803,7 @@ impl ThreadRequestProcessor {
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
-            .map_err(|err| config_load_error(&err))?;
+            .map_err(|err| before_effect(config_load_error(&err)))?;
 
         let fallback_model_provider = config.model_provider_id.clone();
 

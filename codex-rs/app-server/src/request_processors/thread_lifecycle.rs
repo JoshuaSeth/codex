@@ -410,46 +410,6 @@ pub(super) async fn ensure_listener_task_running(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn residency_candidate_final_guard_protects_subscribed_threads() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ true,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_protects_threads_that_became_active() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Active {
-                active_turn_id: None,
-                active_flags: Vec::new(),
-            },
-            &AgentStatus::Completed(None),
-        ));
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Running,
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
-        assert!(!residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-}
-
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
     match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
         Ok(Ok(())) => ThreadShutdownResult::Complete,
@@ -541,6 +501,33 @@ pub(super) async fn handle_thread_listener_command(
             .await;
         }
         ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, goal } => {
+            let terminal_status = match goal.status {
+                ThreadGoalStatus::Complete => Some("complete"),
+                ThreadGoalStatus::Blocked => Some("blocked"),
+                ThreadGoalStatus::UsageLimited => Some("usageLimited"),
+                ThreadGoalStatus::BudgetLimited => Some("budgetLimited"),
+                ThreadGoalStatus::Active | ThreadGoalStatus::Paused => None,
+            };
+            if let Some(terminal_status) = terminal_status
+                && let (Some(turn_id), Some(state_db)) =
+                    (turn_id.as_deref(), conversation.state_db())
+                && let Err(err) =
+                    crate::bespoke_event_handling::persist_terminal_goal_turn_association(
+                        state_db.completions(),
+                        conversation_id,
+                        terminal_status,
+                        goal.updated_at,
+                        turn_id,
+                    )
+                    .await
+            {
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id,
+                    error = %err,
+                    "failed to associate terminal goal state with its active turn"
+                );
+            }
             outgoing
                 .send_server_notification(ServerNotification::ThreadGoalUpdated(
                     ThreadGoalUpdatedNotification {
@@ -868,4 +855,44 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         }
     }
     thread.status = status;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residency_candidate_final_guard_protects_subscribed_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ true,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_threads_that_became_active() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Active {
+                active_turn_id: None,
+                active_flags: Vec::new(),
+            },
+            &AgentStatus::Completed(None),
+        ));
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Running,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
+        assert!(!residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
 }

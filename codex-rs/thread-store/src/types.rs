@@ -13,6 +13,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::PitchAiSkillPrincipal;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -96,6 +97,8 @@ pub struct CreateThreadParams {
     pub history_mode: ThreadHistoryMode,
     /// Initial context-window identity captured when the thread was created.
     pub initial_window_id: String,
+    /// Immutable managed PitchAI tenant/user identity for this thread.
+    pub pitchai_principal: Option<PitchAiSkillPrincipal>,
     /// Metadata captured for the newly created thread.
     pub metadata: ThreadPersistenceMetadata,
 }

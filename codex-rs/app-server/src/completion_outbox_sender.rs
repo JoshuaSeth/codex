@@ -26,7 +26,8 @@ use uuid::Uuid;
 const CENTRAL_URL_ENV: &str = "PITCHAI_PLATFORM_CENTRAL_URL";
 const CELL_TOKEN_ENV: &str = "PITCHAI_PLATFORM_CELL_TOKEN";
 const COMPLETION_EVENT_PATH: &str = "/internal/cell-api/v2/completion-events";
-const COMPLETION_PROTOCOL_VERSION: &str = "pitchai-completion/v1";
+const COMPLETION_PROTOCOL_V1: &str = "pitchai-completion/v1";
+const COMPLETION_PROTOCOL_V2: &str = "pitchai-completion/v2";
 const CLAIM_BATCH_SIZE: i64 = 8;
 const CLAIM_LEASE_MS: i64 = 60_000;
 const MAX_IDLE_SCAN_MS: i64 = 30_000;
@@ -51,6 +52,7 @@ struct CompletionEventPayload<'a> {
     source_thread_id: &'a str,
     execution_kind: &'a str,
     execution_id: &'a str,
+    terminal_turn_id: Option<&'a str>,
     terminal_status: &'a str,
     final_text: &'a str,
     terminal_at: String,
@@ -69,6 +71,11 @@ struct CompletionEventReceipt {
 enum CompletionEventOutcome {
     Accepted,
     Duplicate,
+}
+
+enum CompletionDeliveryFailure {
+    Retryable(String),
+    Permanent(String),
 }
 
 pub(crate) fn start(
@@ -234,7 +241,39 @@ async fn deliver_event(
                 );
             }
         },
-        Err(err) => {
+        Err(CompletionDeliveryFailure::Permanent(err)) => {
+            let stored_error = bounded_error(&err);
+            match store
+                .mark_undeliverable(&event.event_id, &event.lease_id, &stored_error)
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        completion_work_id = %event.completion_work_id,
+                        attempt = event.attempt,
+                        error = %stored_error,
+                        "completion event was permanently rejected by central"
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        event_id = %event.event_id,
+                        attempt = event.attempt,
+                        "completion outbox lease changed before permanent rejection was recorded"
+                    );
+                }
+                Err(store_err) => {
+                    error!(
+                        event_id = %event.event_id,
+                        attempt = event.attempt,
+                        error = %store_err,
+                        "failed to persist permanent completion rejection"
+                    );
+                }
+            }
+        }
+        Err(CompletionDeliveryFailure::Retryable(err)) => {
             let delay_ms = retry_delay_ms(event);
             match store
                 .retry_later(
@@ -280,18 +319,28 @@ async fn post_event(
     client: &Client,
     boot_id: Uuid,
     event: &CompletionOutboxEvent,
-) -> Result<(), String> {
+) -> Result<(), CompletionDeliveryFailure> {
     let terminal_at = DateTime::<Utc>::from_timestamp_millis(event.terminal_at_ms)
-        .ok_or_else(|| "completion event has an invalid terminal timestamp".to_string())?
+        .ok_or_else(|| {
+            CompletionDeliveryFailure::Permanent(
+                "completion event has an invalid terminal timestamp".to_string(),
+            )
+        })?
         .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let terminal_turn_id = terminal_turn_id(event).map_err(CompletionDeliveryFailure::Permanent)?;
     let payload = CompletionEventPayload {
-        protocol_version: COMPLETION_PROTOCOL_VERSION,
+        protocol_version: if terminal_turn_id.is_some() {
+            COMPLETION_PROTOCOL_V2
+        } else {
+            COMPLETION_PROTOCOL_V1
+        },
         boot_id,
         event_id: &event.event_id,
         completion_work_id: &event.completion_work_id,
         source_thread_id: &event.thread_id,
         execution_kind: &event.execution_kind,
         execution_id: &event.execution_id,
+        terminal_turn_id,
         terminal_status: &event.terminal_status,
         final_text: &event.final_text,
         terminal_at,
@@ -303,33 +352,80 @@ async fn post_event(
         .json(&payload)
         .send()
         .await
-        .map_err(|err| format!("central completion endpoint transport failed: {err}"))?;
+        .map_err(|err| {
+            CompletionDeliveryFailure::Retryable(format!(
+                "central completion endpoint transport failed: {err}"
+            ))
+        })?;
     let status = response.status();
     let content_length = response.content_length();
     if content_length.is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
-        return Err("central completion endpoint response was too large".to_string());
+        return Err(CompletionDeliveryFailure::Retryable(
+            "central completion endpoint response was too large".to_string(),
+        ));
     }
-    let response_body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("failed to read central completion response: {err}"))?;
+    let response_body = response.bytes().await.map_err(|err| {
+        CompletionDeliveryFailure::Retryable(format!(
+            "failed to read central completion response: {err}"
+        ))
+    })?;
     if response_body.len() > MAX_RESPONSE_BYTES {
-        return Err("central completion endpoint response was too large".to_string());
+        return Err(CompletionDeliveryFailure::Retryable(
+            "central completion endpoint response was too large".to_string(),
+        ));
     }
     if !status.is_success() {
-        return Err(http_failure(status));
+        let failure = http_failure(status);
+        if permanent_rejection_code(status, &response_body).is_some() {
+            return Err(CompletionDeliveryFailure::Permanent(failure));
+        }
+        return Err(CompletionDeliveryFailure::Retryable(failure));
     }
-    let receipt: CompletionEventReceipt = serde_json::from_slice(&response_body)
-        .map_err(|err| format!("central completion endpoint returned an invalid receipt: {err}"))?;
-    let expected_event_id = Uuid::parse_str(&event.event_id)
-        .map_err(|err| format!("completion event id is not a UUID: {err}"))?;
-    let expected_work_id = Uuid::parse_str(&event.completion_work_id)
-        .map_err(|err| format!("completion work id is not a UUID: {err}"))?;
+    let receipt: CompletionEventReceipt =
+        serde_json::from_slice(&response_body).map_err(|err| {
+            CompletionDeliveryFailure::Retryable(format!(
+                "central completion endpoint returned an invalid receipt: {err}"
+            ))
+        })?;
+    let expected_event_id = Uuid::parse_str(&event.event_id).map_err(|err| {
+        CompletionDeliveryFailure::Permanent(format!("completion event id is not a UUID: {err}"))
+    })?;
+    let expected_work_id = Uuid::parse_str(&event.completion_work_id).map_err(|err| {
+        CompletionDeliveryFailure::Permanent(format!("completion work id is not a UUID: {err}"))
+    })?;
     if receipt.event_id != expected_event_id || receipt.completion_work_id != expected_work_id {
-        return Err("central completion receipt did not match the posted event".to_string());
+        return Err(CompletionDeliveryFailure::Retryable(
+            "central completion receipt did not match the posted event".to_string(),
+        ));
     }
     match receipt.outcome {
         CompletionEventOutcome::Accepted | CompletionEventOutcome::Duplicate => Ok(()),
+    }
+}
+
+fn terminal_turn_id(event: &CompletionOutboxEvent) -> Result<Option<&str>, String> {
+    match event.execution_kind.as_str() {
+        "normal" => {
+            if event
+                .terminal_turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_id != event.execution_id)
+            {
+                return Err(
+                    "normal completion terminal turn does not match its execution id".to_string(),
+                );
+            }
+            Ok(Some(event.execution_id.as_str()))
+        }
+        "goal" => {
+            if event.terminal_turn_id.is_none() && !event.final_text.trim().is_empty() {
+                return Err(
+                    "goal completion with final text has no terminal turn identity".to_string(),
+                );
+            }
+            Ok(event.terminal_turn_id.as_deref())
+        }
+        _ => Err("completion event has an unsupported execution kind".to_string()),
     }
 }
 
@@ -413,6 +509,15 @@ fn http_failure(status: StatusCode) -> String {
     )
 }
 
+fn permanent_rejection_code(status: StatusCode, body: &[u8]) -> Option<&str> {
+    if status != StatusCode::NOT_FOUND {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = payload.get("detail")?.get("code")?.as_str()?;
+    (code == "command_not_found").then_some("command_not_found")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +580,7 @@ mod tests {
             thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
             execution_kind: "normal".to_string(),
             execution_id: "turn-1".to_string(),
+            terminal_turn_id: None,
             callback_metadata_json: String::new(),
             terminal_status: "completed".to_string(),
             final_text: "done".to_string(),
@@ -492,6 +598,65 @@ mod tests {
             ..event
         };
         assert!(retry_delay_ms(&delayed_event) <= RETRY_CAP_MS);
+    }
+
+    #[test]
+    fn terminal_turn_protocol_preserves_goal_fallback_compatibility() {
+        let normal = CompletionOutboxEvent {
+            event_id: "10000000-0000-0000-0000-000000000001".to_string(),
+            completion_work_id: "10000000-0000-0000-0000-000000000001".to_string(),
+            thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
+            execution_kind: "normal".to_string(),
+            execution_id: "turn-1".to_string(),
+            terminal_turn_id: None,
+            callback_metadata_json: String::new(),
+            terminal_status: "completed".to_string(),
+            final_text: "done".to_string(),
+            terminal_at_ms: 1_000,
+            attempt: 1,
+            lease_id: "lease-1".to_string(),
+        };
+        let terminal_goal = CompletionOutboxEvent {
+            execution_kind: "goal".to_string(),
+            execution_id: "goal-1".to_string(),
+            terminal_turn_id: Some("turn-1".to_string()),
+            terminal_status: "complete".to_string(),
+            ..normal.clone()
+        };
+        let empty_fallback = CompletionOutboxEvent {
+            terminal_turn_id: None,
+            final_text: String::new(),
+            ..terminal_goal.clone()
+        };
+        let missing_goal_turn = CompletionOutboxEvent {
+            terminal_turn_id: None,
+            ..terminal_goal.clone()
+        };
+        let mismatched_normal_turn = CompletionOutboxEvent {
+            terminal_turn_id: Some("another-turn".to_string()),
+            ..normal.clone()
+        };
+
+        assert_eq!(
+            Some("turn-1"),
+            terminal_turn_id(&normal).expect("normal turn")
+        );
+        assert_eq!(
+            Some("turn-1"),
+            terminal_turn_id(&terminal_goal).expect("goal terminal turn")
+        );
+        assert_eq!(
+            None,
+            terminal_turn_id(&empty_fallback).expect("legacy empty goal fallback")
+        );
+        assert_eq!(
+            Err("goal completion with final text has no terminal turn identity".to_string()),
+            terminal_turn_id(&missing_goal_turn)
+        );
+        assert_eq!(
+            Err("normal completion terminal turn does not match its execution id".to_string()),
+            terminal_turn_id(&mismatched_normal_turn)
+        );
     }
 
     #[tokio::test]
@@ -566,6 +731,84 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(2, endpoint_state.attempts.load(Ordering::SeqCst));
+
+        shutdown.cancel();
+        sender.await.expect("completion sender should stop cleanly");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sender_finalizes_central_command_not_found_without_retrying() {
+        let temp_dir = TempDir::new().expect("temporary state directory should exist");
+        let runtime =
+            StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime should initialize");
+        let store = runtime.completions().clone();
+        let completion_work_id = "10000000-0000-0000-0000-000000000009";
+        let thread_id = ThreadId::from_string("20000000-0000-0000-0000-000000000009")
+            .expect("thread id should be valid");
+        store
+            .bind_turn(completion_work_id, thread_id, "turn-9")
+            .await
+            .expect("completion binding should persist");
+        store
+            .complete_turn(thread_id, "turn-9", "legacy completion", 1_000)
+            .await
+            .expect("completion event should persist");
+
+        let token = "missing-command-token-with-at-least-32-characters".to_string();
+        let endpoint_state = TestEndpoint {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            expected_token: token.clone(),
+        };
+        let router = Router::new()
+            .route(COMPLETION_EVENT_PATH, post(test_missing_command_endpoint))
+            .with_state(endpoint_state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test endpoint should bind");
+        let address = listener
+            .local_addr()
+            .expect("test endpoint should have an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("test endpoint should serve");
+        });
+
+        let config =
+            CompletionOutboxSenderConfig::from_values(&format!("http://{address}"), &token)
+                .expect("loopback callback endpoint should be valid");
+        let shutdown = CancellationToken::new();
+        let sender = tokio::spawn(run(
+            store.clone(),
+            config,
+            test_http_client(),
+            Uuid::now_v7(),
+            shutdown.clone(),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stats = store
+                .outbox_stats()
+                .await
+                .expect("completion stats should be readable");
+            if stats.sent_count == 1 {
+                assert_eq!(0, stats.pending_count);
+                assert_eq!(0, stats.sending_count);
+                assert_eq!(1, stats.total_attempts);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completion sender did not finalize the permanent rejection in time"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        sleep(Duration::from_millis(RETRY_BASE_MS as u64 + 100)).await;
+        assert_eq!(1, endpoint_state.attempts.load(Ordering::SeqCst));
 
         shutdown.cancel();
         sender.await.expect("completion sender should stop cleanly");
@@ -727,6 +970,11 @@ mod tests {
         else {
             return AxumStatusCode::BAD_REQUEST.into_response();
         };
+        if payload.get("protocol_version").and_then(Value::as_str) != Some(COMPLETION_PROTOCOL_V2)
+            || payload.get("terminal_turn_id") != payload.get("execution_id")
+        {
+            return AxumStatusCode::BAD_REQUEST.into_response();
+        }
         (
             AxumStatusCode::OK,
             Json(json!({
@@ -735,6 +983,31 @@ mod tests {
                 "completion_work_id": completion_work_id,
                 "delivery_count": 1,
                 "received_at": "2026-07-23T17:00:00Z"
+            })),
+        )
+            .into_response()
+    }
+
+    async fn test_missing_command_endpoint(
+        State(state): State<TestEndpoint>,
+        headers: HeaderMap,
+    ) -> Response {
+        let expected_authorization = format!("Bearer {}", state.expected_token);
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some(expected_authorization.as_str())
+        {
+            return AxumStatusCode::UNAUTHORIZED.into_response();
+        }
+        state.attempts.fetch_add(1, Ordering::SeqCst);
+        (
+            AxumStatusCode::NOT_FOUND,
+            Json(json!({
+                "detail": {
+                    "code": "command_not_found",
+                    "message": "Completion work was not found in this source cell scope."
+                }
             })),
         )
             .into_response()

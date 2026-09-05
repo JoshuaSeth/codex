@@ -177,6 +177,7 @@ fn write_rollout_with_user_message(
                     selected_capability_roots: Vec::new(),
                     memory_mode: None,
                     history_mode: Default::default(),
+                    pitchai_principal: None,
                     multi_agent_version: None,
                     context_window: None,
                 },

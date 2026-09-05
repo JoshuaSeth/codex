@@ -863,6 +863,7 @@ mod tests {
             thread_id: "20000000-0000-0000-0000-000000000001".to_string(),
             execution_kind: "normal".to_string(),
             execution_id: "10000000-0000-0000-0000-000000000001".to_string(),
+            terminal_turn_id: None,
             callback_metadata_json: json!({
                 "protocol_version": "pitchai-completion-callback/v2",
                 "text": "Publish this result.",

@@ -224,6 +224,7 @@ impl ExternalAgentSessionImporter {
             multi_agent_version: Some(MultiAgentVersion::V1),
             history_mode: ThreadHistoryMode::Legacy,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
+            pitchai_principal: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(cwd.clone()),
                 model_provider: model_provider.clone(),

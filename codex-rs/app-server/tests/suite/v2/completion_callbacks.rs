@@ -248,9 +248,41 @@ async fn unfinished_callback_turn_resumes_after_app_server_restart_and_emits_onc
 
 #[tokio::test]
 async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Intermediate goal turn").await;
+    let complete_goal_arguments = serde_json::to_string(&json!({"status": "complete"}))?;
+    let (release_terminal_update, terminal_update_gate) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_assistant_message("goal-intermediate", "Intermediate goal turn"),
+                responses::ev_completed("goal-intermediate-response"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: Some(terminal_update_gate),
+            body: responses::sse(vec![
+                responses::ev_function_call(
+                    "goal-complete-call",
+                    "update_goal",
+                    &complete_goal_arguments,
+                ),
+                responses::ev_completed("goal-complete-tool-response"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_assistant_message(
+                    "goal-terminal-final",
+                    "Terminal goal final evidence",
+                ),
+                responses::ev_completed("goal-terminal-final-response"),
+            ]),
+        }],
+    ])
+    .await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml(codex_home.path(), server.uri())?;
     let mut app_server = app_server_without_completion_sender(codex_home.path()).await?;
     timeout(STARTUP_TIMEOUT, app_server.initialize()).await??;
     let thread_id = start_thread(&mut app_server).await?;
@@ -284,6 +316,11 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
         app_server.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/* count */ 2),
+    )
+    .await?;
 
     let intermediate_outbox = claim_outbox(codex_home.path()).await?;
     assert!(
@@ -295,25 +332,25 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
         "an ordinary assistant final must not emit a goal webhook"
     );
 
-    let complete_request = app_server
-        .send_raw_request(
-            "thread/goal/set",
-            Some(json!({
-                "threadId": active_goal.goal.thread_id,
-                "status": "complete",
-            })),
-        )
-        .await?;
-    let complete_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        app_server.read_stream_until_response_message(RequestId::Integer(complete_request)),
-    )
-    .await??;
-    let complete_goal = to_response::<ThreadGoalSetResponse>(complete_response)?;
-    assert_eq!(ThreadGoalStatus::Complete, complete_goal.goal.status);
-    timeout(
+    release_terminal_update
+        .send(())
+        .expect("terminal goal response gate should still be open");
+    let goal_updated = timeout(
         DEFAULT_READ_TIMEOUT,
         app_server.read_stream_until_notification_message("thread/goal/updated"),
+    )
+    .await??;
+    let terminal_turn_id = goal_updated
+        .params
+        .as_ref()
+        .and_then(|params| params.get("turnId"))
+        .and_then(serde_json::Value::as_str)
+        .expect("terminal goal update should identify its emitting turn")
+        .to_string();
+    assert!(!terminal_turn_id.is_empty());
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -322,11 +359,12 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
     let event = &terminal_outbox[0];
     assert_eq!(GOAL_WORK_ID, event.event_id);
     assert_eq!(GOAL_WORK_ID, event.completion_work_id);
-    assert_eq!(complete_goal.goal.thread_id, event.thread_id);
+    assert_eq!(active_goal.goal.thread_id, event.thread_id);
     assert_eq!("goal", event.execution_kind);
     assert!(!event.execution_id.is_empty());
     assert_eq!("complete", event.terminal_status);
-    assert_eq!("", event.final_text);
+    assert_eq!("Terminal goal final evidence", event.final_text);
+    assert_ne!(terminal_turn_id, event.execution_id);
 
     let webhook_outbox = claim_webhook_outbox(codex_home.path()).await?;
     assert_eq!(1, webhook_outbox.len());
@@ -334,6 +372,7 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
     assert_eq!(GOAL_WORK_ID, webhook_event.event_id);
     assert_eq!("goal", webhook_event.execution_kind);
     assert_eq!("complete", webhook_event.terminal_status);
+    assert_eq!("Terminal goal final evidence", webhook_event.final_text);
     assert_eq!(
         callback_metadata(),
         serde_json::from_str::<serde_json::Value>(&webhook_event.callback_metadata_json)?
@@ -344,6 +383,8 @@ async fn goal_callback_waits_for_persisted_terminal_goal_state() -> Result<()> {
         duplicate_outbox.is_empty(),
         "the terminal goal transition must emit exactly once"
     );
+    assert_eq!(3, server.requests().await.len());
+    server.shutdown().await;
     Ok(())
 }
 
@@ -423,7 +464,16 @@ async fn exact_goal_set_retry_does_not_repeat_goal_effects() -> Result<()> {
     .await??;
     let complete_goal = to_response::<ThreadGoalSetResponse>(complete_response)?;
     assert_eq!(ThreadGoalStatus::Complete, complete_goal.goal.status);
-    assert_eq!(1, claim_outbox(codex_home.path()).await?.len());
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string()).await?;
+    assert_eq!(
+        1,
+        state_db.completions().outbox_stats().await?.pending_count
+    );
+    assert!(
+        claim_outbox(codex_home.path()).await?.is_empty(),
+        "a goal completed outside an agent turn must retain its final-capture grace period"
+    );
     Ok(())
 }
 

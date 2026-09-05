@@ -133,6 +133,7 @@ mod tests {
                     multi_agent_version: None,
                     history_mode: ThreadHistoryMode::Legacy,
                     initial_window_id: uuid::Uuid::now_v7().to_string(),
+                    pitchai_principal: None,
                     metadata: ThreadPersistenceMetadata {
                         cwd: None,
                         model_provider: "test-provider".to_string(),
@@ -442,6 +443,7 @@ impl InMemoryThreadStore {
             memory_mode: matches!(params.metadata.memory_mode, ThreadMemoryMode::Disabled)
                 .then_some("disabled".to_string()),
             history_mode: params.history_mode,
+            pitchai_principal: params.pitchai_principal.clone(),
             multi_agent_version: params.multi_agent_version,
             context_window: Some(SessionContextWindow::new(params.initial_window_id.clone())),
             ..SessionMeta::default()

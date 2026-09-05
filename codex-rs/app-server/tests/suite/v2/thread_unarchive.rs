@@ -222,6 +222,7 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
             multi_agent_version: None,
             history_mode: Default::default(),
             initial_window_id: Uuid::now_v7().to_string(),
+            pitchai_principal: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),

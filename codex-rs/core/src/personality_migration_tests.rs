@@ -62,6 +62,7 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
             selected_capability_roots: Vec::new(),
             memory_mode: None,
             history_mode: Default::default(),
+            pitchai_principal: None,
             multi_agent_version: None,
             context_window: None,
         },

@@ -27,6 +27,8 @@ struct GoalAccountingInner {
     consecutive_turn_error_goal_id: Option<String>,
     consecutive_turn_errors: u32,
     blocked_attempt_goal_id: Option<String>,
+    blocked_condition_fingerprint: Option<String>,
+    blocked_evidence_fingerprint: Option<String>,
     consecutive_blocked_turns: u32,
 }
 
@@ -73,10 +75,25 @@ pub(crate) struct RecordedTokenDelta {
     pub(crate) thread_unflushed_delta: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlockedGoalDecision {
-    Continue { blocked_turns: u32 },
+    Continue {
+        blocked_turns: u32,
+        audit_restarted: bool,
+    },
+    AlreadyRecorded {
+        blocked_turns: u32,
+    },
+    StaleEvidence {
+        blocked_turns: u32,
+    },
     Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedGoalReceipt {
+    pub(crate) condition_fingerprint: String,
+    pub(crate) evidence_fingerprint: String,
 }
 
 impl GoalAccountingState {
@@ -257,6 +274,7 @@ impl GoalAccountingState {
         &self,
         turn_id: &str,
         goal_id: &str,
+        receipt: &BlockedGoalReceipt,
     ) -> Option<BlockedGoalDecision> {
         let mut inner = self.inner();
         if inner.current_turn_id.as_deref() != Some(turn_id) {
@@ -268,19 +286,44 @@ impl GoalAccountingState {
         }
         if inner.blocked_attempt_goal_id.as_deref() != Some(goal_id) {
             inner.blocked_attempt_goal_id = Some(goal_id.to_string());
+            inner.blocked_condition_fingerprint = None;
+            inner.blocked_evidence_fingerprint = None;
             inner.consecutive_blocked_turns = 0;
         }
         let already_recorded = inner.turns.get(turn_id)?.blocked_attempted;
-        if !already_recorded {
-            inner.turns.get_mut(turn_id)?.blocked_attempted = true;
-            inner.consecutive_blocked_turns = inner.consecutive_blocked_turns.saturating_add(1);
+        if already_recorded {
+            return Some(BlockedGoalDecision::AlreadyRecorded {
+                blocked_turns: inner.consecutive_blocked_turns,
+            });
         }
+
+        let previous_condition = inner.blocked_condition_fingerprint.as_deref();
+        let audit_restarted = previous_condition
+            .is_some_and(|fingerprint| fingerprint != receipt.condition_fingerprint);
+        if previous_condition != Some(receipt.condition_fingerprint.as_str()) {
+            inner.blocked_condition_fingerprint = Some(receipt.condition_fingerprint.clone());
+            inner.blocked_evidence_fingerprint = None;
+            inner.consecutive_blocked_turns = 0;
+        }
+
+        if inner.blocked_evidence_fingerprint.as_deref()
+            == Some(receipt.evidence_fingerprint.as_str())
+        {
+            return Some(BlockedGoalDecision::StaleEvidence {
+                blocked_turns: inner.consecutive_blocked_turns,
+            });
+        }
+
+        inner.turns.get_mut(turn_id)?.blocked_attempted = true;
+        inner.blocked_evidence_fingerprint = Some(receipt.evidence_fingerprint.clone());
+        inner.consecutive_blocked_turns = inner.consecutive_blocked_turns.saturating_add(1);
         Some(
             if inner.consecutive_blocked_turns >= REQUIRED_CONSECUTIVE_BLOCKED_TURNS {
                 BlockedGoalDecision::Allow
             } else {
                 BlockedGoalDecision::Continue {
                     blocked_turns: inner.consecutive_blocked_turns,
+                    audit_restarted,
                 }
             },
         )
@@ -488,6 +531,8 @@ impl Default for GoalAccountingInner {
             consecutive_turn_error_goal_id: None,
             consecutive_turn_errors: 0,
             blocked_attempt_goal_id: None,
+            blocked_condition_fingerprint: None,
+            blocked_evidence_fingerprint: None,
             consecutive_blocked_turns: 0,
         }
     }
@@ -496,6 +541,8 @@ impl Default for GoalAccountingInner {
 impl GoalAccountingInner {
     fn reset_blocked_goal_audit(&mut self) {
         self.blocked_attempt_goal_id = None;
+        self.blocked_condition_fingerprint = None;
+        self.blocked_evidence_fingerprint = None;
         self.consecutive_blocked_turns = 0;
     }
 

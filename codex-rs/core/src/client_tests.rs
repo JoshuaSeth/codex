@@ -270,6 +270,39 @@ fn test_model_info() -> ModelInfo {
     .expect("deserialize test model info")
 }
 
+#[test]
+fn gateway_trusts_only_exact_catalog_personality_variants() {
+    let mut model = test_model_info();
+    model.model_messages = Some(
+        serde_json::from_value(json!({
+            "instructions_template": "Catalog {{ personality }}",
+            "instructions_variables": {
+                "personality_default": "default",
+                "personality_friendly": "friendly",
+                "personality_pragmatic": "pragmatic"
+            }
+        }))
+        .expect("catalog message fixture"),
+    );
+    for personality in [
+        None,
+        Some(codex_protocol::config_types::Personality::None),
+        Some(codex_protocol::config_types::Personality::Friendly),
+        Some(codex_protocol::config_types::Personality::Pragmatic),
+    ] {
+        let instructions = model.get_model_instructions(personality);
+        assert_eq!(
+            super::trusted_gateway_catalog_instructions(&model, &instructions),
+            instructions
+        );
+    }
+    let custom = "Catalog friendly with a private customer address";
+    assert_ne!(
+        super::trusted_gateway_catalog_instructions(&model, custom),
+        custom
+    );
+}
+
 fn test_session_telemetry() -> SessionTelemetry {
     SessionTelemetry::new(
         ThreadId::new(),
@@ -586,6 +619,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*gateway_session*/ None,
     );
 
     let observed = stream
@@ -637,6 +671,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
+        /*gateway_session*/ None,
     );
 
     while stream.next().await.is_some() {}
@@ -713,6 +748,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         test_session_telemetry(),
         attempt,
         test_model_provider(),
+        /*gateway_session*/ None,
     );
 
     // Fill the mapper channel with non-terminal events, then yield one output

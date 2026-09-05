@@ -127,3 +127,30 @@ fn escape_xml_text(input: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::ThreadGoalStatus;
+
+    #[test]
+    fn continuation_prompt_requires_internal_self_unblocking_and_preserves_outbound_safety() {
+        let prompt = continuation_prompt(&ThreadGoal {
+            thread_id: ThreadId::new(),
+            objective: "finish the operational repair".to_string(),
+            status: ThreadGoalStatus::Active,
+            token_budget: None,
+            tokens_used: 10,
+            time_used_seconds: 20,
+            created_at: 1,
+            updated_at: 2,
+        });
+
+        assert!(prompt.contains("SeaweedFS-backed Git LFS waiting on a backup lock"));
+        assert!(prompt.contains("exact-SHA local-equivalent proof where already authorized"));
+        assert!(prompt.contains("passive rechecks do not qualify"));
+        assert!(prompt.contains("Self-unblocking does not authorize outgoing client"));
+        assert!(prompt.contains("WhatsApp, email, Telegram"));
+    }
+}

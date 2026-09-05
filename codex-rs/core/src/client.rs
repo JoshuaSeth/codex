@@ -112,6 +112,8 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::feedback_tags;
 use crate::privacy::PrivacyFilter;
+use crate::privacy_gateway::GatewayRequestSession;
+use crate::privacy_gateway::PrivacyGateway;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -175,6 +177,22 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
     }
 }
 
+/// Only model-catalog text can bypass gateway transformation, never custom instructions.
+fn trusted_gateway_catalog_instructions(model_info: &ModelInfo, instructions: &str) -> String {
+    use codex_protocol::config_types::Personality;
+
+    [
+        None,
+        Some(Personality::None),
+        Some(Personality::Friendly),
+        Some(Personality::Pragmatic),
+    ]
+    .into_iter()
+    .map(|personality| model_info.get_model_instructions(personality))
+    .find(|catalog| catalog == instructions)
+    .unwrap_or_else(|| model_info.get_model_instructions(/*personality*/ None))
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -207,6 +225,7 @@ struct ModelClientState {
     include_attestation: bool,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     privacy_filter: Arc<StdMutex<PrivacyFilter>>,
+    privacy_gateway: PrivacyGateway,
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
@@ -421,6 +440,7 @@ impl ModelClient {
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         let include_attestation = model_provider.supports_attestation();
+        let privacy_gateway = PrivacyGateway::from_env(thread_id.to_string());
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
@@ -436,6 +456,7 @@ impl ModelClient {
                 include_attestation,
                 attestation_provider,
                 privacy_filter: Arc::new(StdMutex::new(PrivacyFilter::from_env())),
+                privacy_gateway,
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
@@ -580,6 +601,31 @@ impl ModelClient {
             prompt_cache_key: prompt_cache_key.as_deref(),
             text,
         };
+        let prepared_gateway_request = if self.state.privacy_gateway.enabled() {
+            let body = serde_json::to_value(&payload).map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "failed to encode compact request before privacy gateway: {error}"
+                ))
+            })?;
+            let trusted_catalog_instructions =
+                trusted_gateway_catalog_instructions(model_info, &prompt.base_instructions.text);
+            Some(
+                self.state
+                    .privacy_gateway
+                    .prepare_json_body_with_trusted_instructions(
+                        body,
+                        &trusted_catalog_instructions,
+                    )
+                    .await
+                    .map_err(|error| {
+                        CodexErr::InvalidRequest(format!(
+                            "privacy gateway blocked the outbound OpenAI compact request: {error}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let mut extra_headers = ApiHeaderMap::new();
         if let Ok(header_value) = HeaderValue::from_str(&responses_metadata.installation_id) {
@@ -606,16 +652,49 @@ impl ModelClient {
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
                 .with_telemetry(Some(request_telemetry));
-        let trace_attempt = compaction_trace.start_attempt(&payload);
-        let result = client
-            .compact_input(
-                &payload,
-                extra_headers,
-                compact_request_timeout,
-                turn_state.as_deref(),
-            )
-            .await
-            .map_err(|error| self.state.provider.map_api_error(error));
+        let trace_attempt = match &prepared_gateway_request {
+            Some(prepared) => compaction_trace.start_attempt(&prepared.body),
+            None => compaction_trace.start_attempt(&payload),
+        };
+        let (mut result, mut gateway_session) = match prepared_gateway_request {
+            Some(prepared) => (
+                client
+                    .compact(
+                        prepared.body,
+                        extra_headers,
+                        compact_request_timeout,
+                        turn_state.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| self.state.provider.map_api_error(error)),
+                prepared.session,
+            ),
+            None => (
+                client
+                    .compact_input(
+                        &payload,
+                        extra_headers,
+                        compact_request_timeout,
+                        turn_state.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| self.state.provider.map_api_error(error)),
+                None,
+            ),
+        };
+        if let Some(session) = &mut gateway_session {
+            match &mut result {
+                Ok(items) => {
+                    if let Err(error) = session.restore_response_items_and_purge(items).await {
+                        session.abort().await;
+                        result = Err(CodexErr::InvalidRequest(format!(
+                            "privacy gateway blocked the inbound OpenAI compact response: {error}"
+                        )));
+                    }
+                }
+                Err(_) => session.abort().await,
+            }
+        }
         trace_attempt.record_result(result.as_deref());
         result
     }
@@ -627,6 +706,7 @@ impl ModelClient {
         mut extra_headers: ApiHeaderMap,
         api_provider_override: Option<ApiProvider>,
     ) -> Result<RealtimeWebrtcCallStart> {
+        self.ensure_realtime_privacy_edge_supported()?;
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
         let client_setup = self.current_client_setup().await?;
@@ -650,6 +730,13 @@ impl ModelClient {
         })
     }
 
+    pub(crate) fn ensure_realtime_privacy_edge_supported(&self) -> Result<()> {
+        self.state
+            .privacy_gateway
+            .reject_unprotected_endpoint("the realtime voice endpoint")
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))
+    }
+
     /// Builds memory summaries for each provided normalized raw memory.
     ///
     /// This is a unary call (no streaming) to `/v1/memories/trace_summarize`.
@@ -666,6 +753,10 @@ impl ModelClient {
         if raw_memories.is_empty() {
             return Ok(Vec::new());
         }
+        self.state
+            .privacy_gateway
+            .reject_unprotected_endpoint("the memory summarization endpoint")
+            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
 
         let client_setup = self.current_client_setup().await?;
         let transport = ReqwestTransport::new(build_reqwest_client());
@@ -914,7 +1005,8 @@ impl ModelClient {
     ///
     /// WebSocket use is controlled by provider capability and session-scoped fallback state.
     pub fn responses_websocket_enabled(&self) -> bool {
-        if !self.state.provider.info().supports_websockets
+        if self.state.privacy_gateway.enabled()
+            || !self.state.provider.info().supports_websockets
             || self.state.disable_websockets.load(Ordering::Relaxed)
         {
             return false;
@@ -1417,16 +1509,46 @@ impl ModelClientSession {
                 .prepare_response_items_for_request(&mut request.input, store);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
+            let prepared_gateway_request = if self.client.state.privacy_gateway.enabled() {
+                let trusted_catalog_instructions = trusted_gateway_catalog_instructions(
+                    model_info,
+                    &prompt.base_instructions.text,
+                );
+                Some(
+                    self.client
+                        .state
+                        .privacy_gateway
+                        .prepare_responses_request(&request, &trusted_catalog_instructions)
+                        .await
+                        .map_err(|error| {
+                            CodexErr::InvalidRequest(format!(
+                                "privacy gateway blocked the outbound OpenAI request: {error}"
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
-            inference_trace_attempt.record_started(&request);
+            if let Some(prepared) = &prepared_gateway_request {
+                inference_trace_attempt.record_started(&prepared.body);
+            } else {
+                inference_trace_attempt.record_started(&request);
+            }
             let client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-            let stream_result = client.stream_request(request, options).await;
+            let (stream_result, mut gateway_session) = match prepared_gateway_request {
+                Some(prepared) => {
+                    let result = client.stream_value_request(prepared.body, options).await;
+                    (result, prepared.session)
+                }
+                None => (client.stream_request(request, options).await, None),
+            };
 
             match stream_result {
                 Ok(stream) => {
@@ -1436,12 +1558,16 @@ impl ModelClientSession {
                         request_session_telemetry,
                         inference_trace_attempt,
                         Arc::clone(&self.client.state.provider),
+                        gateway_session,
                     );
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
                 )) if status == StatusCode::UNAUTHORIZED => {
+                    if let Some(session) = &mut gateway_session {
+                        session.abort().await;
+                    }
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
                     inference_trace_attempt.record_failed(
@@ -1461,6 +1587,9 @@ impl ModelClientSession {
                     continue;
                 }
                 Err(err) => {
+                    if let Some(session) = &mut gateway_session {
+                        session.abort().await;
+                    }
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
                     let err = self.client.state.provider.map_api_error(err);
@@ -1639,6 +1768,7 @@ impl ModelClientSession {
                 request_session_telemetry,
                 inference_trace_attempt,
                 Arc::clone(&self.client.state.provider),
+                None,
             );
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -1889,6 +2019,7 @@ fn map_response_stream(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    gateway_session: Option<GatewayRequestSession>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
     let codex_api::ResponseStream {
         rx_event,
@@ -1905,6 +2036,7 @@ fn map_response_stream(
         session_telemetry,
         inference_trace_attempt,
         provider,
+        gateway_session,
     )
 }
 
@@ -1915,6 +2047,7 @@ fn map_response_events<S>(
     session_telemetry: SessionTelemetry,
     inference_trace_attempt: InferenceTraceAttempt,
     provider: SharedModelProvider,
+    mut gateway_session: Option<GatewayRequestSession>,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1941,6 +2074,9 @@ where
         loop {
             let event = tokio::select! {
                 _ = consumer_dropped.cancelled() => {
+                    if let Some(session) = &mut gateway_session {
+                        session.abort().await;
+                    }
                     inference_trace_attempt.record_cancelled(
                         STREAM_DROPPED_REASON,
                         upstream_request_id,
@@ -1953,136 +2089,178 @@ where
             let Some(event) = event else {
                 break;
             };
-            let event = event.map(|mut event| {
-                let mut privacy_filter = privacy_filter
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                privacy_filter.de_anonymize_event(&mut event);
-                event
-            });
-            match event {
-                Ok(ResponseEvent::OutputItemDone(item)) => {
-                    let pending_delta = privacy_filter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take_pending_de_anonymized_delta();
-                    if let Some(delta) = pending_delta
-                        && tx_event
-                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
-                            .await
-                            .is_err()
-                    {
-                        inference_trace_attempt.record_cancelled(
-                            STREAM_DROPPED_REASON,
-                            upstream_request_id,
-                            &items_added,
-                        );
-                        return;
-                    }
-                    items_added.push(item.clone());
-                    if tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
-                        .await
-                        .is_err()
-                    {
-                        inference_trace_attempt.record_cancelled(
-                            STREAM_DROPPED_REASON,
-                            upstream_request_id,
-                            &items_added,
-                        );
-                        return;
-                    }
-                }
-                Ok(ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                    end_turn,
-                }) => {
-                    let pending_delta = privacy_filter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take_pending_de_anonymized_delta();
-                    if let Some(delta) = pending_delta
-                        && tx_event
-                            .send(Ok(ResponseEvent::OutputTextDelta(delta)))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                    feedback_tags!(last_model_response_id = &response_id);
-                    if let Some(usage) = &token_usage {
-                        session_telemetry.sse_event_completed(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            Some(usage.cached_input_tokens),
-                            Some(usage.reasoning_output_tokens),
-                            usage.total_tokens,
-                            ttft_ms,
-                        );
-                    }
-                    inference_trace_attempt.record_completed(
-                        &response_id,
-                        upstream_request_id,
-                        &token_usage,
-                        &items_added,
-                    );
-                    if let Some(sender) = tx_last_response.take() {
-                        let _ = sender.send(LastResponse {
-                            response_id: response_id.clone(),
-                            items_added: std::mem::take(&mut items_added),
-                        });
-                    }
-                    if tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id,
-                            token_usage,
-                            end_turn,
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Ok(event) => {
-                    if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
-                        ttft_ms = Some(
-                            i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
-                        );
-                    }
-                    if tx_event.send(Ok(event)).await.is_err() {
-                        inference_trace_attempt.record_cancelled(
-                            STREAM_DROPPED_REASON,
-                            upstream_request_id,
-                            &items_added,
-                        );
-                        return;
-                    }
-                }
+            let mut event = match event {
+                Ok(event) => event,
                 Err(err) => {
                     let response_debug_context =
                         extract_response_debug_context_from_api_error(&err);
-                    let upstream_request_id =
+                    let request_id =
                         upstream_request_id.or(response_debug_context.request_id.as_deref());
-                    if let Some(upstream_request_id) = upstream_request_id {
-                        feedback_tags!(last_model_request_id = upstream_request_id);
+                    if let Some(request_id) = request_id {
+                        feedback_tags!(last_model_request_id = request_id);
                     }
                     let mapped = provider.map_api_error(err);
-                    inference_trace_attempt.record_failed(
-                        &mapped,
-                        upstream_request_id,
-                        &items_added,
-                    );
+                    inference_trace_attempt.record_failed(&mapped, request_id, &items_added);
                     if !logged_error {
                         session_telemetry.see_event_completed_failed(&mapped);
                         logged_error = true;
                     }
-                    if tx_event.send(Err(mapped)).await.is_err() {
+                    let had_gateway_session = gateway_session.is_some();
+                    if let Some(session) = &mut gateway_session {
+                        session.abort().await;
+                    }
+                    if tx_event.send(Err(mapped)).await.is_err() || had_gateway_session {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            {
+                let mut privacy_filter = privacy_filter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                privacy_filter.de_anonymize_event(&mut event);
+            }
+            let events = if let Some(session) = &mut gateway_session {
+                match session.transform_event(event).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        session.abort().await;
+                        let mapped = CodexErr::InvalidRequest(format!(
+                            "privacy gateway blocked the inbound OpenAI response: {error}"
+                        ));
+                        inference_trace_attempt.record_failed(
+                            &mapped,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        session_telemetry.see_event_completed_failed(&mapped);
+                        let _ = tx_event.send(Err(mapped)).await;
                         return;
                     }
                 }
+            } else {
+                vec![event]
+            };
+
+            for event in events {
+                match event {
+                    ResponseEvent::OutputItemDone(item) => {
+                        let pending_delta = privacy_filter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take_pending_de_anonymized_delta();
+                        if let Some(delta) = pending_delta
+                            && tx_event
+                                .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                                .await
+                                .is_err()
+                        {
+                            if let Some(session) = &mut gateway_session {
+                                session.abort().await;
+                            }
+                            inference_trace_attempt.record_cancelled(
+                                STREAM_DROPPED_REASON,
+                                upstream_request_id,
+                                &items_added,
+                            );
+                            return;
+                        }
+                        items_added.push(item.clone());
+                        if tx_event
+                            .send(Ok(ResponseEvent::OutputItemDone(item)))
+                            .await
+                            .is_err()
+                        {
+                            if let Some(session) = &mut gateway_session {
+                                session.abort().await;
+                            }
+                            inference_trace_attempt.record_cancelled(
+                                STREAM_DROPPED_REASON,
+                                upstream_request_id,
+                                &items_added,
+                            );
+                            return;
+                        }
+                    }
+                    ResponseEvent::Completed {
+                        response_id,
+                        token_usage,
+                        end_turn,
+                    } => {
+                        let pending_delta = privacy_filter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take_pending_de_anonymized_delta();
+                        if let Some(delta) = pending_delta
+                            && tx_event
+                                .send(Ok(ResponseEvent::OutputTextDelta(delta)))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        feedback_tags!(last_model_response_id = &response_id);
+                        if let Some(usage) = &token_usage {
+                            session_telemetry.sse_event_completed(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                Some(usage.cached_input_tokens),
+                                Some(usage.reasoning_output_tokens),
+                                usage.total_tokens,
+                                ttft_ms,
+                            );
+                        }
+                        inference_trace_attempt.record_completed(
+                            &response_id,
+                            upstream_request_id,
+                            &token_usage,
+                            &items_added,
+                        );
+                        if let Some(sender) = tx_last_response.take() {
+                            let _ = sender.send(LastResponse {
+                                response_id: response_id.clone(),
+                                items_added: std::mem::take(&mut items_added),
+                            });
+                        }
+                        if tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id,
+                                token_usage,
+                                end_turn,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    event => {
+                        if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none()
+                        {
+                            ttft_ms = Some(
+                                i64::try_from(request_start.elapsed().as_millis())
+                                    .unwrap_or(i64::MAX),
+                            );
+                        }
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            if let Some(session) = &mut gateway_session {
+                                session.abort().await;
+                            }
+                            inference_trace_attempt.record_cancelled(
+                                STREAM_DROPPED_REASON,
+                                upstream_request_id,
+                                &items_added,
+                            );
+                            return;
+                        }
+                    }
+                }
             }
+        }
+        if let Some(session) = &mut gateway_session {
+            session.abort().await;
         }
         inference_trace_attempt.record_failed(
             "stream closed before response.completed",

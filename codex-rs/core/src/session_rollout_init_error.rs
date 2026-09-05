@@ -5,6 +5,10 @@ use crate::rollout::SESSIONS_SUBDIR;
 use codex_protocol::error::CodexErr;
 use codex_thread_store::ThreadStoreError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct InvalidSessionIdentityError(pub(crate) String);
+
 pub(crate) fn map_session_init_error(err: &anyhow::Error, codex_home: &Path) -> CodexErr {
     if let Some(ThreadStoreError::Unsupported { operation }) = err
         .chain()
@@ -13,6 +17,12 @@ pub(crate) fn map_session_init_error(err: &anyhow::Error, codex_home: &Path) -> 
         return CodexErr::UnsupportedOperation(format!("{operation} is not supported yet"));
     }
 
+    if let Some(identity_error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<InvalidSessionIdentityError>())
+    {
+        return CodexErr::InvalidRequest(identity_error.to_string());
+    }
     if let Some(mapped) = err
         .chain()
         .filter_map(|cause| cause.downcast_ref::<std::io::Error>())

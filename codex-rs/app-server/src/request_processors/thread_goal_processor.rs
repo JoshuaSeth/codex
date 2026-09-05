@@ -108,6 +108,9 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            require_bound_pitchai_principal(thread.as_ref()).await?;
+        }
         let completion_callback_metadata_json = canonical_completion_callback_metadata(
             params.completion_work_id.as_deref(),
             params.completion_callback_metadata.as_ref(),

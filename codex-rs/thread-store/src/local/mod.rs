@@ -1291,6 +1291,7 @@ mod tests {
             multi_agent_version: None,
             history_mode: ThreadHistoryMode::Legacy,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
+            pitchai_principal: None,
             metadata: thread_metadata(),
         }
     }

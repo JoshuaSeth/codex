@@ -12,6 +12,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadForkHistoryMode;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadItem;
@@ -303,63 +304,66 @@ async fn thread_fork_at_last_turn_id_keeps_only_terminal_prefix() -> Result<()> 
     }
 
     let original_contents = std::fs::read_to_string(source_path.as_path())?;
-    let fork_id = mcp
-        .send_thread_fork_request(ThreadForkParams {
-            thread_id: source_thread_id.clone(),
-            last_turn_id: Some(turn_ids[1].clone()),
-            ..Default::default()
-        })
-        .await?;
-    let fork_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
-    )
-    .await??;
-    let ThreadForkResponse {
-        thread: forked_thread,
-        ..
-    } = to_response::<ThreadForkResponse>(fork_resp)?;
-
-    assert_eq!(
-        forked_thread
-            .turns
-            .iter()
-            .map(|turn| turn.id.clone())
-            .collect::<Vec<_>>(),
-        turn_ids[..2]
-    );
-    assert!(
-        forked_thread
-            .turns
-            .iter()
-            .all(|turn| turn.status == TurnStatus::Completed)
-    );
-    assert_eq!(forked_thread.forked_from_id, Some(source_thread_id));
-    assert_eq!(forked_thread.preview, "first");
-    assert_eq!(
-        std::fs::read_to_string(source_path.as_path())?,
-        original_contents,
-        "forking at a turn must not mutate the source rollout"
-    );
-
-    let forked_path = forked_thread.path.clone().expect("forked thread path");
-    let forked_contents = std::fs::read_to_string(forked_path.as_path())?;
-    assert!(forked_contents.contains(turn_ids[1].as_str()));
-    assert!(!forked_contents.contains(turn_ids[2].as_str()));
-
-    let started = loop {
-        let notification = timeout(
+    for history_mode in [ThreadForkHistoryMode::Full, ThreadForkHistoryMode::Compact] {
+        let fork_id = mcp
+            .send_thread_fork_request(ThreadForkParams {
+                thread_id: source_thread_id.clone(),
+                last_turn_id: Some(turn_ids[1].clone()),
+                history_mode,
+                ..Default::default()
+            })
+            .await?;
+        let fork_resp: JSONRPCResponse = timeout(
             DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("thread/started"),
+            mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
         )
         .await??;
-        let started: ThreadStartedNotification =
-            serde_json::from_value(notification.params.expect("params must be present"))?;
-        if started.thread.id == forked_thread.id {
-            break started;
-        }
-    };
-    assert!(started.thread.turns.is_empty());
+        let ThreadForkResponse {
+            thread: forked_thread,
+            ..
+        } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+        assert_eq!(
+            forked_thread
+                .turns
+                .iter()
+                .map(|turn| turn.id.clone())
+                .collect::<Vec<_>>(),
+            turn_ids[..2]
+        );
+        assert!(
+            forked_thread
+                .turns
+                .iter()
+                .all(|turn| turn.status == TurnStatus::Completed)
+        );
+        assert_eq!(forked_thread.forked_from_id, Some(source_thread_id.clone()));
+        assert_eq!(forked_thread.preview, "first");
+        assert_eq!(
+            std::fs::read_to_string(source_path.as_path())?,
+            original_contents,
+            "forking at a turn must not mutate the source rollout"
+        );
+
+        let forked_path = forked_thread.path.clone().expect("forked thread path");
+        let forked_contents = std::fs::read_to_string(forked_path.as_path())?;
+        assert!(forked_contents.contains(turn_ids[1].as_str()));
+        assert!(!forked_contents.contains(turn_ids[2].as_str()));
+
+        let started = loop {
+            let notification = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_notification_message("thread/started"),
+            )
+            .await??;
+            let started: ThreadStartedNotification =
+                serde_json::from_value(notification.params.expect("params must be present"))?;
+            if started.thread.id == forked_thread.id {
+                break started;
+            }
+        };
+        assert!(started.thread.turns.is_empty());
+    }
 
     Ok(())
 }
@@ -455,6 +459,50 @@ async fn thread_fork_can_load_source_by_path() -> Result<()> {
     assert_eq!(thread.preview, preview);
     assert_eq!(thread.model_provider, "mock_provider");
     assert_eq!(thread.turns.len(), 1, "expected copied fork history");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = TestAppServer::new_with_env(
+        codex_home.path(),
+        &[("PITCHAI_SKILL_CATALOG_RELEASE", None)],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            history_mode: ThreadForkHistoryMode::Compact,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
+    assert_eq!(thread.preview, "Saved user message");
+    assert!(thread.turns.is_empty());
 
     Ok(())
 }
@@ -656,6 +704,10 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
             .contains("no rollout found for thread id"),
         "unexpected fork error: {}",
         fork_err.error.message
+    );
+    assert_eq!(
+        fork_err.error.data,
+        Some(serde_json::json!({"effect": "notStarted"}))
     );
 
     Ok(())
