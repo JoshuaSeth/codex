@@ -838,6 +838,7 @@ async fn thread_fork_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
     assert_eq!(
         fork_err.error.data,
         Some(json!({
+            "effect": "notStarted",
             "reason": "cloudConfigBundle",
             "errorCode": "Auth",
             "action": "relogin",

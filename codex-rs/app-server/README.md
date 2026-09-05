@@ -52,6 +52,13 @@ Backpressure behavior:
 - When request ingress is saturated, new requests are rejected with a JSON-RPC error code `-32001` and message `"Server overloaded; retry later."`.
 - Clients should treat this as retryable and use exponential backoff with jitter.
 
+Errors rejected before an operation starts can include `error.data.effect` set to
+`"notStarted"`. This marker augments existing structured error details; clients
+must still honor fields such as `reason`, `action`, and `statusCode` (for example,
+a cloud configuration authentication failure requiring login). Non-object error
+data is retained as `error.data.detail` when this marker is added. Absence of the
+marker does not establish whether an operation started.
+
 ## Message Schema
 
 Currently, you can dump a TypeScript version of the schema using `codex app-server generate-ts`, or a JSON Schema bundle via `codex app-server generate-json-schema`. Each output is specific to the version of Codex you used to run the command, so the generated artifacts are guaranteed to match that version.

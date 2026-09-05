@@ -16,9 +16,19 @@ pub(crate) fn invalid_request_before_effect(message: impl Into<String>) -> JSONR
 }
 
 pub(crate) fn before_effect(mut error: JSONRPCErrorError) -> JSONRPCErrorError {
-    error.data = Some(serde_json::json!({"effect": "notStarted"}));
+    let mut data = match error.data.take() {
+        Some(serde_json::Value::Object(data)) => data,
+        None => serde_json::Map::new(),
+        Some(detail) => serde_json::Map::from_iter([("detail".to_owned(), detail)]),
+    };
+    data.insert("effect".to_owned(), "notStarted".into());
+    error.data = Some(serde_json::Value::Object(data));
     error
 }
+
+#[cfg(test)]
+#[path = "error_code_tests.rs"]
+mod tests;
 
 pub(crate) fn method_not_found(message: impl Into<String>) -> JSONRPCErrorError {
     error(METHOD_NOT_FOUND_ERROR_CODE, message)
