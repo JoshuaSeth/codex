@@ -557,6 +557,20 @@ impl GatewayRequestSession {
                     summary_index,
                 }])
             }
+            ResponseEvent::ReasoningSummaryDone {
+                item_id,
+                text,
+                summary_index,
+            } => {
+                // A completed section is atomic, not another streaming delta.
+                // Leave independently buffered output/reasoning chunks intact.
+                let text = self.restore_complete_text(&text).await?;
+                Ok(vec![ResponseEvent::ReasoningSummaryDone {
+                    item_id,
+                    text,
+                    summary_index,
+                }])
+            }
             ResponseEvent::ReasoningContentDelta {
                 delta,
                 content_index,
@@ -2254,6 +2268,91 @@ mod tests {
             completed.last(),
             Some(ResponseEvent::Completed { response_id, .. }) if response_id == "response-test"
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_summary_restores_without_consuming_output_buffer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        let mut session = prepared.session.unwrap();
+        let first = session
+            .transform_event(ResponseEvent::OutputTextDelta("Ava Wo".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.as_slice(), [ResponseEvent::OutputTextDelta(text)] if text.is_empty())
+        );
+        let summary = session
+            .transform_event(ResponseEvent::ReasoningSummaryDone {
+                item_id: "reasoning-1".to_string(),
+                text: "Ask Ava Woods; keep incomplete name Ava".to_string(),
+                summary_index: 2,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            summary.as_slice(),
+            [ResponseEvent::ReasoningSummaryDone { item_id, text, summary_index }]
+                if (item_id.as_str(), text.as_str(), *summary_index)
+                    == ("reasoning-1", "Ask Alice Stone; keep incomplete name Ava", 2)
+        ));
+        let output = session
+            .transform_event(ResponseEvent::OutputTextDelta("ods".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(output.as_slice(), [ResponseEvent::OutputTextDelta(text)] if text == "Alice Stone")
+        );
+        assert!(session.pending.is_empty());
+        session.abort().await;
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_summary_restoration_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        let mut session = prepared.session.unwrap();
+        let result = session
+            .transform_event(ResponseEvent::ReasoningSummaryDone {
+                item_id: "reasoning-1".to_string(),
+                text: "Ask Ava Woods".to_string(),
+                summary_index: 0,
+            })
+            .await;
+        assert!(result.is_err(), "must not emit an unrestored summary");
+        session.abort().await;
     }
 
     #[tokio::test]

@@ -101,6 +101,9 @@ impl PrivacyFilter {
             codex_api::ResponseEvent::OutputTextDelta(delta) => {
                 *delta = self.de_anonymize_stream_delta(delta);
             }
+            codex_api::ResponseEvent::ReasoningSummaryDone { text, .. } => {
+                *text = self.de_anonymize_text(text);
+            }
             codex_api::ResponseEvent::OutputItemDone(item)
             | codex_api::ResponseEvent::OutputItemAdded(item) => {
                 self.de_anonymize_response_item(item);
@@ -535,6 +538,41 @@ print(json.dumps({{"spans": spans}}))
             panic!("expected output text delta");
         };
         assert_eq!(delta, "Hello Jane Smith");
+    }
+
+    #[test]
+    fn completed_reasoning_summary_restores_without_consuming_output_buffer() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let fake = filter.anonymize_text("Jane Smith").unwrap();
+        let split = fake.find(' ').unwrap() + 1;
+        let mut output = codex_api::ResponseEvent::OutputTextDelta(fake[..split].to_string());
+        filter.de_anonymize_event(&mut output);
+        let mut summary = codex_api::ResponseEvent::ReasoningSummaryDone {
+            item_id: "reasoning-1".to_string(),
+            text: format!("Ask {fake}"),
+            summary_index: 2,
+        };
+        filter.de_anonymize_event(&mut summary);
+        let codex_api::ResponseEvent::ReasoningSummaryDone {
+            item_id,
+            text,
+            summary_index,
+        } = summary
+        else {
+            panic!("expected completed reasoning summary");
+        };
+        assert_eq!(
+            (item_id, text, summary_index),
+            ("reasoning-1".to_string(), "Ask Jane Smith".to_string(), 2)
+        );
+        let mut output = codex_api::ResponseEvent::OutputTextDelta(fake[split..].to_string());
+        filter.de_anonymize_event(&mut output);
+        assert!(
+            matches!(output, codex_api::ResponseEvent::OutputTextDelta(text) if text == "Jane Smith")
+        );
+        assert_eq!(filter.take_pending_de_anonymized_delta(), None);
     }
 
     #[test]
