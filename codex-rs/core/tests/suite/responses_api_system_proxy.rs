@@ -5,6 +5,7 @@ use anyhow::Result;
 use codex_login::CodexAuth;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
@@ -58,6 +59,13 @@ async fn responses_and_compaction_use_enabled_proxy_fallback() -> Result<()> {
             String::from_utf8_lossy(&output.stderr),
         );
 
+        assert_eq!(
+            (stream_mock.requests().len(), compact_mock.requests().len()),
+            (1, 1),
+            "child stdout:\n{}\nchild stderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
         let stream = stream_mock.single_request();
         let compact = compact_mock.single_request();
         assert_eq!(
@@ -102,12 +110,27 @@ async fn responses_and_compaction_use_enabled_proxy_fallback() -> Result<()> {
         });
     let test = builder.build_with_auto_env(&unused_origin).await?;
     assert!(test.config.respect_system_proxy);
-    test.submit_turn("hello through proxy").await?;
-    test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    for op in [
+        Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello through proxy".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        },
+        Op::Compact,
+    ] {
+        test.codex.submit(op).await?;
+        wait_for_event(&test.codex, |event| match event {
+            EventMsg::Error(error) => panic!("proxy session operation failed: {error:?}"),
+            EventMsg::TurnComplete(_) => true,
+            _ => false,
+        })
+        .await;
+    }
     assert!(unused_origin.received_requests().await.unwrap().is_empty());
     Ok(())
 }
