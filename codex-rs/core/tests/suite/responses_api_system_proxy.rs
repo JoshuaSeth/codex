@@ -15,7 +15,7 @@ use tokio::process::Command;
 
 const CHILD_ENV: &str = "CODEX_RESPONSES_PROXY_TEST_CHILD";
 const TEST_NAME: &str =
-    "responses_api_system_proxy::responses_and_compaction_use_enabled_proxy_fallback";
+    "suite::responses_api_system_proxy::responses_and_compaction_use_enabled_proxy_fallback";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_and_compaction_use_enabled_proxy_fallback() -> Result<()> {
