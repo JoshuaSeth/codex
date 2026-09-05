@@ -809,6 +809,26 @@ impl ThreadManager {
         self.state.threads.write().await.remove(thread_id)
     }
 
+    /// Removes a thread only when the manager still contains the expected in-memory handle.
+    ///
+    /// This prevents stale failure handling from removing a replacement thread that was resumed
+    /// under the same durable thread ID.
+    pub async fn remove_thread_if_current(
+        &self,
+        thread_id: &ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> Option<Arc<CodexThread>> {
+        let mut threads = self.state.threads.write().await;
+        let current_matches = threads
+            .get(thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected_thread));
+        if current_matches {
+            threads.remove(thread_id)
+        } else {
+            None
+        }
+    }
+
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
