@@ -1725,7 +1725,7 @@ mod tests {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
-    use wiremock::matchers::body_json_partial;
+    use wiremock::matchers::body_partial_json;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
@@ -2282,14 +2282,14 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
-            .and(body_json_partial(json!({"purge_after_restore": false})))
+            .and(body_partial_json(json!({"purge_after_restore": false})))
             .respond_with(restore_response)
             .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
-            .and(body_json_partial(json!({"purge_after_restore": true})))
+            .and(body_partial_json(json!({"purge_after_restore": true})))
             .respond_with(restore_response)
             .expect(1)
             .mount(&server)
@@ -2344,14 +2344,14 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
-            .and(body_json_partial(json!({"purge_after_restore": false})))
+            .and(body_partial_json(json!({"purge_after_restore": false})))
             .respond_with(ResponseTemplate::new(503))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
-            .and(body_json_partial(json!({"purge_after_restore": true})))
+            .and(body_partial_json(json!({"purge_after_restore": true})))
             .respond_with(restore_response)
             .expect(1)
             .mount(&server)
