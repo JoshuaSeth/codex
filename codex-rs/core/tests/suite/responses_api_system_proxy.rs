@@ -96,7 +96,9 @@ async fn responses_and_compaction_use_enabled_proxy_fallback() -> Result<()> {
         .with_pre_build_hook(|home| {
             std::fs::write(
                 home.join("config.toml"),
-                "[features]\nrespect_system_proxy = true\n",
+                // Exercise the unary compaction client introduced by C257;
+                // remote_compaction_v2 instead reuses the streaming endpoint.
+                "[features]\nrespect_system_proxy = true\nremote_compaction_v2 = false\n",
             )
             .expect("write proxy feature configuration");
         })
