@@ -2039,7 +2039,7 @@ mod tests {
                         {"type": "input_text", "text": root_agent_hint},
                         {"type": "input_text", "text": configured_concurrency_hint},
                         {"type": "input_text", "text": legacy_agent_hint},
-                        {"type": "input_text", "text": configured_agent_hint.clone()},
+                        {"type": "input_text", "text": configured_agent_hint},
                         {"type": "input_text", "text": "Custom policy for Alice Stone"}
                     ]
                 },
