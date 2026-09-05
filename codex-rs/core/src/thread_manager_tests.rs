@@ -114,9 +114,10 @@ async fn test_thread_manager(config: &Config, auth_manager: Arc<AuthManager>) ->
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
         /*analytics_events_client*/ None,
         thread_store_from_config(config, state_db.clone()),
-        state_db,
+        local_agent_graph_store_from_state_db(state_db.as_ref()),
         TEST_INSTALLATION_ID.to_string(),
         /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
     )
 }
 
@@ -139,6 +140,7 @@ async fn conditional_removal_evicts_dead_handle_without_deleting_persisted_histo
             ]),
             auth_manager.clone(),
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("create thread with persisted history");
@@ -179,6 +181,7 @@ async fn conditional_removal_evicts_dead_handle_without_deleting_persisted_histo
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("the unarchived rollout should remain resumable");
@@ -229,6 +232,7 @@ async fn conditional_removal_refuses_to_evict_live_replacement_handle() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
         )
         .await
         .expect("resume replacement handle");

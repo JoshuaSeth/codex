@@ -4,8 +4,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_state::CompletionBindingState;
 use codex_state::StateRuntime;
-use tempfile::TempDir;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
 #[test]
 fn internal_agent_died_preserves_registered_completion_binding_for_exact_retry() {
@@ -24,10 +24,9 @@ fn ordinary_rejected_submission_releases_registered_completion_binding() {
 #[tokio::test]
 async fn internal_agent_died_keeps_persisted_registered_completion_binding() {
     let temp_dir = TempDir::new().expect("temporary state directory should exist");
-    let runtime =
-        StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
-            .await
-            .expect("state runtime should initialize");
+    let runtime = StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("state runtime should initialize");
     let completions = runtime.completions();
     let completion_work_id = "19240c9f-7038-47bc-9b54-5d7e52854db2";
     let thread_id = ThreadId::from_string("20000000-0000-0000-0000-000000000007")
