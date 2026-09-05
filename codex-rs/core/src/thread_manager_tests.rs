@@ -55,6 +55,153 @@ fn assistant_msg(text: &str) -> ResponseItem {
     }
 }
 
+async fn test_thread_manager(config: &Config, auth_manager: Arc<AuthManager>) -> ThreadManager {
+    let state_db = init_state_db(config).await;
+    ThreadManager::new(
+        config,
+        auth_manager,
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(config, state_db.clone()),
+        state_db,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+    )
+}
+
+#[tokio::test]
+async fn conditional_removal_evicts_dead_handle_without_deleting_persisted_history() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = test_thread_manager(&config, auth_manager.clone()).await;
+    let source = manager
+        .resume_thread_with_history(
+            config.clone(),
+            InitialHistory::Forked(vec![
+                RolloutItem::ResponseItem(user_msg("persist this user message")),
+                RolloutItem::ResponseItem(assistant_msg("persist this assistant message")),
+            ]),
+            auth_manager.clone(),
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("create thread with persisted history");
+    source.thread.ensure_rollout_materialized().await;
+    source
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush persisted history");
+    let rollout_path = source
+        .thread
+        .rollout_path()
+        .expect("thread should have a rollout path");
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down the in-memory agent loop");
+
+    let removed = manager
+        .remove_thread_if_current(&source.thread_id, &source.thread)
+        .await
+        .expect("the proven-dead handle should be removed");
+
+    assert!(Arc::ptr_eq(&removed, &source.thread));
+    assert!(manager.get_thread(source.thread_id).await.is_err());
+    let history = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("persisted history should remain readable after handle eviction");
+    let history_json =
+        serde_json::to_string(&history.get_rollout_items()).expect("serialize rollout history");
+    assert!(history_json.contains("persist this user message"));
+    assert!(history_json.contains("persist this assistant message"));
+
+    let resumed = manager
+        .resume_thread_from_rollout(
+            config,
+            rollout_path,
+            auth_manager,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("the unarchived rollout should remain resumable");
+    assert_eq!(resumed.thread_id, source.thread_id);
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down resumed thread");
+}
+
+#[tokio::test]
+async fn conditional_removal_refuses_to_evict_live_replacement_handle() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = test_thread_manager(&config, auth_manager.clone()).await;
+    let stale = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start original thread");
+    stale.thread.ensure_rollout_materialized().await;
+    stale
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush original rollout");
+    let rollout_path = stale
+        .thread
+        .rollout_path()
+        .expect("original thread should have a rollout path");
+    stale
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down original handle");
+    manager
+        .remove_thread(&stale.thread_id)
+        .await
+        .expect("remove original handle before resume");
+    let replacement = manager
+        .resume_thread_from_rollout(
+            config,
+            rollout_path,
+            auth_manager,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("resume replacement handle");
+
+    let removed = manager
+        .remove_thread_if_current(&stale.thread_id, &stale.thread)
+        .await;
+
+    assert!(removed.is_none());
+    let current = manager
+        .get_thread(stale.thread_id)
+        .await
+        .expect("replacement should remain loaded");
+    assert!(Arc::ptr_eq(&current, &replacement.thread));
+    replacement
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down replacement thread");
+}
+
 fn contextual_user_interrupted_marker() -> ResponseItem {
     interrupted_turn_history_marker(InterruptedTurnHistoryMarker::ContextualUser)
         .expect("contextual-user interrupted marker should be enabled")

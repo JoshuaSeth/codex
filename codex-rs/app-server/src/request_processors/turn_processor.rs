@@ -6,6 +6,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::CompletionBindingState;
+use codex_state::CompletionStore;
 use codex_utils_path_uri::PathUri;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
@@ -14,6 +15,23 @@ const MAX_CALLBACK_TEXT_CHARS: usize = 65_536;
 const MAX_CALLBACK_FINAL_TEXT_CHARS: usize = 1_048_576;
 const MAX_CALLBACK_IDENTITY_CHARS: usize = 256;
 const MAX_CALLBACK_EXECUTION_ID_CHARS: usize = 128;
+
+fn preserve_completion_binding_after_submit_error(error: &CodexErr) -> bool {
+    matches!(error, CodexErr::InternalAgentDied)
+}
+
+async fn release_rejected_completion_binding(
+    completions: &CompletionStore,
+    completion_work_id: &str,
+    error: &CodexErr,
+) -> anyhow::Result<()> {
+    if preserve_completion_binding_after_submit_error(error) {
+        return Ok(());
+    }
+    completions
+        .release_registered_turn_binding(completion_work_id)
+        .await
+}
 
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
@@ -490,6 +508,55 @@ impl TurnRequestProcessor {
         })
     }
 
+    async fn evict_proven_dead_thread_handle(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        error: &CodexErr,
+    ) -> bool {
+        if !matches!(error, CodexErr::InternalAgentDied) {
+            return false;
+        }
+        let Ok(_thread_list_state_permit) = self.thread_list_state_permit.acquire().await else {
+            tracing::error!(
+                "failed to serialize proven-dead handle eviction for thread {thread_id}"
+            );
+            return false;
+        };
+        if self
+            .thread_manager
+            .remove_thread_if_current(&thread_id, expected_thread)
+            .await
+            .is_none()
+        {
+            warn!(
+                "refused to evict stale dead handle for thread {thread_id} because a replacement handle is current"
+            );
+            return false;
+        }
+
+        self.pending_thread_unloads.lock().await.remove(&thread_id);
+        self.outgoing
+            .cancel_requests_for_thread(thread_id, /*error*/ None)
+            .await;
+        self.thread_state_manager
+            .remove_thread_state(thread_id)
+            .await;
+        self.thread_watch_manager
+            .remove_thread(&thread_id.to_string())
+            .await;
+        self.thread_residency_manager.note_removed(thread_id).await;
+        self.outgoing
+            .send_server_notification(ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: thread_id.to_string(),
+            }))
+            .await;
+        info!(
+            "evicted proven-dead in-memory handle for thread {thread_id}; persisted rollout remains resumable"
+        );
+        true
+    }
+
     async fn submit_core_op(
         &self,
         request_id: &ConnectionRequestId,
@@ -661,9 +728,14 @@ impl TurnRequestProcessor {
                         trace: self.request_trace_context(&request_id).await,
                     };
                     if let Err(err) = thread.submit_user_input_with_id(submission).await {
-                        if let Err(release_err) = completions
-                            .release_registered_turn_binding(completion_work_id)
-                            .await
+                        self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                            .await;
+                        if let Err(release_err) = release_rejected_completion_binding(
+                            completions,
+                            completion_work_id,
+                            &err,
+                        )
+                        .await
                         {
                             tracing::error!(
                                 %completion_work_id,
@@ -690,18 +762,23 @@ impl TurnRequestProcessor {
             }
             turn_id
         } else {
-            thread
+            match thread
                 .submit_user_input_with_client_user_message_id(
                     turn_op,
                     self.request_trace_context(&request_id).await,
                     client_user_message_id,
                 )
                 .await
-                .map_err(|err| {
+            {
+                Ok(turn_id) => turn_id,
+                Err(err) => {
+                    self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                        .await;
                     let error = internal_error(format!("failed to start turn: {err}"));
                     self.track_error_response(&request_id, &error, /*error_type*/ None);
-                    error
-                })?
+                    return Err(error);
+                }
+            }
         };
 
         if turn_has_input {
@@ -1745,6 +1822,67 @@ impl TurnRequestProcessor {
             raw_events_enabled,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preserve_completion_binding_after_submit_error;
+    use super::release_rejected_completion_binding;
+    use codex_protocol::ThreadId;
+    use codex_protocol::error::CodexErr;
+    use codex_state::CompletionBindingState;
+    use codex_state::StateRuntime;
+    use tempfile::TempDir;
+
+    #[test]
+    fn internal_agent_died_preserves_registered_completion_binding_for_exact_retry() {
+        assert!(preserve_completion_binding_after_submit_error(
+            &CodexErr::InternalAgentDied
+        ));
+    }
+
+    #[test]
+    fn ordinary_rejected_submission_releases_registered_completion_binding() {
+        assert!(!preserve_completion_binding_after_submit_error(
+            &CodexErr::InvalidRequest("rejected".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_agent_died_keeps_persisted_registered_completion_binding() {
+        let temp_dir = TempDir::new().expect("temporary state directory should exist");
+        let runtime =
+            StateRuntime::init(temp_dir.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime should initialize");
+        let completions = runtime.completions();
+        let completion_work_id = "19240c9f-7038-47bc-9b54-5d7e52854db2";
+        let thread_id = ThreadId::from_string("20000000-0000-0000-0000-000000000007")
+            .expect("thread id should be valid");
+        completions
+            .bind_turn(completion_work_id, thread_id, completion_work_id)
+            .await
+            .expect("completion binding should persist");
+
+        release_rejected_completion_binding(
+            completions,
+            completion_work_id,
+            &CodexErr::InternalAgentDied,
+        )
+        .await
+        .expect("dead-handle recovery should preserve the binding");
+
+        assert_eq!(
+            completions
+                .existing_turn_binding(completion_work_id, thread_id)
+                .await
+                .expect("completion binding should remain readable"),
+            Some((
+                completion_work_id.to_string(),
+                CompletionBindingState::Registered
+            ))
+        );
     }
 }
 
