@@ -975,6 +975,8 @@ fn is_uuid_like(value: &str) -> bool {
 }
 
 fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
+    let configured_temp_prefix = std::env::temp_dir().join(".tmp");
+    let configured_temp_prefix = configured_temp_prefix.to_string_lossy();
     let mut search_start = 0;
     while let Some(relative_marker_index) = text[search_start..].find(marker) {
         let marker_index = search_start + relative_marker_index;
@@ -994,6 +996,14 @@ fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
             .or_else(|| prefix.rfind("/var/folders/"))
             .or_else(|| prefix.rfind("/private/tmp/.tmp"))
             .or_else(|| prefix.rfind("/tmp/.tmp"))
+            .or_else(|| {
+                prefix
+                    .rfind(configured_temp_prefix.as_ref())
+                    .filter(|start| {
+                        let suffix = &prefix[*start + configured_temp_prefix.len()..];
+                        !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_alphanumeric())
+                    })
+            })
             .or(windows_appdata_temp_start);
         if let Some(start_index) = start {
             text.replace_range(start_index..marker_index, "<CODEX_HOME>");
@@ -1002,6 +1012,30 @@ fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
             search_start = marker_index + marker.len();
         }
     }
+}
+
+#[test]
+fn normalize_string_rewrites_configured_temp_skill_paths() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let relative_skill = Path::new("skills")
+        .join(".system")
+        .join("imagegen")
+        .join("SKILL.md");
+    let skill = home.path().join(&relative_skill);
+    let text = format!(
+        "imagegen: preserve this description (file: {})",
+        skill.display()
+    );
+
+    // Only normalize the generated home prefix, not the skill identity or body.
+    assert_eq!(
+        normalize_string(&text),
+        format!(
+            "imagegen: preserve this description (file: {})",
+            Path::new("<CODEX_HOME>").join(relative_skill).display()
+        )
+    );
+    Ok(())
 }
 
 #[test]
