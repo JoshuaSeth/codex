@@ -75,10 +75,10 @@ use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_login::auth::ExternalAuth;
 use codex_login::auth::ExternalAuthRefreshContext;
 use codex_login::auth::ExternalAuthRefreshReason;
-use codex_login::auth::ExternalAuthTokens;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode as LoginAuthMode;
 use codex_protocol::protocol::SessionSource;
@@ -122,10 +122,7 @@ impl ExternalAuthRefreshBridge {
         }
     }
 
-    async fn refresh(
-        &self,
-        context: ExternalAuthRefreshContext,
-    ) -> std::io::Result<ExternalAuthTokens> {
+    async fn refresh(&self, context: ExternalAuthRefreshContext) -> std::io::Result<CodexAuth> {
         let params = ChatgptAuthTokensRefreshParams {
             reason: Self::map_reason(context.reason),
             previous_account_id: context.previous_account_id,
@@ -163,11 +160,11 @@ impl ExternalAuthRefreshBridge {
         let response: ChatgptAuthTokensRefreshResponse =
             serde_json::from_value(result).map_err(std::io::Error::other)?;
 
-        Ok(ExternalAuthTokens::chatgpt(
-            response.access_token,
-            response.chatgpt_account_id,
-            response.chatgpt_plan_type,
-        ))
+        CodexAuth::from_external_chatgpt_tokens(
+            response.access_token.as_str(),
+            response.chatgpt_account_id.as_str(),
+            response.chatgpt_plan_type.as_deref(),
+        )
     }
 }
 
@@ -179,7 +176,7 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
     fn refresh(
         &self,
         context: ExternalAuthRefreshContext,
-    ) -> codex_login::ExternalAuthFuture<'_, ExternalAuthTokens> {
+    ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
         Box::pin(ExternalAuthRefreshBridge::refresh(self, context))
     }
 }
