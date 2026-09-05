@@ -1725,6 +1725,7 @@ mod tests {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_json_partial;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
@@ -2281,8 +2282,16 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
+            .and(body_json_partial(json!({"purge_after_restore": false})))
             .respond_with(restore_response)
             .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_json_partial(json!({"purge_after_restore": true})))
+            .respond_with(restore_response)
+            .expect(1)
             .mount(&server)
             .await;
         let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
@@ -2321,6 +2330,7 @@ mod tests {
         );
         assert!(session.pending.is_empty());
         session.abort().await;
+        assert!(session.mappings.iter().all(|mapping| mapping.purged));
     }
 
     #[tokio::test]
@@ -2334,7 +2344,15 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/de-pseudonymize"))
+            .and(body_json_partial(json!({"purge_after_restore": false})))
             .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_json_partial(json!({"purge_after_restore": true})))
+            .respond_with(restore_response)
             .expect(1)
             .mount(&server)
             .await;
@@ -2353,6 +2371,7 @@ mod tests {
             .await;
         assert!(result.is_err(), "must not emit an unrestored summary");
         session.abort().await;
+        assert!(session.mappings.iter().all(|mapping| mapping.purged));
     }
 
     #[tokio::test]

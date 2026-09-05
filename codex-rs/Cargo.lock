@@ -1957,6 +1957,7 @@ dependencies = [
  "tungstenite",
  "url",
  "wiremock",
+ "zstd 0.13.3",
 ]
 
 [[package]]

@@ -518,7 +518,17 @@ async fn serialized_edge_path_is_transport_equivalent_to_typed_request() -> Resu
     assert_eq!(typed.method, value.method);
     assert_eq!(typed.url, value.url);
     assert_eq!(typed.headers, value.headers);
-    assert_eq!(typed.body, value.body);
+    assert_eq!(
+        typed.headers.get(http::header::CONTENT_ENCODING),
+        Some(&HeaderValue::from_static("zstd"))
+    );
+    // Struct and Value serialization may order JSON keys differently. Compare
+    // every decoded field while retaining compressed transport coverage.
+    for actual in [&typed, &value] {
+        let decoded = zstd::stream::decode_all(request_body_bytes(actual))?;
+        let body: serde_json::Value = serde_json::from_slice(&decoded)?;
+        assert_eq!(body, serde_json::to_value(&request)?);
+    }
     assert_eq!(typed.compression, value.compression);
     assert_eq!(typed.timeout, value.timeout);
     Ok(())
