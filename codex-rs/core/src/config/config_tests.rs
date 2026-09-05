@@ -8812,6 +8812,28 @@ allow_login_shell = false
 }
 
 #[tokio::test]
+async fn config_loads_disable_reasoning_on_first_response_from_toml() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+model = "gpt-5.4"
+disable_reasoning_on_first_response = true
+"#,
+    )
+    .expect("TOML deserialization should succeed for first-response reasoning config");
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert!(config.disable_reasoning_on_first_response);
+    Ok(())
+}
+
+#[tokio::test]
 async fn config_loads_apps_mcp_product_sku_from_toml() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let toml = r#"

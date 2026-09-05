@@ -915,6 +915,12 @@ pub struct Config {
     /// Value to use for `reasoning.effort` when making a request using the
     /// Responses API.
     pub model_reasoning_effort: Option<ReasoningEffort>,
+
+    /// Whether the first sampling request after user input should use no
+    /// reasoning before restoring the configured reasoning settings for
+    /// follow-up sampling in the same turn.
+    pub disable_reasoning_on_first_response: bool,
+
     /// Optional Plan-mode-specific reasoning effort override used by the TUI.
     ///
     /// When unset, Plan mode uses the built-in Plan preset default (currently
@@ -3574,6 +3580,9 @@ impl Config {
                 .unwrap_or(false),
             guardian_policy_config,
             model_reasoning_effort: cfg.model_reasoning_effort,
+            disable_reasoning_on_first_response: cfg
+                .disable_reasoning_on_first_response
+                .unwrap_or(false),
             plan_mode_reasoning_effort: cfg.plan_mode_reasoning_effort,
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,

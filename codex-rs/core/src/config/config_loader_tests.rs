@@ -403,6 +403,26 @@ async fn strict_config_rejects_unknown_cli_override_key() {
 }
 
 #[tokio::test]
+async fn strict_config_accepts_disable_reasoning_on_first_response_cli_override() {
+    let tmp = tempdir().expect("tempdir");
+
+    let config = ConfigBuilder::default()
+        .codex_home(tmp.path().to_path_buf())
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .cli_overrides(vec![(
+            "disable_reasoning_on_first_response".to_string(),
+            TomlValue::Boolean(true),
+        )])
+        .strict_config(/*strict_config*/ true)
+        .build()
+        .await
+        .expect("strict config should accept the first-response reasoning override");
+
+    assert!(config.disable_reasoning_on_first_response);
+}
+
+#[tokio::test]
 async fn strict_config_rejects_unknown_cli_override_key_with_relative_path_override() {
     let tmp = tempdir().expect("tempdir");
     let instructions_path = tmp.path().join("instructions.md");

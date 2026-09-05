@@ -279,13 +279,14 @@ async fn schedule_startup_prewarm_inner(
         );
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
+    let sampling_reasoning = startup_turn_context.reasoning_for_sampling_request(0);
     client_session
         .prewarm_websocket(
             &startup_prompt,
             &startup_turn_context.model_info,
             &startup_turn_context.session_telemetry,
-            startup_turn_context.reasoning_effort.clone(),
-            startup_turn_context.reasoning_summary,
+            sampling_reasoning.effort,
+            sampling_reasoning.summary,
             startup_turn_context.config.service_tier.clone(),
             &responses_metadata,
         )

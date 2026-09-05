@@ -334,6 +334,11 @@ pub struct ConfigToml {
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: Option<bool>,
 
+    /// When set to `true`, the first sampling request after user input uses no
+    /// reasoning; follow-up sampling in the same turn restores the configured
+    /// reasoning effort and summary.
+    pub disable_reasoning_on_first_response: Option<bool>,
+
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub plan_mode_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
