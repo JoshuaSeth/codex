@@ -202,6 +202,7 @@ struct ModelClientState {
 /// share the same auth/provider setup flow.
 struct CurrentClientSetup {
     auth: Option<CodexAuth>,
+    auth_generation: u64,
     api_provider: ApiProvider,
     api_auth: SharedAuthProvider,
 }
@@ -272,6 +273,7 @@ struct LastResponse {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    auth_generation: u64,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
@@ -887,14 +889,26 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
-        let auth = self.state.provider.auth().await;
-        let api_provider = self.state.provider.api_provider().await?;
-        let api_auth = self.state.provider.api_auth().await?;
-        Ok(CurrentClientSetup {
-            auth,
-            api_provider,
-            api_auth,
-        })
+        loop {
+            let auth_generation = self.auth_generation();
+            let auth = self.state.provider.auth().await;
+            let api_provider = self.state.provider.api_provider().await?;
+            let api_auth = self.state.provider.api_auth().await?;
+            if auth_generation == self.auth_generation() {
+                return Ok(CurrentClientSetup {
+                    auth,
+                    auth_generation,
+                    api_provider,
+                    api_auth,
+                });
+            }
+        }
+    }
+
+    fn auth_generation(&self) -> u64 {
+        self.auth_manager()
+            .map(|manager| *manager.auth_change_receiver().borrow())
+            .unwrap_or_default()
     }
 
     /// Opens a websocket connection using the same header and telemetry wiring as normal turns.
@@ -1040,6 +1054,16 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
+    fn synchronize_websocket_auth_generation(&mut self, generation: u64) {
+        if self.websocket_session.auth_generation != generation {
+            // Only reconnect between requests. Never append under a previous account's
+            // authenticated transport, response id, or sticky routing state.
+            self.reset_websocket_session();
+            self.turn_state = Arc::new(OnceLock::new());
+            self.websocket_session.auth_generation = generation;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///
@@ -1168,15 +1192,15 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
-
         let client_setup = self.client.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        self.synchronize_websocket_auth_generation(client_setup.auth_generation);
+        if self.websocket_session.connection.is_some() {
+            return Ok(());
+        }
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
@@ -1473,6 +1497,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            self.synchronize_websocket_auth_generation(client_setup.auth_generation);
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
