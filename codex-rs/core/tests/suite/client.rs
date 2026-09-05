@@ -60,6 +60,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -2152,6 +2153,64 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
             .get("reasoning")
             .and_then(|reasoning| reasoning.get("summary")),
         None
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_response_without_reasoning_restores_configured_follow_up() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_shell_command_call("call-1", "printf done"),
+                ev_completed("resp1"),
+            ]),
+            sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
+        ],
+    )
+    .await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config.disable_reasoning_on_first_response = true;
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let first_request = requests[0].body_json();
+    let second_request = requests[1].body_json();
+    assert_eq!(first_request["reasoning"]["effort"].as_str(), Some("none"));
+    assert_eq!(first_request["reasoning"].get("summary"), None);
+    assert_eq!(second_request["reasoning"]["effort"].as_str(), Some("high"));
+    assert_eq!(
+        second_request["reasoning"]["summary"].as_str(),
+        Some("detailed")
     );
 
     Ok(())

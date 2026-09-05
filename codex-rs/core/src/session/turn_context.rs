@@ -84,6 +84,13 @@ impl TurnEnvironment {
     }
 }
 
+/// Reasoning settings selected for one model sampling request.
+#[derive(Clone, Debug)]
+pub(crate) struct SamplingReasoningConfig {
+    pub(crate) effort: Option<ReasoningEffortConfig>,
+    pub(crate) summary: ReasoningSummaryConfig,
+}
+
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
@@ -172,6 +179,23 @@ impl TurnContext {
                 .or_else(|| self.model_info.default_reasoning_level.clone())
         } else {
             None
+        }
+    }
+
+    pub(crate) fn reasoning_for_sampling_request(
+        &self,
+        sampling_request_index: usize,
+    ) -> SamplingReasoningConfig {
+        if self.config.disable_reasoning_on_first_response && sampling_request_index == 0 {
+            return SamplingReasoningConfig {
+                effort: Some(ReasoningEffortConfig::None),
+                summary: ReasoningSummaryConfig::None,
+            };
+        }
+
+        SamplingReasoningConfig {
+            effort: self.reasoning_effort.clone(),
+            summary: self.reasoning_summary,
         }
     }
 
