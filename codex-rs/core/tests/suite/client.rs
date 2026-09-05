@@ -2701,10 +2701,11 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
     Ok(())
 }
 
-#[rstest::rstest]
+#[test_case::test_case(false; "legacy_delivery")]
+#[test_case::test_case(true; "sequential_cutoff")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_response_without_reasoning_restores_configured_follow_up(
-    #[values(false, true)] sequential_cutoff: bool,
+    sequential_cutoff: bool,
 ) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = MockServer::start().await;
