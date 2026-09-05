@@ -225,7 +225,10 @@ async fn maybe_unload_residency_candidate(
         .await;
     let agent_status = thread.agent_status().await;
     let is_active = matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::PendingInit | AgentStatus::Running);
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        );
     let is_protected =
         residency_candidate_is_protected(has_subscribers, &loaded_status, &agent_status);
     thread_residency_manager
@@ -263,7 +266,10 @@ fn residency_candidate_is_protected(
 ) -> bool {
     has_subscribers
         || matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::PendingInit | AgentStatus::Running)
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        )
 }
 
 pub(super) async fn ensure_listener_task_running(
