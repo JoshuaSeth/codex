@@ -73,6 +73,98 @@ const TEST_WINDOW_ID: &str = "test-thread:0";
 const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
     "x-codex-ws-stream-request-start-ms";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_reload_reconnects_before_next_request_without_losing_history() {
+    skip_if_no_network!();
+
+    for across_turns in [false, true] {
+        let response = vec![ev_response_created("resp-1"), ev_completed("resp-1")];
+        let server = start_websocket_server_with_headers(vec![
+            WebSocketConnectionConfig {
+                requests: vec![response.clone(), response.clone(), response.clone()],
+                response_headers: vec![(
+                    "x-codex-turn-state".to_string(),
+                    "synthetic-old-routing-state".to_string(),
+                )],
+                accept_delay: None,
+                close_after_requests: true,
+            },
+            WebSocketConnectionConfig {
+                requests: vec![response],
+                response_headers: vec![],
+                accept_delay: None,
+                close_after_requests: true,
+            },
+        ])
+        .await;
+        let mut harness = websocket_harness(&server).await;
+        let auth_manager = codex_login::AuthManager::from_auth_for_testing_with_home(
+            CodexAuth::from_api_key("synthetic-old-account"),
+            harness._codex_home.path().to_path_buf(),
+        );
+        let mut provider = websocket_provider(&server);
+        provider.requires_openai_auth = true;
+        harness.client = ModelClient::new(
+            Some(auth_manager.clone()),
+            harness.thread_id,
+            provider,
+            SessionSource::Exec,
+            /*model_verbosity*/ None,
+            /*enable_request_compression*/ false,
+            /*include_timing_metrics*/ false,
+            /*beta_features_header*/ None,
+            /*attestation_provider*/ None,
+        );
+        let prompt = prompt_with_input(vec![message_item("preserved work")]);
+        let mut session = harness.client.new_session();
+        stream_until_complete(&mut session, &harness, &prompt).await;
+        stream_until_complete(&mut session, &harness, &prompt).await;
+        assert_eq!(server.handshakes().len(), 1);
+
+        std::fs::write(
+            harness._codex_home.path().join("auth.json"),
+            serde_json::to_vec(&json!({"OPENAI_API_KEY": "synthetic-new-account"})).unwrap(),
+        )
+        .unwrap();
+        auth_manager.reload().await;
+        assert_eq!(*auth_manager.auth_change_receiver().borrow(), 1);
+        if across_turns {
+            drop(session);
+            session = harness.client.new_session();
+            session
+                .preconnect_websocket(
+                    &harness.session_telemetry,
+                    &websocket_connection_metadata(&harness),
+                )
+                .await
+                .unwrap();
+        }
+        stream_until_complete(&mut session, &harness, &prompt).await;
+
+        let headers: Vec<_> = server
+            .handshakes()
+            .iter()
+            .map(|handshake| handshake.header("authorization"))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                Some("Bearer synthetic-old-account".to_string()),
+                Some("Bearer synthetic-new-account".to_string()),
+            ]
+        );
+        let connections = server.connections();
+        let new_request = connections[1][0].body_json();
+        assert_eq!(new_request["input"], json!(prompt.input));
+        assert_eq!(new_request.get("previous_response_id"), None);
+        assert_eq!(
+            new_request["client_metadata"].get("x-codex-turn-state"),
+            None
+        );
+        server.shutdown().await;
+    }
+}
+
 fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTraceContext) {
     let client_metadata = body["client_metadata"]
         .as_object()

@@ -1972,6 +1972,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 ### API Overview
 
 - `account/read` — fetch current account info; optionally refresh tokens.
+- `account/reload` — reload the managed authentication file without restarting the server. A changed authentication generation invalidates cached provider WebSockets before the next model request, including connections retained across turns. Active responses finish normally; the next request reconnects with current authentication and full conversation history, without reusing the previous account's response ID or sticky routing state.
 - `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptDeviceCode`).
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
