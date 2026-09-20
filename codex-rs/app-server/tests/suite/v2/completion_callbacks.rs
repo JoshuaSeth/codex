@@ -35,6 +35,9 @@ const GOAL_WORK_ID: &str = "10000000-0000-0000-0000-000000000102";
 const CALLBACK_PROTOCOL_VERSION: &str = "pitchai-completion-callback/v1";
 const CALLBACK_TEXT: &str = "Report this completion to the Events inbox.";
 
+#[path = "successful_turn_receipts_tests.rs"]
+mod successful_turn_receipts_tests;
+
 #[tokio::test]
 async fn turn_completion_persists_central_and_webhook_events() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Normal callback evidence").await;
@@ -78,6 +81,18 @@ async fn turn_completion_persists_central_and_webhook_events() -> Result<()> {
     assert_eq!(turn.id, event.execution_id);
     assert_eq!("completed", event.terminal_status);
     assert_eq!("Normal callback evidence", event.final_text);
+    let state_db =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string()).await?;
+    assert_eq!(
+        Some(event.terminal_at_ms),
+        state_db
+            .completions()
+            .successful_turn_completed_at(
+                codex_protocol::ThreadId::from_string(&thread_id)?,
+                &turn.id
+            )
+            .await?
+    );
 
     let webhook_outbox = claim_webhook_outbox(codex_home.path()).await?;
     assert_eq!(1, webhook_outbox.len());

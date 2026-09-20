@@ -225,10 +225,6 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
             if !turn_failed
                 && let Some(state_db) = conversation.state_db()
-                && state_db
-                    .completions()
-                    .turn_is_tracked_in_process(conversation_id, &turn_complete_event.turn_id)
-                    .await
                 && let Err(err) = persist_turn_completion(
                     state_db.completions(),
                     conversation_id,
@@ -239,7 +235,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await
             {
                 let message = format!(
-                    "turn finished but its completion callback state could not be persisted: {err}"
+                    "turn finished but its durable completion state could not be persisted: {err}"
                 );
                 let turn_error = TurnError {
                     message: message.clone(),
@@ -260,7 +256,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id = %conversation_id,
                     turn_id = %turn_complete_event.turn_id,
                     error = %err,
-                    "failed to persist turn completion callback event"
+                    "failed to persist durable turn completion"
                 );
             }
             thread_watch_manager

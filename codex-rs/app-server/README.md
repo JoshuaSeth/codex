@@ -11,11 +11,34 @@
 - [Initialization](#initialization)
 - [API Overview](#api-overview)
 - [Events](#events)
+- [Local successful-turn receipts](#local-successful-turn-receipts)
 - [Approvals](#approvals)
 - [Skills](#skills)
 - [Apps](#apps)
 - [Auth endpoints](#auth-endpoints)
 - [Experimental API Opt-in](#experimental-api-opt-in)
+
+## Local successful-turn receipts
+
+When the native state database is available, a successful live `TurnComplete`
+persists an exact `(thread_id, turn_id, completed_at_ms)` receipt in
+`goals_1.sqlite` before emitting `turn/completed`. This includes ordinary turns
+without `completionWorkId`. Failed or interrupted turns do not receive success
+receipts. Receipt persistence uses the existing bounded completion-write retry;
+exhausted persistence failure reports a failed turn instead of durable success.
+
+The `successful_turn_receipts` table contains metadata only, not messages or
+artifact content. Its composite primary key supports an exact bounded lookup;
+duplicate completion writes retain the original timestamp. Receipt and optional
+callback-outbox writes share one transaction. Unregistered turns create no
+central or webhook publication, and migration does not infer historical success.
+
+A receipt proves only that exact turn succeeded. It is not proof that a goal
+completed, callbacks were accepted, queues drained, writers stopped, or thirty
+continuous minutes of verified inactivity elapsed. Hibernation must establish
+those independently and verify runtime ownership/version; older binaries may
+coexist with a migrated database but will not produce these receipts. No
+conversation history is read, rewritten, or deleted by this mechanism.
 
 ## Protocol
 

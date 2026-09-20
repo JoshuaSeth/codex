@@ -13,6 +13,8 @@ const COMPLETION_FINAL_TEXT_TRUNCATION_NOTICE: &str =
     "\n\n[PitchAI callback final output truncated at the durable transport limit.]";
 const TERMINAL_GOAL_FINAL_CAPTURE_GRACE_MS: i64 = 60_000;
 
+mod terminal_receipts;
+
 #[derive(Clone)]
 pub struct CompletionStore {
     pool: Arc<SqlitePool>,
@@ -297,6 +299,18 @@ WHERE completion_work_id = ? AND execution_kind = 'normal' AND state = 'register
     ) -> anyhow::Result<u64> {
         let final_text = bounded_completion_final_text(final_text);
         let mut transaction = self.pool.begin().await?;
+        // Keep local evidence and any optional callback publication atomic. This
+        // narrow hook belongs in the existing terminal transaction: a failed
+        // callback write must not leave a successful local receipt behind.
+        sqlx::query(
+            "INSERT INTO successful_turn_receipts (thread_id, turn_id, completed_at_ms) \
+             VALUES (?, ?, ?) ON CONFLICT (thread_id, turn_id) DO NOTHING",
+        )
+        .bind(thread_id.to_string())
+        .bind(turn_id)
+        .bind(terminal_at_ms)
+        .execute(&mut *transaction)
+        .await?;
         let terminal_work_ids: HashSet<String> = sqlx::query_scalar(
             r#"
 SELECT completion_work_id
