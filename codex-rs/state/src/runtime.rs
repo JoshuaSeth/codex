@@ -17,6 +17,7 @@ use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::apply_rollout_item;
+use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_memories_migrator;
@@ -60,6 +61,7 @@ use tracing::warn;
 mod agent_jobs;
 mod backfill;
 mod completions;
+mod external_agent_config_imports;
 mod goals;
 mod logs;
 mod memories;
@@ -77,6 +79,10 @@ pub use completions::CompletionCallbackState;
 pub use completions::CompletionOutboxEvent;
 pub use completions::CompletionOutboxStats;
 pub use completions::CompletionStore;
+pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;
+pub use external_agent_config_imports::ExternalAgentConfigImportFailureRecord;
+pub use external_agent_config_imports::ExternalAgentConfigImportHistoryRecord;
+pub use external_agent_config_imports::ExternalAgentConfigImportSuccessRecord;
 pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
@@ -165,6 +171,7 @@ pub struct StateRuntime {
     thread_goals: GoalStore,
     memories: MemoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
+    thread_recency_at_millis: Arc<AtomicI64>,
 }
 
 impl StateRuntime {
@@ -267,32 +274,36 @@ impl StateRuntime {
             return Err(err);
         }
         let started = Instant::now();
-        let thread_updated_at_millis_result: anyhow::Result<Option<i64>> =
-            sqlx::query_scalar("SELECT MAX(threads.updated_at_ms) FROM threads")
-                .fetch_one(pool.as_ref())
-                .await
-                .map_err(anyhow::Error::from);
+        let thread_timestamp_millis_result: anyhow::Result<(Option<i64>, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT MAX(threads.updated_at_ms), MAX(threads.recency_at_ms) FROM threads",
+            )
+            .fetch_one(pool.as_ref())
+            .await
+            .map_err(anyhow::Error::from);
         crate::telemetry::record_init_result(
             telemetry_override,
             DbKind::State,
             "post_init_query",
             started.elapsed(),
-            &thread_updated_at_millis_result,
+            &thread_timestamp_millis_result,
         );
-        let thread_updated_at_millis = match thread_updated_at_millis_result {
-            Ok(value) => value,
-            Err(err) => {
-                close_sqlite_pools(&[
-                    pool.as_ref(),
-                    logs_pool.as_ref(),
-                    goals_pool.as_ref(),
-                    memories_pool.as_ref(),
-                ])
-                .await;
-                return Err(err);
-            }
-        };
+        let (thread_updated_at_millis, thread_recency_at_millis) =
+            match thread_timestamp_millis_result {
+                Ok(value) => value,
+                Err(err) => {
+                    close_sqlite_pools(&[
+                        pool.as_ref(),
+                        logs_pool.as_ref(),
+                        goals_pool.as_ref(),
+                        memories_pool.as_ref(),
+                    ])
+                    .await;
+                    return Err(err);
+                }
+            };
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
+        let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
         let completions = CompletionStore::new(Arc::clone(&goals_pool)).await?;
         let runtime = Arc::new(Self {
             thread_goals: GoalStore::new(Arc::clone(&goals_pool), completions.clone()),
@@ -303,6 +314,7 @@ impl StateRuntime {
             codex_home,
             default_provider,
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
+            thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
         });
         if let Err(err) = runtime.run_logs_startup_maintenance().await {
             warn!(
@@ -431,7 +443,13 @@ async fn open_sqlite(
     let pool = pool_result
         .map_err(|source| recovery::RuntimeDbInitError::new(spec.label, "open", path, source))?;
     let started = Instant::now();
-    let migrate_result = migrator.run(&pool).await.map_err(anyhow::Error::from);
+    let migrate_result = async {
+        if matches!(spec.kind, DbKind::State) {
+            repair_legacy_recency_migration_version(&pool, migrator).await?;
+        }
+        migrator.run(&pool).await.map_err(anyhow::Error::from)
+    }
+    .await;
     crate::telemetry::record_init_result(
         telemetry_override,
         spec.kind,

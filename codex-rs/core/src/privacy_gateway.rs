@@ -557,6 +557,20 @@ impl GatewayRequestSession {
                     summary_index,
                 }])
             }
+            ResponseEvent::ReasoningSummaryDone {
+                item_id,
+                text,
+                summary_index,
+            } => {
+                // A completed section is atomic, not another streaming delta.
+                // Leave independently buffered output/reasoning chunks intact.
+                let text = self.restore_complete_text(&text).await?;
+                Ok(vec![ResponseEvent::ReasoningSummaryDone {
+                    item_id,
+                    text,
+                    summary_index,
+                }])
+            }
             ResponseEvent::ReasoningContentDelta {
                 delta,
                 content_index,
@@ -683,6 +697,11 @@ impl GatewayRequestSession {
 
     async fn restore_response_item(&self, item: &mut ResponseItem) -> Result<()> {
         match item {
+            ResponseItem::AdditionalTools { tools, .. } => {
+                for tool in tools {
+                    self.restore_json_strings(tool).await?;
+                }
+            }
             ResponseItem::Message { content, .. } => {
                 for item in content {
                     match item {
@@ -780,7 +799,7 @@ impl GatewayRequestSession {
                 }
             }
             ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger
+            | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => {}
         }
@@ -1307,7 +1326,7 @@ fn is_default_multi_agent_usage_hint(text: &str) -> bool {
     .any(|base| {
         let Some(count_text) = text
             .strip_prefix(base)
-            .and_then(|suffix| suffix.strip_prefix("\nThere are "))
+            .and_then(|suffix| suffix.rsplit_once("\nThere are ").map(|(_, tail)| tail))
             .and_then(|suffix| {
                 suffix
                     .split_once(" available concurrency slots,")
@@ -1321,7 +1340,8 @@ fn is_default_multi_agent_usage_hint(text: &str) -> bool {
         };
         count > 0
             && count_text == count.to_string()
-            && text == default_multi_agent_v2_usage_hint_text(base, count)
+            && (text == default_multi_agent_v2_usage_hint_text(base, count)
+                || text == format!("{base}\nThere are {count} available concurrency slots, meaning that up to {count} agents can be active at once, including you."))
     })
 }
 
@@ -1705,6 +1725,7 @@ mod tests {
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::body_partial_json;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
 
@@ -2019,6 +2040,9 @@ mod tests {
             6,
         );
         let configured_agent_hint = format!("{root_agent_hint}\nCustom Alice Stone guidance.");
+        let legacy_agent_hint = format!(
+            "{DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT}\nThere are 6 available concurrency slots, meaning that up to 6 agents can be active at once, including you."
+        );
         let body = json!({
             "input": [
                 {
@@ -2029,7 +2053,8 @@ mod tests {
                         {"type": "input_text", "text": multi_agent},
                         {"type": "input_text", "text": root_agent_hint},
                         {"type": "input_text", "text": configured_concurrency_hint},
-                        {"type": "input_text", "text": configured_agent_hint.clone()},
+                        {"type": "input_text", "text": legacy_agent_hint},
+                        {"type": "input_text", "text": configured_agent_hint},
                         {"type": "input_text", "text": "Custom policy for Alice Stone"}
                     ]
                 },
@@ -2062,11 +2087,12 @@ mod tests {
         assert_eq!(
             trusted_platform_context_metrics(&body),
             (
-                5,
+                6,
                 skills.chars().count()
                     + multi_agent.chars().count()
                     + root_agent_hint.chars().count()
                     + configured_concurrency_hint.chars().count()
+                    + legacy_agent_hint.chars().count()
                     + environment.chars().count()
             )
         );
@@ -2243,6 +2269,155 @@ mod tests {
             completed.last(),
             Some(ResponseEvent::Completed { response_id, .. }) if response_id == "response-test"
         ));
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_summary_restores_without_consuming_output_buffer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_partial_json(json!({"purge_after_restore": false})))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_partial_json(json!({"purge_after_restore": true})))
+            .respond_with(restore_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        let mut session = prepared.session.unwrap();
+        let first = session
+            .transform_event(ResponseEvent::OutputTextDelta("Ava Wo".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.as_slice(), [ResponseEvent::OutputTextDelta(text)] if text.is_empty())
+        );
+        let summary = session
+            .transform_event(ResponseEvent::ReasoningSummaryDone {
+                item_id: "reasoning-1".to_string(),
+                text: "Ask Ava Woods; keep incomplete name Ava".to_string(),
+                summary_index: 2,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            summary.as_slice(),
+            [ResponseEvent::ReasoningSummaryDone { item_id, text, summary_index }]
+                if (item_id.as_str(), text.as_str(), *summary_index)
+                    == ("reasoning-1", "Ask Alice Stone; keep incomplete name Ava", 2)
+        ));
+        let output = session
+            .transform_event(ResponseEvent::OutputTextDelta("ods".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(output.as_slice(), [ResponseEvent::OutputTextDelta(text)] if text == "Alice Stone")
+        );
+        assert!(session.pending.is_empty());
+        session.abort().await;
+        assert!(session.mappings.iter().all(|mapping| mapping.purged));
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_summary_restoration_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_partial_json(json!({"purge_after_restore": false})))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .and(body_partial_json(json!({"purge_after_restore": true})))
+            .respond_with(restore_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        let mut session = prepared.session.unwrap();
+        let result = session
+            .transform_event(ResponseEvent::ReasoningSummaryDone {
+                item_id: "reasoning-1".to_string(),
+                text: "Ask Ava Woods".to_string(),
+                summary_index: 0,
+            })
+            .await;
+        assert!(result.is_err(), "must not emit an unrestored summary");
+        session.abort().await;
+        assert!(session.mappings.iter().all(|mapping| mapping.purged));
+    }
+
+    #[tokio::test]
+    async fn additional_tools_restore_nested_response_text_and_preserve_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/pseudonymize"))
+            .respond_with(pseudonymize_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/de-pseudonymize"))
+            .respond_with(restore_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let gateway = test_gateway(&server.uri(), Duration::from_secs(1));
+        let prepared = gateway
+            .prepare_json_body(json!({"instructions": "Help Alice Stone"}))
+            .await
+            .unwrap();
+        let mut session = prepared.session.unwrap();
+        let mut items = vec![ResponseItem::AdditionalTools {
+            id: Some("tools-1".to_string()),
+            role: "system".to_string(),
+            tools: vec![json!({
+                "type": "function", "name": "lookup",
+                "metadata": {"description": "Help Ava Woods"}
+            })],
+        }];
+        session
+            .restore_response_items_and_purge(&mut items)
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(
+            items,
+            vec![ResponseItem::AdditionalTools {
+                id: Some("tools-1".to_string()),
+                role: "system".to_string(),
+                tools: vec![json!({
+                    "type": "function", "name": "lookup",
+                    "metadata": {"description": "Help Alice Stone"}
+                })],
+            }]
+        );
     }
 
     #[tokio::test]

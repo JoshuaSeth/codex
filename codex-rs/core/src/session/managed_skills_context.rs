@@ -27,14 +27,18 @@ impl Session {
 
         let (current, warning) = if turn_context.config.include_skill_instructions {
             match build_available_skills(
-                &turn_context.turn_skills.outcome,
+                turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
                 SkillRenderSideEffects::None,
             ) {
                 Some(available_skills) => {
                     let warning = available_skills.warning_message.clone();
                     (
-                        AvailableSkillsInstructions::from(available_skills).render(),
+                        AvailableSkillsInstructions::from_available_skills(
+                            &available_skills,
+                            turn_context.model_info.include_skills_usage_instructions,
+                        )
+                        .render(),
                         warning,
                     )
                 }

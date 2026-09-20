@@ -342,7 +342,7 @@ async fn compacted_legacy_resume_replaces_stale_skills_context_before_model_requ
     let stale_skills = "<skills_instructions>\n## Skills\n### Available skills\n- pitchai-thomas-m365: stale Thomas capability\n- seth-private: stale Seth capability\n- stale-secret-sentinel: must not reach the model\n</skills_instructions>";
     let turn_context = TurnContextItem {
         turn_id: Some("legacy-turn".to_string()),
-        cwd: PathBuf::from("/"),
+        cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(PathBuf::from("/"))?,
         workspace_roots: None,
         current_date: Some("2026-08-09".to_string()),
         timezone: Some("UTC".to_string()),
@@ -355,6 +355,7 @@ async fn compacted_legacy_resume_replaces_stale_skills_context_before_model_requ
         comp_hash: None,
         personality: None,
         collaboration_mode: None,
+        multi_agent_mode: None,
         multi_agent_version: None,
         realtime_active: Some(false),
         effort: None,

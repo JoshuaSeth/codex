@@ -10,6 +10,8 @@ use codex_config::ThreadConfigLoader;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
+#[cfg(debug_assertions)]
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -45,12 +47,12 @@ use crate::transport::start_remote_control;
 use crate::transport::start_stdio_connection;
 use crate::transport::start_websocket_acceptor;
 use codex_analytics::AppServerRpcTransport;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
 use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
@@ -73,6 +75,7 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::FilterExt;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::Registry;
@@ -81,28 +84,34 @@ use tracing_subscriber::util::SubscriberInitExt;
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 
 mod analytics_utils;
+mod app_info;
 mod app_server_tracing;
 mod attestation;
+mod auth_mode;
 mod bespoke_event_handling;
 mod command_exec;
 mod completion_callback_metadata;
 mod completion_outbox_sender;
 mod completion_webhook_sender;
 mod config;
+mod config_layer;
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
 mod connection_rpc_gate;
+mod current_time;
 mod dynamic_tools;
 mod error_code;
 mod extensions;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
+mod image_url;
 pub mod in_process;
 mod mcp_refresh;
 mod message_processor;
 mod models;
+mod models_refresh_worker;
 mod outgoing_message;
 mod request_processors;
 mod request_serialization;
@@ -125,6 +134,8 @@ pub use crate::transport::take_remote_control_disabled_env;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
+#[cfg(debug_assertions)]
+const TEST_USER_CONFIG_FILE_ENV_VAR: &str = "CODEX_APP_SERVER_TEST_USER_CONFIG_FILE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogFormat {
@@ -319,6 +330,16 @@ fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Optio
     }
 }
 
+fn exec_policy_config_warning(err: &ExecPolicyError) -> ConfigWarningNotification {
+    let (path, range) = exec_policy_warning_location(err);
+    ConfigWarningNotification {
+        summary: "Error parsing rules; custom rules not applied.".to_string(),
+        details: Some(err.to_string()),
+        path,
+        range,
+    }
+}
+
 fn app_text_range(range: &CoreTextRange) -> AppTextRange {
     AppTextRange {
         start: AppTextPosition {
@@ -444,6 +465,10 @@ pub async fn run_main_with_transport_options(
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<()> {
+    let loader_overrides = loader_overrides_with_test_user_config_file(
+        loader_overrides,
+        test_user_config_file_from_env(),
+    )?;
     let (transport_event_tx, mut transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) =
@@ -608,14 +633,7 @@ pub async fn run_main_with_transport_options(
     }
 
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
-        let (path, range) = exec_policy_warning_location(&err);
-        let message = ConfigWarningNotification {
-            summary: "Error parsing rules; custom rules not applied.".to_string(),
-            details: Some(err.to_string()),
-            path,
-            range,
-        };
-        config_warnings.push(message);
+        config_warnings.push(exec_policy_config_warning(&err));
     }
 
     if let Some(warning) = project_config_warning(&config) {
@@ -662,9 +680,9 @@ pub async fn run_main_with_transport_options(
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
     let log_db = state_db.clone().map(log_db::start);
-    let log_db_layer = log_db
-        .clone()
-        .map(|layer| layer.with_filter(filter_fn(app_server_log_db_filter)));
+    let log_db_layer = log_db.clone().map(|layer| {
+        layer.with_filter(log_db::default_filter().and(filter_fn(app_server_log_db_filter)))
+    });
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
     let _ = tracing_subscriber::registry()
@@ -920,7 +938,7 @@ pub async fn run_main_with_transport_options(
         async move {
             let mut listen_for_threads = true;
             let mut shutdown_state = ShutdownState::default();
-            loop {
+            let exit_reason = loop {
                 let running_turn_count = {
                     let running_turn_count = running_turn_count_rx.borrow();
                     *running_turn_count
@@ -933,7 +951,7 @@ pub async fn run_main_with_transport_options(
                     let _ = outbound_control_tx
                         .send(OutboundControlEvent::DisconnectAll)
                         .await;
-                    break;
+                    break "shutdown_requested";
                 }
 
                 tokio::select! {
@@ -955,7 +973,7 @@ pub async fn run_main_with_transport_options(
                     }
                     event = transport_event_rx.recv() => {
                         let Some(event) = event else {
-                            break;
+                            break "transport_channel_closed";
                         };
                         match event {
                             TransportEvent::ConnectionOpened {
@@ -985,7 +1003,7 @@ pub async fn run_main_with_transport_options(
                                     .await
                                     .is_err()
                                 {
-                                    break;
+                                    break "outbound_router_closed";
                                 }
                                 connections.insert(
                                     connection_id,
@@ -1013,10 +1031,10 @@ pub async fn run_main_with_transport_options(
                                         .await;
                                 });
                                 if !outbound_closed {
-                                    break;
+                                    break "outbound_router_closed";
                                 }
                                 if shutdown_when_no_connections && connections.is_empty() {
-                                    break;
+                                    break "last_connection_closed";
                                 }
                             }
                             TransportEvent::IncomingMessage { connection_id, message } => {
@@ -1164,7 +1182,7 @@ pub async fn run_main_with_transport_options(
                         }
                     }
                 }
-            }
+            };
 
             if !shutdown_state.forced() {
                 futures::future::join_all(
@@ -1179,7 +1197,12 @@ pub async fn run_main_with_transport_options(
             } else {
                 connection_cleanup_tasks.abort();
             }
-            info!("processor task exited (channel closed)");
+            info!(
+                exit_reason,
+                remaining_connection_count = connections.len(),
+                shutdown_forced = shutdown_state.forced(),
+                "processor task exited"
+            );
         }
     });
 
@@ -1337,6 +1360,43 @@ fn app_server_log_db_filter(metadata: &Metadata<'_>) -> bool {
     !metadata.target().starts_with("codex_otel")
 }
 
+fn test_user_config_file_from_env() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(TEST_USER_CONFIG_FILE_ENV_VAR)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+fn loader_overrides_with_test_user_config_file(
+    mut loader_overrides: LoaderOverrides,
+    test_user_config_file: Option<std::path::PathBuf>,
+) -> IoResult<LoaderOverrides> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = test_user_config_file {
+        let path = AbsolutePathBuf::from_absolute_path(path).map_err(|err| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid test user config path: {err}"),
+            )
+        })?;
+        warn!(
+            path = %path.as_path().display(),
+            "using debug-only app-server test user config file"
+        );
+        loader_overrides.user_config_path = Some(path);
+    }
+
+    #[cfg(not(debug_assertions))]
+    let _ = test_user_config_file;
+
+    Ok(loader_overrides)
+}
+
 fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransport {
     match transport {
         AppServerTransport::Stdio => AppServerRpcTransport::Stdio,
@@ -1349,6 +1409,12 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 #[cfg(test)]
 mod tests {
     use super::LogFormat;
+    #[cfg(debug_assertions)]
+    use super::loader_overrides_with_test_user_config_file;
+    #[cfg(debug_assertions)]
+    use codex_config::LoaderOverrides;
+    #[cfg(debug_assertions)]
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -1367,5 +1433,21 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_test_user_config_file_overrides_loader_path() {
+        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
+        let loader_overrides = loader_overrides_with_test_user_config_file(
+            LoaderOverrides::default(),
+            Some(path.clone()),
+        )
+        .expect("test config path should be valid");
+
+        assert_eq!(
+            loader_overrides.user_config_path,
+            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
+        );
     }
 }

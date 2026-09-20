@@ -373,6 +373,8 @@ pub struct ModelInfo {
     pub base_instructions: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_messages: Option<ModelMessages>,
+    #[serde(default)]
+    pub include_skills_usage_instructions: bool,
     pub supports_reasoning_summaries: bool,
     #[serde(default)]
     pub default_reasoning_summary: ReasoningSummary,
@@ -483,6 +485,13 @@ impl ModelInfo {
 pub struct ModelMessages {
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
+    pub approvals: Option<ApprovalMessages>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ApprovalMessages {
+    pub on_request: Option<String>,
+    pub on_request_auto_review: Option<String>,
 }
 
 impl ModelMessages {
@@ -668,6 +677,7 @@ mod tests {
             upgrade: None,
             base_instructions: "base".to_string(),
             model_messages: spec,
+            include_skills_usage_instructions: false,
             supports_reasoning_summaries: false,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
@@ -702,26 +712,53 @@ mod tests {
     }
 
     #[test]
+    fn model_messages_preserve_absent_and_empty_approval_variants() {
+        let absent: ModelMessages =
+            from_str(r#"{"instructions_template":null,"instructions_variables":null}"#)
+                .expect("legacy model messages");
+        assert_eq!(absent.approvals, None);
+        let present: ModelMessages =
+            from_str(r#"{"approvals":{"on_request":""}}"#).expect("approval model messages");
+        assert_eq!(
+            present.approvals,
+            Some(ApprovalMessages {
+                on_request: Some(String::new()),
+                on_request_auto_review: None,
+            })
+        );
+    }
+
+    #[test]
     fn reasoning_effort_accepts_known_and_custom_values() {
-        let custom = ReasoningEffort::Custom("max".to_string());
-        let deserialized = from_str::<ReasoningEffort>(r#""max""#)
+        let custom = ReasoningEffort::Custom("custom-effort".to_string());
+        let deserialized = from_str::<ReasoningEffort>(r#""custom-effort""#)
             .expect("custom reasoning effort should deserialize");
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
+        let serialized_max = to_string(&ReasoningEffort::Max).expect("Max should serialize");
+        let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
+                "ultra".parse(),
                 "max".parse(),
+                "custom-effort".parse(),
                 deserialized,
                 serialized,
+                serialized_max,
+                serialized_ultra,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
+                Ok(ReasoningEffort::Ultra),
+                Ok(ReasoningEffort::Max),
                 Ok(custom.clone()),
                 custom,
+                r#""custom-effort""#.to_string(),
                 r#""max""#.to_string(),
-                "max".to_string(),
+                r#""ultra""#.to_string(),
+                "custom-effort".to_string(),
             )
         );
     }
@@ -762,6 +799,7 @@ mod tests {
         let model = test_model(Some(ModelMessages {
             instructions_template: Some("Hello {{ personality }}".to_string()),
             instructions_variables: Some(personality_variables()),
+            approvals: None,
         }));
 
         let instructions = model.get_model_instructions(Some(Personality::Friendly));
@@ -778,6 +816,7 @@ mod tests {
                 personality_friendly: Some("friendly".to_string()),
                 personality_pragmatic: None,
             }),
+            approvals: None,
         }));
         assert_eq!(
             model.get_model_instructions(Some(Personality::Friendly)),
@@ -803,6 +842,7 @@ mod tests {
                 personality_friendly: None,
                 personality_pragmatic: None,
             }),
+            approvals: None,
         }));
         assert_eq!(
             model_no_personality.get_model_instructions(Some(Personality::Friendly)),
@@ -831,6 +871,7 @@ mod tests {
                 personality_friendly: None,
                 personality_pragmatic: None,
             }),
+            approvals: None,
         }));
 
         let instructions = model.get_model_instructions(Some(Personality::Friendly));
@@ -946,6 +987,7 @@ mod tests {
         .expect("deserialize model info");
 
         assert_eq!(model.availability_nux, None);
+        assert!(!model.include_skills_usage_instructions);
         assert!(!model.supports_image_detail_original);
         assert_eq!(model.web_search_tool_type, WebSearchToolType::Text);
         assert!(!model.supports_search_tool);

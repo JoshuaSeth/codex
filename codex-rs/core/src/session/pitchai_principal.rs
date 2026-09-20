@@ -77,12 +77,15 @@ pub(super) async fn resolve_and_bind_pitchai_principal(
         .await?;
         resumed.rollout_path = Some(materialized_path);
         let conversation_id = resumed.conversation_id;
-        let Some(meta_line) = resumed.history.iter_mut().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == conversation_id => {
-                Some(meta_line)
-            }
-            _ => None,
-        }) else {
+        let Some(meta_line) = std::sync::Arc::make_mut(&mut resumed.history)
+            .iter_mut()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == conversation_id => {
+                    Some(meta_line)
+                }
+                _ => None,
+            })
+        else {
             return Err(InvalidSessionIdentityError(
                 "Legacy managed thread does not contain canonical identity metadata.".to_string(),
             )

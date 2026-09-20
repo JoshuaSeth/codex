@@ -1,12 +1,17 @@
 use super::*;
 use crate::completion_callback_metadata::canonical_completion_callback_metadata;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::CompletionBindingState;
-use codex_utils_path_uri::PathUri;
+use codex_state::CompletionStore;
+
+use crate::image_url::REMOTE_IMAGE_URL_ERROR;
+use crate::image_url::is_remote_image_url;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
@@ -14,6 +19,75 @@ const MAX_CALLBACK_TEXT_CHARS: usize = 65_536;
 const MAX_CALLBACK_FINAL_TEXT_CHARS: usize = 1_048_576;
 const MAX_CALLBACK_IDENTITY_CHARS: usize = 256;
 const MAX_CALLBACK_EXECUTION_ID_CHARS: usize = 128;
+
+fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+    if input.iter().any(|item| {
+        matches!(
+            item,
+            V2UserInput::Image { url, .. } if is_remote_image_url(url)
+        )
+    }) {
+        return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
+    }
+    Ok(())
+}
+
+fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONRPCErrorError> {
+    if items.iter().any(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|item| {
+            matches!(
+                item,
+                ContentItem::InputImage { image_url, .. } if is_remote_image_url(image_url)
+            )
+        }),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            output.content_items().is_some_and(|content| {
+                content.iter().any(|item| {
+                    matches!(
+                        item,
+                        FunctionCallOutputContentItem::InputImage { image_url, .. }
+                            if is_remote_image_url(image_url)
+                    )
+                })
+            })
+        }
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Other => false,
+    }) {
+        return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
+    }
+    Ok(())
+}
+
+fn preserve_completion_binding_after_submit_error(error: &CodexErr) -> bool {
+    matches!(error, CodexErr::InternalAgentDied)
+}
+
+async fn release_rejected_completion_binding(
+    completions: &CompletionStore,
+    completion_work_id: &str,
+    error: &CodexErr,
+) -> anyhow::Result<()> {
+    if preserve_completion_binding_after_submit_error(error) {
+        return Ok(());
+    }
+    completions
+        .release_registered_turn_binding(completion_work_id)
+        .await
+}
 
 #[derive(Clone)]
 pub(crate) struct TurnRequestProcessor {
@@ -164,10 +238,13 @@ fn callback_response_items(record: &CompletionCallbackRecord) -> Vec<ResponseIte
             namespace: None,
             arguments,
             call_id: record.call_id.clone(),
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
+            id: None,
             call_id: record.call_id.clone(),
             output: FunctionCallOutputPayload::from_text(output),
+            internal_chat_message_metadata_passthrough: None,
         },
     ]
 }
@@ -215,12 +292,15 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        supports_openai_form_elicitation: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
             request_id,
             params,
             app_server_client_name,
             app_server_client_version,
+            /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
         )
         .await
         .map(|response| Some(response.into()))
@@ -259,6 +339,7 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnSteerParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        validate_user_input_image_urls(&params.input)?;
         self.turn_steer_inner(request_id, params)
             .await
             .map(|response| Some(response.into()))
@@ -300,6 +381,16 @@ impl TurnRequestProcessor {
         params: ThreadRealtimeAppendTextParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.thread_realtime_append_text_inner(request_id, params)
+            .await
+            .map(|response| response.map(Into::into))
+    }
+
+    pub(crate) async fn thread_realtime_append_speech(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadRealtimeAppendSpeechParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_realtime_append_speech_inner(request_id, params)
             .await
             .map(|response| response.map(Into::into))
     }
@@ -453,27 +544,6 @@ impl TurnRequestProcessor {
         Ok((review_request, hint))
     }
 
-    fn parse_environment_selections(
-        &self,
-        environments: Option<Vec<TurnEnvironmentParams>>,
-    ) -> Result<Option<Vec<TurnEnvironmentSelection>>, JSONRPCErrorError> {
-        let environment_selections = environments.map(|environments| {
-            environments
-                .into_iter()
-                .map(|environment| TurnEnvironmentSelection {
-                    environment_id: environment.environment_id,
-                    cwd: PathUri::from_abs_path(&environment.cwd),
-                })
-                .collect::<Vec<_>>()
-        });
-        if let Some(environment_selections) = environment_selections.as_ref() {
-            self.thread_manager
-                .validate_environment_selections(environment_selections)
-                .map_err(environment_selection_error)?;
-        }
-        Ok(environment_selections)
-    }
-
     async fn request_trace_context(
         &self,
         request_id: &ConnectionRequestId,
@@ -488,6 +558,55 @@ impl TurnRequestProcessor {
         thread.state_db().ok_or_else(|| {
             internal_error("completion tracking requires a persistent app-server state database")
         })
+    }
+
+    async fn evict_proven_dead_thread_handle(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        error: &CodexErr,
+    ) -> bool {
+        if !matches!(error, CodexErr::InternalAgentDied) {
+            return false;
+        }
+        let Ok(_thread_list_state_permit) = self.thread_list_state_permit.acquire().await else {
+            tracing::error!(
+                "failed to serialize proven-dead handle eviction for thread {thread_id}"
+            );
+            return false;
+        };
+        if self
+            .thread_manager
+            .remove_thread_if_current(&thread_id, expected_thread)
+            .await
+            .is_none()
+        {
+            warn!(
+                "refused to evict stale dead handle for thread {thread_id} because a replacement handle is current"
+            );
+            return false;
+        }
+
+        self.pending_thread_unloads.lock().await.remove(&thread_id);
+        self.outgoing
+            .cancel_requests_for_thread(thread_id, /*error*/ None)
+            .await;
+        self.thread_state_manager
+            .remove_thread_state(thread_id)
+            .await;
+        self.thread_watch_manager
+            .remove_thread(&thread_id.to_string())
+            .await;
+        self.thread_residency_manager.note_removed(thread_id).await;
+        self.outgoing
+            .send_server_notification(ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: thread_id.to_string(),
+            }))
+            .await;
+        info!(
+            "evicted proven-dead in-memory handle for thread {thread_id}; persisted rollout remains resumable"
+        );
+        true
     }
 
     async fn submit_core_op(
@@ -527,6 +646,7 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        supports_openai_form_elicitation: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -555,8 +675,17 @@ impl TurnRequestProcessor {
         .inspect_err(|error| {
             self.track_error_response(&request_id, error, /*error_type*/ None);
         })?;
+        thread
+            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to update OpenAI form elicitation support: {err}"
+                ))
+            })?;
 
-        let environment_selections = self.parse_environment_selections(params.environments)?;
+        let environment_selections =
+            resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
 
         // Map v2 input items to core input items.
         let completion_callback_metadata_json = canonical_completion_callback_metadata(
@@ -573,8 +702,9 @@ impl TurnRequestProcessor {
         let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !mapped_items.is_empty();
         let cwd = resolve_request_cwd(params.cwd)?;
-        let environments =
-            Self::build_environment_override(thread.as_ref(), cwd, environment_selections).await;
+        let environments = self
+            .build_environment_override(thread.as_ref(), cwd, environment_selections)
+            .await;
         let thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
@@ -661,9 +791,14 @@ impl TurnRequestProcessor {
                         trace: self.request_trace_context(&request_id).await,
                     };
                     if let Err(err) = thread.submit_user_input_with_id(submission).await {
-                        if let Err(release_err) = completions
-                            .release_registered_turn_binding(completion_work_id)
-                            .await
+                        self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                            .await;
+                        if let Err(release_err) = release_rejected_completion_binding(
+                            completions,
+                            completion_work_id,
+                            &err,
+                        )
+                        .await
                         {
                             tracing::error!(
                                 %completion_work_id,
@@ -690,18 +825,23 @@ impl TurnRequestProcessor {
             }
             turn_id
         } else {
-            thread
+            match thread
                 .submit_user_input_with_client_user_message_id(
                     turn_op,
                     self.request_trace_context(&request_id).await,
                     client_user_message_id,
                 )
                 .await
-                .map_err(|err| {
+            {
+                Ok(turn_id) => turn_id,
+                Err(err) => {
+                    self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                        .await;
                     let error = internal_error(format!("failed to start turn: {err}"));
                     self.track_error_response(&request_id, &error, /*error_type*/ None);
-                    error
-                })?
+                    return Err(error);
+                }
+            }
         };
 
         if turn_has_input {
@@ -734,28 +874,36 @@ impl TurnRequestProcessor {
     }
 
     async fn build_environment_override(
+        &self,
         thread: &CodexThread,
         cwd: Option<AbsolutePathBuf>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
     ) -> Option<TurnEnvironmentSelections> {
-        if cwd.is_none() && environment_selections.is_none() {
-            return None;
+        match (cwd, environment_selections) {
+            (None, None) => None,
+            (Some(cwd), None) => {
+                let environment_selections =
+                    self.thread_manager.default_environment_selections(&cwd);
+                Some(TurnEnvironmentSelections::new(cwd, environment_selections))
+            }
+            (cwd, Some(environment_selections)) => {
+                let legacy_fallback_cwd = match cwd {
+                    Some(cwd) => cwd,
+                    None => {
+                        let snapshot = thread.config_snapshot().await;
+                        environment_selections
+                            .iter()
+                            .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
+                            .and_then(|selection| selection.cwd.to_abs_path().ok())
+                            .unwrap_or_else(|| snapshot.cwd().clone())
+                    }
+                };
+                Some(TurnEnvironmentSelections::new(
+                    legacy_fallback_cwd,
+                    environment_selections,
+                ))
+            }
         }
-
-        let snapshot = thread.config_snapshot().await;
-        let environment_selections =
-            environment_selections.unwrap_or_else(|| snapshot.environment_selections().to_vec());
-        let legacy_fallback_cwd = cwd.unwrap_or_else(|| {
-            environment_selections
-                .iter()
-                .find(|selection| selection.environment_id == LOCAL_ENVIRONMENT_ID)
-                .and_then(|selection| selection.cwd.to_abs_path().ok())
-                .unwrap_or_else(|| snapshot.cwd().clone())
-        });
-        Some(TurnEnvironmentSelections::new(
-            legacy_fallback_cwd,
-            environment_selections,
-        ))
     }
 
     async fn build_thread_settings_overrides(
@@ -919,12 +1067,9 @@ impl TurnRequestProcessor {
     ) -> Result<ThreadSettingsUpdateResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
         let cwd = resolve_request_cwd(params.cwd)?;
-        let environments = Self::build_environment_override(
-            thread.as_ref(),
-            cwd,
-            /*environment_selections*/ None,
-        )
-        .await;
+        let environments = self
+            .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
+            .await;
         let thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
@@ -975,6 +1120,7 @@ impl TurnRequestProcessor {
             })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(invalid_request)?;
+        validate_response_item_image_urls(&items)?;
 
         thread
             .inject_response_items(items)
@@ -1342,9 +1488,16 @@ impl TurnRequestProcessor {
             request_id,
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
-                architecture: params.architecture,
+                client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                flush_transcript_tail_on_session_end: params
+                    .flush_transcript_tail_on_session_end
+                    .unwrap_or(false),
+                codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
+                codex_response_item_prefix: params.codex_response_item_prefix,
+                codex_response_handoff_prefix: params.codex_response_handoff_prefix,
                 model: params.model,
                 output_modality: params.output_modality,
+                include_startup_context: params.include_startup_context.unwrap_or(true),
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
                 transport: params.transport.map(|transport| match transport {
@@ -1417,6 +1570,31 @@ impl TurnRequestProcessor {
             ))
         })?;
         Ok(Some(ThreadRealtimeAppendTextResponse::default()))
+    }
+
+    async fn thread_realtime_append_speech_inner(
+        &self,
+        request_id: &ConnectionRequestId,
+        params: ThreadRealtimeAppendSpeechParams,
+    ) -> Result<Option<ThreadRealtimeAppendSpeechResponse>, JSONRPCErrorError> {
+        let Some((_, thread)) = self
+            .prepare_realtime_conversation_thread(request_id, &params.thread_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.submit_core_op(
+            request_id,
+            thread.as_ref(),
+            Op::RealtimeConversationSpeech(ConversationSpeechParams { text: params.text }),
+        )
+        .await
+        .map_err(|err| {
+            internal_error(format!(
+                "failed to append realtime conversation speech: {err}"
+            ))
+        })?;
+        Ok(Some(ThreadRealtimeAppendSpeechResponse::default()))
     }
 
     async fn thread_realtime_stop_inner(
@@ -1541,11 +1719,12 @@ impl TurnRequestProcessor {
                 config.clone(),
                 InitialHistory::Resumed(ResumedHistory {
                     conversation_id: parent_thread_id,
-                    history: parent_history.items,
+                    history: Arc::new(parent_history.items),
                     rollout_path: parent_thread.rollout_path(),
                 }),
                 /*thread_source*/ None,
                 self.request_trace_context(request_id).await,
+                /*supports_openai_form_elicitation*/ false,
             )
             .await
             .map_err(|err| {
@@ -1747,6 +1926,10 @@ impl TurnRequestProcessor {
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "turn_processor_dead_handle_tests.rs"]
+mod tests;
 
 fn xcode_26_4_mcp_elicitations_auto_deny(
     client_name: Option<&str>,

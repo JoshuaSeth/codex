@@ -4,6 +4,7 @@ use super::AskForApproval;
 use super::SandboxMode;
 use super::SandboxPolicy;
 use super::Thread;
+use super::ThreadHistoryMode;
 use super::ThreadItem;
 use super::ThreadSource;
 use super::Turn;
@@ -14,14 +15,21 @@ use codex_experimental_api_macros::ExperimentalApi;
 pub use codex_protocol::capabilities::CapabilityRootLocation;
 pub use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+pub use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+pub use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+pub use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
+pub use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
 use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -38,55 +46,6 @@ pub enum ThreadStartSource {
     Clear,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct DynamicToolSpec {
-    #[ts(optional)]
-    pub namespace: Option<String>,
-    pub name: String,
-    pub description: String,
-    pub input_schema: JsonValue,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub defer_loading: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DynamicToolSpecDe {
-    namespace: Option<String>,
-    name: String,
-    description: String,
-    input_schema: JsonValue,
-    defer_loading: Option<bool>,
-    expose_to_context: Option<bool>,
-}
-
-impl<'de> Deserialize<'de> for DynamicToolSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let DynamicToolSpecDe {
-            namespace,
-            name,
-            description,
-            input_schema,
-            defer_loading,
-            expose_to_context,
-        } = DynamicToolSpecDe::deserialize(deserializer)?;
-
-        Ok(Self {
-            namespace,
-            name,
-            description,
-            input_schema,
-            defer_loading: defer_loading
-                .unwrap_or_else(|| expose_to_context.map(|visible| !visible).unwrap_or(false)),
-        })
-    }
-}
-
 // === Threads, Turns, and Items ===
 // Thread APIs
 #[derive(
@@ -99,6 +58,11 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    /// Allow a provider with an authoritative static model catalog to replace an unavailable
+    /// requested model with its default.
+    #[experimental("thread/start.allowProviderModelFallback")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_provider_model_fallback: bool,
     #[serde(
         default,
         deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
@@ -136,8 +100,17 @@ pub struct ThreadStartParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// @deprecated Ignored. Ultra reasoning effort enables proactive multi-agent behavior only on
+    /// eligible root threads; spawned children remain explicit-request-only.
+    #[experimental("thread/start.multiAgentMode")]
+    #[ts(optional = nullable)]
+    pub multi_agent_mode: Option<MultiAgentMode>,
     #[ts(optional = nullable)]
     pub ephemeral: Option<bool>,
+    /// Persisted thread history contract to use for this new thread.
+    #[experimental("thread/start.historyMode")]
+    #[ts(optional = nullable)]
+    pub history_mode: Option<ThreadHistoryMode>,
     #[ts(optional = nullable)]
     pub session_start_source: Option<ThreadStartSource>,
     /// Optional client-supplied analytics source classification for this thread.
@@ -153,6 +126,10 @@ pub struct ThreadStartParams {
     #[ts(optional = nullable)]
     pub environments: Option<Vec<TurnEnvironmentParams>>,
     #[experimental("thread/start.dynamicTools")]
+    #[serde(
+        default,
+        deserialize_with = "codex_protocol::dynamic_tools::deserialize_dynamic_tool_specs"
+    )]
     #[ts(optional = nullable)]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     /// Capability roots selected for this thread by the hosting platform.
@@ -202,9 +179,9 @@ pub struct ThreadStartResponse {
     #[experimental("thread/start.runtimeWorkspaceRoots")]
     #[serde(default)]
     pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
-    /// Instruction source files currently loaded for this thread.
+    /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
-    pub instruction_sources: Vec<AbsolutePathBuf>,
+    pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
     /// Reviewer currently used for approval requests on this thread.
@@ -218,6 +195,17 @@ pub struct ThreadStartResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// @deprecated Always `explicitRequestOnly`. Eligible roots derive Ultra behavior per turn.
+    #[experimental("thread/start.multiAgentMode")]
+    #[serde(default)]
+    pub multi_agent_mode: MultiAgentMode,
+}
+
+impl ThreadStartResponse {
+    /// Parses valid absolute instruction source paths and omits malformed legacy values.
+    pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
+        instruction_source_path_uris(&self.instruction_sources)
+    }
 }
 
 #[derive(
@@ -271,6 +259,10 @@ pub struct ThreadSettingsUpdateParams {
     #[experimental("thread/settings/update.collaborationMode")]
     #[ts(optional = nullable)]
     pub collaboration_mode: Option<CollaborationMode>,
+    /// @deprecated Ignored. `effort: "ultra"` enables proactive behavior only on eligible roots.
+    #[experimental("thread/settings/update.multiAgentMode")]
+    #[ts(optional = nullable)]
+    pub multi_agent_mode: Option<MultiAgentMode>,
     /// Override the personality for subsequent turns.
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
@@ -281,7 +273,7 @@ pub struct ThreadSettingsUpdateParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadSettingsUpdateResponse {}
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSettings {
@@ -296,6 +288,10 @@ pub struct ThreadSettings {
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
     pub collaboration_mode: CollaborationMode,
+    /// @deprecated Always `explicitRequestOnly`. Eligible roots derive Ultra behavior per turn.
+    #[experimental("thread/settings.multiAgentMode")]
+    #[serde(default)]
+    pub multi_agent_mode: MultiAgentMode,
     pub personality: Option<Personality>,
 }
 
@@ -416,9 +412,9 @@ pub struct ThreadResumeResponse {
     #[experimental("thread/resume.runtimeWorkspaceRoots")]
     #[serde(default)]
     pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
-    /// Instruction source files currently loaded for this thread.
+    /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
-    pub instruction_sources: Vec<AbsolutePathBuf>,
+    pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
     /// Reviewer currently used for approval requests on this thread.
@@ -432,10 +428,21 @@ pub struct ThreadResumeResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// @deprecated Always `explicitRequestOnly`. Eligible roots derive Ultra behavior per turn.
+    #[experimental("thread/resume.multiAgentMode")]
+    #[serde(default)]
+    pub multi_agent_mode: MultiAgentMode,
     /// `thread/turns/list` page returned when requested by `initialTurnsPage`.
     #[experimental("thread/resume.initialTurnsPage")]
     #[serde(default)]
     pub initial_turns_page: Option<TurnsPage>,
+}
+
+impl ThreadResumeResponse {
+    /// Parses valid absolute instruction source paths and omits malformed legacy values.
+    pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
+        instruction_source_path_uris(&self.instruction_sources)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -487,6 +494,13 @@ impl From<ThreadTurnsListResponse> for TurnsPage {
 /// Prefer using thread_id whenever possible.
 pub struct ThreadForkParams {
     pub thread_id: String,
+
+    /// Optional last turn id to fork through, inclusive.
+    ///
+    /// When specified, turns after `last_turn_id` are omitted from the fork.
+    /// The referenced turn cannot be in progress.
+    #[ts(optional = nullable)]
+    pub last_turn_id: Option<String>,
 
     /// [UNSTABLE] Specify the rollout path to fork from.
     /// If specified, the thread_id param will be ignored.
@@ -581,9 +595,9 @@ pub struct ThreadForkResponse {
     #[experimental("thread/fork.runtimeWorkspaceRoots")]
     #[serde(default)]
     pub runtime_workspace_roots: Vec<AbsolutePathBuf>,
-    /// Instruction source files currently loaded for this thread.
+    /// Environment-native paths to instruction source files currently loaded for this thread.
     #[serde(default)]
-    pub instruction_sources: Vec<AbsolutePathBuf>,
+    pub instruction_sources: Vec<LegacyAppPathString>,
     #[experimental(nested)]
     pub approval_policy: AskForApproval,
     /// Reviewer currently used for approval requests on this thread.
@@ -597,6 +611,34 @@ pub struct ThreadForkResponse {
     #[serde(default)]
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// @deprecated Always `explicitRequestOnly`. Eligible roots derive Ultra behavior per turn.
+    #[experimental("thread/fork.multiAgentMode")]
+    #[serde(default)]
+    pub multi_agent_mode: MultiAgentMode,
+}
+
+impl ThreadForkResponse {
+    /// Parses valid absolute instruction source paths and omits malformed legacy values.
+    pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
+        instruction_source_path_uris(&self.instruction_sources)
+    }
+}
+
+fn instruction_source_path_uris(sources: &[LegacyAppPathString]) -> Vec<PathUri> {
+    // Instruction sources are advisory diagnostics. Warn and fail open so a malformed legacy
+    // path cannot fail thread start, resume, or fork.
+    sources
+        .iter()
+        .filter_map(|source| {
+            source.to_inferred_path_uri().or_else(|| {
+                tracing::warn!(
+                    path = source.as_str(),
+                    "ignoring invalid instruction source path from app-server"
+                );
+                None
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -661,7 +703,7 @@ pub struct ThreadIncrementElicitationParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadIncrementElicitationResponse {
     /// Current out-of-band elicitation count after the increment.
-    pub count: u64,
+    pub count: i64,
     /// Whether timeout accounting is paused after applying the increment.
     pub paused: bool,
 }
@@ -681,7 +723,7 @@ pub struct ThreadDecrementElicitationParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadDecrementElicitationResponse {
     /// Current out-of-band elicitation count after the decrement.
-    pub count: u64,
+    pub count: i64,
     /// Whether timeout accounting remains paused after applying the decrement.
     pub paused: bool,
 }
@@ -1024,6 +1066,7 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// DEPRECATED: `thread/rollback` will be removed soon.
 pub struct ThreadRollbackParams {
     pub thread_id: String,
     /// The number of turns to drop from the end of the thread. Must be >= 1.
@@ -1085,10 +1128,15 @@ pub struct ThreadListParams {
     /// Optional substring filter for the extracted thread title.
     #[ts(optional = nullable)]
     pub search_term: Option<String>,
-    /// Optional direct parent thread filter.
+    /// Optional direct parent thread filter. Mutually exclusive with `ancestorThreadId`.
     #[experimental("thread/list.parentThreadId")]
     #[ts(optional = nullable)]
     pub parent_thread_id: Option<String>,
+    /// Optional ancestor thread filter. Returns spawned descendants at any depth, excluding the
+    /// ancestor itself. Mutually exclusive with `parentThreadId`.
+    #[experimental("thread/list.ancestorThreadId")]
+    #[ts(optional = nullable)]
+    pub ancestor_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1150,6 +1198,7 @@ pub enum ThreadSourceKind {
 pub enum ThreadSortKey {
     CreatedAt,
     UpdatedAt,
+    RecencyAt,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, JsonSchema, TS)]
@@ -1231,7 +1280,6 @@ pub struct ThreadResidencyDiagnostics {
     pub hard_cap_bytes: u64,
     pub idle_min_ttl_secs: u64,
     pub eviction_poll_secs: u64,
-    #[ts(optional = nullable)]
     pub rss_bytes: Option<u64>,
     pub loaded_threads: usize,
     pub resident_estimated_bytes: u64,
@@ -1245,11 +1293,8 @@ pub struct ThreadResidencyRecord {
     pub thread_id: String,
     pub loaded_for_secs: u64,
     pub idle_for_secs: u64,
-    #[ts(optional = nullable)]
     pub estimated_bytes: Option<u64>,
-    #[ts(optional = nullable)]
     pub resume_source: Option<String>,
-    #[ts(optional = nullable)]
     pub resume_duration_ms: Option<u64>,
 }
 
@@ -1264,8 +1309,7 @@ pub enum ThreadStatus {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Active {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional = nullable)]
+        #[serde(default)]
         active_turn_id: Option<String>,
         active_flags: Vec<ThreadActiveFlag>,
     },
@@ -1419,9 +1463,11 @@ pub struct ThreadTurnsListResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadTurnsItemsListParams {
+pub struct ThreadItemsListParams {
     pub thread_id: String,
-    pub turn_id: String,
+    /// Optional turn id to filter by. When omitted, returns items across the thread.
+    #[ts(optional = nullable)]
+    pub turn_id: Option<String>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     #[ts(optional = nullable)]
     pub cursor: Option<String>,
@@ -1436,7 +1482,7 @@ pub struct ThreadTurnsItemsListParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadTurnsItemsListResponse {
+pub struct ThreadItemsListResponse {
     pub data: Vec<ThreadItem>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.

@@ -8,7 +8,7 @@ use codex_app_server_protocol::SkillsChangedNotification;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::skills::SkillsLoadInput;
-use codex_core::skills::SkillsManager;
+use codex_core::skills::SkillsService;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::Receiver;
@@ -35,7 +35,7 @@ pub(crate) struct SkillsWatcher {
 
 impl SkillsWatcher {
     pub(crate) fn new(
-        skills_manager: Arc<SkillsManager>,
+        skills_service: Arc<SkillsService>,
         outgoing: Arc<OutgoingMessageSender>,
     ) -> Arc<Self> {
         let file_watcher = match FileWatcher::new() {
@@ -48,7 +48,7 @@ impl SkillsWatcher {
         let (subscriber, rx) = file_watcher.add_subscriber();
         let shutdown_token = CancellationToken::new();
         let shutdown_drop_guard = shutdown_token.clone().drop_guard();
-        Self::spawn_event_loop(rx, skills_manager, outgoing, shutdown_token.child_token());
+        Self::spawn_event_loop(rx, skills_service, outgoing, shutdown_token.child_token());
         Arc::new(Self {
             subscriber,
             runtime_extra_roots_registration: Mutex::new(WatchRegistration::default()),
@@ -104,10 +104,12 @@ impl SkillsWatcher {
             config.bundled_skills_enabled(),
         );
         let skill_roots = thread_manager
-            .skills_manager()
+            .skills_service()
             .skill_roots_for_config(&skills_input, Some(environment.get_filesystem()))
             .await
             .into_iter()
+            // Plugin roots are invalidated by plugin lifecycle operations.
+            .filter(|root| root.plugin_id.is_none())
             .map(|root| root.path)
             .collect::<Vec<_>>();
         let roots = existing_skill_root_watch_paths(skill_roots.iter());
@@ -116,7 +118,7 @@ impl SkillsWatcher {
 
     fn spawn_event_loop(
         rx: Receiver,
-        skills_manager: Arc<SkillsManager>,
+        skills_service: Arc<SkillsService>,
         outgoing: Arc<OutgoingMessageSender>,
         shutdown_token: CancellationToken,
     ) {
@@ -134,7 +136,7 @@ impl SkillsWatcher {
                 if event.is_none() {
                     break;
                 }
-                skills_manager.clear_cache();
+                skills_service.clear_cache();
                 outgoing
                     .send_server_notification(ServerNotification::SkillsChanged(
                         SkillsChangedNotification {},

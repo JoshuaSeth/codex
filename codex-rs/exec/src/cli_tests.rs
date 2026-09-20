@@ -2,6 +2,18 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn resume_parses_no_thinking_first_response_flag_and_alias() {
+    for flag in [
+        "--no-thinking-first-response",
+        "--disable-reasoning-on-first-response",
+    ] {
+        let cli = Cli::parse_from(["codex-exec", "resume", flag, "--last", "continue"]);
+        assert!(cli.no_thinking_first_response);
+    }
+    assert!(!Cli::parse_from(["codex-exec", "summarize"]).no_thinking_first_response);
+}
+
+#[test]
 fn resume_parses_prompt_after_global_flags() {
     const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
     let cli = Cli::parse_from([

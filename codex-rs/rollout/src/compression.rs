@@ -226,6 +226,7 @@ mod worker {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::fs::FileTimes;
+    use std::fs::Metadata;
     use std::fs::Permissions;
     use std::io;
     use std::io::Write;
@@ -235,6 +236,9 @@ mod worker {
     use std::time::Instant;
     use std::time::SystemTime;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
     use tracing::debug;
     use tracing::info;
     use tracing::warn;
@@ -243,6 +247,8 @@ mod worker {
 
     use crate::ARCHIVED_SESSIONS_SUBDIR;
     use crate::SESSIONS_SUBDIR;
+    use crate::file_lock::ExclusiveLockAttempt;
+    use crate::file_lock::try_lock_exclusive;
 
     use super::RolloutFile;
     use super::metrics;
@@ -362,9 +368,14 @@ mod worker {
         let result = async {
             cleanup_stale_temps(codex_home.as_path()).await?;
             let mut stats = CompressionStats::default();
-            if started_at.elapsed() < WORKER_MAX_RUNTIME {
-                let archived_root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
-                compress_rollouts_in_root(archived_root.as_path(), started_at, &mut stats).await?;
+            for root in [
+                codex_home.join(ARCHIVED_SESSIONS_SUBDIR),
+                codex_home.join(SESSIONS_SUBDIR),
+            ] {
+                if started_at.elapsed() >= WORKER_MAX_RUNTIME {
+                    break;
+                }
+                compress_rollouts_in_root(root.as_path(), started_at, &mut stats).await?;
             }
             Ok::<_, io::Error>(stats)
         }
@@ -486,6 +497,7 @@ mod worker {
         Compressed,
         SkippedNotCold,
         SkippedChanged,
+        SkippedWriterOwned,
         SkippedAlreadyCompressed,
     }
 
@@ -495,6 +507,7 @@ mod worker {
                 CompressionOutcome::Compressed => "compressed",
                 CompressionOutcome::SkippedNotCold => "skipped_not_cold",
                 CompressionOutcome::SkippedChanged => "skipped_changed",
+                CompressionOutcome::SkippedWriterOwned => "skipped_writer_owned",
                 CompressionOutcome::SkippedAlreadyCompressed => "skipped_already_compressed",
             }
         }
@@ -550,6 +563,7 @@ mod worker {
                     }
                     CompressionOutcome::SkippedNotCold
                     | CompressionOutcome::SkippedChanged
+                    | CompressionOutcome::SkippedWriterOwned
                     | CompressionOutcome::SkippedAlreadyCompressed => {
                         stats.skipped = stats.skipped.saturating_add(1);
                     }
@@ -581,7 +595,18 @@ mod worker {
     }
 
     fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
-        let before = match cold_file_state(path)? {
+        let mut source_file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(CompressionMeasurement::new(
+                    CompressionOutcome::SkippedNotCold,
+                    /*source_bytes*/ None,
+                    /*compressed_bytes*/ None,
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        let before = match cold_file_state(source_file.metadata()?)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {
                 return Ok(CompressionMeasurement::new(
@@ -592,6 +617,26 @@ mod worker {
             }
         };
         let source_bytes = Some(before.len);
+        match try_lock_exclusive(&source_file, path)? {
+            ExclusiveLockAttempt::Acquired => {}
+            ExclusiveLockAttempt::Contended => {
+                return Ok(CompressionMeasurement::new(
+                    CompressionOutcome::SkippedWriterOwned,
+                    source_bytes,
+                    /*compressed_bytes*/ None,
+                ));
+            }
+        }
+        // `source_file` is the lock guard. Keep it alive through publication and
+        // source removal, and prove the path still names the locked file before
+        // reading or mutating either representation.
+        if !same_file_state(path, &before)? {
+            return Ok(CompressionMeasurement::new(
+                CompressionOutcome::SkippedChanged,
+                source_bytes,
+                /*compressed_bytes*/ None,
+            ));
+        }
         let compressed_path = path::compressed_rollout_path(path);
         if compressed_path.exists() {
             return Ok(CompressionMeasurement::new(
@@ -610,7 +655,7 @@ mod worker {
             .prefix("rollout-compress-")
             .suffix(TEMP_SUFFIX)
             .tempfile_in(temp_dir)?;
-        encode_zstd_to_writer(path, temp_file.as_file_mut())?;
+        encode_zstd_to_writer(&mut source_file, temp_file.as_file_mut())?;
         temp_file.as_file_mut().flush()?;
         verify_zstd(temp_file.path())?;
         if !same_file_state(path, &before)? {
@@ -655,16 +700,13 @@ mod worker {
         len: u64,
         modified: SystemTime,
         permissions: Permissions,
+        #[cfg(unix)]
+        device: u64,
+        #[cfg(unix)]
+        inode: u64,
     }
 
-    fn cold_file_state(path: &Path) -> io::Result<ColdFileState> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(ColdFileState::NotCold(None));
-            }
-            Err(err) => return Err(err),
-        };
+    fn cold_file_state(metadata: Metadata) -> io::Result<ColdFileState> {
         if !metadata.is_file() {
             return Ok(ColdFileState::NotCold(None));
         }
@@ -673,6 +715,10 @@ mod worker {
             len: metadata.len(),
             modified,
             permissions: metadata.permissions(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
         };
         let age = SystemTime::now()
             .duration_since(modified)
@@ -685,18 +731,30 @@ mod worker {
 
     fn same_file_state(path: &Path, expected: &FileState) -> io::Result<bool> {
         match std::fs::metadata(path) {
-            Ok(metadata) => Ok(metadata.len() == expected.len
-                && metadata.modified()? == expected.modified
-                && metadata.permissions() == expected.permissions),
+            Ok(metadata) => {
+                let identity_matches = {
+                    #[cfg(unix)]
+                    {
+                        metadata.dev() == expected.device && metadata.ino() == expected.inode
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                };
+                Ok(identity_matches
+                    && metadata.len() == expected.len
+                    && metadata.modified()? == expected.modified
+                    && metadata.permissions() == expected.permissions)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err),
         }
     }
 
-    fn encode_zstd_to_writer(source: &Path, output: impl Write) -> io::Result<()> {
-        let mut input = File::open(source)?;
+    fn encode_zstd_to_writer(source: &mut File, output: impl Write) -> io::Result<()> {
         let mut encoder = zstd::stream::write::Encoder::new(output, COMPRESSION_LEVEL)?;
-        io::copy(&mut input, &mut encoder)?;
+        io::copy(source, &mut encoder)?;
         encoder.finish()?;
         Ok(())
     }

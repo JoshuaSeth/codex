@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::config_types::MultiAgentMode;
 
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
@@ -224,7 +225,10 @@ async fn maybe_unload_residency_candidate(
         .await;
     let agent_status = thread.agent_status().await;
     let is_active = matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::Running);
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        );
     let is_protected =
         residency_candidate_is_protected(has_subscribers, &loaded_status, &agent_status);
     thread_residency_manager
@@ -262,7 +266,10 @@ fn residency_candidate_is_protected(
 ) -> bool {
     has_subscribers
         || matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::Running)
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        )
 }
 
 pub(super) async fn ensure_listener_task_running(
@@ -688,6 +695,8 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_permission_profile,
         workspace_roots,
         reasoning_effort,
+        thread_source,
+        originator,
         ..
     } = config_snapshot;
     let instruction_sources = pending.instruction_sources;
@@ -696,6 +705,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_response_active_permission_profile(active_permission_profile);
     let session_id = conversation.session_configured().session_id.to_string();
     thread.session_id = session_id;
+    thread.thread_source = thread_source.map(Into::into);
 
     let response = ThreadResumeResponse {
         thread,
@@ -710,9 +720,12 @@ pub(super) async fn handle_pending_thread_resume_request(
         sandbox,
         active_permission_profile,
         reasoning_effort,
+        multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         initial_turns_page,
     };
-    outgoing.send_response(request_id, response).await;
+    outgoing
+        .send_response_with_thread_originator(request_id, response, originator)
+        .await;
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
     if let Some(token_usage_thread) = token_usage_thread {
@@ -877,6 +890,15 @@ mod tests {
             /*has_subscribers*/ false,
             &ThreadStatus::Idle,
             &AgentStatus::Running,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_initializing_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::PendingInit,
         ));
     }
 
