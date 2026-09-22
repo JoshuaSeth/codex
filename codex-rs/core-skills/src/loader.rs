@@ -1,4 +1,5 @@
 mod environment;
+mod namespace;
 
 pub use environment::EnvironmentSkillLoadOutcome;
 pub use environment::EnvironmentSkillMetadata;
@@ -30,9 +31,10 @@ use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::DISCOVERABLE_PLUGIN_MANIFEST_PATHS;
 use codex_utils_plugins::PluginSkillRoot;
-use codex_utils_plugins::plugin_namespace_for_skill_path;
 use dirs::home_dir;
 use futures::future::join_all;
+use namespace::ResolvedSkillNamespace;
+use namespace::SkillNamespaceResolver;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -866,9 +868,10 @@ async fn load_skills_under_root(
     let allowed_source_root = allowed_source_root.map(PathUri::from_abs_path);
     let SkillFileDiscovery {
         skill_files,
+        plugin_roots,
+        namespace_roots,
         warnings,
         boundary_errors,
-        ..
     } = discover_skills_under_root_with_boundary(
         fs,
         &PathUri::from_abs_path(root),
@@ -888,6 +891,20 @@ async fn load_skills_under_root(
             message: boundary_error.message.to_string(),
         });
     }
+    let root_uri = PathUri::from_abs_path(root);
+    let namespace_resolver = match plugin_namespace {
+        Some(namespace) => SkillNamespaceResolver::with_provided_namespace(namespace),
+        None => {
+            SkillNamespaceResolver::discover(
+                fs,
+                &root_uri,
+                &skill_files,
+                plugin_roots,
+                namespace_roots,
+            )
+            .await
+        }
+    };
     for path_uri in skill_files {
         let path = match path_uri.to_abs_path() {
             Ok(path) => path,
@@ -901,7 +918,7 @@ async fn load_skills_under_root(
             &path,
             scope,
             plugin_id,
-            plugin_namespace,
+            namespace_resolver.for_skill(&root_uri, &path_uri),
             plugin_root.as_ref(),
         )
         .await
@@ -921,7 +938,7 @@ async fn parse_skill_file(
     path: &AbsolutePathBuf,
     scope: SkillScope,
     plugin_id: Option<&str>,
-    plugin_namespace: Option<&str>,
+    namespace: &ResolvedSkillNamespace,
     plugin_root: Option<&AbsolutePathBuf>,
 ) -> Result<SkillMetadata, SkillParseError> {
     let path_uri = PathUri::from_abs_path(path);
@@ -934,7 +951,7 @@ async fn parse_skill_file(
         description,
         short_description,
     } = parse_skill_frontmatter_metadata_inner(&contents, || default_skill_name(path))?;
-    let name = namespaced_skill_name(fs, path, &base_name, plugin_namespace).await;
+    let name = namespace.qualify(&base_name);
     let LoadedSkillMetadata {
         interface,
         dependencies,
@@ -1018,21 +1035,6 @@ fn default_skill_name(path: &AbsolutePathBuf) -> String {
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "skill".to_string())
-}
-
-async fn namespaced_skill_name(
-    fs: &dyn ExecutorFileSystem,
-    path: &AbsolutePathBuf,
-    base_name: &str,
-    plugin_namespace: Option<&str>,
-) -> String {
-    if let Some(plugin_namespace) = plugin_namespace {
-        return format!("{plugin_namespace}:{base_name}");
-    }
-    plugin_namespace_for_skill_path(fs, path)
-        .await
-        .map(|namespace| format!("{namespace}:{base_name}"))
-        .unwrap_or_else(|| base_name.to_string())
 }
 
 async fn load_skill_metadata(
