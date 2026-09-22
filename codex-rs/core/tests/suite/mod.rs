@@ -65,6 +65,8 @@ mod image_rollout;
 mod items;
 mod json_result;
 mod live_cli;
+#[cfg(unix)]
+mod mcp_refresh_cleanup;
 mod mcp_tool_exposure;
 mod mcp_turn_metadata;
 mod model_overrides;
@@ -97,6 +99,8 @@ mod request_permissions_tool;
 mod request_plugin_install;
 mod request_user_input;
 mod responses_api_proxy_headers;
+#[cfg(target_os = "linux")]
+mod responses_api_system_proxy;
 mod responses_lite;
 mod resume;
 mod resume_warning;
@@ -124,6 +128,7 @@ mod tools;
 mod truncation;
 mod turn_state;
 mod unified_exec;
+mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;

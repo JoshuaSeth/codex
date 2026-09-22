@@ -24,6 +24,7 @@ use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
@@ -39,6 +40,7 @@ use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::NewThreadModelDefaults;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
@@ -178,6 +180,7 @@ pub(crate) struct AppServerSession {
     thread_settings_update_supported: bool,
     default_model: Option<String>,
     available_models: Vec<ModelPreset>,
+    managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_completion_pending: AtomicBool,
 }
 
@@ -222,6 +225,7 @@ impl AppServerSession {
             thread_settings_update_supported: true,
             default_model: None,
             available_models: Vec::new(),
+            managed_new_thread_defaults: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
     }
@@ -260,6 +264,21 @@ impl AppServerSession {
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         let account = self.read_account().await?;
+        let requirements_request_id = self.next_request_id();
+        let requirements: ConfigRequirementsReadResponse = self
+            .client
+            .request_typed(ClientRequest::ConfigRequirementsRead {
+                request_id: requirements_request_id,
+                params: None,
+            })
+            .await
+            .map_err(|err| {
+                bootstrap_request_error("configRequirements/read failed during TUI bootstrap", err)
+            })?;
+        self.managed_new_thread_defaults = requirements
+            .requirements
+            .and_then(|requirements| requirements.models)
+            .and_then(|models| models.new_thread);
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
             .client
@@ -348,6 +367,10 @@ impl AppServerSession {
             has_chatgpt_account,
             available_models,
         })
+    }
+
+    pub(crate) fn managed_new_thread_defaults(&self) -> Option<&NewThreadModelDefaults> {
+        self.managed_new_thread_defaults.as_ref()
     }
 
     /// Fetches the current account info without refreshing the auth token.
@@ -1296,6 +1319,12 @@ fn config_request_overrides_from_config(
     if config.bypass_hook_trust {
         overrides.insert("bypass_hook_trust".to_string(), true.into());
     }
+    if config.disable_reasoning_on_first_response {
+        overrides.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            true.into(),
+        );
+    }
     Some(overrides)
 }
 
@@ -2222,6 +2251,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_lifecycle_params_forward_first_response_override_to_remote_and_embedded() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let mut expected = config_request_overrides_from_config(&config).expect("config overrides");
+        assert!(!expected.contains_key("disable_reasoning_on_first_response"));
+        config.disable_reasoning_on_first_response = true;
+        expected.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            true.into(),
+        );
+
+        for mode in [ThreadParamsMode::Embedded, ThreadParamsMode::Remote] {
+            let thread_id = ThreadId::new();
+            let configs = [
+                thread_start_params_from_config(
+                    &config, mode, /*remote_cwd_override*/ None,
+                    /*session_start_source*/ None,
+                )
+                .config,
+                thread_resume_params_from_config(
+                    config.clone(),
+                    thread_id,
+                    mode,
+                    /*remote_cwd_override*/ None,
+                )
+                .config,
+                thread_fork_params_from_config(
+                    config.clone(),
+                    thread_id,
+                    mode,
+                    /*remote_cwd_override*/ None,
+                )
+                .config,
+            ];
+            for actual in configs {
+                assert_eq!(actual, Some(expected.clone()));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn thread_fork_params_forward_instruction_overrides() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
@@ -2326,11 +2396,13 @@ mod tests {
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
                 id: thread_id.to_string(),
+                extra: None,
                 session_id: ThreadId::new().to_string(),
                 forked_from_id: Some(forked_from_id.to_string()),
                 parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
+                history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 created_at: 1,
                 updated_at: 2,

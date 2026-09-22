@@ -225,7 +225,10 @@ async fn maybe_unload_residency_candidate(
         .await;
     let agent_status = thread.agent_status().await;
     let is_active = matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::Running);
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        );
     let is_protected =
         residency_candidate_is_protected(has_subscribers, &loaded_status, &agent_status);
     thread_residency_manager
@@ -263,7 +266,10 @@ fn residency_candidate_is_protected(
 ) -> bool {
     has_subscribers
         || matches!(loaded_status, ThreadStatus::Active { .. })
-        || matches!(agent_status, AgentStatus::Running)
+        || matches!(
+            agent_status,
+            AgentStatus::PendingInit | AgentStatus::Running
+        )
 }
 
 pub(super) async fn ensure_listener_task_running(
@@ -410,46 +416,6 @@ pub(super) async fn ensure_listener_task_running(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn residency_candidate_final_guard_protects_subscribed_threads() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ true,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_protects_threads_that_became_active() {
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Active {
-                active_turn_id: None,
-                active_flags: Vec::new(),
-            },
-            &AgentStatus::Completed(None),
-        ));
-        assert!(residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Running,
-        ));
-    }
-
-    #[test]
-    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
-        assert!(!residency_candidate_is_protected(
-            /*has_subscribers*/ false,
-            &ThreadStatus::Idle,
-            &AgentStatus::Completed(None),
-        ));
-    }
-}
-
 pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> ThreadShutdownResult {
     match tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait()).await {
         Ok(Ok(())) => ThreadShutdownResult::Complete,
@@ -541,6 +507,33 @@ pub(super) async fn handle_thread_listener_command(
             .await;
         }
         ThreadListenerCommand::EmitThreadGoalUpdated { turn_id, goal } => {
+            let terminal_status = match goal.status {
+                ThreadGoalStatus::Complete => Some("complete"),
+                ThreadGoalStatus::Blocked => Some("blocked"),
+                ThreadGoalStatus::UsageLimited => Some("usageLimited"),
+                ThreadGoalStatus::BudgetLimited => Some("budgetLimited"),
+                ThreadGoalStatus::Active | ThreadGoalStatus::Paused => None,
+            };
+            if let Some(terminal_status) = terminal_status
+                && let (Some(turn_id), Some(state_db)) =
+                    (turn_id.as_deref(), conversation.state_db())
+                && let Err(err) =
+                    crate::bespoke_event_handling::persist_terminal_goal_turn_association(
+                        state_db.completions(),
+                        conversation_id,
+                        terminal_status,
+                        goal.updated_at,
+                        turn_id,
+                    )
+                    .await
+            {
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id,
+                    error = %err,
+                    "failed to associate terminal goal state with its active turn"
+                );
+            }
             outgoing
                 .send_server_notification(ServerNotification::ThreadGoalUpdated(
                     ThreadGoalUpdatedNotification {
@@ -702,6 +695,8 @@ pub(super) async fn handle_pending_thread_resume_request(
         active_permission_profile,
         workspace_roots,
         reasoning_effort,
+        thread_source,
+        originator,
         ..
     } = config_snapshot;
     let instruction_sources = pending.instruction_sources;
@@ -710,6 +705,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_response_active_permission_profile(active_permission_profile);
     let session_id = conversation.session_configured().session_id.to_string();
     thread.session_id = session_id;
+    thread.thread_source = thread_source.map(Into::into);
 
     let response = ThreadResumeResponse {
         thread,
@@ -727,7 +723,9 @@ pub(super) async fn handle_pending_thread_resume_request(
         multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
         initial_turns_page,
     };
-    outgoing.send_response(request_id, response).await;
+    outgoing
+        .send_response_with_thread_originator(request_id, response, originator)
+        .await;
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
     if let Some(token_usage_thread) = token_usage_thread {
@@ -863,4 +861,53 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
         }
     }
     thread.status = status;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residency_candidate_final_guard_protects_subscribed_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ true,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_threads_that_became_active() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Active {
+                active_turn_id: None,
+                active_flags: Vec::new(),
+            },
+            &AgentStatus::Completed(None),
+        ));
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Running,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_protects_initializing_threads() {
+        assert!(residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::PendingInit,
+        ));
+    }
+
+    #[test]
+    fn residency_candidate_final_guard_allows_idle_unsubscribed_threads() {
+        assert!(!residency_candidate_is_protected(
+            /*has_subscribers*/ false,
+            &ThreadStatus::Idle,
+            &AgentStatus::Completed(None),
+        ));
+    }
 }

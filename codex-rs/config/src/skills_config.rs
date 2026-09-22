@@ -5,6 +5,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+pub use codex_protocol::protocol::PitchAiSkillPrincipal;
+
 const fn default_enabled() -> bool {
     true
 }
@@ -40,14 +42,6 @@ pub struct SkillsConfig {
     /// or client-supplied filesystem paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pitchai_principal: Option<PitchAiSkillPrincipal>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct PitchAiSkillPrincipal {
-    pub schema_version: u8,
-    pub tenant_id: String,
-    pub user_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

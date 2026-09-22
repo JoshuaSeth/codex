@@ -63,6 +63,7 @@ pub(crate) use legacy_unified_exec_process_limit_warning::LegacyUnifiedExecProce
 pub(crate) use model_switch_instructions::ModelSwitchInstructions;
 pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
 pub(crate) use network_rule_saved::NetworkRuleSaved;
+pub use permissions_instructions::ApprovalPromptContext;
 pub use permissions_instructions::PermissionsInstructions;
 pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
 pub(crate) use plugin_instructions::PluginInstructions;
@@ -72,6 +73,7 @@ pub(crate) use realtime_start_with_instructions::RealtimeStartWithInstructions;
 pub(crate) use recommended_plugins_instructions::RecommendedPluginsInstructions;
 pub(crate) use rollout_budget::RolloutBudgetContext;
 pub(crate) use subagent_notification::SubagentNotification;
+pub(crate) use token_budget_context::ContextWindowGuidance;
 pub(crate) use token_budget_context::TokenBudgetContext;
 pub(crate) use token_budget_context::TokenBudgetRemainingContext;
 pub(crate) use token_budget_context::TokenBudgetReminder;

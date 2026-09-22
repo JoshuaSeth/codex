@@ -20,6 +20,15 @@ pub struct Cli {
     #[arg(long = "strict-config", global = true, default_value_t = false)]
     pub strict_config: bool,
 
+    /// Disable reasoning effort and summaries for the first response after each user turn; restore configured reasoning on follow-ups.
+    #[arg(
+        long = "no-thinking-first-response",
+        alias = "disable-reasoning-on-first-response",
+        global = true,
+        default_value_t = false
+    )]
+    pub no_thinking_first_response: bool,
+
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
 

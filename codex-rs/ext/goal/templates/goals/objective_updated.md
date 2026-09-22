@@ -13,4 +13,6 @@ Budget:
 
 Adjust the current turn to pursue the updated objective. Avoid continuing work that only served the previous objective unless it also helps the updated objective.
 
+Retire previous-objective blockers, permission rituals, waiting conditions, reminder assumptions, and verification checklists that do not apply to the updated objective. Re-read current state before acting; do not replay a stale blocker merely because it appeared in earlier conversation or resume context. Existing higher-priority safety and outgoing-communication policies remain unchanged.
+
 Do not call update_goal unless the updated goal is actually complete.

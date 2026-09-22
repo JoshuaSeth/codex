@@ -315,12 +315,13 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
-        tools: Vec::new(),
+        tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
@@ -401,12 +402,13 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         model: "gpt-test".into(),
         instructions: "Say hi".into(),
         input: Vec::new(),
-        tools: Vec::new(),
+        tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
@@ -443,6 +445,92 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         Some(&HeaderValue::from_static("zstd"))
     );
     assert_eq!(requests[0].2, codex_client::RequestCompression::None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn serialized_edge_path_is_transport_equivalent_to_typed_request() -> Result<()> {
+    let request = ResponsesApiRequest {
+        model: "gpt-test".into(),
+        instructions: "Help Alice Stone".into(),
+        input: vec![ResponseItem::Message {
+            id: Some("msg_1".into()),
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: "Email alice@example.invalid".into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        tools: Some(vec![
+            serde_json::json!({"name": "lookup", "description": "Lookup user"}),
+        ]),
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream: true,
+        stream_options: Some(codex_api::StreamOptions {
+            reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+        }),
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: Some("cache-test".into()),
+        text: None,
+        client_metadata: None,
+    };
+    let options = || {
+        let mut extra_headers = HeaderMap::new();
+        extra_headers.insert("x-test-header", HeaderValue::from_static("present"));
+        ResponsesOptions {
+            session_id: Some("session-test".into()),
+            thread_id: Some("thread-test".into()),
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
+            extra_headers,
+            compression: Compression::Zstd,
+            turn_state: None,
+        }
+    };
+
+    let typed_state = RecordingState::default();
+    let typed_client = ResponsesClient::new(
+        RecordingTransport::new(typed_state.clone()),
+        provider("openai"),
+        Arc::new(NoAuth),
+    );
+    let _typed_stream = typed_client
+        .stream_request(request.clone(), options())
+        .await?;
+
+    let value_state = RecordingState::default();
+    let value_client = ResponsesClient::new(
+        RecordingTransport::new(value_state.clone()),
+        provider("openai"),
+        Arc::new(NoAuth),
+    );
+    let serialized = serde_json::to_value(&request)?;
+    let _value_stream = value_client
+        .stream_value_request(serialized, options())
+        .await?;
+
+    let typed = typed_state.take_stream_requests().remove(0);
+    let value = value_state.take_stream_requests().remove(0);
+    assert_eq!(typed.method, value.method);
+    assert_eq!(typed.url, value.url);
+    assert_eq!(typed.headers, value.headers);
+    assert_eq!(
+        typed.headers.get(http::header::CONTENT_ENCODING),
+        Some(&HeaderValue::from_static("zstd"))
+    );
+    // Struct and Value serialization may order JSON keys differently. Compare
+    // every decoded field while retaining compressed transport coverage.
+    for actual in [&typed, &value] {
+        let decoded = zstd::stream::decode_all(request_body_bytes(actual))?;
+        let body: serde_json::Value = serde_json::from_slice(&decoded)?;
+        assert_eq!(body, serde_json::to_value(&request)?);
+    }
+    assert_eq!(typed.compression, value.compression);
+    assert_eq!(typed.timeout, value.timeout);
     Ok(())
 }
 
@@ -520,12 +608,13 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
-        tools: Vec::new(),
+        tools: Some(Vec::new()),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
         store: true,
         stream: true,
+        stream_options: None,
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,

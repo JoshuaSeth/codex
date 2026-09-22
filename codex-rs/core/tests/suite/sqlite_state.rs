@@ -177,6 +177,14 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
     })
     .await;
 
+    // Another manager must not acquire the rollout while its original writer
+    // is still alive. Shutdown flushes the history and releases ownership.
+    started.thread.submit(Op::Shutdown).await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
     let mut resume_builder = test_codex().with_config(|config| {
         config
             .features
@@ -372,8 +380,12 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     model_provider: None,
                     base_instructions: None,
                     dynamic_tools: None,
+                    selected_capability_roots: Vec::new(),
                     memory_mode: None,
+                    history_mode: Default::default(),
+                    pitchai_principal: None,
                     multi_agent_version: None,
+                    context_window: None,
                 },
                 git: None,
             };
@@ -656,6 +668,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
         servers.insert(
             server_name.to_string(),
             McpServerConfig {
+                auth: Default::default(),
                 transport: McpServerTransportConfig::Stdio {
                     command: rmcp_test_server_bin,
                     args: Vec::new(),

@@ -1,14 +1,20 @@
 use super::*;
+use crate::error_code::before_effect;
+use crate::error_code::invalid_request_before_effect;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::protocol::ThreadHistoryMode;
 use futures::future::join_all;
 
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
+const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
+const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
+    "thread/rollback is deprecated and will be removed soon";
 const THREAD_STATUS_LIST_LIVE_BACKFILL_TIMEOUT: Duration = Duration::from_millis(250);
 
 struct ThreadListFilters {
@@ -18,7 +24,7 @@ struct ThreadListFilters {
     cwd_filters: Option<Vec<PathBuf>>,
     search_term: Option<String>,
     use_state_db_only: bool,
-    parent_thread_id: Option<ThreadId>,
+    relation_filter: Option<StoreThreadRelationFilter>,
 }
 
 async fn loaded_statuses_with_bounded_live_active_turn_ids<
@@ -419,6 +425,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_residency_reaper_shutdown: CancellationToken,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -451,6 +458,7 @@ impl ThreadRequestProcessor {
         state_db: Option<StateDbHandle>,
         log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
+        initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
         let thread_residency_reaper_shutdown = CancellationToken::new();
         spawn_thread_residency_reaper(
@@ -481,6 +489,7 @@ impl ThreadRequestProcessor {
             thread_residency_reaper_shutdown,
             background_tasks: TaskTracker::new(),
             skills_watcher,
+            initial_config_warnings: Arc::new(initial_config_warnings),
         }
     }
 
@@ -704,10 +713,27 @@ impl ThreadRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: ThreadRollbackParams,
+        app_server_client_name: Option<&str>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if app_server_client_name != Some(CODEX_TUI_CLIENT_NAME) {
+            self.send_thread_rollback_deprecation_notice(request_id.connection_id)
+                .await;
+        }
         self.thread_rollback_inner(request_id, params)
             .await
             .map(|()| None)
+    }
+
+    async fn send_thread_rollback_deprecation_notice(&self, connection_id: ConnectionId) {
+        self.outgoing
+            .send_server_notification_to_connections(
+                &[connection_id],
+                ServerNotification::DeprecationNotice(DeprecationNoticeNotification {
+                    summary: THREAD_ROLLBACK_DEPRECATION_SUMMARY.to_string(),
+                    details: None,
+                }),
+            )
+            .await;
     }
 
     pub(crate) async fn thread_list(
@@ -773,13 +799,13 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
-    pub(crate) async fn thread_turns_items_list(
+    pub(crate) async fn thread_items_list(
         &self,
-        _params: ThreadTurnsItemsListParams,
+        params: ThreadItemsListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Err(method_not_found(
-            "thread/turns/items/list is not supported yet",
-        ))
+        self.thread_items_list_response_inner(params)
+            .await
+            .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn thread_shell_command(
@@ -979,6 +1005,7 @@ impl ThreadRequestProcessor {
         let ThreadStartParams {
             model,
             model_provider,
+            allow_provider_model_fallback,
             service_tier,
             cwd,
             runtime_workspace_roots,
@@ -997,10 +1024,12 @@ impl ThreadRequestProcessor {
             personality,
             multi_agent_mode: _multi_agent_mode,
             ephemeral,
+            history_mode,
             session_start_source,
             thread_source,
             environments,
         } = params;
+        required_pitchai_principal_from_config(config.as_ref())?;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
                 "`permissions` cannot be combined with `sandbox`",
@@ -1038,6 +1067,7 @@ impl ThreadRequestProcessor {
         };
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
+        let initial_config_warnings = Arc::clone(&self.initial_config_warnings);
         let outgoing = Arc::clone(&listener_task_context.outgoing);
         let error_request_id = request_id.clone();
         let thread_start_task = async move {
@@ -1052,12 +1082,15 @@ impl ThreadRequestProcessor {
                 typesafe_overrides,
                 dynamic_tools,
                 selected_capability_roots.unwrap_or_default(),
+                history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
                 environment_selections,
                 service_name,
+                allow_provider_model_fallback,
                 experimental_raw_events,
                 request_trace,
+                initial_config_warnings,
             )
             .await
             {
@@ -1131,12 +1164,15 @@ impl ThreadRequestProcessor {
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<DynamicToolSpec>>,
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
+        history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
         service_name: Option<String>,
+        allow_provider_model_fallback: bool,
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
+        initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
     ) -> Result<(), JSONRPCErrorError> {
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
@@ -1210,6 +1246,21 @@ impl ThreadRequestProcessor {
                 .map_err(|err| config_load_error(&err))?;
         }
 
+        if let Ok(Some(err)) =
+            codex_core::check_execpolicy_for_warnings(&config.config_layer_stack).await
+        {
+            let notification = crate::exec_policy_config_warning(&err);
+            if !initial_config_warnings.contains(&notification) {
+                listener_task_context
+                    .outgoing
+                    .send_server_notification_to_connections(
+                        &[request_id.connection_id],
+                        ServerNotification::ConfigWarning(notification),
+                    )
+                    .await;
+            }
+        }
+
         let environments = environments.unwrap_or_else(|| {
             listener_task_context
                 .thread_manager
@@ -1230,7 +1281,6 @@ impl ThreadRequestProcessor {
         let mut thread_extension_init = ExtensionDataInit::new();
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
-            codex_mcp_extension::initialize_executor_plugin_thread_data(&mut thread_extension_init);
         }
         let create_thread_started_at = std::time::Instant::now();
         let NewThread {
@@ -1242,12 +1292,14 @@ impl ThreadRequestProcessor {
             .thread_manager
             .start_thread_with_options(StartThreadOptions {
                 config,
+                allow_provider_model_fallback,
                 initial_history: match session_start_source
                     .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
                 {
                     codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
                     codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
                 },
+                history_mode,
                 session_source: None,
                 thread_source,
                 dynamic_tools,
@@ -1265,6 +1317,7 @@ impl ThreadRequestProcessor {
             .await
             .map_err(|err| match err {
                 CodexErr::InvalidRequest(message) => invalid_request(message),
+                CodexErr::UnsupportedOperation(message) => method_not_found(message),
                 err => internal_error(format!("error creating thread: {err}")),
             })?;
         let session_telemetry = thread.session_telemetry();
@@ -1348,6 +1401,7 @@ impl ThreadRequestProcessor {
         let cwd = config_snapshot.cwd().clone();
         let active_permission_profile =
             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
+        let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadStartResponse {
             thread: thread.clone(),
@@ -1367,7 +1421,7 @@ impl ThreadRequestProcessor {
         let notif = thread_started_notification(thread);
         listener_task_context
             .outgoing
-            .send_response(request_id, response)
+            .send_response_with_thread_originator(request_id, response, thread_originator)
             .instrument(tracing::info_span!(
                 "app_server.thread_start.send_response",
                 otel.name = "app_server.thread_start.send_response",
@@ -1531,25 +1585,14 @@ impl ThreadRequestProcessor {
         &self,
         thread_id: ThreadId,
     ) -> Result<Vec<ThreadId>, JSONRPCErrorError> {
-        let mut thread_ids = vec![thread_id];
-        let Some(state_db_ctx) = self.state_db.as_ref() else {
-            return Ok(thread_ids);
-        };
-        let mut seen = HashSet::from([thread_id]);
-        let descendants = state_db_ctx
-            .list_thread_spawn_descendants(thread_id)
+        self.thread_manager
+            .list_agent_subtree_thread_ids(thread_id)
             .await
             .map_err(|err| {
                 internal_error(format!(
                     "failed to list spawned descendants for thread id {thread_id}: {err}"
                 ))
-            })?;
-        for descendant_id in descendants {
-            if seen.insert(descendant_id) {
-                thread_ids.push(descendant_id);
-            }
-        }
-        Ok(thread_ids)
+            })
     }
 
     async fn thread_increment_elicitation_inner(
@@ -2006,13 +2049,25 @@ impl ThreadRequestProcessor {
             use_state_db_only,
             search_term,
             parent_thread_id,
+            ancestor_thread_id,
         } = params;
         let cwd_filters = normalize_thread_list_cwd_filters(cwd)?;
-        let parent_thread_id = parent_thread_id
-            .as_deref()
-            .map(ThreadId::from_string)
-            .transpose()
-            .map_err(|err| invalid_request(format!("invalid parent thread id: {err}")))?;
+        let relation_filter = match (parent_thread_id, ancestor_thread_id) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_request(
+                    "parentThreadId and ancestorThreadId are mutually exclusive",
+                ));
+            }
+            (Some(parent_thread_id), None) => Some(StoreThreadRelationFilter::DirectChildrenOf(
+                ThreadId::from_string(&parent_thread_id)
+                    .map_err(|err| invalid_request(format!("invalid parent thread id: {err}")))?,
+            )),
+            (None, Some(ancestor_thread_id)) => Some(StoreThreadRelationFilter::DescendantsOf(
+                ThreadId::from_string(&ancestor_thread_id)
+                    .map_err(|err| invalid_request(format!("invalid ancestor thread id: {err}")))?,
+            )),
+            (None, None) => None,
+        };
 
         let requested_page_size = limit
             .map(|value| value as usize)
@@ -2037,7 +2092,7 @@ impl ThreadRequestProcessor {
                     cwd_filters,
                     search_term,
                     use_state_db_only,
-                    parent_thread_id,
+                    relation_filter,
                 },
             )
             .await?;
@@ -2472,6 +2527,9 @@ impl ThreadRequestProcessor {
             Err(ThreadStoreError::InvalidRequest { message }) => {
                 Err(ThreadReadViewError::InvalidRequest(message))
             }
+            Err(ThreadStoreError::Unsupported { operation }) => {
+                Err(ThreadReadViewError::Unsupported(operation))
+            }
             Err(err) => Err(ThreadReadViewError::Internal(format!(
                 "failed to read thread: {err}"
             ))),
@@ -2583,6 +2641,68 @@ impl ThreadRequestProcessor {
         )
     }
 
+    async fn thread_items_list_response_inner(
+        &self,
+        params: ThreadItemsListParams,
+    ) -> Result<ThreadItemsListResponse, JSONRPCErrorError> {
+        let ThreadItemsListParams {
+            thread_id,
+            turn_id,
+            cursor,
+            limit,
+            sort_direction,
+        } = params;
+        let thread_id = ThreadId::from_string(&thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        let page_size = limit
+            .map(|value| value as usize)
+            .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
+            .clamp(1, THREAD_ITEMS_MAX_LIMIT);
+        let page = self
+            .thread_store
+            .list_items(StoreListItemsParams {
+                thread_id,
+                turn_id,
+                include_archived: true,
+                cursor,
+                page_size,
+                sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
+                    SortDirection::Asc => StoreSortDirection::Asc,
+                    SortDirection::Desc => StoreSortDirection::Desc,
+                },
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+                ThreadStoreError::Unsupported { .. } => {
+                    method_not_found("thread/items/list is not supported yet")
+                }
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    invalid_request(format!("no rollout found for thread id {thread_id}"))
+                }
+                err => internal_error(format!("failed to list thread items: {err}")),
+            })?;
+        let data =
+            page.items
+                .into_iter()
+                .map(|item| {
+                    serde_json::from_slice::<ThreadItem>(&item.materialized_thread_item_json)
+                        .map_err(|err| {
+                            internal_error(format!(
+                                "failed to deserialize stored thread item {}: {err}",
+                                item.item_key
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ThreadItemsListResponse {
+            data,
+            next_cursor: page.next_cursor,
+            backwards_cursor: page.backwards_cursor,
+        })
+    }
+
     async fn load_thread_turns_list_history(
         &self,
         thread_id: ThreadId,
@@ -2611,6 +2731,9 @@ impl ThreadRequestProcessor {
             }) if missing_thread_id == thread_id => {}
             Err(ThreadStoreError::InvalidRequest { message }) => {
                 return Err(ThreadReadViewError::InvalidRequest(message));
+            }
+            Err(ThreadStoreError::Unsupported { operation }) => {
+                return Err(ThreadReadViewError::Unsupported(operation));
             }
             Err(err) => {
                 return Err(ThreadReadViewError::Internal(format!(
@@ -2720,6 +2843,13 @@ impl ThreadRequestProcessor {
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
         let resume_started_at = std::time::Instant::now();
+        let requested_principal = required_pitchai_principal_from_config(params.config.as_ref())?;
+        if managed_pitchai_catalog_enabled() && (params.history.is_some() || params.path.is_some())
+        {
+            return Err(invalid_request(
+                "Managed PitchAI thread resume requires canonical stored history selected by thread id; client-supplied history and paths are not authoritative identity sources.",
+            ));
+        }
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -2817,6 +2947,14 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        if let InitialHistory::Resumed(resumed) = &thread_history {
+            validate_requested_principal_against_rollout(
+                resumed.history.as_slice(),
+                resumed.conversation_id,
+                requested_principal.as_ref(),
+                /*require_persisted*/ false,
+            )?;
+        }
 
         let history_cwd = thread_history.session_cwd();
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
@@ -2964,7 +3102,7 @@ impl ThreadRequestProcessor {
                 let token_usage_thread = include_turns.then(|| thread.clone());
                 let mut initial_turns_page = if let Some(params) = initial_turns_page.as_ref() {
                     match build_thread_resume_initial_turns_page(
-                        &response_history.get_rollout_items(),
+                        response_history.get_rollout_items(),
                         thread.status.clone(),
                         /*has_live_running_thread*/ false,
                         /*active_turn*/ None,
@@ -2986,6 +3124,7 @@ impl ThreadRequestProcessor {
                     }
                 }
 
+                let thread_originator = config_snapshot.originator.clone();
                 let response = ThreadResumeResponse {
                     thread,
                     model: session_configured.model,
@@ -3004,12 +3143,14 @@ impl ThreadRequestProcessor {
                 };
 
                 let connection_id = request_id.connection_id;
-                self.outgoing.send_response(request_id, response).await;
+                self.outgoing
+                    .send_response_with_thread_originator(request_id, response, thread_originator)
+                    .await;
                 // `excludeTurns` is explicitly the cheap resume path, so avoid
                 // rebuilding history only to attribute a replayed usage update.
                 if let Some(token_usage_thread) = token_usage_thread {
                     let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
-                        &response_history.get_rollout_items(),
+                        response_history.get_rollout_items(),
                         token_usage_thread.turns.as_slice(),
                     );
                     // The client needs restored usage before it starts another turn.
@@ -3030,7 +3171,10 @@ impl ThreadRequestProcessor {
                     .await;
             }
             Err(err) => {
-                let error = internal_error(format!("error resuming thread: {err}"));
+                let error = match err {
+                    CodexErr::InvalidRequest(message) => invalid_request(message),
+                    err => internal_error(format!("error resuming thread: {err}")),
+                };
                 self.outgoing.send_error(request_id, error).await;
             }
         }
@@ -3111,7 +3255,7 @@ impl ThreadRequestProcessor {
             }
         };
 
-        if let Some((existing_thread_id, existing_thread, source_thread)) = running_thread {
+        if let Some((existing_thread_id, existing_thread, mut source_thread)) = running_thread {
             let existing_thread_rollout_path = existing_thread.rollout_path();
             let active_path = existing_thread_rollout_path
                 .as_ref()
@@ -3125,6 +3269,10 @@ impl ThreadRequestProcessor {
                     active_path.display()
                 )));
             }
+            let requested_principal =
+                required_pitchai_principal_from_config(params.config.as_ref())?;
+            require_matching_pitchai_principal(existing_thread.as_ref(), requested_principal)
+                .await?;
             let config_snapshot = existing_thread.config_snapshot().await;
             let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
             if !mismatch_details.is_empty() {
@@ -3173,8 +3321,8 @@ impl ThreadRequestProcessor {
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());
             let history_items = source_thread
                 .history
-                .as_ref()
-                .map(|history| history.items.clone())
+                .take()
+                .map(|history| history.items)
                 .unwrap_or_default();
 
             let thread_state = self
@@ -3194,10 +3342,8 @@ impl ThreadRequestProcessor {
             )
             .await?;
 
-            let mut summary_source_thread = source_thread;
-            summary_source_thread.history = None;
             let mut thread_summary = self.stored_thread_to_api_thread(
-                summary_source_thread,
+                source_thread,
                 config_snapshot.model_provider_id.as_str(),
                 /*include_turns*/ false,
             );
@@ -3471,7 +3617,7 @@ impl ThreadRequestProcessor {
             let history_items = thread_history.get_rollout_items();
             populate_thread_turns_from_history(
                 &mut thread,
-                &history_items,
+                history_items,
                 /*active_turn*/ None,
             );
         }
@@ -3506,6 +3652,7 @@ impl ThreadRequestProcessor {
     ) -> Result<(), JSONRPCErrorError> {
         let ThreadForkParams {
             thread_id,
+            last_turn_id,
             path,
             model,
             model_provider,
@@ -3521,31 +3668,96 @@ impl ThreadRequestProcessor {
             developer_instructions,
             ephemeral,
             thread_source,
+            history_mode,
             exclude_turns,
         } = params;
+        let requested_principal = required_pitchai_principal_from_config(cli_overrides.as_ref())
+            .map_err(before_effect)?;
+        if managed_pitchai_catalog_enabled() && path.is_some() {
+            return Err(invalid_request_before_effect(
+                "Managed PitchAI thread fork requires canonical stored history selected by thread id; a client-supplied path is not an authoritative identity source.",
+            ));
+        }
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
-            return Err(invalid_request(
+            return Err(invalid_request_before_effect(
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
-        let source_thread = self
-            .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
-            .await?;
+        let include_full_history = matches!(
+            history_mode,
+            codex_app_server_protocol::ThreadForkHistoryMode::Full
+        );
+        let mut source_thread = self
+            .read_stored_thread_for_resume(
+                &thread_id,
+                path.as_ref(),
+                /*include_history*/ include_full_history,
+            )
+            .await
+            .map_err(before_effect)?;
         let source_thread_id = source_thread.thread_id;
         let source_thread_name = source_thread
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
-        let history_items = source_thread
-            .history
-            .as_ref()
-            .map(|history| history.items.clone())
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "thread {source_thread_id} did not include persisted history"
-                ))
-            })?;
+        let history_items = match history_mode {
+            codex_app_server_protocol::ThreadForkHistoryMode::Full => source_thread
+                .history
+                .take()
+                .map(|history| Arc::new(history.items))
+                .ok_or_else(|| {
+                    before_effect(internal_error(format!(
+                        "thread {source_thread_id} did not include persisted history"
+                    )))
+                })?,
+            codex_app_server_protocol::ThreadForkHistoryMode::Compact => {
+                let rollout_path = source_thread.rollout_path.as_ref().ok_or_else(|| {
+                    before_effect(internal_error(format!(
+                        "rollout path missing for thread {source_thread_id}"
+                    )))
+                })?;
+                let history = codex_rollout::RolloutRecorder::get_rollout_fork_history(
+                    rollout_path.as_path(),
+                )
+                .await
+                .map_err(|err| {
+                    invalid_request_before_effect(format!(
+                        "failed to load compact fork history for thread {source_thread_id}: {err}"
+                    ))
+                })?;
+                let InitialHistory::Resumed(resumed) = history else {
+                    return Err(invalid_request_before_effect(format!(
+                        "thread {source_thread_id} has no persisted history to fork"
+                    )));
+                };
+                if resumed.conversation_id != source_thread_id {
+                    return Err(invalid_request_before_effect(format!(
+                        "rollout `{}` belongs to thread {}, not {}",
+                        rollout_path.display(),
+                        resumed.conversation_id,
+                        source_thread_id
+                    )));
+                }
+                resumed.history
+            }
+        };
+        validate_requested_principal_against_rollout(
+            history_items.as_slice(),
+            source_thread_id,
+            requested_principal.as_ref(),
+            /*require_persisted*/ true,
+        )
+        .map_err(before_effect)?;
+        let history_items = if let Some(last_turn_id) = last_turn_id.as_deref() {
+            Arc::new(
+                truncate_rollout_after_turn_id(&history_items, last_turn_id).map_err(|err| {
+                    before_effect(core_thread_write_error("truncate thread for fork", err))
+                })?,
+            )
+        } else {
+            history_items
+        };
         let history_cwd = Some(source_thread.cwd.clone());
 
         // Persist Windows sandbox mode.
@@ -3591,7 +3803,7 @@ impl ThreadRequestProcessor {
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
-            .map_err(|err| config_load_error(&err))?;
+            .map_err(|err| before_effect(config_load_error(&err)))?;
 
         let fallback_model_provider = config.model_provider_id.clone();
 
@@ -3607,7 +3819,7 @@ impl ThreadRequestProcessor {
                 config,
                 InitialHistory::Resumed(ResumedHistory {
                     conversation_id: source_thread_id,
-                    history: history_items.clone(),
+                    history: Arc::clone(&history_items),
                     rollout_path: source_thread.rollout_path.clone(),
                 }),
                 thread_source.map(Into::into),
@@ -3721,6 +3933,7 @@ impl ThreadRequestProcessor {
         );
         let active_permission_profile =
             thread_response_active_permission_profile(config_snapshot.active_permission_profile);
+        let thread_originator = config_snapshot.originator.clone();
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
@@ -3741,7 +3954,9 @@ impl ThreadRequestProcessor {
         let notif = thread_started_notification(thread);
         let connection_id = request_id.connection_id;
         let token_usage_thread = include_turns.then(|| response.thread.clone());
-        self.outgoing.send_response(request_id, response).await;
+        self.outgoing
+            .send_response_with_thread_originator(request_id, response, thread_originator)
+            .await;
         // `excludeTurns` is the cheap fork path, so skip restored usage replay
         // instead of rebuilding history only to attribute a historical update.
         if let Some(token_usage_thread) = token_usage_thread {
@@ -3825,7 +4040,7 @@ impl ThreadRequestProcessor {
             cwd_filters,
             search_term,
             use_state_db_only,
-            parent_thread_id,
+            relation_filter,
         } = filters;
         let mut cursor_obj = cursor;
         let mut last_cursor = cursor_obj.clone();
@@ -3841,11 +4056,11 @@ impl ThreadRequestProcessor {
                     Some(providers)
                 }
             }
-            None if parent_thread_id.is_some() => None,
+            None if relation_filter.is_some() => None,
             None => Some(vec![self.config.model_provider_id.clone()]),
         };
         let (allowed_sources_vec, source_kind_filter) =
-            if parent_thread_id.is_some() && source_kinds.is_none() {
+            if relation_filter.is_some() && source_kinds.is_none() {
                 (Vec::new(), None)
             } else {
                 compute_source_filters(source_kinds)
@@ -3871,7 +4086,7 @@ impl ThreadRequestProcessor {
                     archived,
                     search_term: search_term.clone(),
                     use_state_db_only,
-                    parent_thread_id,
+                    relation_filter,
                 })
                 .await
                 .map_err(thread_store_list_error)?;
@@ -3936,6 +4151,8 @@ fn xcode_26_4_mcp_elicitations_auto_deny(
 
 const THREAD_TURNS_DEFAULT_LIMIT: usize = 25;
 const THREAD_TURNS_MAX_LIMIT: usize = 100;
+const THREAD_ITEMS_DEFAULT_LIMIT: usize = 25;
+const THREAD_ITEMS_MAX_LIMIT: usize = 100;
 
 fn thread_backwards_cursor_for_sort_key(
     thread: &StoredThread,
@@ -4392,11 +4609,13 @@ pub(crate) fn thread_from_stored_thread(
     let thread_id = thread.thread_id.to_string();
     let thread = Thread {
         id: thread_id.clone(),
+        extra: None,
         session_id: thread_id,
         forked_from_id: thread.forked_from_id.map(|id| id.to_string()),
         parent_thread_id: thread.parent_thread_id.map(|id| id.to_string()),
         preview: thread.preview,
         ephemeral: false,
+        history_mode: thread.history_mode.into(),
         model_provider: if thread.model_provider.is_empty() {
             fallback_provider.to_string()
         } else {
@@ -4602,11 +4821,13 @@ fn build_thread_from_snapshot(
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     Thread {
         id: thread_id.to_string(),
+        extra: None,
         session_id,
         forked_from_id: None,
         parent_thread_id: config_snapshot.parent_thread_id.map(|id| id.to_string()),
         preview: String::new(),
         ephemeral: config_snapshot.ephemeral,
+        history_mode: config_snapshot.history_mode.into(),
         model_provider: config_snapshot.model_provider_id.clone(),
         created_at: now,
         updated_at: now,

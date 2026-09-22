@@ -2,7 +2,9 @@
 
 use anyhow::Context as _;
 use anyhow::ensure;
-use codex_arg0::Arg0PathEntryGuard;
+use codex_test_binary_support::TestBinaryDispatchGuard;
+use codex_test_binary_support::TestBinaryDispatchMode;
+use codex_test_binary_support::configure_test_binary_dispatch;
 use codex_utils_cargo_bin::CargoBinError;
 use ctor::ctor;
 use std::sync::OnceLock;
@@ -36,11 +38,17 @@ mod test_environment;
 pub mod tracing;
 pub mod zsh_fork;
 
-pub use test_environment::TestEnvironment;
-pub use test_environment::get_remote_test_env;
-pub use test_environment::test_environment;
+pub(crate) use test_environment::TestEnvironment;
+pub use test_environment::TestTargetOs;
+pub use test_environment::is_remote_test_environment;
+#[doc(hidden)]
+pub use test_environment::is_wine_exec_test_environment;
+#[doc(hidden)]
+pub use test_environment::test_docker_container_name;
+pub(crate) use test_environment::test_environment;
+pub use test_environment::test_target_os;
 
-static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
+static TEST_ARG0_PATH_ENTRY: OnceLock<Option<TestBinaryDispatchGuard>> = OnceLock::new();
 
 #[ctor]
 fn enable_deterministic_unified_exec_process_ids_for_tests() {
@@ -50,7 +58,13 @@ fn enable_deterministic_unified_exec_process_ids_for_tests() {
 
 #[ctor]
 fn configure_arg0_dispatch_for_test_binaries() {
-    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
+    let _ = TEST_ARG0_PATH_ENTRY.get_or_init(|| {
+        // Keep aliases out of the developer's home and reachable by sandboxed
+        // children, even when this support crate initializes before the binary.
+        configure_test_binary_dispatch("core-test-support", |_, _| {
+            TestBinaryDispatchMode::InstallAliases
+        })
+    });
 }
 
 #[ctor]
@@ -574,21 +588,18 @@ macro_rules! skip_if_no_network {
 }
 
 // Exported so the public skip macros can expand in downstream test crates.
-// Call `skip_if_remote!` or `skip_if_wine_exec!` instead.
 #[macro_export]
 #[doc(hidden)]
-macro_rules! skip_if_test_environment {
-    ($pattern:pat, $reason:expr $(,)?) => {{
-        let environment = $crate::test_environment();
-        if ::std::matches!(&environment, $pattern) {
-            eprintln!("Skipping test in {environment:?}: {}", $reason);
+macro_rules! skip_if_test_condition {
+    ($condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return;
         }
     }};
-    ($return_value:expr, $pattern:pat, $reason:expr $(,)?) => {{
-        let environment = $crate::test_environment();
-        if ::std::matches!(&environment, $pattern) {
-            eprintln!("Skipping test in {environment:?}: {}", $reason);
+    ($return_value:expr, $condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return $return_value;
         }
     }};
@@ -597,29 +608,71 @@ macro_rules! skip_if_test_environment {
 #[macro_export]
 macro_rules! skip_if_remote {
     ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
-            $crate::TestEnvironment::Docker { .. } | $crate::TestEnvironment::WineExec,
+        $crate::skip_if_test_condition!(
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
             $reason,
         );
     }};
     ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
+        $crate::skip_if_test_condition!(
             $return_value,
-            $crate::TestEnvironment::Docker { .. } | $crate::TestEnvironment::WineExec,
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
             $reason,
         );
     }};
 }
 
 #[macro_export]
+macro_rules! skip_if_no_remote_env {
+    () => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return;
+        }
+    }};
+    ($return_value:expr $(,)?) => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
 macro_rules! skip_if_wine_exec {
     ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!($crate::TestEnvironment::WineExec, $reason);
+        $crate::skip_if_test_condition!(
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
     }};
     ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
+        $crate::skip_if_test_condition!(
             $return_value,
-            $crate::TestEnvironment::WineExec,
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_target_windows {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
             $reason,
         );
     }};
@@ -662,7 +715,7 @@ macro_rules! codex_linux_sandbox_exe_or_skip {
 }
 
 #[macro_export]
-macro_rules! skip_if_windows {
+macro_rules! skip_if_host_windows {
     ($return_value:expr $(,)?) => {{
         if cfg!(target_os = "windows") {
             println!("Skipping test because it cannot execute on Windows.");

@@ -19,7 +19,6 @@
         {
           "enum": [
             "untrusted",
-            "on-failure",
             "on-request",
             "never"
           ],
@@ -69,6 +68,13 @@
         "read-only",
         "workspace-write",
         "danger-full-access"
+      ],
+      "type": "string"
+    },
+    "ThreadForkHistoryMode": {
+      "enum": [
+        "full",
+        "compact"
       ],
       "type": "string"
     },
@@ -126,6 +132,13 @@
     },
     "ephemeral": {
       "type": "boolean"
+    },
+    "lastTurnId": {
+      "description": "Optional last turn id to fork through, inclusive.\n\nWhen specified, turns after `last_turn_id` are omitted from the fork. The referenced turn cannot be in progress.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "model": {
       "description": "Configuration overrides for the forked thread, if any.",

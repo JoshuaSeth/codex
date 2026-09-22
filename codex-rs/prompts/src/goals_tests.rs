@@ -21,10 +21,15 @@ fn continuation_prompt_allows_complete_and_strict_blocked_updates() {
     assert!(prompt.contains("Token budget: 10000"));
     assert!(prompt.contains("call update_goal with status \"complete\""));
     assert!(prompt.contains("status \"blocked\""));
-    assert!(prompt.contains("at least three consecutive goal turns"));
-    assert!(prompt.contains("same blocking condition"));
+    assert!(prompt.contains("at least three qualifying goal turns"));
+    assert!(prompt.contains("same scoped external condition"));
     assert!(prompt.contains("original/user-triggered turn"));
     assert!(prompt.contains("truly at an impasse"));
+    assert!(prompt.contains("SeaweedFS-backed Git LFS waiting on a backup lock"));
+    assert!(prompt.contains("exact-SHA local-equivalent proof where already authorized"));
+    assert!(prompt.contains("passive rechecks do not qualify"));
+    assert!(prompt.contains("Self-unblocking does not authorize outgoing client"));
+    assert!(prompt.contains("WhatsApp, email, Telegram"));
     assert!(!prompt.contains("budgetLimited"));
     assert!(!prompt.contains("status \"paused\""));
 }

@@ -1009,6 +1009,7 @@ async fn cli_main(
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
             exec_cli.strict_config |= root_strict_config;
+            exec_cli.no_thinking_first_response |= interactive.no_thinking_first_response;
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
@@ -1693,9 +1694,7 @@ async fn run_exec_server_command(
             .environment_id
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
         let config = load_exec_server_config(root_config_overrides, strict_config).await?;
-        let _otel = exec_server_telemetry::init(Some(&config))
-            .inspect_err(|err| eprintln!("Could not create otel exporter: {err}"))
-            .ok();
+        let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
         let auth_provider =
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
                 .await?;
@@ -1707,7 +1706,11 @@ async fn run_exec_server_command(
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
-        codex_exec_server::run_remote_environment(remote_config, runtime_paths).await?;
+        let remote_config = remote_config.with_telemetry(telemetry);
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_remote_environment(remote_config, runtime_paths).await
+        })
+        .await?;
         Ok(())
     } else {
         let config_result = load_exec_server_config(root_config_overrides, strict_config).await;
@@ -1716,16 +1719,15 @@ async fn run_exec_server_command(
         } else {
             config_result.ok()
         };
-        let _otel = exec_server_telemetry::init(config.as_ref())
-            .inspect_err(|err| eprintln!("Could not create otel exporter: {err}"))
-            .ok();
+        let (_otel, telemetry) = exec_server_telemetry::init(config.as_ref());
         let listen_url = cmd
             .listen
-            .as_deref()
-            .unwrap_or(codex_exec_server::DEFAULT_LISTEN_URL);
-        codex_exec_server::run_main(listen_url, runtime_paths)
-            .await
-            .map_err(anyhow::Error::from_boxed)
+            .unwrap_or_else(|| codex_exec_server::DEFAULT_LISTEN_URL.to_string());
+        exec_server_telemetry::run_until_shutdown(async move {
+            codex_exec_server::run_main_with_telemetry(&listen_url, runtime_paths, telemetry).await
+        })
+        .await
+        .map_err(anyhow::Error::from_boxed)
     }
 }
 
@@ -2454,6 +2456,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     let TuiCli {
         shared,
         strict_config,
+        no_thinking_first_response,
         approval_policy,
         web_search,
         prompt,
@@ -2472,6 +2475,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if strict_config {
         interactive.strict_config = true;
     }
+    interactive.no_thinking_first_response |= no_thinking_first_response;
     if let Some(prompt) = prompt {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
         interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
@@ -2965,7 +2969,28 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
-    fn sandbox_parses_permissions_profile() {
+    fn sandbox_parses_permission_profile() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "sandbox",
+            "--permission-profile",
+            ":workspace",
+            "--",
+            "echo",
+        ])
+        .expect("parse");
+
+        let Some(Subcommand::Sandbox(command)) = cli.subcommand else {
+            panic!("expected sandbox command");
+        };
+
+        assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
+        assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_parses_legacy_permissions_profile_alias() {
         let cli = MultitoolCli::try_parse_from([
             "codex",
             "sandbox",
@@ -2982,6 +3007,14 @@ mod tests {
 
         assert_eq!(command.permissions_profile.as_deref(), Some(":workspace"));
         assert_eq!(command.command, vec!["echo"]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn sandbox_help_only_shows_singular_permission_profile() {
+        let help = help_from_args(&["codex", "sandbox", "--help"]);
+        assert!(help.contains("--permission-profile"), "{help}");
+        assert!(!help.contains("--permissions-profile"), "{help}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -3193,6 +3226,40 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_preserves_no_thinking_first_response_from_root_or_subcommand() {
+        for args in [
+            ["codex", "--no-thinking-first-response", "resume", "sid"],
+            ["codex", "resume", "sid", "--no-thinking-first-response"],
+            [
+                "codex",
+                "resume",
+                "sid",
+                "--disable-reasoning-on-first-response",
+            ],
+        ] {
+            assert!(finalize_resume_from_args(&args).no_thinking_first_response);
+        }
+        assert!(!finalize_resume_from_args(&["codex", "resume", "sid"]).no_thinking_first_response);
+    }
+
+    #[test]
+    fn fork_preserves_no_thinking_first_response_from_root_or_subcommand() {
+        for args in [
+            ["codex", "--no-thinking-first-response", "fork", "sid"],
+            ["codex", "fork", "sid", "--no-thinking-first-response"],
+            [
+                "codex",
+                "fork",
+                "sid",
+                "--disable-reasoning-on-first-response",
+            ],
+        ] {
+            assert!(finalize_fork_from_args(&args).no_thinking_first_response);
+        }
+        assert!(!finalize_fork_from_args(&["codex", "fork", "sid"]).no_thinking_first_response);
     }
 
     #[test]
@@ -3557,6 +3624,15 @@ mod tests {
         .expect_err("remote-control should reject root --remote");
 
         assert!(err.to_string().contains("remote-control"));
+    }
+
+    #[test]
+    fn remote_control_pair_parses() {
+        let cli = MultitoolCli::try_parse_from(["codex", "remote-control", "pair"]).expect("parse");
+        let Some(Subcommand::RemoteControl(remote_control)) = &cli.subcommand else {
+            panic!("expected remote-control subcommand");
+        };
+        assert_eq!(remote_control.subcommand_name(), "remote-control pair");
     }
 
     #[test]

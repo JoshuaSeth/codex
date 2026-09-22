@@ -1,5 +1,6 @@
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
@@ -16,9 +17,11 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
+use codex_protocol::protocol::WorldStateItem;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -29,7 +32,6 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 /// Transcript of thread history
@@ -52,7 +54,7 @@ pub(crate) struct ContextManager {
     /// whose non-diff fragments no longer exist in the surviving history.
     reference_context_item: Option<TurnContextItem>,
     /// World state most recently appended to model-visible history.
-    world_state_baseline: Option<Arc<WorldState>>,
+    world_state_baseline: Option<WorldStateSnapshot>,
 }
 
 impl ContextManager {
@@ -86,18 +88,25 @@ impl ContextManager {
 
     pub(crate) fn update_world_state(
         &mut self,
-        world_state: WorldState,
-    ) -> Vec<Box<dyn ContextualUserFragment>> {
-        let fragments = self.world_state_baseline.as_deref().map_or_else(
-            || world_state.render_full(),
-            |previous| world_state.render_diff(previous),
+        world_state: &WorldState,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, Option<WorldStateItem>) {
+        let snapshot = world_state.snapshot();
+        let fragments =
+            world_state.render_history_diff(self.world_state_baseline.as_ref(), &self.items);
+        let rollout_item = self.world_state_baseline.as_ref().map_or_else(
+            || Some(WorldStateItem::full(snapshot.clone().into_value())),
+            |previous| {
+                snapshot
+                    .merge_patch_from(previous)
+                    .map(WorldStateItem::patch)
+            },
         );
-        self.world_state_baseline = Some(Arc::new(world_state));
-        fragments
+        self.world_state_baseline = Some(snapshot);
+        (fragments, rollout_item)
     }
 
-    pub(crate) fn set_world_state_baseline(&mut self, world_state: WorldState) {
-        self.world_state_baseline = Some(Arc::new(world_state));
+    pub(crate) fn set_world_state_baseline(&mut self, snapshot: WorldStateSnapshot) {
+        self.world_state_baseline = Some(snapshot);
     }
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
@@ -132,7 +141,22 @@ impl ContextManager {
     /// outputs.
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
+        // Skill availability is contextual state, not cumulative conversation history. Keep the
+        // append-only transcript intact while projecting only the newest catalog into a model
+        // request. This prevents a resumed or force-reloaded thread from retaining permissions
+        // described by an older catalog.
+        self.retain_latest_skills_instructions();
         self.items
+    }
+
+    /// Returns the newest rendered skills context stored in the append-only transcript.
+    pub(crate) fn latest_skills_instructions(&self) -> Option<&str> {
+        self.items.iter().rev().find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                content.iter().rev().find_map(skills_instructions_text)
+            }
+            _ => None,
+        })
     }
 
     /// Returns raw items in the history.
@@ -167,10 +191,14 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
+        let latest_skills_position = self.latest_skills_instructions_position();
         let items_tokens = self
             .items
             .iter()
-            .map(estimate_item_token_count)
+            .enumerate()
+            .map(|(item_index, item)| {
+                estimate_projected_item_token_count(item, item_index, latest_skills_position)
+            })
             .fold(0i64, i64::saturating_add);
 
         Some(base_tokens.saturating_add(items_tokens))
@@ -359,6 +387,52 @@ impl ContextManager {
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
 
+    fn retain_latest_skills_instructions(&mut self) {
+        let Some(latest_position) = self.latest_skills_instructions_position() else {
+            return;
+        };
+
+        let mut item_index = 0usize;
+        self.items.retain_mut(|item| {
+            let current_item_index = item_index;
+            item_index = item_index.saturating_add(1);
+            let ResponseItem::Message { role, content, .. } = item else {
+                return true;
+            };
+            if role != "developer" {
+                return true;
+            }
+
+            let mut content_index = 0usize;
+            content.retain(|content_item| {
+                let current_content_index = content_index;
+                content_index = content_index.saturating_add(1);
+                skills_instructions_text(content_item).is_none()
+                    || (current_item_index, current_content_index) == latest_position
+            });
+            !content.is_empty()
+        });
+    }
+
+    fn latest_skills_instructions_position(&self) -> Option<(usize, usize)> {
+        self.items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(item_index, item)| match item {
+                ResponseItem::Message { role, content, .. } if role == "developer" => content
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(content_index, content_item)| {
+                        skills_instructions_text(content_item)
+                            .is_some()
+                            .then_some((item_index, content_index))
+                    }),
+                _ => None,
+            })
+    }
+
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
         let policy_with_serialization_budget = policy * 1.2;
         match item {
@@ -386,7 +460,8 @@ impl ContextManager {
                 output: truncate_function_output_payload(output, policy_with_serialization_budget),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
-            ResponseItem::Message { .. }
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Message { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
@@ -451,6 +526,30 @@ impl ContextManager {
     }
 }
 
+fn skills_instructions_text(content_item: &ContentItem) -> Option<&str> {
+    let ContentItem::InputText { text } = content_item else {
+        return None;
+    };
+    let trimmed = text.trim_start();
+    trimmed
+        .get(..SKILLS_INSTRUCTIONS_OPEN_TAG.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(SKILLS_INSTRUCTIONS_OPEN_TAG))
+        .then_some(text.as_str())
+}
+
+pub(crate) fn remove_matching_skills_instructions(items: &mut Vec<ResponseItem>, expected: &str) {
+    items.retain_mut(|item| {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return true;
+        };
+        if role != "developer" {
+            return true;
+        }
+        content.retain(|content_item| skills_instructions_text(content_item) != Some(expected));
+        !content.is_empty()
+    });
+}
+
 pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
@@ -476,7 +575,8 @@ pub(crate) fn truncate_function_output_payload(
 fn is_api_message(message: &ResponseItem) -> bool {
     match message {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
-        ResponseItem::AgentMessage { .. }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::AgentMessage { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::ToolSearchCall { .. }
@@ -509,6 +609,47 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
+}
+
+fn estimate_projected_item_token_count(
+    item: &ResponseItem,
+    item_index: usize,
+    latest_skills_position: Option<(usize, usize)>,
+) -> i64 {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return estimate_item_token_count(item);
+    };
+    if role != "developer" {
+        return estimate_item_token_count(item);
+    }
+
+    let has_superseded_skills = content
+        .iter()
+        .enumerate()
+        .any(|(content_index, content_item)| {
+            skills_instructions_text(content_item).is_some()
+                && Some((item_index, content_index)) != latest_skills_position
+        });
+    if !has_superseded_skills {
+        return estimate_item_token_count(item);
+    }
+
+    let mut projected = item.clone();
+    let ResponseItem::Message { content, .. } = &mut projected else {
+        unreachable!("a cloned developer message remains a developer message");
+    };
+    let mut content_index = 0usize;
+    content.retain(|content_item| {
+        let current_content_index = content_index;
+        content_index = content_index.saturating_add(1);
+        skills_instructions_text(content_item).is_none()
+            || Some((item_index, current_content_index)) == latest_skills_position
+    });
+    if content.is_empty() {
+        0
+    } else {
+        estimate_item_token_count(&projected)
+    }
 }
 
 /// Approximate model-visible byte cost for one image input.
@@ -722,7 +863,8 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::CompactionTrigger { .. } => false,
-        ResponseItem::FunctionCallOutput { .. }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::AgentMessage { .. }

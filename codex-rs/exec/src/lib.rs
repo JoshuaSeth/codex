@@ -249,6 +249,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let Cli {
         command,
         strict_config,
+        no_thinking_first_response,
         shared,
         skip_git_repo_check,
         ephemeral,
@@ -260,7 +261,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
-        config_overrides,
+        mut config_overrides,
     } = cli;
     let shared = shared.into_inner();
     let SharedCliOptions {
@@ -298,6 +299,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
+    if no_thinking_first_response {
+        config_overrides.disable_reasoning_on_first_response();
+    }
     let cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
@@ -1102,9 +1106,17 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
 }
 
 fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
-    config
-        .bypass_hook_trust
-        .then(|| HashMap::from([("bypass_hook_trust".to_string(), Value::Bool(true))]))
+    let mut overrides = HashMap::new();
+    if config.bypass_hook_trust {
+        overrides.insert("bypass_hook_trust".to_string(), Value::Bool(true));
+    }
+    if config.disable_reasoning_on_first_response {
+        overrides.insert(
+            "disable_reasoning_on_first_response".to_string(),
+            Value::Bool(true),
+        );
+    }
+    (!overrides.is_empty()).then_some(overrides)
 }
 
 fn permissions_selection_from_config(config: &Config) -> Option<String> {
@@ -1473,6 +1485,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         parent_thread_id: None,
+                        ancestor_thread_id: None,
                         cwd: None,
                         use_state_db_only: false,
                         search_term: None,
@@ -1539,6 +1552,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     parent_thread_id: None,
+                    ancestor_thread_id: None,
                     cwd: None,
                     use_state_db_only: false,
                     search_term: Some(session_id.to_string()),

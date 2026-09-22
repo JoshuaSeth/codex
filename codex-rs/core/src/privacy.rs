@@ -101,6 +101,9 @@ impl PrivacyFilter {
             codex_api::ResponseEvent::OutputTextDelta(delta) => {
                 *delta = self.de_anonymize_stream_delta(delta);
             }
+            codex_api::ResponseEvent::ReasoningSummaryDone { text, .. } => {
+                *text = self.de_anonymize_text(text);
+            }
             codex_api::ResponseEvent::OutputItemDone(item)
             | codex_api::ResponseEvent::OutputItemAdded(item) => {
                 self.de_anonymize_response_item(item);
@@ -160,7 +163,11 @@ impl PrivacyFilter {
                     }
                 }
             }
-            ResponseItem::Reasoning { .. }
+            // `AdditionalTools` is the Responses Lite carrier for the same structural tool
+            // definitions that otherwise travel outside the prompt-item list. Rewriting arbitrary
+            // strings inside those JSON schemas would corrupt tool names and contracts.
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
             | ResponseItem::ToolSearchCall { .. }
@@ -500,6 +507,26 @@ print(json.dumps({{"spans": spans}}))
     }
 
     #[test]
+    fn additional_tools_payload_is_preserved() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let original = ResponseItem::AdditionalTools {
+            id: Some("at_test".to_string()),
+            role: "developer".to_string(),
+            tools: vec![serde_json::json!({
+                "name": "lookup_jane_smith",
+                "description": "Look up Jane Smith",
+            })],
+        };
+        let mut items = vec![original.clone()];
+
+        filter.anonymize_items(&mut items).unwrap();
+
+        assert_eq!(items, vec![original]);
+    }
+
+    #[test]
     fn de_anonymizes_backend_like_response_events() {
         let script = detector_script();
         let mut filter =
@@ -511,6 +538,41 @@ print(json.dumps({{"spans": spans}}))
             panic!("expected output text delta");
         };
         assert_eq!(delta, "Hello Jane Smith");
+    }
+
+    #[test]
+    fn completed_reasoning_summary_restores_without_consuming_output_buffer() {
+        let script = detector_script();
+        let mut filter =
+            PrivacyFilter::new_for_tests(format!("python3 {}", script.path().display()));
+        let fake = filter.anonymize_text("Jane Smith").unwrap();
+        let split = fake.find(' ').unwrap() + 1;
+        let mut output = codex_api::ResponseEvent::OutputTextDelta(fake[..split].to_string());
+        filter.de_anonymize_event(&mut output);
+        let mut summary = codex_api::ResponseEvent::ReasoningSummaryDone {
+            item_id: "reasoning-1".to_string(),
+            text: format!("Ask {fake}"),
+            summary_index: 2,
+        };
+        filter.de_anonymize_event(&mut summary);
+        let codex_api::ResponseEvent::ReasoningSummaryDone {
+            item_id,
+            text,
+            summary_index,
+        } = summary
+        else {
+            panic!("expected completed reasoning summary");
+        };
+        assert_eq!(
+            (item_id, text, summary_index),
+            ("reasoning-1".to_string(), "Ask Jane Smith".to_string(), 2)
+        );
+        let mut output = codex_api::ResponseEvent::OutputTextDelta(fake[split..].to_string());
+        filter.de_anonymize_event(&mut output);
+        assert!(
+            matches!(output, codex_api::ResponseEvent::OutputTextDelta(text) if text == "Jane Smith")
+        );
+        assert_eq!(filter.take_pending_de_anonymized_delta(), None);
     }
 
     #[test]

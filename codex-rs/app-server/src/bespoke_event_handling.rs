@@ -23,7 +23,6 @@ use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::DynamicToolCallParams;
-use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::ExecPolicyAmendment as V2ExecPolicyAmendment;
 use codex_app_server_protocol::FileChangeApprovalDecision;
@@ -91,6 +90,7 @@ use codex_core::ThreadManager;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::items::parse_hook_prompt_message;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -103,6 +103,7 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
+use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -199,22 +200,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
             respond_to_pending_interrupts(&thread_state, &outgoing).await;
             let mut turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
-            if !turn_failed
-                && let Some(state_db) = conversation.state_db()
-                && state_db
-                    .completions()
-                    .turn_is_tracked_in_process(conversation_id, &turn_complete_event.turn_id)
-                    .await
-            {
-                let terminal_at_ms = turn_complete_event
-                    .completed_at
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-                    .unwrap_or_else(now_unix_timestamp_ms);
-                let final_text = turn_complete_event
-                    .last_agent_message
-                    .as_deref()
-                    .unwrap_or_default();
-                if let Err(err) = persist_turn_completion(
+            let terminal_at_ms = turn_complete_event
+                .completed_at
+                .and_then(|seconds| seconds.checked_mul(1_000))
+                .unwrap_or_else(now_unix_timestamp_ms);
+            let final_text = turn_complete_event
+                .last_agent_message
+                .as_deref()
+                .unwrap_or_default();
+            if let Some(state_db) = conversation.state_db()
+                && let Err(err) = persist_terminal_goal_final(
                     state_db.completions(),
                     conversation_id,
                     &turn_complete_event.turn_id,
@@ -222,32 +217,53 @@ pub(crate) async fn apply_bespoke_event_handling(
                     terminal_at_ms,
                 )
                 .await
-                {
-                    let message = format!(
-                        "turn finished but its completion callback state could not be persisted: {err}"
-                    );
-                    let turn_error = TurnError {
-                        message: message.clone(),
-                        codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
-                        additional_details: None,
-                    };
-                    handle_error(conversation_id, turn_error.clone(), &thread_state).await;
-                    outgoing
-                        .send_server_notification(ServerNotification::Error(ErrorNotification {
-                            error: turn_error,
-                            will_retry: false,
-                            thread_id: conversation_id.to_string(),
-                            turn_id: turn_complete_event.turn_id.clone(),
-                        }))
-                        .await;
-                    turn_failed = true;
-                    error!(
-                        thread_id = %conversation_id,
-                        turn_id = %turn_complete_event.turn_id,
-                        error = %err,
-                        "failed to persist turn completion callback event"
-                    );
-                }
+            {
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id = %turn_complete_event.turn_id,
+                    error = %err,
+                    "failed to attach the terminal assistant message to goal completion"
+                );
+            }
+            if !turn_failed
+                && let Some(state_db) = conversation.state_db()
+                && state_db
+                    .completions()
+                    .turn_is_tracked_in_process(conversation_id, &turn_complete_event.turn_id)
+                    .await
+                && let Err(err) = persist_turn_completion(
+                    state_db.completions(),
+                    conversation_id,
+                    &turn_complete_event.turn_id,
+                    final_text,
+                    terminal_at_ms,
+                )
+                .await
+            {
+                let message = format!(
+                    "turn finished but its completion callback state could not be persisted: {err}"
+                );
+                let turn_error = TurnError {
+                    message: message.clone(),
+                    codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
+                    additional_details: None,
+                };
+                handle_error(conversation_id, turn_error.clone(), &thread_state).await;
+                outgoing
+                    .send_server_notification(ServerNotification::Error(ErrorNotification {
+                        error: turn_error,
+                        will_retry: false,
+                        thread_id: conversation_id.to_string(),
+                        turn_id: turn_complete_event.turn_id.clone(),
+                    }))
+                    .await;
+                turn_failed = true;
+                error!(
+                    thread_id = %conversation_id,
+                    turn_id = %turn_complete_event.turn_id,
+                    error = %err,
+                    "failed to persist turn completion callback event"
+                );
             }
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -262,18 +278,20 @@ pub(crate) async fn apply_bespoke_event_handling(
             .await;
         }
         EventMsg::McpStartupUpdate(update) => {
-            let (status, error) = match update.status {
+            let (status, error, failure_reason) = match update.status {
                 codex_protocol::protocol::McpStartupStatus::Starting => {
-                    (McpServerStartupState::Starting, None)
+                    (McpServerStartupState::Starting, None, None)
                 }
                 codex_protocol::protocol::McpStartupStatus::Ready => {
-                    (McpServerStartupState::Ready, None)
+                    (McpServerStartupState::Ready, None, None)
                 }
-                codex_protocol::protocol::McpStartupStatus::Failed { error } => {
-                    (McpServerStartupState::Failed, Some(error))
-                }
+                codex_protocol::protocol::McpStartupStatus::Failed { error, reason } => (
+                    McpServerStartupState::Failed,
+                    Some(error),
+                    reason.map(Into::into),
+                ),
                 codex_protocol::protocol::McpStartupStatus::Cancelled => {
-                    (McpServerStartupState::Cancelled, None)
+                    (McpServerStartupState::Cancelled, None, None)
                 }
             };
             let notification = McpServerStatusUpdatedNotification {
@@ -281,6 +299,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 name: update.server,
                 status,
                 error,
+                failure_reason,
             };
             outgoing
                 .send_server_notification(ServerNotification::McpServerStatusUpdated(notification))
@@ -881,52 +900,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 on_request_permissions_response(pending_response, conversation, thread_state).await;
             });
         }
-        EventMsg::DynamicToolCallRequest(request) => {
-            let call_id = request.call_id;
-            let turn_id = request.turn_id;
-            let namespace = request.namespace;
-            let tool = request.tool;
-            let arguments = request.arguments;
-            let item = ThreadItem::DynamicToolCall {
-                id: call_id.clone(),
-                namespace: namespace.clone(),
-                tool: tool.clone(),
-                arguments: arguments.clone(),
-                status: DynamicToolCallStatus::InProgress,
-                content_items: None,
-                success: None,
-                duration_ms: None,
-            };
-            let notification = ItemStartedNotification {
-                thread_id: conversation_id.to_string(),
-                turn_id: turn_id.clone(),
-                started_at_ms: request.started_at_ms,
-                item,
-            };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(notification))
-                .await;
-            let params = DynamicToolCallParams {
-                thread_id: conversation_id.to_string(),
-                turn_id: turn_id.clone(),
-                call_id: call_id.clone(),
-                namespace,
-                tool: tool.clone(),
-                arguments: arguments.clone(),
-            };
-            let (_pending_request_id, rx) = outgoing
-                .send_request(ServerRequestPayload::DynamicToolCall(params))
-                .await;
-            tokio::spawn(async move {
-                crate::dynamic_tools::on_call_response(call_id, rx, conversation).await;
-            });
+        EventMsg::DynamicToolCallRequest(_) | EventMsg::DynamicToolCallResponse(_) => {
+            // Deprecated dynamic-tool events are still fanned out for raw-event and rollout
+            // compatibility consumers. App-server v2 receives the canonical DynamicToolCall
+            // item lifecycle and dispatches client requests from canonical starts instead.
         }
         EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
             // Deprecated MCP tool-call events are still fanned out for legacy clients.
             // App-server v2 receives the canonical TurnItem::McpToolCall lifecycle instead.
         }
-        msg @ (EventMsg::DynamicToolCallResponse(_)
-        | EventMsg::CollabAgentSpawnBegin(_)
+        msg @ (EventMsg::CollabAgentSpawnBegin(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionBegin(_)
         | EventMsg::CollabAgentInteractionEnd(_)
@@ -1086,10 +1069,57 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ItemCompleted(completed))
                 .await;
         }
-        msg @ (EventMsg::ItemStarted(_)
-        | EventMsg::ItemCompleted(_)
-        | EventMsg::PatchApplyUpdated(_)
-        | EventMsg::TerminalInteraction(_)) => {
+        EventMsg::ItemStarted(event) => {
+            let should_emit = match &event.item {
+                // Approval and guardian flows can emit the command start notification before core
+                // emits the canonical item. Reuse the same set to suppress that duplicate.
+                CoreTurnItem::CommandExecution(item) => thread_state
+                    .lock()
+                    .await
+                    .turn_summary
+                    .command_execution_started
+                    .insert(item.id.clone()),
+                _ => true,
+            };
+            let dynamic_tool_call_params = match &event.item {
+                CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event.turn_id.clone(),
+                    call_id: item.id.clone(),
+                    namespace: item.namespace.clone(),
+                    tool: item.tool.clone(),
+                    arguments: item.arguments.clone(),
+                }),
+                _ => None,
+            };
+            if should_emit {
+                let notification = item_event_to_server_notification(
+                    EventMsg::ItemStarted(event),
+                    &conversation_id.to_string(),
+                    &event_turn_id,
+                );
+                outgoing.send_server_notification(notification).await;
+            }
+            if let Some(params) = dynamic_tool_call_params {
+                let call_id = params.call_id.clone();
+                let (_pending_request_id, rx) = outgoing
+                    .send_request(ServerRequestPayload::DynamicToolCall(params))
+                    .await;
+                tokio::spawn(async move {
+                    crate::dynamic_tools::on_call_response(call_id, rx, conversation).await;
+                });
+            }
+        }
+        EventMsg::ItemCompleted(event) => {
+            apply_canonical_item_completed_side_effects(&thread_state, &event.item).await;
+            let notification = item_event_to_server_notification(
+                EventMsg::ItemCompleted(event),
+                &conversation_id.to_string(),
+                &event_turn_id,
+            );
+            outgoing.send_server_notification(notification).await;
+        }
+        msg @ (EventMsg::PatchApplyUpdated(_) | EventMsg::TerminalInteraction(_)) => {
             let notification = item_event_to_server_notification(
                 msg,
                 &conversation_id.to_string(),
@@ -1165,61 +1195,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Core still fans out these deprecated events for legacy clients;
             // v2 clients receive the canonical FileChange item instead.
         }
-        EventMsg::ExecCommandBegin(exec_command_begin_event) => {
-            if matches!(
-                exec_command_begin_event.source,
-                codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
-            ) {
-                // TerminalInteraction is the v2 surface for unified exec
-                // stdin/poll events. Suppress the legacy CommandExecution
-                // item so clients do not render the same wait twice.
-                return;
-            }
-            let item_id = exec_command_begin_event.call_id.clone();
-            let first_start = {
-                let mut state = thread_state.lock().await;
-                state
-                    .turn_summary
-                    .command_execution_started
-                    .insert(item_id.clone())
-            };
-            if first_start {
-                let notification = item_event_to_server_notification(
-                    EventMsg::ExecCommandBegin(exec_command_begin_event),
-                    &conversation_id.to_string(),
-                    &event_turn_id,
-                );
-                outgoing.send_server_notification(notification).await;
-            }
+        EventMsg::ExecCommandBegin(_) | EventMsg::ExecCommandEnd(_) => {
+            // Deprecated command-execution events are still fanned out for raw-event and rollout
+            // compatibility consumers. App-server v2 receives the canonical CommandExecution
+            // item lifecycle instead.
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let notification = item_event_to_server_notification(
                 EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event),
-                &conversation_id.to_string(),
-                &event_turn_id,
-            );
-            outgoing.send_server_notification(notification).await;
-        }
-        EventMsg::ExecCommandEnd(exec_command_end_event) => {
-            let call_id = exec_command_end_event.call_id.clone();
-            {
-                let mut state = thread_state.lock().await;
-                state
-                    .turn_summary
-                    .command_execution_started
-                    .remove(&call_id);
-            }
-            if matches!(
-                exec_command_end_event.source,
-                codex_protocol::protocol::ExecCommandSource::UnifiedExecInteraction
-            ) {
-                // The paired begin event is suppressed above; keep the
-                // completion out of v2 as well so no orphan legacy item is
-                // emitted for unified exec interactions.
-                return;
-            }
-            let notification = item_event_to_server_notification(
-                EventMsg::ExecCommandEnd(exec_command_end_event),
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
@@ -1307,6 +1290,40 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
         }
         EventMsg::ThreadGoalUpdated(thread_goal_event) => {
+            if matches!(
+                thread_goal_event.goal.status,
+                ThreadGoalStatus::Complete
+                    | ThreadGoalStatus::Blocked
+                    | ThreadGoalStatus::UsageLimited
+                    | ThreadGoalStatus::BudgetLimited
+            ) {
+                let terminal_status = match thread_goal_event.goal.status {
+                    ThreadGoalStatus::Complete => "complete",
+                    ThreadGoalStatus::Blocked => "blocked",
+                    ThreadGoalStatus::UsageLimited => "usageLimited",
+                    ThreadGoalStatus::BudgetLimited => "budgetLimited",
+                    ThreadGoalStatus::Active | ThreadGoalStatus::Paused => unreachable!(),
+                };
+                if let (Some(turn_id), Some(state_db)) = (
+                    thread_goal_event.turn_id.as_deref(),
+                    conversation.state_db(),
+                ) && let Err(err) = persist_terminal_goal_turn_association(
+                    state_db.completions(),
+                    conversation_id,
+                    terminal_status,
+                    thread_goal_event.goal.updated_at,
+                    turn_id,
+                )
+                .await
+                {
+                    error!(
+                        thread_id = %conversation_id,
+                        turn_id,
+                        error = %err,
+                        "failed to associate terminal goal state with its active turn"
+                    );
+                }
+            }
             let notification = ThreadGoalUpdatedNotification {
                 thread_id: thread_goal_event.thread_id.to_string(),
                 turn_id: thread_goal_event.turn_id,
@@ -1378,7 +1395,67 @@ async fn persist_turn_completion(
             Err(err) => last_error = Some(err),
         }
     }
-    Err(last_error.expect("completion persistence loop always executes"))
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("turn completion has no persistence attempts"),
+    }
+}
+
+pub(crate) async fn persist_terminal_goal_turn_association(
+    completions: &codex_state::CompletionStore,
+    thread_id: ThreadId,
+    terminal_status: &str,
+    terminal_updated_at_seconds: i64,
+    turn_id: &str,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for delay_ms in COMPLETION_PERSIST_RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match completions
+            .associate_terminal_goal_turn(
+                thread_id,
+                terminal_status,
+                terminal_updated_at_seconds,
+                turn_id,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("terminal goal turn association has no persistence attempts"),
+    }
+}
+
+async fn persist_terminal_goal_final(
+    completions: &codex_state::CompletionStore,
+    thread_id: ThreadId,
+    turn_id: &str,
+    final_text: &str,
+    completed_at_ms: i64,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for delay_ms in COMPLETION_PERSIST_RETRY_DELAYS_MS {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match completions
+            .complete_terminal_goal_turn(thread_id, turn_id, final_text, completed_at_ms)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("terminal goal final capture has no persistence attempts"),
+    }
 }
 
 async fn handle_turn_diff(
@@ -1449,6 +1526,20 @@ async fn emit_turn_completed_with_status(
     outgoing
         .send_server_notification(ServerNotification::TurnCompleted(notification))
         .await;
+}
+
+async fn apply_canonical_item_completed_side_effects(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    item: &CoreTurnItem,
+) {
+    if let CoreTurnItem::CommandExecution(item) = item {
+        thread_state
+            .lock()
+            .await
+            .turn_summary
+            .command_execution_started
+            .remove(&item.id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2272,10 +2363,14 @@ mod tests {
     use codex_app_server_protocol::AutoReviewDecisionSource;
     use codex_app_server_protocol::GuardianApprovalReviewStatus;
     use codex_app_server_protocol::JSONRPCErrorError;
+    use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_login::CodexAuth;
     use codex_protocol::AgentPath;
+    use codex_protocol::items::DynamicToolCallItem;
+    use codex_protocol::items::DynamicToolCallStatus as CoreDynamicToolCallStatus;
     use codex_protocol::items::HookPromptFragment;
+    use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::build_hook_prompt_message;
     use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
     use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
@@ -2292,6 +2387,7 @@ mod tests {
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::GuardianAssessmentEvent;
     use codex_protocol::protocol::GuardianAssessmentStatus;
+    use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::RateLimitSnapshot;
     use codex_protocol::protocol::RateLimitWindow;
     use codex_protocol::protocol::RolloutItem;
@@ -2369,6 +2465,7 @@ mod tests {
             cwd: test_path_buf("/tmp").abs().into(),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
+            history_mode: Default::default(),
             thread_source: None,
             agent_nickname: None,
             agent_role: None,
@@ -3639,6 +3736,93 @@ mod tests {
                 thread_id: conversation_id.to_string(),
                 turn_id: "turn-1".to_string(),
                 completed_at_ms: 42,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_dynamic_tool_start_emits_item_and_requests_client() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: conversation_id,
+                    turn_id: "turn-1".to_string(),
+                    item: CoreTurnItem::DynamicToolCall(DynamicToolCallItem {
+                        id: "dynamic-1".to_string(),
+                        namespace: Some("apps".to_string()),
+                        tool: "lookup".to_string(),
+                        arguments: json!({"id": "123"}),
+                        status: CoreDynamicToolCallStatus::InProgress,
+                        content_items: None,
+                        success: None,
+                        error: None,
+                        duration: None,
+                    }),
+                    started_at_ms: 42,
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            new_thread_state(),
+            ThreadResidencyManager::new(),
+            ThreadWatchManager::new(),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let item_started = recv_broadcast_message(&mut rx).await?;
+        let OutgoingMessage::AppServerNotification(ServerNotification::ItemStarted(payload)) =
+            item_started
+        else {
+            bail!("unexpected message: {item_started:?}");
+        };
+        assert_eq!(payload.item.id(), "dynamic-1");
+
+        let request = recv_broadcast_message(&mut rx).await?;
+        let OutgoingMessage::Request(ServerRequest::DynamicToolCall { params, .. }) = request
+        else {
+            bail!("unexpected message: {request:?}");
+        };
+        assert_eq!(
+            params,
+            DynamicToolCallParams {
+                thread_id: conversation_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                call_id: "dynamic-1".to_string(),
+                namespace: Some("apps".to_string()),
+                tool: "lookup".to_string(),
+                arguments: json!({"id": "123"}),
             }
         );
         Ok(())

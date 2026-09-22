@@ -217,7 +217,9 @@ def main() -> int:
     outbound_user_texts = _request_user_texts(state.request_json)
     real_in_request = [value for value in REAL_VALUES if value in request_blob]
     real_in_relevant_user_texts = [
-        value for value in REAL_VALUES if any(value in text for text in outbound_user_texts)
+        value
+        for value in REAL_VALUES
+        if any(value in text for text in outbound_user_texts)
     ]
     real_restored_stdout = [value for value in REAL_VALUES if value in stdout]
     fake_request_values = _candidate_fake_texts(outbound_user_texts)
@@ -244,9 +246,13 @@ def main() -> int:
     if proc.returncode != 0:
         raise RuntimeError(f"codex exited {proc.returncode}; see {out}")
     if real_in_request:
-        raise RuntimeError(f"real values leaked into outbound request: {real_in_request}; see {out}")
+        raise RuntimeError(
+            f"real values leaked into outbound request: {real_in_request}; see {out}"
+        )
     if len(fake_request_values) == 0:
-        raise RuntimeError(f"captured request did not include fake PII values; see {out}")
+        raise RuntimeError(
+            f"captured request did not include fake PII values; see {out}"
+        )
     if len(real_restored_stdout) < len(REAL_VALUES):
         raise RuntimeError(f"stdout did not restore all real values; see {out}")
 

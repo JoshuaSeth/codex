@@ -334,11 +334,13 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
 fn turn_items_for_thread_returns_matching_turn_items() {
     let thread = AppServerThread {
         id: "thread-1".to_string(),
+        extra: None,
         session_id: "thread-1".to_string(),
         forked_from_id: None,
         parent_thread_id: None,
         preview: String::new(),
         ephemeral: false,
+        history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 0,
         updated_at: 0,
@@ -630,6 +632,34 @@ fn active_profile_selection_uses_profile_id_only() {
 }
 
 #[tokio::test]
+async fn thread_lifecycle_params_preserve_first_response_override() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    assert_eq!(thread_config_overrides_from_config(&config), None);
+    config.disable_reasoning_on_first_response = true;
+    config.bypass_hook_trust = true;
+    let expected = Some(HashMap::from([
+        (
+            "disable_reasoning_on_first_response".to_string(),
+            Value::Bool(true),
+        ),
+        ("bypass_hook_trust".to_string(), Value::Bool(true)),
+    ]));
+
+    assert_eq!(thread_start_params_from_config(&config).config, expected);
+    assert_eq!(
+        thread_resume_params_from_config(&config, "thread-id".to_string()).config,
+        expected
+    );
+}
+
+#[tokio::test]
 async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile() {
     let codex_home = tempdir().expect("create temp codex home");
     let cwd = tempdir().expect("create temp cwd");
@@ -753,11 +783,13 @@ fn sample_thread_start_response() -> ThreadStartResponse {
     ThreadStartResponse {
         thread: codex_app_server_protocol::Thread {
             id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+            extra: None,
             session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),
             forked_from_id: None,
             parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
+            history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 0,
             updated_at: 0,

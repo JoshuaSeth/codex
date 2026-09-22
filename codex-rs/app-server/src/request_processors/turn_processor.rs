@@ -8,6 +8,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::CompletionBindingState;
+use codex_state::CompletionStore;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
@@ -63,11 +64,29 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
         | ResponseItem::Compaction { .. }
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::AdditionalTools { .. }
         | ResponseItem::Other => false,
     }) {
         return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
     }
     Ok(())
+}
+
+fn preserve_completion_binding_after_submit_error(error: &CodexErr) -> bool {
+    matches!(error, CodexErr::InternalAgentDied)
+}
+
+async fn release_rejected_completion_binding(
+    completions: &CompletionStore,
+    completion_work_id: &str,
+    error: &CodexErr,
+) -> anyhow::Result<()> {
+    if preserve_completion_binding_after_submit_error(error) {
+        return Ok(());
+    }
+    completions
+        .release_registered_turn_binding(completion_work_id)
+        .await
 }
 
 #[derive(Clone)]
@@ -541,6 +560,55 @@ impl TurnRequestProcessor {
         })
     }
 
+    async fn evict_proven_dead_thread_handle(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        error: &CodexErr,
+    ) -> bool {
+        if !matches!(error, CodexErr::InternalAgentDied) {
+            return false;
+        }
+        let Ok(_thread_list_state_permit) = self.thread_list_state_permit.acquire().await else {
+            tracing::error!(
+                "failed to serialize proven-dead handle eviction for thread {thread_id}"
+            );
+            return false;
+        };
+        if self
+            .thread_manager
+            .remove_thread_if_current(&thread_id, expected_thread)
+            .await
+            .is_none()
+        {
+            warn!(
+                "refused to evict stale dead handle for thread {thread_id} because a replacement handle is current"
+            );
+            return false;
+        }
+
+        self.pending_thread_unloads.lock().await.remove(&thread_id);
+        self.outgoing
+            .cancel_requests_for_thread(thread_id, /*error*/ None)
+            .await;
+        self.thread_state_manager
+            .remove_thread_state(thread_id)
+            .await;
+        self.thread_watch_manager
+            .remove_thread(&thread_id.to_string())
+            .await;
+        self.thread_residency_manager.note_removed(thread_id).await;
+        self.outgoing
+            .send_server_notification(ServerNotification::ThreadClosed(ThreadClosedNotification {
+                thread_id: thread_id.to_string(),
+            }))
+            .await;
+        info!(
+            "evicted proven-dead in-memory handle for thread {thread_id}; persisted rollout remains resumable"
+        );
+        true
+    }
+
     async fn submit_core_op(
         &self,
         request_id: &ConnectionRequestId,
@@ -586,6 +654,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(&request_id, error, /*error_type*/ None);
                 })?;
+        require_bound_pitchai_principal(thread.as_ref()).await?;
         self.thread_residency_manager.note_accessed(thread_id).await;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
@@ -722,9 +791,14 @@ impl TurnRequestProcessor {
                         trace: self.request_trace_context(&request_id).await,
                     };
                     if let Err(err) = thread.submit_user_input_with_id(submission).await {
-                        if let Err(release_err) = completions
-                            .release_registered_turn_binding(completion_work_id)
-                            .await
+                        self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                            .await;
+                        if let Err(release_err) = release_rejected_completion_binding(
+                            completions,
+                            completion_work_id,
+                            &err,
+                        )
+                        .await
                         {
                             tracing::error!(
                                 %completion_work_id,
@@ -751,18 +825,23 @@ impl TurnRequestProcessor {
             }
             turn_id
         } else {
-            thread
+            match thread
                 .submit_user_input_with_client_user_message_id(
                     turn_op,
                     self.request_trace_context(&request_id).await,
                     client_user_message_id,
                 )
                 .await
-                .map_err(|err| {
+            {
+                Ok(turn_id) => turn_id,
+                Err(err) => {
+                    self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
+                        .await;
                     let error = internal_error(format!("failed to start turn: {err}"));
                     self.track_error_response(&request_id, &error, /*error_type*/ None);
-                    error
-                })?
+                    return Err(error);
+                }
+            }
         };
 
         if turn_has_input {
@@ -1106,6 +1185,17 @@ impl TurnRequestProcessor {
                 true,
             ));
         };
+        if require_bound_pitchai_principal(thread.as_ref())
+            .await
+            .is_err()
+        {
+            return Ok(callback_insert_response(
+                outcome,
+                ThreadCallbackInsertState::Pending,
+                record.call_id,
+                true,
+            ));
+        }
         if thread.contains_response_call_id(&record.call_id).await {
             state_db
                 .completions()
@@ -1187,6 +1277,7 @@ impl TurnRequestProcessor {
                 .inspect_err(|error| {
                     self.track_error_response(request_id, error, /*error_type*/ None);
                 })?;
+        require_bound_pitchai_principal(thread.as_ref()).await?;
         self.ensure_direct_input_allowed(request_id, thread.as_ref())
             .await?;
 
@@ -1398,6 +1489,9 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                flush_transcript_tail_on_session_end: params
+                    .flush_transcript_tail_on_session_end
+                    .unwrap_or(false),
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_prefix: params.codex_response_handoff_prefix,
@@ -1625,7 +1719,7 @@ impl TurnRequestProcessor {
                 config.clone(),
                 InitialHistory::Resumed(ResumedHistory {
                     conversation_id: parent_thread_id,
-                    history: parent_history.items,
+                    history: Arc::new(parent_history.items),
                     rollout_path: parent_thread.rollout_path(),
                 }),
                 /*thread_source*/ None,
@@ -1832,6 +1926,10 @@ impl TurnRequestProcessor {
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "turn_processor_dead_handle_tests.rs"]
+mod tests;
 
 fn xcode_26_4_mcp_elicitations_auto_deny(
     client_name: Option<&str>,

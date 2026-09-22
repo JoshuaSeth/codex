@@ -199,6 +199,12 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    // The manual fixture uses a synthetic cwd. Do not discover a host repository
+    // in its ancestors; project-root tests provide their own cwd or cache entry.
+    widget.status_line_project_root_name_cache = Some(CachedProjectRootName {
+        cwd: widget.config.cwd.to_path_buf(),
+        root_name: None,
+    });
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.normal_placeholder_text = "Ask Codex to do anything".to_string();
@@ -679,7 +685,7 @@ pub(super) fn handle_patch_apply_end(
 pub(super) fn handle_view_image_tool_call(
     chat: &mut ChatWidget,
     call_id: impl Into<String>,
-    path: AbsolutePathBuf,
+    path: impl Into<LegacyAppPathString>,
 ) {
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -688,7 +694,7 @@ pub(super) fn handle_view_image_tool_call(
             completed_at_ms: 0,
             item: AppServerThreadItem::ImageView {
                 id: call_id.into(),
-                path,
+                path: path.into(),
             },
         }),
         /*replay_kind*/ None,
@@ -1331,6 +1337,7 @@ pub(super) fn plugins_test_summary(
     PluginSummary {
         id: id.to_string(),
         remote_plugin_id: None,
+        version: None,
         local_version: None,
         name: name.to_string(),
         share_context: None,
@@ -1340,6 +1347,7 @@ pub(super) fn plugins_test_summary(
         installed,
         enabled,
         install_policy,
+        install_policy_source: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
         interface: Some(plugins_test_interface(
@@ -1361,6 +1369,7 @@ pub(super) fn plugins_test_remote_summary(
     PluginSummary {
         id: remote_plugin_id.to_string(),
         remote_plugin_id: Some(remote_plugin_id.to_string()),
+        version: None,
         local_version: None,
         name: name.to_string(),
         share_context: None,
@@ -1368,6 +1377,7 @@ pub(super) fn plugins_test_remote_summary(
         installed,
         enabled: true,
         install_policy: PluginInstallPolicy::Available,
+        install_policy_source: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
         interface: Some(plugins_test_interface(

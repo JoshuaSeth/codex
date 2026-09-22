@@ -183,6 +183,14 @@ impl SessionStartupPrewarmHandle {
 impl Session {
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
         if !self.services.model_client.responses_websocket_enabled() {
+            // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
+            // register or engage this session's bearer fallback before the first user request.
+            let model_client = self.services.model_client.clone();
+            tokio::spawn(async move {
+                if let Err(err) = model_client.prewarm_auth().await {
+                    warn!("startup auth prewarm failed: {err:#}");
+                }
+            });
             return;
         }
 
@@ -258,9 +266,13 @@ async fn schedule_startup_prewarm_inner(
     }
     let startup_cancellation_token = CancellationToken::new();
     let built_tools_started_at = Instant::now();
+    // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
+    let step_context = session
+        .capture_step_context(Arc::clone(&startup_turn_context))
+        .await;
     let startup_router = built_tools(
         session.as_ref(),
-        startup_turn_context.as_ref(),
+        step_context.as_ref(),
         &startup_cancellation_token,
     )
     .await?;
@@ -293,13 +305,14 @@ async fn schedule_startup_prewarm_inner(
         );
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
+    let sampling_reasoning = startup_turn_context.reasoning_for_sampling_request(0);
     client_session
         .prewarm_websocket(
             &startup_prompt,
             &startup_turn_context.model_info,
             &startup_turn_context.session_telemetry,
-            startup_turn_context.reasoning_effort.clone(),
-            startup_turn_context.reasoning_summary,
+            sampling_reasoning.effort,
+            sampling_reasoning.summary,
             startup_turn_context.config.service_tier.clone(),
             &responses_metadata,
         )

@@ -72,6 +72,30 @@ impl<T: HttpTransport> ResponsesClient<T> {
         request: ResponsesApiRequest,
         options: ResponsesOptions,
     ) -> Result<ResponseStream, ApiError> {
+        let body = EncodedJsonBody::encode(&request)
+            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        self.stream_encoded_request(body, options).await
+    }
+
+    /// Stream an already serialized Responses payload after an edge transform.
+    ///
+    /// The caller prepares item IDs on the typed request before the edge transform,
+    /// following the same provider policy as the untransformed request path.
+    pub async fn stream_value_request(
+        &self,
+        body: Value,
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
+        let body = EncodedJsonBody::encode(&body)
+            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        self.stream_encoded_request(body, options).await
+    }
+
+    async fn stream_encoded_request(
+        &self,
+        body: EncodedJsonBody,
+        options: ResponsesOptions,
+    ) -> Result<ResponseStream, ApiError> {
         let ResponsesOptions {
             session_id,
             thread_id,
@@ -80,9 +104,6 @@ impl<T: HttpTransport> ResponsesClient<T> {
             compression,
             turn_state,
         } = options;
-
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
