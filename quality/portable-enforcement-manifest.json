@@ -1,0 +1,24 @@
+{
+  "files": {
+    "QUALITY.md": "041a28bed5c7347f5252cf5c808c60c2ac07b7468951a679ff31c42a586c6c15",
+    "quality/.gitignore": "9c7bcd3943d0972b48a7484f6a2a3635bfaa89db04176068f3afab590ef7785e",
+    "quality/.semgrep.yml": "0a28fa4fffaf94ea919e37687de3d9196dcce52dd2dc47741d77293a9d881e63",
+    "quality/.semgrepignore": "5ac837fad6ac50281eec4bafdbd801f53b86229d6b9d7789ad677a2c707630e1",
+    "quality/pitchai_quality/__init__.py": "9ff94adb5ef0caff64ea7874c7b27522114838259c3f9d3904c505fdc0ce80c5",
+    "quality/pitchai_quality/analysis_support.py": "0de59dfe41717017c26db3dc052cf17c551ca1ae0891f28c5227bb115716f702",
+    "quality/pitchai_quality/check.py": "d89ca2bb261d4f7332005a0855c56214b644c964ed913ff31970078f94da17df",
+    "quality/pitchai_quality/check_nested_event_loops.py": "217c33cb5c0a489455823890e0cadec20672f0670a26bc669f56f729624793bb",
+    "quality/pitchai_quality/check_no_dense_inline_comprehensions.py": "6b92d27b231cff3627169c89b1cffc0a4e8807c19e47c7b76320211ac7c8da68",
+    "quality/pitchai_quality/check_no_pure_wrapper_functions.py": "41d04633ef98ce4dcd7c1167ef0722148571304ee26e0747147f743751360e0c",
+    "quality/pitchai_quality/check_no_single_use_one_line_functions.py": "1cbe48ffe7dc6423bd47b7a91a85adfbec72a3e008a35f57e47b94240bde06ec",
+    "quality/pitchai_quality/check_no_vague_signatures.py": "73ea3156085de8c309f56ce1f890506b9737c9bebc1070ec84d9d264d343f1df",
+    "quality/pitchai_quality/pure_wrapper_index.py": "5b6224328c321af0a20f1e57f64cbfaac41ffba4c3e6cd770aa5658ee7a24691",
+    "quality/pitchai_quality/pure_wrapper_resolution.py": "0c42e1489804f28705a112658dbe9cbde4b6354e83083dadd063d9637c4dd3a4",
+    "quality/pitchai_quality/single_use_reporting.py": "15c3234eb503abeeac0844fa491ed2d2532ce009b28a47f14a1520af729cdadb",
+    "quality/pitchai_quality/source_files.py": "fb53f3871634d650ed3dcd3ffa3a8f435f1800eb8f1697c368f8377d9406dd26",
+    "quality/pitchai_quality/strict_policy.py": "62e61f1279d604f7bfda0e05d043d47f39122cd432612e88a60f893b936b06ac",
+    "quality/pyproject.toml": "c4e9adaf04b52fe5f59617e6fb0d2309d4943d0540351afbef61413a0a6b3500",
+    "quality/uv.lock": "5902b8f54fdb6f8a6ebaa0e9e6ed585a6fa40af8bbbb74179965ce8c39a05565"
+  },
+  "schema": 1
+}

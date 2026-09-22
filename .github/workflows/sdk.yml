@@ -3,7 +3,12 @@ name: sdk
 on:
   push:
     branches: [main]
-  pull_request: {}
+  pull_request:
+    paths-ignore:
+      - "quality/**"
+      - "quality_tests/**"
+      - "QUALITY.md"
+      - ".github/workflows/python-strict.yml"
 
 jobs:
   sdks:
