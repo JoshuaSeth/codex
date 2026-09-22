@@ -1,6 +1,11 @@
 name: rust-ci
 on:
-  pull_request: {}
+  pull_request:
+    paths-ignore:
+      - "quality/**"
+      - "quality_tests/**"
+      - "QUALITY.md"
+      - ".github/workflows/python-strict.yml"
   push:
     branches:
       - main
