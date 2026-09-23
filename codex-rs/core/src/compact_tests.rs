@@ -5,6 +5,7 @@ use crate::context::InternalModelContextFragment;
 use crate::session::tests::build_world_state_from_turn_context;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
@@ -95,7 +96,7 @@ fn content_items_to_text_ignores_image_only_content() {
 fn collect_user_messages_extracts_user_text_only() {
     let items = vec![
         ResponseItem::Message {
-            id: Some("assistant".to_string()),
+            id: Some(ResponseItemId::with_suffix("msg", "assistant")),
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
                 text: "ignored".to_string(),
@@ -104,7 +105,7 @@ fn collect_user_messages_extracts_user_text_only() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
-            id: Some("user".to_string()),
+            id: Some(ResponseItemId::with_suffix("msg", "user")),
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: "first".to_string(),

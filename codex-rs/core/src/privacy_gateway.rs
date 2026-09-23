@@ -708,7 +708,10 @@ impl GatewayRequestSession {
                         ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                             *text = self.restore_complete_text(text).await?;
                         }
-                        ContentItem::InputImage { .. } => {}
+                        // Only text fields carry redaction placeholders; image
+                        // and audio payloads are opaque to the gateway and stay
+                        // untouched, as they do in image/audio preparation.
+                        ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => {}
                     }
                 }
             }

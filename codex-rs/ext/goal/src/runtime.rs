@@ -506,6 +506,21 @@ impl GoalRuntimeHandle {
         // change the goal after we read it but before the continuation launches.
         let _goal_state_permit = self.goal_state_permit().await?;
 
+        if self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .has_thread_goal_continuation_deferral(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            // Upstream's own `continue_if_idle` skips the pass with `Ok(())`
+            // when a deferral is recorded; this lane splits that function, so
+            // the same skip is the attempt-level outcome that starts no turn
+            // and asks for no retry.
+            return Ok(GoalContinuationAttempt::Finished);
+        }
+
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             tracing::debug!("skipping goal continuation because thread manager is unavailable");
             return Ok(GoalContinuationAttempt::Retry(

@@ -55,11 +55,71 @@ pub(super) async fn update_thread_metadata(
         .await;
     }
 
-    let needs_rollout_compat = needs_rollout_compatibility_update(&patch);
-    if needs_rollout_compat {
-        // These explicit patches still write legacy rollout/name-index state after the
-        // SQLite update. Paginated threads must fail before either side is mutated.
-        let thread = read_thread::read_thread(
+    let requires_rollout_compat = requires_rollout_compatibility_update(&patch);
+    let has_explicit_metadata = patch.name.is_some() || requires_rollout_compat;
+    let history_mode = if has_explicit_metadata {
+        Some(
+            read_thread::read_thread(
+                store,
+                ReadThreadParams {
+                    thread_id,
+                    include_archived: params.include_archived,
+                    include_history: false,
+                },
+            )
+            .await?
+            .history_mode,
+        )
+    } else {
+        None
+    };
+    let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+    if paginated && requires_rollout_compat && patch.git_info.is_none() {
+        // PitchAI local: a paginated thread keeps its metadata in SQLite, and a Git-metadata
+        // patch is applied there directly by the block below. Any other patch that needs the
+        // legacy rollout path has no paginated representation, so it fails here, before either
+        // persistence layer is mutated, instead of being half-applied.
+        if let Some(history_mode) = history_mode {
+            reject_paginated_history_mode(history_mode)?;
+        }
+    }
+    let require_sqlite_write = sqlite_write_failure_should_block(&patch) || paginated;
+    apply_metadata_update(
+        store,
+        thread_id,
+        patch.clone(),
+        params.include_archived,
+        require_sqlite_write,
+        history_mode,
+    )
+    .await?;
+    if paginated
+        && requires_rollout_compat
+        && let Some(git_info) = patch.git_info.as_ref()
+    {
+        // The generic upsert preserves non-null Git fields for rollout reconciliation. Apply the
+        // explicit patch afterward so clears are written to SQLite too.
+        let Some(state_db) = store.state_db().await else {
+            return Err(ThreadStoreError::Internal {
+                message: format!("sqlite state db unavailable for thread {thread_id}"),
+            });
+        };
+        apply_thread_git_info_patch(state_db.as_ref(), thread_id, git_info).await?;
+    }
+    if paginated {
+        // Paginated metadata lives in SQLite. Keep the name index update, then stop before the
+        // legacy SessionMeta compatibility path below.
+        if let Some(name) = patch.name.as_ref()
+            && let Err(err) = append_thread_name(
+                store.config.codex_home.as_path(),
+                thread_id,
+                name.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            warn!("failed to index paginated thread name for {thread_id}: {err}");
+        }
+        return read_thread::read_thread(
             store,
             ReadThreadParams {
                 thread_id,
@@ -67,18 +127,9 @@ pub(super) async fn update_thread_metadata(
                 include_history: false,
             },
         )
-        .await?;
-        reject_paginated_history_mode(thread.history_mode)?;
+        .await;
     }
-    let require_sqlite_write = sqlite_write_failure_should_block(&patch);
-    apply_metadata_update(
-        store,
-        thread_id,
-        patch.clone(),
-        params.include_archived,
-        require_sqlite_write,
-    )
-    .await?;
+    let needs_rollout_compat = requires_rollout_compat || patch.name.is_some();
     if !needs_rollout_compat {
         return read_thread::read_thread(
             store,
@@ -124,7 +175,15 @@ pub(super) async fn update_thread_metadata(
     .await;
 
     if let Some(name) = name {
-        apply_thread_name(store, thread_id, name.unwrap_or_default()).await?;
+        append_thread_name(
+            store.config.codex_home.as_path(),
+            thread_id,
+            &name.unwrap_or_default(),
+        )
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to index thread name: {err}"),
+        })?;
     }
 
     let resolved_git_info = match git_info {
@@ -216,10 +275,31 @@ pub(super) async fn apply_thread_metadata_patch(
     if params.patch.is_empty() {
         return Ok(());
     }
-    if needs_rollout_compatibility_update(&params.patch) {
+    let requires_rollout_compat = requires_rollout_compatibility_update(&params.patch);
+    if requires_rollout_compat {
         update_thread_metadata(store, params).await?;
         return Ok(());
     }
+    // PitchAI local: this entry point exists so live append paths can synchronize derived
+    // metadata without building a materialized thread response. The explicit name update below
+    // still needs the canonical mode, and upstream reads it the same way - metadata only, no
+    // history - so the local path keeps its no-response contract without guessing the mode.
+    let history_mode = if params.patch.name.is_some() {
+        Some(
+            read_thread::read_thread(
+                store,
+                ReadThreadParams {
+                    thread_id: params.thread_id,
+                    include_archived: params.include_archived,
+                    include_history: false,
+                },
+            )
+            .await?
+            .history_mode,
+        )
+    } else {
+        None
+    };
     let require_sqlite_write = sqlite_write_failure_should_block(&params.patch);
     apply_metadata_update(
         store,
@@ -227,6 +307,7 @@ pub(super) async fn apply_thread_metadata_patch(
         params.patch,
         params.include_archived,
         require_sqlite_write,
+        history_mode,
     )
     .await
 }
@@ -243,6 +324,7 @@ async fn apply_metadata_update(
     patch: ThreadMetadataPatch,
     include_archived: bool,
     require_sqlite_write: bool,
+    history_mode: Option<ThreadHistoryMode>,
 ) -> ThreadStoreResult<()> {
     let live_rollout_path = live_writer::rollout_path(store, thread_id).await.ok();
     let mut rollout_path = patch.rollout_path.clone().or(live_rollout_path);
@@ -290,11 +372,13 @@ async fn apply_metadata_update(
             if let Some(rollout_path) = rollout_path {
                 metadata.rollout_path = rollout_path;
             }
+            if let Some(history_mode) = history_mode {
+                // The read above gets the canonical mode from the rollout. Persist it before an
+                // explicit paginated patch makes SQLite metadata authoritative.
+                metadata.history_mode = history_mode;
+            }
             if let Some(preview) = patch.preview {
                 metadata.preview = Some(preview);
-            }
-            if let Some(name) = patch.name {
-                metadata.title = name.unwrap_or_default();
             }
             if let Some(title) = patch.title {
                 metadata.title = title;
@@ -369,6 +453,35 @@ async fn apply_metadata_update(
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to update thread metadata for {thread_id}: {err}"),
                 })?;
+            if let Some(name) = patch.name.as_ref() {
+                let history_mode = history_mode.ok_or_else(|| ThreadStoreError::Internal {
+                    message: format!(
+                        "thread history mode unavailable before name update: {thread_id}"
+                    ),
+                })?;
+                let updated = match history_mode {
+                    ThreadHistoryMode::Legacy => {
+                        state_db
+                            .update_thread_title(thread_id, name.as_deref().unwrap_or_default())
+                            .await
+                    }
+                    ThreadHistoryMode::Paginated => {
+                        state_db
+                            .update_thread_name(thread_id, name.as_deref())
+                            .await
+                    }
+                }
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to set thread name: {err}"),
+                })?;
+                if !updated {
+                    return Err(ThreadStoreError::Internal {
+                        message: format!(
+                            "thread metadata unavailable before name update: {thread_id}"
+                        ),
+                    });
+                }
+            }
             if existing.is_some()
                 && let Some(recency_at) = advance_recency_at
             {
@@ -392,22 +505,19 @@ async fn apply_metadata_update(
             Ok(())
         }
         .await
+    } else if require_sqlite_write {
+        Err(ThreadStoreError::Internal {
+            message: format!("sqlite state db unavailable for thread {thread_id}"),
+        })
     } else {
         Ok(())
     };
-    match (state_db.is_some(), sqlite_write_result) {
-        (true, Ok(())) => {}
-        (true, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
+    match sqlite_write_result {
+        Ok(()) => {}
+        Err(err) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
             return Err(err);
         }
-        (true, Err(err)) => {
-            warn!("state db update_thread_metadata failed for {thread_id}: {err}");
-        }
-        (false, Ok(())) => {}
-        (false, Err(err)) if require_sqlite_write || !sqlite_write_error_is_best_effort(&err) => {
-            return Err(err);
-        }
-        (false, Err(err)) => {
+        Err(err) => {
             warn!("state db update_thread_metadata failed for {thread_id}: {err}");
         }
     }
@@ -487,10 +597,7 @@ async fn canonical_history_mode(
     Ok(session_meta.meta.history_mode)
 }
 
-fn needs_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
-    if patch.name.is_some() {
-        return true;
-    }
+fn requires_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
     if patch.memory_mode.is_none() && patch.git_info.is_none() {
         return false;
     }
@@ -541,6 +648,34 @@ fn enum_to_string<T: serde::Serialize>(value: &T) -> String {
 
 fn normalize_cwd(cwd: PathBuf) -> PathBuf {
     codex_utils_path::normalize_for_path_comparison(cwd.as_path()).unwrap_or(cwd)
+}
+
+async fn apply_thread_git_info_patch(
+    state_db: &codex_state::StateRuntime,
+    thread_id: ThreadId,
+    git_info: &GitInfoPatch,
+) -> ThreadStoreResult<()> {
+    let updated = state_db
+        .update_thread_git_info(
+            thread_id,
+            git_info.sha.as_ref().map(|sha| sha.as_deref()),
+            git_info.branch.as_ref().map(|branch| branch.as_deref()),
+            git_info
+                .origin_url
+                .as_ref()
+                .map(|origin_url| origin_url.as_deref()),
+        )
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to update git metadata for thread {thread_id}: {err}"),
+        })?;
+    if updated {
+        Ok(())
+    } else {
+        Err(ThreadStoreError::Internal {
+            message: format!("thread metadata unavailable before git update: {thread_id}"),
+        })
+    }
 }
 
 async fn apply_thread_git_info(
@@ -635,32 +770,6 @@ async fn apply_thread_git_info_to_rollout(
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to set thread git metadata: {err}"),
     })
-}
-
-async fn apply_thread_name(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    name: String,
-) -> ThreadStoreResult<()> {
-    if let Some(state_db) = store.state_db().await {
-        let updated = state_db
-            .update_thread_title(thread_id, &name)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!("failed to set thread name: {err}"),
-            })?;
-        if !updated {
-            return Err(ThreadStoreError::Internal {
-                message: format!("thread metadata unavailable before name update: {thread_id}"),
-            });
-        }
-    }
-
-    append_thread_name(store.config.codex_home.as_path(), thread_id, &name)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to index thread name: {err}"),
-        })
 }
 
 async fn apply_thread_memory_mode(
@@ -881,6 +990,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paginated_name_updates_use_sqlite_without_rollout_writes() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(318);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T14-15-00",
+            uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("session file");
+        let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let thread = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Canonical paginated name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("set paginated thread name");
+
+        assert_eq!(thread.name.as_deref(), Some("Canonical paginated name"));
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata")
+            .expect("thread metadata");
+        assert_eq!(metadata.name.as_deref(), Some("Canonical paginated name"));
+        assert!(metadata.title.is_empty());
+        assert_eq!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .expect("find thread name")
+                .as_deref(),
+            Some("Canonical paginated name")
+        );
+
+        let thread = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    title: Some("Derived first message".to_string()),
+                    preview: Some("Derived first message".to_string()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("apply derived paginated metadata");
+        assert_eq!(thread.name.as_deref(), Some("Canonical paginated name"));
+
+        let session_index_path = home.path().join("session_index.jsonl");
+        std::fs::remove_file(&session_index_path).expect("remove session index");
+        std::fs::create_dir(&session_index_path).expect("block session index writes");
+        let thread = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Updated SQLite name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("set paginated thread name with unavailable index");
+        assert_eq!(thread.name.as_deref(), Some("Updated SQLite name"));
+
+        let err = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None)
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Unpersistable name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect_err("paginated name update without sqlite should fail");
+
+        assert!(matches!(err, ThreadStoreError::Internal { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rollout"),
+            original_rollout
+        );
+    }
+
+    #[tokio::test]
     async fn update_thread_metadata_sets_memory_mode_on_active_rollout() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
@@ -933,6 +1140,7 @@ mod tests {
             ThreadHistoryMode::Paginated,
         )
         .expect("session file");
+        let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
         let runtime = codex_state::StateRuntime::init(
             home.path().to_path_buf(),
             config.default_model_provider_id.clone(),
@@ -946,6 +1154,7 @@ mod tests {
                 .update_thread_metadata(UpdateThreadMetadataParams {
                     thread_id,
                     patch: ThreadMetadataPatch {
+                        name: Some(Some("Must not persist".to_string())),
                         memory_mode: Some(ThreadMemoryMode::Disabled),
                         ..Default::default()
                     },
@@ -958,7 +1167,10 @@ mod tests {
             }
         ));
 
-        assert_eq!(last_rollout_item(path.as_path())["type"], "event_msg");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rollout"),
+            original_rollout
+        );
         assert_eq!(
             runtime
                 .get_thread_memory_mode(thread_id)
@@ -966,6 +1178,124 @@ mod tests {
                 .expect("thread memory mode should be readable")
                 .as_deref(),
             Some("enabled")
+        );
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("thread metadata should be readable")
+                .expect("thread metadata")
+                .name,
+            None
+        );
+        assert_eq!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .expect("find thread name"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn update_thread_metadata_updates_paginated_git_info_in_sqlite_only() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(303);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let path = write_session_file_with_history_mode(
+            home.path(),
+            "2025-01-03T14-35-00",
+            uuid,
+            ThreadHistoryMode::Paginated,
+        )
+        .expect("session file");
+        let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        codex_rollout::state_db::reconcile_rollout(
+            Some(runtime.as_ref()),
+            path.as_path(),
+            config.default_model_provider_id.as_str(),
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+        let mut stale_metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata")
+            .expect("thread metadata");
+        stale_metadata.history_mode = ThreadHistoryMode::Legacy;
+        runtime
+            .upsert_thread(&stale_metadata)
+            .await
+            .expect("seed stale history mode");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+
+        let thread = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    git_info: Some(GitInfoPatch {
+                        sha: Some(None),
+                        branch: Some(Some("feature".to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("paginated metadata update");
+
+        let git_info = thread.git_info.expect("git info");
+        assert_eq!(git_info.commit_hash, None);
+        assert_eq!(git_info.branch.as_deref(), Some("feature"));
+        assert_eq!(
+            git_info.repository_url.as_deref(),
+            Some("https://example.com/repo.git")
+        );
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("read metadata")
+                .expect("thread metadata")
+                .history_mode,
+            ThreadHistoryMode::Paginated
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read rollout"),
+            original_rollout
+        );
+        codex_rollout::state_db::reconcile_rollout(
+            Some(runtime.as_ref()),
+            path.as_path(),
+            config.default_model_provider_id.as_str(),
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+        let thread = store
+            .read_thread_by_rollout_path(
+                path, /*include_archived*/ false, /*include_history*/ false,
+            )
+            .await
+            .expect("read paginated thread by rollout path");
+        let git_info = thread.git_info.expect("git info");
+        assert_eq!(git_info.commit_hash, None);
+        assert_eq!(git_info.branch.as_deref(), Some("feature"));
+        assert_eq!(
+            git_info.repository_url.as_deref(),
+            Some("https://example.com/repo.git")
         );
     }
 

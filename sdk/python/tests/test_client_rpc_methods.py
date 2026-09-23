@@ -8,13 +8,18 @@ from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,
     ApprovalsReviewer,
     ReasoningEffort,
+    ReasoningEffortOption,
+    ThreadForkParams,
     ThreadListParams,
     ThreadResumeResponse,
+    ThreadStartParams,
     ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
+    TurnStartParams,
     WarningNotification,
 )
 from openai_codex.models import Notification, UnknownNotification
+from openai_codex.types import ThreadSource
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,6 +40,54 @@ def test_generated_v2_bundle_has_single_shared_plan_type_definition() -> None:
 def test_generated_reasoning_effort_accepts_sol_modes() -> None:
     assert ReasoningEffort.max.value == "max"
     assert ReasoningEffort.ultra.value == "ultra"
+def test_reasoning_effort_preserves_enum_constants_and_accepts_future_values() -> None:
+    """Known effort members and new runtime values should share the enum-style API."""
+    known_option = ReasoningEffortOption.model_validate(
+        {"description": "Balanced", "reasoningEffort": "medium"}
+    )
+    future_option = ReasoningEffortOption.model_validate(
+        {"description": "Future", "reasoningEffort": "ultra"}
+    )
+    turn_params = TurnStartParams(
+        thread_id="thread-1",
+        input=[],
+        effort=ReasoningEffort.medium,
+    )
+
+    assert {
+        "known_member": ReasoningEffort.medium.value,
+        "known_option": known_option.reasoning_effort.value,
+        "future_option": future_option.reasoning_effort.value,
+        "turn_effort": _params_dict(turn_params)["effort"],
+    } == {
+        "known_member": "medium",
+        "known_option": "medium",
+        "future_option": "ultra",
+        "turn_effort": "medium",
+    }
+
+
+def test_thread_source_preserves_enum_constants_and_accepts_future_values() -> None:
+    """Known thread sources and new runtime values should share the enum-style API."""
+    start_params = ThreadStartParams(thread_source=ThreadSource.user)
+    fork_params = ThreadForkParams(
+        thread_id="thread-1",
+        thread_source=ThreadSource("future_source"),
+    )
+
+    assert {
+        "known_member": ThreadSource.user.value,
+        "subagent_member": ThreadSource.subagent.value,
+        "memory_member": ThreadSource.memory_consolidation.value,
+        "start_source": _params_dict(start_params)["threadSource"],
+        "fork_source": _params_dict(fork_params)["threadSource"],
+    } == {
+        "known_member": "user",
+        "subagent_member": "subagent",
+        "memory_member": "memory_consolidation",
+        "start_source": "user",
+        "fork_source": "future_source",
+    }
 
 
 def test_thread_resume_response_accepts_auto_review_reviewer() -> None:
