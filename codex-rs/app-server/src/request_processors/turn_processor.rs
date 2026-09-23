@@ -3,6 +3,7 @@ use crate::completion_callback_metadata::canonical_completion_callback_metadata;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::PermissionProfile;
@@ -90,7 +91,7 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
 }
 
 fn preserve_completion_binding_after_submit_error(error: &CodexErr) -> bool {
-    matches!(error, CodexErr::InternalAgentDied)
+    matches!(error.details(), CodexErrorDetails::InternalAgentDied)
 }
 
 async fn release_rejected_completion_binding(
@@ -597,7 +598,7 @@ impl TurnRequestProcessor {
         expected_thread: &Arc<CodexThread>,
         error: &CodexErr,
     ) -> bool {
-        if !matches!(error, CodexErr::InternalAgentDied) {
+        if !matches!(error.details(), CodexErrorDetails::InternalAgentDied) {
             return false;
         }
         let Ok(_thread_list_state_permit) = self.thread_list_state_permit.acquire().await else {
@@ -1195,9 +1196,9 @@ impl TurnRequestProcessor {
         thread
             .inject_response_items(items)
             .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!("failed to inject response items: {err}")),
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("failed to inject response items: {err}")),
             })?;
         Ok(ThreadInjectItemsResponse {})
     }
@@ -1565,6 +1566,8 @@ impl TurnRequestProcessor {
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_mode: params.codex_response_handoff_mode.unwrap_or_default(),
+                codex_response_handoff_channel_prefixes: params
+                    .codex_response_handoff_channel_prefixes,
                 model: params.model,
                 output_modality: params.output_modality,
                 include_startup_context: params.include_startup_context.unwrap_or(true),

@@ -10,11 +10,21 @@ use codex_thread_store::ThreadStoreError;
 pub(crate) struct InvalidSessionIdentityError(pub(crate) String);
 
 pub(crate) fn map_session_init_error(err: &anyhow::Error, codex_home: &Path) -> CodexErr {
-    if let Some(ThreadStoreError::Unsupported { operation }) = err
+    if let Some(store_error) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<ThreadStoreError>())
     {
-        return CodexErr::UnsupportedOperation(format!("{operation} is not supported yet"));
+        match store_error {
+            ThreadStoreError::Unsupported { operation } => {
+                return CodexErr::UnsupportedOperation(format!("{operation} is not supported yet"));
+            }
+            ThreadStoreError::Conflict { message } => {
+                return CodexErr::InvalidRequest(message.clone());
+            }
+            ThreadStoreError::ThreadNotFound { .. }
+            | ThreadStoreError::InvalidRequest { .. }
+            | ThreadStoreError::Internal { .. } => {}
+        }
     }
 
     if let Some(identity_error) = err

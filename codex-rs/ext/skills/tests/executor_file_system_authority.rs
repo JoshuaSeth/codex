@@ -209,10 +209,11 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
                 canonical_root: PathUri::from_abs_path(&canonical_root),
                 has_plugin_manifest: false,
             }),
-            plugin_id: None,
+            plugin_identity: None,
             plugin_namespace: None,
             plugin_root: None,
             allowed_source_root: None,
+            discovery_mode: Default::default(),
         }],
         /*plugin_skill_snapshots*/ None,
         Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
@@ -265,6 +266,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
                     },
                 })
                 .collect(),
+            resolved_executor_roots: Vec::new(),
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
@@ -327,6 +329,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
         .list(SkillListQuery {
             turn_id: "turn-1".to_string(),
             executor_roots,
+            resolved_executor_roots: Vec::new(),
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
@@ -343,6 +346,7 @@ async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
         authority: entry.authority.clone(),
         package: entry.id.clone(),
         resource: entry.main_prompt.clone(),
+        resolved_executor_roots: Vec::new(),
         host_snapshot: None,
         mcp_resources: None,
     };

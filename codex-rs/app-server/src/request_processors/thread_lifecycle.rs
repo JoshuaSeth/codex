@@ -1,4 +1,5 @@
 use super::*;
+use crate::extensions::send_thread_warning;
 use codex_protocol::config_types::MultiAgentMode;
 
 #[derive(Clone)]
@@ -537,6 +538,9 @@ pub(super) async fn handle_thread_listener_command(
                     },
                 ))
                 .await;
+        }
+        ThreadListenerCommand::EmitWarning { message } => {
+            send_thread_warning(outgoing, thread_state_manager, conversation_id, message).await;
         }
         ThreadListenerCommand::EmitThreadGoalCleared => {
             outgoing

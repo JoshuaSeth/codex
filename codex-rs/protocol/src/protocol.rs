@@ -111,6 +111,8 @@ pub const SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<skills_instructions>";
 pub const SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_instructions>";
 pub const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
 pub const PLUGINS_INSTRUCTIONS_CLOSE_TAG: &str = "</plugins_instructions>";
+pub const TOOLS_OPEN_TAG: &str = "<tools>";
+pub const TOOLS_CLOSE_TAG: &str = "</tools>";
 pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
@@ -192,16 +194,6 @@ pub struct W3cTraceContext {
     pub tracestate: Option<String>,
 }
 
-/// Config payload for refreshing MCP servers.
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpServerRefreshConfig {
-    /// Complete runtime server map after source and thread-scoped resolution.
-    pub mcp_servers: Value,
-    /// OAuth credential store mode to use with this server snapshot.
-    pub mcp_oauth_credentials_store_mode: Value,
-    pub auth_keyring_backend_kind: Value,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConversationStartParams {
     /// Whether Codex response handoffs are managed through explicit client append calls.
@@ -216,6 +208,8 @@ pub struct ConversationStartParams {
     /// Selects how automatic Codex handoffs are routed in Frameless Bidi sessions.
     /// Realtime V1 and V2 ignore this setting.
     pub codex_response_handoff_mode: CodexResponseHandoffMode,
+    /// Optional client-selected BEM prefixes keyed by `analysis`, `commentary`, and `final`.
+    pub codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     /// Overrides the configured realtime model for this session only.
     pub model: Option<String>,
     /// Selects whether the realtime session should produce text or audio output.
@@ -639,7 +633,7 @@ pub enum Op {
     },
 
     /// Request MCP servers to reinitialize and refresh cached tool lists.
-    RefreshMcpServers { config: McpServerRefreshConfig },
+    RefreshMcpServers,
 
     /// Reload user config layer overrides for the active session.
     ///
@@ -880,7 +874,7 @@ impl Op {
             Self::UserInputAnswer { .. } => "user_input_answer",
             Self::RequestPermissionsResponse { .. } => "request_permissions_response",
             Self::DynamicToolResponse { .. } => "dynamic_tool_response",
-            Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
+            Self::RefreshMcpServers => "refresh_mcp_servers",
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
@@ -1845,6 +1839,9 @@ pub struct ItemCompletedEvent {
     pub thread_id: ThreadId,
     pub turn_id: String,
     pub item: TurnItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub started_at_ms: Option<i64>,
     // Old rollout files may contain ItemCompleted events for PlanItem without
     // this field. Default to 0 so those persisted rollouts still deserialize
     // after tightening the core event contract.
@@ -2033,7 +2030,7 @@ pub struct ThreadSettingsAppliedEvent {
     pub thread_settings: ThreadSettingsSnapshot,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ThreadSettingsSnapshot {
     pub model: String,
     pub model_provider_id: String,
@@ -2682,28 +2679,6 @@ impl InitialHistory {
                 .map(|meta| meta.history_mode)
                 .unwrap_or(default_history_mode),
         }
-    }
-
-    pub fn get_latest_effective_multi_agent_mode(&self) -> Option<MultiAgentMode> {
-        let items = match self {
-            InitialHistory::New | InitialHistory::Cleared => return None,
-            InitialHistory::Resumed(resumed) => &resumed.history,
-            InitialHistory::Forked(items) => items,
-        };
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                RolloutItem::TurnContext(turn_context) => Some(turn_context),
-                RolloutItem::SessionMeta(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::EventMsg(_) => None,
-            })
-            .and_then(|turn_context| turn_context.multi_agent_mode.clone())
     }
 
     pub fn get_resumed_session_sources(&self) -> Option<(SessionSource, Option<ThreadSource>)> {
@@ -3390,7 +3365,7 @@ pub struct TurnContextItem {
     pub collaboration_mode: Option<CollaborationMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<MultiAgentVersion>,
-    /// Effective model-visible mode used as the durable context-diff baseline.
+    /// Legacy effective model-visible mode retained to deserialize older rollouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3608,6 +3583,14 @@ pub enum ExecCommandStatus {
 pub struct ExecCommandBeginEvent {
     /// Identifier so this can be paired with the ExecCommandEnd event.
     pub call_id: String,
+    /// Trusted first-party plugin attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    /// Safe plugin-relative path attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub script_path: Option<String>,
     /// Identifier for the underlying PTY process (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -3634,6 +3617,14 @@ pub struct ExecCommandBeginEvent {
 pub struct ExecCommandEndEvent {
     /// Identifier for the ExecCommandBegin that finished.
     pub call_id: String,
+    /// Trusted first-party plugin attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    /// Safe plugin-relative path attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub script_path: Option<String>,
     /// Identifier for the underlying PTY process (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -5005,6 +4996,7 @@ mod tests {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         }]);
         assert!(read_only.has_full_disk_read_access());
         assert!(!read_only.has_full_disk_write_access());
@@ -5015,6 +5007,7 @@ mod tests {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         }]);
         assert!(writable.has_full_disk_read_access());
         assert!(writable.has_full_disk_write_access());
@@ -5045,10 +5038,12 @@ mod tests {
                     value: FileSystemSpecialPath::Root,
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: blocked },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -5096,16 +5091,19 @@ mod tests {
                     value: FileSystemSpecialPath::Minimal,
                 },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: secret },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -5164,14 +5162,17 @@ mod tests {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: docs },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: docs_public },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -5208,6 +5209,7 @@ mod tests {
                 path: external_write_path,
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         }]);
 
         let err = policy
@@ -5417,6 +5419,7 @@ mod tests {
                 result: "Zm9v".into(),
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         };
 
@@ -5442,6 +5445,7 @@ mod tests {
         let event = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
                 id: "patch-1".into(),
@@ -5480,6 +5484,7 @@ mod tests {
         let event = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::McpToolCall(McpToolCallItem {
                 id: "mcp-1".into(),
@@ -5536,6 +5541,8 @@ mod tests {
             started_at_ms: 10,
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
+                plugin_id: Some("sample@openai-curated".into()),
+                script_path: Some("scripts/run.py".into()),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
                 cwd: cwd.clone(),
@@ -5556,9 +5563,12 @@ mod tests {
         let completed = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
+                plugin_id: Some("sample@openai-curated".into()),
+                script_path: Some("scripts/run.py".into()),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
                 cwd,
@@ -5581,10 +5591,15 @@ mod tests {
             started.as_legacy_events(/*show_raw_agent_reasoning*/ false).as_slice(),
             [EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                 call_id,
+                plugin_id,
+                script_path,
                 turn_id,
                 started_at_ms: 10,
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1"
+            })] if call_id == "exec-1"
+                && plugin_id.as_deref() == Some("sample@openai-curated")
+                && script_path.as_deref() == Some("scripts/run.py")
+                && turn_id == "turn-1"
         ));
         assert!(matches!(
             completed
@@ -5592,11 +5607,17 @@ mod tests {
                 .as_slice(),
             [EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                 call_id,
+                plugin_id,
+                script_path,
                 turn_id,
                 completed_at_ms: 20,
                 aggregated_output,
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1" && aggregated_output == "done\n"
+            })] if call_id == "exec-1"
+                && plugin_id.as_deref() == Some("sample@openai-curated")
+                && script_path.as_deref() == Some("scripts/run.py")
+                && turn_id == "turn-1"
+                && aggregated_output == "done\n"
         ));
     }
 
@@ -5621,6 +5642,7 @@ mod tests {
         let completed = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::DynamicToolCall(DynamicToolCallItem {
                 id: "dynamic-1".into(),
@@ -5665,6 +5687,7 @@ mod tests {
         let entered = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::EnteredReviewMode(EnteredReviewModeItem {
                 id: "entered-review".into(),
@@ -5677,6 +5700,7 @@ mod tests {
         let exited = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::ExitedReviewMode(ExitedReviewModeItem {
                 id: "exited-review".into(),
@@ -5737,12 +5761,14 @@ mod tests {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             item: TurnItem::UserMessage(UserMessageItem::new(&[])),
+            started_at_ms: None,
             completed_at_ms: 123,
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("completed_at_ms");
 
         let event = serde_json::from_value::<ItemCompletedEvent>(value).unwrap();
+        assert_eq!(event.started_at_ms, None);
         assert_eq!(event.completed_at_ms, 0);
     }
 
@@ -6244,6 +6270,7 @@ mod tests {
                         pattern: "/tmp/private/**/*.txt".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ])),
             model: "gpt-5".to_string(),
