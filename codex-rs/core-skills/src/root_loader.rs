@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -30,6 +32,20 @@ impl PluginSkillSnapshots {
         Self {
             snapshots_by_root: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+}
+
+impl PartialEq for PluginSkillSnapshots {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.snapshots_by_root, &other.snapshots_by_root)
+    }
+}
+
+impl Eq for PluginSkillSnapshots {}
+
+impl Hash for PluginSkillSnapshots {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.snapshots_by_root).hash(state);
     }
 }
 
@@ -77,48 +93,7 @@ where
                 .acquire()
                 .await
                 .unwrap_or_else(|_| unreachable!());
-            let cache_key = match (
-                root.plugin_identity.clone(),
-                root.plugin_namespace.clone(),
-                root.plugin_root.clone(),
-            ) {
-                (Some(plugin_identity), Some(plugin_namespace), Some(plugin_root)) => {
-                    Some(PluginSkillRoot {
-                        path: root.path.clone(),
-                        plugin_identity,
-                        plugin_namespace,
-                        plugin_root,
-                        discovery_mode: root.discovery_mode,
-                    })
-                }
-                _ => None,
-            };
-            let cached_snapshot = cache_key.as_ref().and_then(|cache_key| {
-                let plugin_skill_snapshots = plugin_skill_snapshots?;
-                plugin_skill_snapshots
-                    .snapshots_by_root
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(cache_key)
-                    .cloned()
-            });
-
-            let snapshot = match cached_snapshot {
-                Some(snapshot) => snapshot,
-                None => {
-                    let snapshot = load_skill_root(root).await;
-                    if let Some(plugin_skill_snapshots) = plugin_skill_snapshots
-                        && let Some(cache_key) = cache_key
-                    {
-                        plugin_skill_snapshots
-                            .snapshots_by_root
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(cache_key, snapshot.clone());
-                    }
-                    snapshot
-                }
-            };
+            let snapshot = load_skill_root_snapshot(root, plugin_skill_snapshots).await;
             (root_index, snapshot)
         })
         // Keep each load's scan queue bounded while avoiding head-of-line blocking.
@@ -132,10 +107,71 @@ where
         .map(|(_, snapshot)| snapshot)
         .collect();
 
-    merge_skill_root_snapshots(root_snapshots, enforce_name_precedence)
+    merge_skill_root_snapshots_with_name_precedence(root_snapshots, enforce_name_precedence)
 }
 
-fn merge_skill_root_snapshots(
+/// Loads one root while preserving the existing plugin-loader snapshot reuse.
+///
+/// This is a temporary migration boundary for callers that load non-plugin roots elsewhere but
+/// still need plugin roots to use the legacy preload cache.
+pub async fn load_skill_root_snapshot(
+    root: SkillRoot,
+    plugin_skill_snapshots: Option<&PluginSkillSnapshots>,
+) -> SkillRootSnapshot {
+    let cache_key = match (
+        root.plugin_identity.clone(),
+        root.plugin_namespace.clone(),
+        root.plugin_root.clone(),
+    ) {
+        (Some(plugin_identity), Some(plugin_namespace), Some(plugin_root)) => {
+            Some(PluginSkillRoot {
+                path: root.path.clone(),
+                plugin_identity,
+                plugin_namespace,
+                plugin_root,
+                discovery_mode: root.discovery_mode,
+            })
+        }
+        _ => None,
+    };
+    let cached_snapshot = cache_key.as_ref().and_then(|cache_key| {
+        let plugin_skill_snapshots = plugin_skill_snapshots?;
+        plugin_skill_snapshots
+            .snapshots_by_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cache_key)
+            .cloned()
+    });
+
+    match cached_snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            let snapshot = load_skill_root(root).await;
+            if let Some(plugin_skill_snapshots) = plugin_skill_snapshots
+                && let Some(cache_key) = cache_key
+            {
+                plugin_skill_snapshots
+                    .snapshots_by_root
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(cache_key, snapshot.clone());
+            }
+            snapshot
+        }
+    }
+}
+
+/// Merges independently loaded root snapshots into one outcome.
+///
+/// This is upstream's entry point and the shape `SkillLoadOutcome::from_root_snapshots`
+/// calls: it keeps the plain signature and leaves name precedence off. PitchAI's
+/// tenant-aware entry points call the `_with_name_precedence` form below.
+pub(crate) fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOutcome {
+    merge_skill_root_snapshots_with_name_precedence(snapshots, /*enforce_name_precedence*/ false)
+}
+
+fn merge_skill_root_snapshots_with_name_precedence(
     snapshots: Vec<SkillRootSnapshot>,
     enforce_name_precedence: bool,
 ) -> SkillLoadOutcome {
@@ -155,12 +191,15 @@ fn merge_skill_root_snapshots(
     let mut outcome = SkillLoadOutcome::default();
     let mut skill_roots = Vec::new();
     let mut skill_root_by_path = HashMap::new();
+    let mut skill_discovery_path_by_path = HashMap::new();
     let mut file_systems_by_skill_path = HashMap::new();
 
     for snapshot in snapshots {
         let SkillRootSnapshot {
             root,
+            is_agent_plugin,
             skills,
+            skill_discovery_path_by_path: discovery_paths,
             errors,
             file_system,
         } = snapshot;
@@ -168,12 +207,17 @@ fn merge_skill_root_snapshots(
             skill_roots.push(root.clone());
         }
         for skill in &skills {
-            skill_root_by_path
-                .entry(skill.path_to_skills_md.clone())
-                .or_insert_with(|| root.clone());
-            file_systems_by_skill_path
-                .entry(skill.path_to_skills_md.clone())
-                .or_insert_with(|| Arc::clone(&file_system));
+            let path = skill.path_to_skills_md.clone();
+            if !skill_root_by_path.contains_key(&path) {
+                skill_root_by_path.insert(path.clone(), root.clone());
+                if let Some(discovery_path) = discovery_paths.get(&path) {
+                    skill_discovery_path_by_path.insert(path.clone(), discovery_path.clone());
+                }
+                file_systems_by_skill_path.insert(path.clone(), Arc::clone(&file_system));
+                if is_agent_plugin {
+                    outcome.agent_plugin_skill_paths.insert(path);
+                }
+            }
         }
         outcome.skills.extend(skills);
         outcome.errors.extend(errors);
@@ -195,11 +239,16 @@ fn merge_skill_root_snapshots(
         .map(|skill| skill.path_to_skills_md.clone())
         .collect::<HashSet<_>>();
     skill_root_by_path.retain(|path, _| retained_skill_paths.contains(path));
+    skill_discovery_path_by_path.retain(|path, _| retained_skill_paths.contains(path));
     let used_roots = skill_root_by_path.values().cloned().collect::<HashSet<_>>();
     skill_roots.retain(|root| used_roots.contains(root));
     file_systems_by_skill_path.retain(|path, _| retained_skill_paths.contains(path));
+    outcome
+        .agent_plugin_skill_paths
+        .retain(|path| retained_skill_paths.contains(path));
     outcome.skill_roots = skill_roots;
     outcome.skill_root_by_path = Arc::new(skill_root_by_path);
+    outcome.skill_discovery_path_by_path = Arc::new(skill_discovery_path_by_path);
     outcome.file_systems_by_skill_path = SkillFileSystemsByPath::new(file_systems_by_skill_path);
 
     outcome.skills.sort_by(|a, b| {

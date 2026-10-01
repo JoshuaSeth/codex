@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use codex_core::ThreadManager;
 use codex_core::TryStartTurnIfIdleRejectionReason;
+use codex_core::TurnInput;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -551,7 +552,10 @@ impl GoalRuntimeHandle {
         }
         let item = continuation_steering_item(&protocol_goal_from_state(goal));
 
-        if let Err(err) = thread.try_start_turn_if_idle(vec![item]).await {
+        if let Err(err) = thread
+            .try_start_turn_if_idle(vec![TurnInput::ResponseItem(item)])
+            .await
+        {
             return match err.reason() {
                 TryStartTurnIfIdleRejectionReason::Busy => Ok(GoalContinuationAttempt::Retry(
                     GoalContinuationRetryReason::IdleTurnBusy,

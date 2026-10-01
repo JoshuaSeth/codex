@@ -292,25 +292,14 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
     )
     .await??;
 
-    let steer_req = mcp
-        .send_turn_steer_request(TurnSteerParams {
-            thread_id: thread.id.clone(),
-            client_user_message_id: Some("client-steer-message-1".to_string()),
-            completion_work_id: None,
-            completion_callback_metadata: None,
-            input: vec![V2UserInput::Text {
-                text: "steer".to_string(),
-                text_elements: Vec::new(),
-            }],
-            responsesapi_client_metadata: None,
-            additional_context: None,
-            expected_turn_id: turn.id.clone(),
     let steer: TurnSteerResponse = mcp
         .request(|request_id| ClientRequest::TurnSteer {
             request_id,
             params: TurnSteerParams {
                 thread_id: thread.id.clone(),
                 client_user_message_id: Some("client-steer-message-1".to_string()),
+                completion_work_id: None,
+                completion_callback_metadata: None,
                 input: vec![V2UserInput::Text {
                     text: "steer".to_string(),
                     text_elements: Vec::new(),

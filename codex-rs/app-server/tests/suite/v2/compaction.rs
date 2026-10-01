@@ -9,10 +9,13 @@ use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_mock_responses_config_toml;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RawResponseCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadCompactStartParams;
@@ -34,6 +37,7 @@ use codex_protocol::models::ResponseItem;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -677,6 +681,7 @@ fn input_item_contains_text(item: &serde_json::Value, expected: &str) -> bool {
                     .is_some_and(|text| text.contains(expected))
             })
         })
+}
 fn compaction_config(server_uri: &str, auto_compact_limit: i64) -> MockResponsesConfig {
     MockResponsesConfig::new(server_uri)
         .with_root_config(&format!(

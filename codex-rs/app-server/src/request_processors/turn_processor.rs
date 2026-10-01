@@ -18,6 +18,7 @@ use codex_skills::system_cache_root_dir;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
+use codex_core::TurnInput;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
@@ -205,11 +206,14 @@ async fn inject_callback_into_thread(
     let Err(items) = thread.inject_if_running(items).await else {
         return Ok(());
     };
-    match thread.try_start_turn_if_idle(items).await {
+    // The idle-turn gate takes typed turn input, so the callback's response
+    // items are wrapped for that attempt while the items themselves stay
+    // available for the running-turn injector the rejection falls back to.
+    let idle_input: Vec<TurnInput> = items.iter().cloned().map(TurnInput::ResponseItem).collect();
+    match thread.try_start_turn_if_idle(idle_input).await {
         Ok(()) => Ok(()),
         Err(rejection) => {
             let reason = rejection.reason();
-            let items = rejection.into_input();
             if thread.inject_if_running(items).await.is_ok() {
                 Ok(())
             } else {
@@ -255,6 +259,7 @@ fn callback_response_items(record: &CompletionCallbackRecord) -> Vec<ResponseIte
             name: "pitchai_completion_callback".to_string(),
             namespace: None,
             arguments,
+            encrypted_function_args: None,
             call_id: record.call_id.clone(),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -312,7 +317,6 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        supports_openai_form_elicitation: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
@@ -320,7 +324,6 @@ impl TurnRequestProcessor {
             params,
             app_server_client_name,
             app_server_client_version,
-            /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
         )
         .await
         .map(|response| Some(response.into()))
@@ -370,9 +373,11 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.turn_interrupt_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
+        let result = self.turn_interrupt_inner(request_id, params).await;
+        if let Err(error) = &result {
+            self.track_error_response(request_id, error, /*error_type*/ None);
+        }
+        result.map(|response| response.map(Into::into))
     }
 
     pub(crate) async fn thread_realtime_start(
@@ -678,7 +683,6 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        supports_openai_form_elicitation: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -707,15 +711,6 @@ impl TurnRequestProcessor {
         .inspect_err(|error| {
             self.track_error_response(&request_id, error, /*error_type*/ None);
         })?;
-        thread
-            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to update OpenAI form elicitation support: {err}"
-                ))
-            })?;
-
         let runtime_workspace_roots = params
             .runtime_workspace_roots
             .map(resolve_runtime_workspace_roots);
@@ -835,6 +830,7 @@ impl TurnRequestProcessor {
                         op: turn_op,
                         client_user_message_id,
                         trace: self.request_trace_context(&request_id).await,
+                        parent_turn_id: None,
                     };
                     if let Err(err) = thread.submit_user_input_with_id(submission).await {
                         self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
@@ -1560,6 +1556,7 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                delegation_ack_filler: params.delegation_ack_filler,
                 flush_transcript_tail_on_session_end: params
                     .flush_transcript_tail_on_session_end
                     .unwrap_or(false),
@@ -1580,6 +1577,8 @@ impl TurnRequestProcessor {
                         role: item.role,
                     })
                     .collect(),
+                realtime_start_instructions: params.realtime_start_instructions,
+                realtime_end_instructions: params.realtime_end_instructions,
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
                 transport: params.transport.map(|transport| match transport {

@@ -4,191 +4,85 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_utils_path::write_atomically;
 use serde::Deserialize;
 use serde::Serialize;
+use std::fmt;
+use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::task;
-use tracing::error;
 use tracing::info;
 
-/// Manages loading and saving of models cache to disk.
-#[derive(Debug)]
-pub(crate) struct ModelsCacheManager {
-    cache_path: PathBuf,
-    cache_ttl: Duration,
-    write_lock: Semaphore,
+/// Asynchronous storage for model catalog snapshots used by the models manager.
+///
+/// Implementations own cache freshness and lookup partitioning. [`ModelsCache::load`] must not
+/// return stale entries or entries for a different client version. A shared backend must also keep
+/// catalogs for different providers and tenants separate, typically through configuration captured
+/// by the implementation.
+///
+/// Cache failures are non-fatal. The models manager logs them and falls back to the configured
+/// models endpoint.
+pub trait ModelsCache: fmt::Debug + Send + Sync {
+    /// Loads a fresh entry for `client_version`.
+    ///
+    /// Returns `Ok(None)` for a normal miss, including an absent, stale, or version-mismatched
+    /// entry. Returns `Err` when the backend could not complete the lookup; the models manager
+    /// treats that error as a miss and fetches the catalog from the models endpoint.
+    fn load<'a>(
+        &'a self,
+        client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>>;
+
+    /// Stores `entry`, replacing the snapshot for this cache implementation's lookup identity.
+    ///
+    /// The implementation derives that identity from its own configuration and the entry metadata.
+    /// For example, a shared backend can capture provider and tenant identity when it is constructed.
+    fn store<'a>(
+        &'a self,
+        entry: &'a ModelsCacheEntry,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>>;
+
+    /// Extends the freshness of the entry for `client_version` without changing its catalog.
+    ///
+    /// The models manager calls this after the endpoint confirms that the cached ETag is still
+    /// current. Implementations must preserve the models, ETag, and client version. This operation
+    /// cannot be expressed in terms of [`ModelsCache::load`], because `load` intentionally omits
+    /// expired entries. File-backed implementations can read and revalidate the stored entry
+    /// directly, while backends with native TTL support can extend the entry in place.
+    fn refresh_ttl<'a>(
+        &'a self,
+        client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>>;
 }
 
-impl ModelsCacheManager {
-    /// Create a new cache manager with the given path and TTL.
-    pub(crate) fn new(cache_path: PathBuf, cache_ttl: Duration) -> Self {
-        Self {
-            cache_path,
-            cache_ttl,
-            write_lock: Semaphore::new(1),
-        }
-    }
+/// Boxed future returned by [`ModelsCache`] implementations.
+pub type ModelsCacheFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-    /// Attempt to load a fresh cache entry. Returns `None` if the cache doesn't exist or is stale.
-    pub(crate) async fn load_fresh(&self, expected_version: &str) -> Option<ModelsCache> {
-        info!(
-            cache_path = %self.cache_path.display(),
-            expected_version,
-            "models cache: attempting load_fresh"
-        );
-        let cache = match self.load().await {
-            Ok(cache) => cache?,
-            Err(err) => {
-                error!("failed to load models cache: {err}");
-                return None;
-            }
-        };
-        info!(
-            cache_path = %self.cache_path.display(),
-            cached_version = ?cache.client_version,
-            fetched_at = %cache.fetched_at,
-            "models cache: loaded cache file"
-        );
-        if cache.client_version.as_deref() != Some(expected_version) {
-            info!(
-                cache_path = %self.cache_path.display(),
-                expected_version,
-                cached_version = ?cache.client_version,
-                "models cache: cache version mismatch"
-            );
-            return None;
-        }
-        if !cache.is_fresh(self.cache_ttl) {
-            info!(
-                cache_path = %self.cache_path.display(),
-                cache_ttl_secs = self.cache_ttl.as_secs(),
-                fetched_at = %cache.fetched_at,
-                "models cache: cache is stale"
-            );
-            return None;
-        }
-        info!(
-            cache_path = %self.cache_path.display(),
-            cache_ttl_secs = self.cache_ttl.as_secs(),
-            "models cache: cache hit"
-        );
-        Some(cache)
-    }
-
-    /// Persist the cache to disk, creating parent directories as needed.
-    pub(crate) async fn persist_cache(
-        &self,
-        models: &[ModelInfo],
-        etag: Option<String>,
-        client_version: String,
-    ) {
-        let cache = ModelsCache {
-            fetched_at: Utc::now(),
-            etag,
-            client_version: Some(client_version),
-            models: models.to_vec(),
-        };
-        let _write_permit = self.acquire_write_permit().await;
-        if let Err(err) = self.save_internal(&cache).await {
-            error!("failed to write models cache: {err}");
-        }
-    }
-
-    /// Renew the cache TTL by updating the fetched_at timestamp to now.
-    pub(crate) async fn renew_cache_ttl(&self) -> io::Result<()> {
-        let _write_permit = self.acquire_write_permit().await;
-        let mut cache = match self.load().await? {
-            Some(cache) => cache,
-            None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
-        };
-        cache.fetched_at = Utc::now();
-        self.save_internal(&cache).await
-    }
-
-    async fn load(&self) -> io::Result<Option<ModelsCache>> {
-        match fs::read(&self.cache_path).await {
-            Ok(contents) => {
-                let cache = serde_json::from_slice(&contents)
-                    .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-                Ok(Some(cache))
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn save_internal(&self, cache: &ModelsCache) -> io::Result<()> {
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let json = serde_json::to_string_pretty(cache)
-            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
-        let cache_path = self.cache_path.clone();
-        task::spawn_blocking(move || write_atomically(&cache_path, &json))
-            .await
-            .map_err(io::Error::other)?
-    }
-
-    async fn acquire_write_permit(&self) -> SemaphorePermit<'_> {
-        self.write_lock
-            .acquire()
-            .await
-            .unwrap_or_else(|_| unreachable!())
-    }
-
-    #[cfg(test)]
-    /// Set the cache TTL.
-    pub(crate) fn set_ttl(&mut self, ttl: Duration) {
-        self.cache_ttl = ttl;
-    }
-
-    #[cfg(test)]
-    /// Manipulate cache file for testing. Allows setting a custom fetched_at timestamp.
-    pub(crate) async fn manipulate_cache_for_test<F>(&self, f: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut DateTime<Utc>),
-    {
-        let _write_permit = self.acquire_write_permit().await;
-        let mut cache = match self.load().await? {
-            Some(cache) => cache,
-            None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
-        };
-        f(&mut cache.fetched_at);
-        self.save_internal(&cache).await
-    }
-
-    #[cfg(test)]
-    /// Mutate the full cache contents for testing.
-    pub(crate) async fn mutate_cache_for_test<F>(&self, f: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut ModelsCache),
-    {
-        let _write_permit = self.acquire_write_permit().await;
-        let mut cache = match self.load().await? {
-            Some(cache) => cache,
-            None => return Err(io::Error::new(ErrorKind::NotFound, "cache not found")),
-        };
-        f(&mut cache);
-        self.save_internal(&cache).await
-    }
-}
-
-/// Serialized snapshot of models and metadata cached on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ModelsCache {
-    pub(crate) fetched_at: DateTime<Utc>,
+/// Serialized model catalog and validation metadata stored in a [`ModelsCache`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelsCacheEntry {
+    /// Time when the catalog was fetched or last revalidated with the models endpoint.
+    pub fetched_at: DateTime<Utc>,
+    /// Endpoint ETag used to revalidate the catalog without downloading an unchanged payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) etag: Option<String>,
+    pub etag: Option<String>,
+    /// Client version for which this catalog was returned.
+    ///
+    /// The models manager rejects entries whose value is absent or differs from its current version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) client_version: Option<String>,
-    pub(crate) models: Vec<ModelInfo>,
+    pub client_version: Option<String>,
+    /// Models returned by the catalog endpoint.
+    #[serde(
+        deserialize_with = "codex_protocol::openai_models::deserialize_model_infos_with_legacy_base"
+    )]
+    pub models: Vec<ModelInfo>,
 }
 
-impl ModelsCache {
+impl ModelsCacheEntry {
     /// Returns `true` when the cache entry has not exceeded the configured TTL.
     fn is_fresh(&self, ttl: Duration) -> bool {
         if ttl.is_zero() {
@@ -202,6 +96,172 @@ impl ModelsCache {
     }
 }
 
+/// Error returned by a [`ModelsCache`] implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsCacheError {
+    message: String,
+}
+
+impl ModelsCacheError {
+    /// Create a cache error without exposing backend-specific error types.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ModelsCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelsCacheError {}
+
+/// Built-in file-backed model catalog cache.
+///
+/// Writes are serialized through `write_lock` and land through `write_atomically`, so a concurrent
+/// reader or writer never observes a partially written snapshot.
+#[derive(Debug)]
+pub(crate) struct FileModelsCache {
+    cache_path: PathBuf,
+    cache_ttl: Duration,
+    write_lock: Semaphore,
+}
+
+impl FileModelsCache {
+    /// Create a file-backed cache with the given path and TTL.
+    pub(crate) fn new(cache_path: PathBuf, cache_ttl: Duration) -> Self {
+        Self {
+            cache_path,
+            cache_ttl,
+            write_lock: Semaphore::new(1),
+        }
+    }
+
+    /// Serialize writes so a read-modify-write of the file cannot interleave with another writer.
+    async fn acquire_write_permit(&self) -> SemaphorePermit<'_> {
+        self.write_lock
+            .acquire()
+            .await
+            .unwrap_or_else(|_| unreachable!())
+    }
+}
+
+impl ModelsCache for FileModelsCache {
+    fn load<'a>(
+        &'a self,
+        client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<Option<ModelsCacheEntry>, ModelsCacheError>> {
+        Box::pin(
+            async move { load_fresh_file(&self.cache_path, self.cache_ttl, client_version).await },
+        )
+    }
+
+    fn store<'a>(
+        &'a self,
+        entry: &'a ModelsCacheEntry,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
+        Box::pin(async move {
+            let _write_permit = self.acquire_write_permit().await;
+            save_file(&self.cache_path, entry).await
+        })
+    }
+
+    fn refresh_ttl<'a>(
+        &'a self,
+        _client_version: &'a str,
+    ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
+        Box::pin(async move {
+            let _write_permit = self.acquire_write_permit().await;
+            let mut entry = load_file(&self.cache_path)
+                .await
+                .map_err(cache_error)?
+                .ok_or_else(|| ModelsCacheError::new("cache not found"))?;
+            if entry.is_fresh(self.cache_ttl / 2) {
+                return Ok(());
+            }
+            entry.fetched_at = Utc::now();
+            save_file(&self.cache_path, &entry).await
+        })
+    }
+}
+
+async fn load_fresh_file(
+    cache_path: &PathBuf,
+    cache_ttl: Duration,
+    expected_version: &str,
+) -> Result<Option<ModelsCacheEntry>, ModelsCacheError> {
+    info!(
+        cache_path = %cache_path.display(),
+        expected_version,
+        "models cache: attempting load_fresh"
+    );
+    let Some(cache) = load_file(cache_path).await.map_err(cache_error)? else {
+        return Ok(None);
+    };
+    info!(
+        cache_path = %cache_path.display(),
+        cached_version = ?cache.client_version,
+        fetched_at = %cache.fetched_at,
+        "models cache: loaded cache file"
+    );
+    if cache.client_version.as_deref() != Some(expected_version) {
+        info!(
+            cache_path = %cache_path.display(),
+            expected_version,
+            cached_version = ?cache.client_version,
+            "models cache: cache version mismatch"
+        );
+        return Ok(None);
+    }
+    if !cache.is_fresh(cache_ttl) {
+        info!(
+            cache_path = %cache_path.display(),
+            cache_ttl_secs = cache_ttl.as_secs(),
+            fetched_at = %cache.fetched_at,
+            "models cache: cache is stale"
+        );
+        return Ok(None);
+    }
+    info!(
+        cache_path = %cache_path.display(),
+        cache_ttl_secs = cache_ttl.as_secs(),
+        "models cache: cache hit"
+    );
+    Ok(Some(cache))
+}
+
+async fn load_file(cache_path: &PathBuf) -> io::Result<Option<ModelsCacheEntry>> {
+    match fs::read(cache_path).await {
+        Ok(contents) => {
+            let cache = serde_json::from_slice(&contents)
+                .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
+            Ok(Some(cache))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+async fn save_file(cache_path: &PathBuf, cache: &ModelsCacheEntry) -> Result<(), ModelsCacheError> {
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).await.map_err(cache_error)?;
+    }
+    let json = serde_json::to_string_pretty(cache).map_err(cache_error)?;
+    let cache_path = cache_path.clone();
+    task::spawn_blocking(move || write_atomically(&cache_path, &json))
+        .await
+        .map_err(io::Error::other)
+        .and_then(|written| written)
+        .map_err(cache_error)
+}
+
+fn cache_error(error: impl fmt::Display) -> ModelsCacheError {
+    ModelsCacheError::new(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,38 +269,41 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    fn entry_with_etag(etag: &str) -> ModelsCacheEntry {
+        ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: Some(etag.to_string()),
+            client_version: Some("test-client".to_string()),
+            models: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn cache_write_atomically_replaces_existing_file() {
         let temp_dir = tempdir().expect("create temp dir");
         let cache_path = temp_dir.path().join("models_cache.json");
-        let manager = ModelsCacheManager::new(cache_path.clone(), Duration::from_secs(60));
-        manager
-            .persist_cache(
-                &[],
-                Some("original-etag".to_string()),
-                "test-client".to_string(),
-            )
-            .await;
+        let cache = FileModelsCache::new(cache_path.clone(), Duration::from_secs(60));
+        cache
+            .store(&entry_with_etag("original-etag"))
+            .await
+            .expect("store original cache");
         let mut original_file = std::fs::File::open(&cache_path).expect("open original cache");
 
-        manager
-            .persist_cache(
-                &[],
-                Some("replacement-etag".to_string()),
-                "test-client".to_string(),
-            )
-            .await;
+        cache
+            .store(&entry_with_etag("replacement-etag"))
+            .await
+            .expect("store replacement cache");
 
         let mut original_contents = String::new();
         original_file
             .read_to_string(&mut original_contents)
             .expect("read original cache handle");
-        let original_cache: ModelsCache =
+        let original_cache: ModelsCacheEntry =
             serde_json::from_str(&original_contents).expect("parse original cache handle");
         assert_eq!(original_cache.etag.as_deref(), Some("original-etag"));
 
-        let current_cache = manager
-            .load()
+        let current_cache = cache
+            .load("test-client")
             .await
             .expect("load current cache")
             .expect("current cache exists");
@@ -251,31 +314,37 @@ mod tests {
     async fn concurrent_cache_updates_remain_valid_json() {
         let temp_dir = tempdir().expect("create temp dir");
         let cache_path = temp_dir.path().join("models_cache.json");
-        let manager = Arc::new(ModelsCacheManager::new(
+        let cache = Arc::new(FileModelsCache::new(
             cache_path.clone(),
             Duration::from_secs(60),
         ));
-        manager
-            .persist_cache(
-                &[],
-                Some("initial-etag".to_string()),
-                "test-client".to_string(),
-            )
-            .await;
+        cache
+            .store(&entry_with_etag("initial-etag"))
+            .await
+            .expect("store initial cache");
 
         let mut tasks = Vec::new();
         for writer_id in 0..8 {
-            let manager = Arc::clone(&manager);
+            let cache = Arc::clone(&cache);
             tasks.push(tokio::spawn(async move {
                 for update_id in 0..20 {
                     let etag = format!(
                         "writer-{writer_id}-update-{update_id}-{}",
                         "x".repeat(64_000)
                     );
-                    manager
-                        .persist_cache(&[], Some(etag), "test-client".to_string())
-                        .await;
-                    manager.renew_cache_ttl().await.expect("renew cache TTL");
+                    cache
+                        .store(&ModelsCacheEntry {
+                            fetched_at: Utc::now(),
+                            etag: Some(etag),
+                            client_version: Some("test-client".to_string()),
+                            models: Vec::new(),
+                        })
+                        .await
+                        .expect("store cache");
+                    cache
+                        .refresh_ttl("test-client")
+                        .await
+                        .expect("renew cache TTL");
                 }
             }));
         }
@@ -284,7 +353,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 for _ in 0..400 {
                     let contents = fs::read(&cache_path).await.expect("read cache");
-                    serde_json::from_slice::<ModelsCache>(&contents)
+                    serde_json::from_slice::<ModelsCacheEntry>(&contents)
                         .expect("cache remains valid JSON");
                     task::yield_now().await;
                 }

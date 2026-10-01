@@ -1343,7 +1343,7 @@ fn is_default_multi_agent_usage_hint(text: &str) -> bool {
         };
         count > 0
             && count_text == count.to_string()
-            && (text == default_multi_agent_v2_usage_hint_text(base, count)
+            && (text == default_multi_agent_v2_usage_hint_text(base, count, None)
                 || text == format!("{base}\nThere are {count} available concurrency slots, meaning that up to {count} agents can be active at once, including you."))
     })
 }
@@ -2037,10 +2037,12 @@ mod tests {
         let root_agent_hint = default_multi_agent_v2_usage_hint_text(
             DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
             DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            None,
         );
         let configured_concurrency_hint = default_multi_agent_v2_usage_hint_text(
             DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
             6,
+            None,
         );
         let configured_agent_hint = format!("{root_agent_hint}\nCustom Alice Stone guidance.");
         let legacy_agent_hint = format!(
@@ -2507,6 +2509,7 @@ mod tests {
         let root_agent_hint = default_multi_agent_v2_usage_hint_text(
             DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
             DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            None,
         );
         let prepared = gateway
             .prepare_json_body(json!({

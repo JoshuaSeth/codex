@@ -2,20 +2,22 @@ pub mod config_rules;
 pub mod injection;
 pub(crate) mod invocation_utils;
 pub mod loader;
-mod mention_counts;
 pub mod model;
 mod pitchai_principal;
 pub mod remote;
-pub mod render;
 mod root_loader;
-pub mod service;
 mod skill_instructions;
-pub mod system;
 
+/// Hard byte limit for one model-visible skill instruction body.
+///
+/// Both the legacy explicit-injection path and the skills extension use this
+/// limit so a skill cannot bypass context bounds by changing how it is loaded.
+pub const MAX_SKILL_PROMPT_BYTES: usize = 8_000;
+
+pub use codex_skills::ImplicitSkillLookup;
+pub use codex_skills::build_skill_name_counts;
+pub use codex_skills::detect_implicit_skill_invocation_for_command;
 pub(crate) use invocation_utils::build_implicit_skill_path_indexes;
-pub use invocation_utils::detect_implicit_skill_invocation_for_command;
-pub use mention_counts::build_skill_name_counts;
-pub use model::HostSkillsSnapshot;
 pub use model::SkillError;
 pub use model::SkillLoadOutcome;
 pub use model::SkillMetadata;
@@ -23,16 +25,13 @@ pub use model::SkillPolicy;
 pub use model::filter_skill_load_outcome_for_product;
 pub use pitchai_principal::managed_pitchai_catalog_enabled;
 pub use pitchai_principal::pitchai_skill_principal_from_stack;
-pub use render::AvailableSkills;
-pub use render::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
-pub use render::SKILLS_HOW_TO_USE_WITH_ALIASES;
-pub use render::SKILLS_INTRO_WITH_ABSOLUTE_PATHS;
-pub use render::SkillMetadataBudget;
-pub use render::SkillRenderReport;
-pub use render::build_available_skills;
-pub use render::default_skill_metadata_budget;
-pub use render::render_available_skills_body;
+
+// The PitchAI seam the skills extension reaches. Ext/skills owns the host
+// skills service from 267 on, but the managed-catalog resolution and the
+// tenant name precedence stay in this crate; these three names are the
+// contract between them.
+pub use loader::SkillRootsResolution as PitchaiSkillRootsResolution;
+pub use loader::load_skills_from_roots_with_name_precedence_and_pool as pitchai_load_skills_from_roots_with_name_precedence;
+pub use loader::skill_roots_with_diagnostics as pitchai_skill_roots_with_diagnostics;
 pub use root_loader::PluginSkillSnapshots;
-pub use service::SkillsLoadInput;
-pub use service::SkillsService;
 pub use skill_instructions::SkillInstructions;

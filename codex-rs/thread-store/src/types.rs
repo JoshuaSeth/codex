@@ -263,6 +263,8 @@ pub enum ThreadSortKey {
     UpdatedAt,
     /// Sort by the thread's product recency timestamp.
     RecencyAt,
+    /// Sort by the thread's persisted position within its section.
+    SectionPosition,
 }
 
 /// The direction to use when listing stored threads.
@@ -303,8 +305,9 @@ pub struct ListThreadsParams {
     /// Optional cwd filters. `None` means all working directories, while an empty vector matches no
     /// threads.
     pub cwd_filters: Option<Vec<PathBuf>>,
-    /// Optional persisted pin-state filter.
-    pub is_pinned: Option<bool>,
+    /// Omit to include every section, set to `None` to match unsectioned
+    /// threads, or provide a section ID to match that section.
+    pub section: Option<Option<String>>,
     /// Whether archived threads should be listed instead of active threads.
     pub archived: bool,
     /// Optional substring/full-text search term for thread title/preview.
@@ -567,8 +570,14 @@ pub struct StoredThread {
     pub recency_at: DateTime<Utc>,
     /// Thread archive timestamp, if archived.
     pub archived_at: Option<DateTime<Utc>>,
-    /// Whether this thread has been pinned by the user.
-    pub is_pinned: bool,
+    /// The user-selected section for this thread, if any.
+    pub section: Option<codex_state::ThreadSection>,
+    /// The server-owned ordering position within the thread's section.
+    #[serde(default)]
+    pub section_position: Option<i64>,
+    /// The time when the thread most recently entered its current section.
+    #[serde(default)]
+    pub section_entered_at: Option<DateTime<Utc>>,
     /// Working directory captured for the thread.
     pub cwd: PathBuf,
     /// CLI version captured for the thread.
@@ -725,8 +734,6 @@ pub struct ThreadMetadataPatch {
     pub token_usage: Option<TokenUsage>,
     /// First user message observed for this thread.
     pub first_user_message: Option<String>,
-    /// Replacement user-selected thread pin state.
-    pub is_pinned: Option<bool>,
     /// Git metadata patch.
     pub git_info: Option<GitInfoPatch>,
     /// Thread memory behavior.
@@ -803,9 +810,6 @@ impl ThreadMetadataPatch {
         if next.first_user_message.is_some() {
             self.first_user_message = next.first_user_message;
         }
-        if next.is_pinned.is_some() {
-            self.is_pinned = next.is_pinned;
-        }
         if let Some(git_info) = next.git_info {
             self.git_info
                 .get_or_insert_with(GitInfoPatch::default)
@@ -838,7 +842,6 @@ impl ThreadMetadataPatch {
             && self.permission_profile.is_none()
             && self.token_usage.is_none()
             && self.first_user_message.is_none()
-            && self.is_pinned.is_none()
             && self.git_info.is_none()
             && self.memory_mode.is_none()
     }
@@ -853,6 +856,17 @@ pub struct UpdateThreadMetadataParams {
     pub patch: ThreadMetadataPatch,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
+}
+
+/// Parameters for moving a thread to, within, or out of a server-ordered section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveThreadToSectionParams {
+    /// Thread to move.
+    pub thread_id: ThreadId,
+    /// Destination section, or `None` to remove the thread from its section.
+    pub section: Option<String>,
+    /// Existing section member to insert before, or `None` to append.
+    pub before_thread_id: Option<ThreadId>,
 }
 
 /// Parameters for archiving or unarchiving a thread.
@@ -980,7 +994,6 @@ mod tests {
         let mut current = ThreadMetadataPatch {
             name: Some(Some("old name".to_string())),
             preview: Some("old preview".to_string()),
-            is_pinned: Some(true),
             git_info: Some(GitInfoPatch {
                 sha: Some(Some("abc123".to_string())),
                 branch: Some(Some("main".to_string())),
@@ -993,7 +1006,6 @@ mod tests {
             name: Some(None),
             preview: None,
             title: Some("new title".to_string()),
-            is_pinned: Some(false),
             git_info: Some(GitInfoPatch {
                 sha: None,
                 branch: Some(Some("feature".to_string())),
@@ -1005,7 +1017,6 @@ mod tests {
         assert_eq!(current.name, Some(None));
         assert_eq!(current.preview.as_deref(), Some("old preview"));
         assert_eq!(current.title.as_deref(), Some("new title"));
-        assert_eq!(current.is_pinned, Some(false));
         assert_eq!(
             current.git_info,
             Some(GitInfoPatch {

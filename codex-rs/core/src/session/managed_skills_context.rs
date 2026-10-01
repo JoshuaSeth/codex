@@ -1,15 +1,12 @@
 use super::Session;
 use super::TurnContext;
-use crate::build_available_skills;
-use crate::context::AvailableSkillsInstructions;
-use crate::context::ContextualUserFragment;
 use crate::context_manager::remove_matching_skills_instructions;
 use crate::context_manager::updates::build_developer_update_item;
-use crate::default_skill_metadata_budget;
-use crate::skills::SkillRenderSideEffects;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
+use codex_skills_extension::provider::empty_skills_instructions_fragment;
+use codex_skills_extension::provider::render_host_skills_instructions;
 
 const EMPTY_MANAGED_SKILLS_WARNING: &str =
     "Managed PitchAI skill context has no available skills; historical skill access was revoked.";
@@ -26,30 +23,20 @@ impl Session {
         }
 
         let (current, warning) = if turn_context.config.include_skill_instructions {
-            match build_available_skills(
+            match render_host_skills_instructions(
                 turn_context.turn_skills.snapshot.outcome(),
-                default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::None,
+                turn_context.model_info.context_window,
+                turn_context.model_info.include_skills_usage_instructions,
             ) {
-                Some(available_skills) => {
-                    let warning = available_skills.warning_message.clone();
-                    (
-                        AvailableSkillsInstructions::from_available_skills(
-                            &available_skills,
-                            turn_context.model_info.include_skills_usage_instructions,
-                        )
-                        .render(),
-                        warning,
-                    )
-                }
+                Some(rendered) => (rendered.fragment, rendered.warning),
                 None => (
-                    AvailableSkillsInstructions::from_skill_lines(Vec::new()).render(),
+                    empty_skills_instructions_fragment(),
                     Some(EMPTY_MANAGED_SKILLS_WARNING.to_string()),
                 ),
             }
         } else {
             (
-                AvailableSkillsInstructions::from_skill_lines(Vec::new()).render(),
+                empty_skills_instructions_fragment(),
                 Some(DISABLED_MANAGED_SKILLS_WARNING.to_string()),
             )
         };

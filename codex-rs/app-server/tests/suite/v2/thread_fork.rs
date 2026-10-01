@@ -97,7 +97,7 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
             model_providers: None,
             source_kinds: None,
             archived: None,
-            is_pinned: None,
+            section_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -480,78 +480,19 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     }
 
     let original_contents = std::fs::read_to_string(source_path.as_path())?;
-    for history_mode in [ThreadForkHistoryMode::Full, ThreadForkHistoryMode::Compact] {
+    for fork_history_mode in [ThreadForkHistoryMode::Full, ThreadForkHistoryMode::Compact] {
         let fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
                 thread_id: source_thread_id.clone(),
                 last_turn_id: Some(turn_ids[1].clone()),
-                history_mode,
+                history_mode: fork_history_mode,
                 ..Default::default()
             })
             .await?;
-        let fork_resp: JSONRPCResponse = timeout(
-    let fork_id = mcp
-        .send_thread_fork_request(ThreadForkParams {
-            thread_id: source_thread_id.clone(),
-            last_turn_id: Some(turn_ids[1].clone()),
-            ..Default::default()
-        })
-        .await?;
-    let ThreadForkResponse {
-        thread: forked_thread,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
-
-    assert_eq!(
-        forked_thread
-            .turns
-            .iter()
-            .map(|turn| turn.id.clone())
-            .collect::<Vec<_>>(),
-        turn_ids[..2]
-    );
-    assert!(
-        forked_thread
-            .turns
-            .iter()
-            .all(|turn| turn.status == TurnStatus::Completed)
-    );
-    assert_eq!(forked_thread.forked_from_id, Some(source_thread_id.clone()));
-    if history_mode == ThreadHistoryMode::Legacy {
-        assert_eq!(forked_thread.preview, "first");
-    }
-    assert_eq!(
-        std::fs::read_to_string(source_path.as_path())?,
-        original_contents,
-        "forking at a turn must not mutate the source rollout"
-    );
-
-    let forked_path = forked_thread.path.clone().expect("forked thread path");
-    let forked_contents = std::fs::read_to_string(forked_path.as_path())?;
-    if history_mode == ThreadHistoryMode::Paginated {
-        assert!(
-            read_session_meta_line(forked_path.as_path())
-                .await?
-                .meta
-                .history_base
-                .is_some()
-        );
-        assert!(!forked_contents.contains(turn_ids[1].as_str()));
-    } else {
-        assert!(forked_contents.contains(turn_ids[1].as_str()));
-    }
-    assert!(!forked_contents.contains(turn_ids[2].as_str()));
-
-    let started = loop {
-        let notification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
-        )
-        .await??;
         let ThreadForkResponse {
             thread: forked_thread,
             ..
-        } = to_response::<ThreadForkResponse>(fork_resp)?;
+        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
 
         assert_eq!(
             forked_thread
@@ -568,7 +509,9 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
                 .all(|turn| turn.status == TurnStatus::Completed)
         );
         assert_eq!(forked_thread.forked_from_id, Some(source_thread_id.clone()));
-        assert_eq!(forked_thread.preview, "first");
+        if history_mode == ThreadHistoryMode::Legacy {
+            assert_eq!(forked_thread.preview, "first");
+        }
         assert_eq!(
             std::fs::read_to_string(source_path.as_path())?,
             original_contents,
@@ -577,7 +520,18 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
 
         let forked_path = forked_thread.path.clone().expect("forked thread path");
         let forked_contents = std::fs::read_to_string(forked_path.as_path())?;
-        assert!(forked_contents.contains(turn_ids[1].as_str()));
+        if history_mode == ThreadHistoryMode::Paginated {
+            assert!(
+                read_session_meta_line(forked_path.as_path())
+                    .await?
+                    .meta
+                    .history_base
+                    .is_some()
+            );
+            assert!(!forked_contents.contains(turn_ids[1].as_str()));
+        } else {
+            assert!(forked_contents.contains(turn_ids[1].as_str()));
+        }
         assert!(!forked_contents.contains(turn_ids[2].as_str()));
 
         let started = loop {
@@ -593,57 +547,56 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             }
         };
         assert!(started.thread.turns.is_empty());
-    }
-
-    if history_mode == ThreadHistoryMode::Paginated {
-        let before_fork_id = mcp
-            .send_thread_fork_request(ThreadForkParams {
-                thread_id: source_thread_id,
-                before_turn_id: Some(turn_ids[2].clone()),
-                ..Default::default()
-            })
-            .await?;
-        let ThreadForkResponse {
-            thread: before_fork,
-            ..
-        } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(before_fork_id)).await??;
-        assert_eq!(
-            before_fork
-                .turns
-                .iter()
-                .map(|turn| turn.id.clone())
-                .collect::<Vec<_>>(),
-            turn_ids[..2]
-        );
-
-        let completed = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.start_turn_and_wait_for_completion(TurnStartParams {
-                thread_id: forked_thread.id.clone(),
-                input: vec![UserInput::Text {
-                    text: "private child prompt".to_string(),
-                    text_elements: Vec::new(),
-                }],
-                ..Default::default()
-            }),
-        )
-        .await??;
-        let ThreadForkResponse {
-            thread: ephemeral_fork,
-            ..
-        } = mcp
-            .request(|request_id| ClientRequest::ThreadFork {
-                request_id,
-                params: ThreadForkParams {
-                    thread_id: forked_thread.id,
-                    before_turn_id: Some(completed.turn.id),
-                    ephemeral: true,
-                    exclude_turns: true,
+        if history_mode == ThreadHistoryMode::Paginated {
+            let before_fork_id = mcp
+                .send_thread_fork_request(ThreadForkParams {
+                    thread_id: source_thread_id.clone(),
+                    before_turn_id: Some(turn_ids[2].clone()),
                     ..Default::default()
-                },
-            })
-            .await?;
-        assert_eq!(ephemeral_fork.preview, "first");
+                })
+                .await?;
+            let ThreadForkResponse {
+                thread: before_fork,
+                ..
+            } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(before_fork_id)).await??;
+            assert_eq!(
+                before_fork
+                    .turns
+                    .iter()
+                    .map(|turn| turn.id.clone())
+                    .collect::<Vec<_>>(),
+                turn_ids[..2]
+            );
+
+            let completed = timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.start_turn_and_wait_for_completion(TurnStartParams {
+                    thread_id: forked_thread.id.clone(),
+                    input: vec![UserInput::Text {
+                        text: "private child prompt".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .await??;
+            let ThreadForkResponse {
+                thread: ephemeral_fork,
+                ..
+            } = mcp
+                .request(|request_id| ClientRequest::ThreadFork {
+                    request_id,
+                    params: ThreadForkParams {
+                        thread_id: forked_thread.id.clone(),
+                        before_turn_id: Some(completed.turn.id),
+                        ephemeral: true,
+                        exclude_turns: true,
+                        ..Default::default()
+                    },
+                })
+                .await?;
+            assert_eq!(ephemeral_fork.preview, "first");
+        }
     }
 
     Ok(())
@@ -710,7 +663,14 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
         .await??;
         turn_ids.push(completed.turn.id);
     }
-    mcp.clear_message_buffer();
+    // Stop the source before its active goal exists so a late idle hook cannot continue it.
+    timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    drop(mcp);
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
 
     let state_db = StateRuntime::init(
         codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
@@ -741,24 +701,6 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
         .get_thread_goal(source_thread_id)
         .await?
         .expect("source goal");
-
-    let ordinary_fork_id = mcp
-        .send_thread_fork_request(ThreadForkParams {
-            thread_id: source_thread.id.clone(),
-            ..Default::default()
-        })
-        .await?;
-    let ThreadForkResponse {
-        thread: ordinary_fork,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(ordinary_fork_id)).await??;
-    assert_eq!(
-        state_db
-            .thread_goals()
-            .get_thread_goal(ThreadId::from_string(&ordinary_fork.id)?)
-            .await?,
-        None
-    );
 
     let mut forked_threads = Vec::new();
     for (last_turn_id, before_turn_id, expected_turn_count) in [
@@ -1002,7 +944,7 @@ async fn thread_fork_can_load_source_by_path() -> Result<()> {
 async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    create_config_toml(codex_home.path(), &server.uri())?;
 
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -1019,26 +961,6 @@ async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
     )
     .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build_initialized()
-        .await?;
-
-    let read_id = mcp
-        .send_thread_read_request(ThreadReadParams {
-            thread_id: conversation_id.clone(),
-            include_turns: true,
-        })
-        .await?;
-    let ThreadReadResponse {
-        thread: source_thread,
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
-    assert_eq!(source_thread.turns.len(), 2);
-    assert_eq!(source_thread.turns[1].id, unfinished_turn_id);
-    assert_eq!(source_thread.turns[1].status, TurnStatus::Interrupted);
 
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
@@ -1058,12 +980,6 @@ async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
     assert_eq!(thread.forked_from_id, Some(conversation_id));
     assert_eq!(thread.preview, "Saved user message");
     assert!(thread.turns.is_empty());
-    let ThreadForkResponse {
-        thread: forked_thread,
-        ..
-    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
-    assert_eq!(forked_thread.turns.len(), 1);
-    assert_eq!(forked_thread.preview, "Saved user message");
 
     Ok(())
 }
@@ -1072,7 +988,7 @@ async fn thread_fork_can_use_compact_history_mode() -> Result<()> {
 async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let filename_ts = "2025-01-05T12-00-00";
     let conversation_id = create_fake_rollout(
@@ -1108,9 +1024,8 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let read_id = mcp
         .send_thread_read_request(ThreadReadParams {
@@ -1118,14 +1033,9 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
             include_turns: true,
         })
         .await?;
-    let read_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
-    )
-    .await??;
     let ThreadReadResponse {
         thread: source_thread,
-    } = to_response::<ThreadReadResponse>(read_response)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     assert_eq!(source_thread.turns.len(), 2);
     assert_eq!(source_thread.turns[1].id, unfinished_turn_id);
     assert_eq!(source_thread.turns[1].status, TurnStatus::Interrupted);
@@ -1137,15 +1047,10 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let fork_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
-    )
-    .await??;
     let ThreadForkResponse {
         thread: forked_thread,
         ..
-    } = to_response::<ThreadForkResponse>(fork_response)?;
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
     assert_eq!(forked_thread.turns.len(), 1);
     assert_eq!(forked_thread.preview, "Saved user message");
 
@@ -1425,7 +1330,7 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id: forked_thread_id,
+            thread_id: forked_thread_id.clone(),
             input: vec![UserInput::Text {
                 text: "Continue from the fork".to_string(),
                 text_elements: Vec::new(),
@@ -1468,6 +1373,33 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     let excluded_turns_path = excluded_turns_thread.path.expect("forked rollout path");
     let excluded_turns_meta = read_session_meta_line(excluded_turns_path.as_path()).await?;
     assert_eq!(excluded_turns_meta.meta.history_base, Some(history_base));
+
+    let ThreadForkResponse {
+        thread: nested_thread,
+        ..
+    } = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: forked_thread_id.clone(),
+                exclude_turns: true,
+                ..ThreadForkParams::default()
+            },
+        })
+        .await?;
+    assert_eq!(nested_thread.forked_from_id, Some(forked_thread_id.clone()));
+    assert_eq!(nested_thread.history_mode, ThreadHistoryMode::Paginated);
+    assert!(nested_thread.turns.is_empty());
+    let nested_path = nested_thread.path.expect("nested fork rollout path");
+    let nested_meta = read_session_meta_line(nested_path.as_path()).await?;
+    assert_eq!(
+        nested_meta
+            .meta
+            .history_base
+            .expect("nested fork history base")
+            .thread_id,
+        ThreadId::from_string(forked_thread_id.as_str())?
+    );
     Ok(())
 }
 
