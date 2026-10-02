@@ -11,6 +11,7 @@ use codex_api::AuthProvider;
 use codex_api::Compression;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
+use codex_api::ResponsesApiTools;
 use codex_api::ResponsesClient;
 use codex_api::ResponsesOptions;
 use codex_client::HttpTransport;
@@ -460,7 +461,7 @@ async fn serialized_edge_path_is_transport_equivalent_to_typed_request() -> Resu
         model: "gpt-test".into(),
         instructions: "Help Alice Stone".into(),
         input: vec![ResponseItem::Message {
-            id: Some("msg_1".into()),
+            id: Some(ResponseItemId::from_server("msg_1".to_string())),
             role: "user".into(),
             content: vec![ContentItem::InputText {
                 text: "Email alice@example.invalid".into(),
@@ -468,9 +469,12 @@ async fn serialized_edge_path_is_transport_equivalent_to_typed_request() -> Resu
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
-        tools: Some(vec![
-            serde_json::json!({"name": "lookup", "description": "Lookup user"}),
-        ]),
+        tools: Some(ResponsesApiTools::from(Arc::from(
+            serde_json::value::to_raw_value(&serde_json::json!([
+                {"name": "lookup", "description": "Lookup user"}
+            ]))
+            .expect("tool json"),
+        ))),
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,

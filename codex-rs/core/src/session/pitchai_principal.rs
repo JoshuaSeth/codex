@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::session_rollout_init_error::InvalidSessionIdentityError;
 use codex_config::PitchAiSkillPrincipal;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::RolloutItem;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 
 /// Resolve the immutable managed principal before any session skill warmup.
 ///
@@ -15,7 +15,7 @@ pub(super) async fn resolve_and_bind_pitchai_principal(
     initial_history: &mut InitialHistory,
 ) -> anyhow::Result<Option<PitchAiSkillPrincipal>> {
     let configured =
-        codex_core_skills::pitchai_skill_principal_from_stack(&config.config_layer_stack)
+        codex_skills_extension::pitchai_skill_principal_from_stack(&config.config_layer_stack)
             .map_err(InvalidSessionIdentityError)?;
     if let Some(principal) = configured.as_ref() {
         validate_principal(principal)?;
@@ -43,7 +43,7 @@ pub(super) async fn resolve_and_bind_pitchai_principal(
         .into());
     }
     validate_catalog_principal_presence(
-        codex_core_skills::managed_pitchai_catalog_enabled(),
+        codex_skills_extension::managed_pitchai_catalog_enabled(),
         configured.as_ref(),
     )?;
     if matches!(&*initial_history, InitialHistory::Forked(items) if items.iter().any(|item| matches!(item, RolloutItem::SessionMeta(_))))
@@ -102,7 +102,7 @@ fn pitchai_principal_from_initial_history(
     match initial_history {
         InitialHistory::New | InitialHistory::Cleared => Ok(None),
         InitialHistory::Resumed(resumed) => {
-            codex_protocol::protocol::pitchai_skill_principal_from_rollout_items(
+            codex_history::pitchai_skill_principal_from_rollout_items(
                 resumed.history.as_slice(),
                 resumed.conversation_id,
             )
@@ -114,7 +114,7 @@ fn pitchai_principal_from_initial_history(
             }) else {
                 return Ok(None);
             };
-            codex_protocol::protocol::pitchai_skill_principal_from_rollout_items(
+            codex_history::pitchai_skill_principal_from_rollout_items(
                 items.as_slice(),
                 source_thread_id,
             )

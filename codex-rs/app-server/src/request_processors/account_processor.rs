@@ -13,6 +13,7 @@ mod rate_limit_resets;
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+const THREAD_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 60);
 const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
     Duration::from_millis(/*millis*/ 1000);
 // Login overrides are intentionally available only in debug builds.
@@ -155,8 +156,9 @@ impl AccountRequestProcessor {
 
     pub(crate) async fn get_account_token_usage(
         &self,
+        params: Option<GetAccountTokenUsageParams>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.get_account_token_usage_response()
+        self.get_account_token_usage_response(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -289,6 +291,9 @@ impl AccountRequestProcessor {
         request_id: ConnectionRequestId,
         params: LoginAccountParams,
     ) -> Result<(), JSONRPCErrorError> {
+        if self.auth_manager.is_workload_identity_selected() {
+            return Err(self.configured_auth_owned_by_host_error());
+        }
         match params {
             LoginAccountParams::ApiKey { api_key } => {
                 self.login_api_key_v2(request_id, LoginApiKeyParams { api_key })
@@ -346,6 +351,12 @@ impl AccountRequestProcessor {
         )
     }
 
+    fn configured_auth_owned_by_host_error(&self) -> JSONRPCErrorError {
+        invalid_request(
+            "Configured external authentication is owned by the app-server host and cannot be changed through account RPCs.",
+        )
+    }
+
     async fn login_api_key_common(
         &self,
         params: &LoginApiKeyParams,
@@ -379,6 +390,7 @@ impl AccountRequestProcessor {
         ) {
             Ok(()) => {
                 self.auth_manager.reload().await;
+                self.config_manager.clear_cloud_config_bundle_loader();
                 Ok(())
             }
             Err(err) => Err(internal_error(format!("failed to save api key: {err}"))),
@@ -446,6 +458,7 @@ impl AccountRequestProcessor {
             )
             .map_err(|err| internal_error(format!("failed to save Amazon Bedrock auth: {err}")))?;
             self.auth_manager.reload().await;
+            self.config_manager.clear_cloud_config_bundle_loader();
             Ok(LoginAccountResponse::AmazonBedrock {})
         }
         .await;
@@ -871,6 +884,9 @@ impl AccountRequestProcessor {
     }
 
     async fn logout_common(&self) -> std::result::Result<Option<AuthMode>, JSONRPCErrorError> {
+        if self.auth_manager.is_workload_identity_selected() {
+            return Err(self.configured_auth_owned_by_host_error());
+        }
         let managed_bedrock_auth = matches!(
             self.auth_manager.auth_cached(),
             Some(CodexAuth::BedrockApiKey(_))
@@ -896,6 +912,8 @@ impl AccountRequestProcessor {
                 return Err(internal_error(format!("logout failed: {err}")));
             }
         }
+
+        self.config_manager.clear_cloud_config_bundle_loader();
 
         if managed_bedrock_auth {
             clear_user_model_provider_if_bedrock(&self.config_manager).await?;
@@ -1039,30 +1057,31 @@ impl AccountRequestProcessor {
                     let permanent_refresh_failure =
                         self.auth_manager.refresh_failure_for_auth(&auth).is_some();
                     let auth_mode = auth_mode_to_api(auth.api_auth_mode());
-                    let (reported_auth_method, token_opt) = if matches!(
-                        auth,
-                        CodexAuth::Headers(_)
-                            | CodexAuth::AgentIdentity(_)
-                            | CodexAuth::PersonalAccessToken(_)
-                    ) || include_token
-                        && permanent_refresh_failure
-                    {
-                        // This response cannot represent the metadata needed to reuse these
-                        // credentials.
-                        (Some(auth_mode), None)
-                    } else {
-                        match auth.get_token() {
-                            Ok(token) if !token.is_empty() => {
-                                let tok = if include_token { Some(token) } else { None };
-                                (Some(auth_mode), tok)
+                    let (reported_auth_method, token_opt) =
+                        if self.auth_manager.is_workload_identity_selected()
+                            || matches!(
+                                auth,
+                                CodexAuth::Headers(_)
+                                    | CodexAuth::AgentIdentity(_)
+                                    | CodexAuth::PersonalAccessToken(_)
+                            )
+                            || include_token && permanent_refresh_failure
+                        {
+                            // Host-owned and metadata-bearing credentials are never exported.
+                            (Some(auth_mode), None)
+                        } else {
+                            match auth.get_token() {
+                                Ok(token) if !token.is_empty() => {
+                                    let tok = if include_token { Some(token) } else { None };
+                                    (Some(auth_mode), tok)
+                                }
+                                Ok(_) => (None, None),
+                                Err(err) => {
+                                    tracing::warn!("failed to get token for auth status: {err}");
+                                    (None, None)
+                                }
                             }
-                            Ok(_) => (None, None),
-                            Err(err) => {
-                                tracing::warn!("failed to get token for auth status: {err}");
-                                (None, None)
-                            }
-                        }
-                    };
+                        };
                     GetAuthStatusResponse {
                         auth_method: reported_auth_method,
                         auth_token: token_opt,
@@ -1178,7 +1197,16 @@ impl AccountRequestProcessor {
 
     async fn get_account_token_usage_response(
         &self,
+        params: Option<GetAccountTokenUsageParams>,
     ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {
+        let thread_id = params
+            .and_then(|params| params.thread_id)
+            .map(|thread_id| {
+                ThreadId::from_string(&thread_id)
+                    .map_err(|err| invalid_request(format!("invalid thread id: {err}")))
+            })
+            .transpose()?;
+
         let Some(auth) = self.auth_manager.auth().await else {
             return Err(invalid_request(
                 "codex account authentication required to read token usage",
@@ -1196,6 +1224,61 @@ impl AccountRequestProcessor {
             &auth,
             self.config.http_client_factory(),
         );
+        if let Some(thread_id) = thread_id {
+            let thread_id = thread_id.to_string();
+            let usage = tokio::time::timeout(
+                THREAD_USAGE_FETCH_TIMEOUT,
+                client.get_thread_usage(&thread_id),
+            )
+            .await
+            .map_err(|_| internal_error("thread usage fetch timed out"))?;
+            let thread_usage = match usage {
+                Ok(usage) => Some(codex_app_server_protocol::ThreadUsage {
+                    thread_id: usage.thread_id,
+                    estimated_usage_credits_micros: usage.estimated_usage_credits_micros,
+                    estimated_usage_usd_micros: usage.estimated_usage_usd_micros,
+                    groups: usage
+                        .groups
+                        .into_iter()
+                        .map(
+                            |group| codex_app_server_protocol::ThreadUsageBreakdownGroup {
+                                model: group.model,
+                                reasoning_effort: group.reasoning_effort,
+                                speed: group.speed,
+                                estimated_usage_credits_micros: group
+                                    .estimated_usage_credits_micros,
+                                net_new_input_tokens: group.net_new_input_tokens,
+                                cached_input_tokens: group.cached_input_tokens,
+                                input_tokens: group.input_tokens,
+                                output_tokens: group.output_tokens,
+                                total_tokens: group.total_tokens,
+                            },
+                        )
+                        .collect(),
+                }),
+                Err(err)
+                    if matches!(err.status().map(|status| status.as_u16()), Some(403 | 404)) =>
+                {
+                    None
+                }
+                Err(err) => {
+                    return Err(internal_error(format!(
+                        "failed to fetch thread usage: {err}"
+                    )));
+                }
+            };
+            return Ok(GetAccountTokenUsageResponse {
+                summary: AccountTokenUsageSummary {
+                    lifetime_tokens: None,
+                    peak_daily_tokens: None,
+                    longest_running_turn_sec: None,
+                    current_streak_days: None,
+                    longest_streak_days: None,
+                },
+                daily_usage_buckets: None,
+                thread_usage,
+            });
+        }
         let profile = tokio::time::timeout(
             ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT,
             client.get_token_usage_profile(),
@@ -1270,6 +1353,7 @@ impl AccountRequestProcessor {
                     })
                     .collect()
             }),
+            thread_usage: None,
         }
     }
 
@@ -1419,6 +1503,7 @@ mod tests {
                     start_date: "2026-05-29".to_string(),
                     tokens: 10,
                 }]),
+                thread_usage: None,
             }
         );
     }

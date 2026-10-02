@@ -1481,12 +1481,16 @@ mod tests {
     use crate::runtime::GoalUpdate;
     use crate::runtime::test_support::test_thread_metadata;
     use crate::runtime::test_support::unique_temp_dir;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
 
     async fn test_runtime() -> Arc<StateRuntime> {
-        StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize")
+        StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(unique_temp_dir().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize")
     }
 
     fn test_thread_id() -> ThreadId {
@@ -1495,9 +1499,9 @@ mod tests {
 
     async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId) {
         let metadata = test_thread_metadata(
-            runtime.codex_home(),
+            runtime.sqlite().home(),
             thread_id,
-            runtime.codex_home().join("workspace"),
+            runtime.sqlite().home().join("workspace"),
         );
         runtime
             .upsert_thread(&metadata)
@@ -1676,7 +1680,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_restart_tracks_only_outstanding_normal_callback_turns() {
-        let sqlite_home = unique_temp_dir();
+        let sqlite_home = crate::SqliteConfig::new_for_testing(unique_temp_dir().abs());
         let thread_id = test_thread_id();
         let completion_work_id = "10000000-0000-0000-0000-000000000005";
         let runtime = StateRuntime::init(sqlite_home.clone(), "test-provider".to_string())

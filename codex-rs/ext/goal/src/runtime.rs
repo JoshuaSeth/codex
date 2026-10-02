@@ -5,8 +5,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_core::ThreadManager;
-use codex_core::TryStartTurnIfIdleRejectionReason;
+use codex_core::NotSubmittedReason;
+use codex_core::StartIfIdleSubmission;
 use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -552,23 +554,41 @@ impl GoalRuntimeHandle {
         }
         let item = continuation_steering_item(&protocol_goal_from_state(goal));
 
-        if let Err(err) = thread
-            .try_start_turn_if_idle(vec![TurnInput::ResponseItem(item)])
+        match thread
+            .start_turn_if_idle(TurnInputRequest::new(TurnInput::ResponseItem(item)))
             .await
         {
-            return match err.reason() {
-                TryStartTurnIfIdleRejectionReason::Busy => Ok(GoalContinuationAttempt::Retry(
-                    GoalContinuationRetryReason::IdleTurnBusy,
-                )),
-                TryStartTurnIfIdleRejectionReason::PendingTriggerTurn
-                | TryStartTurnIfIdleRejectionReason::PlanMode => {
+            Ok(StartIfIdleSubmission::Started { .. }) => {}
+            Ok(StartIfIdleSubmission::NotSubmitted { reason }) => match reason {
+                NotSubmittedReason::NotIdle => {
+                    return Ok(GoalContinuationAttempt::Retry(
+                        GoalContinuationRetryReason::IdleTurnBusy,
+                    ));
+                }
+                NotSubmittedReason::PendingTriggerTurn | NotSubmittedReason::PlanMode => {
                     tracing::debug!(
-                        reason = ?err.reason(),
+                        ?reason,
                         "skipping goal continuation because higher-priority work or mode blocks it"
                     );
-                    Ok(GoalContinuationAttempt::Finished)
+                    return Ok(GoalContinuationAttempt::Finished);
                 }
-            };
+                other => {
+                    tracing::debug!(
+                        ?other,
+                        "skipping goal continuation because the thread rejected automatic idle work"
+                    );
+                    return Ok(GoalContinuationAttempt::Finished);
+                }
+            },
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "retrying goal continuation because the idle submission did not reach the thread"
+                );
+                return Ok(GoalContinuationAttempt::Retry(
+                    GoalContinuationRetryReason::IdleTurnBusy,
+                ));
+            }
         }
 
         let current_turn_is_goal_active = self

@@ -1,5 +1,7 @@
 use super::*;
 use crate::extensions::send_thread_warning;
+use codex_app_server_protocol::ThreadQueueChangedNotification;
+use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
 
 #[derive(Clone)]
@@ -441,12 +443,14 @@ pub(super) async fn unload_thread_without_subscribers(
     tokio::spawn(async move {
         match wait_for_thread_shutdown(&thread).await {
             ThreadShutdownResult::Complete => {
-                if thread_manager.remove_thread(&thread_id).await.is_none() {
-                    info!("thread {thread_id} was already removed before teardown finalized");
-                    thread_watch_manager
-                        .remove_thread(&thread_id.to_string())
-                        .await;
-                    thread_residency_manager.note_removed(thread_id).await;
+                // A delayed unload can finish after thread/revert replaces this runtime under
+                // the same thread ID. Only the runtime that scheduled this unload may remove it.
+                if thread_manager
+                    .remove_thread_if_matches(&thread_id, &thread)
+                    .await
+                    .is_none()
+                {
+                    info!("thread {thread_id} was replaced or removed before teardown finalized");
                     pending_thread_unloads.lock().await.remove(&thread_id);
                     return;
                 }
@@ -535,6 +539,23 @@ pub(super) async fn handle_thread_listener_command(
                         thread_id: conversation_id.to_string(),
                         turn_id,
                         goal,
+                    },
+                ))
+                .await;
+        }
+        ThreadListenerCommand::EmitThreadQueueChanged => {
+            let subscribed_connection_ids = thread_state_manager
+                .subscribed_connection_ids(conversation_id)
+                .await;
+            let outgoing = ThreadScopedOutgoingMessageSender::new(
+                Arc::clone(outgoing),
+                subscribed_connection_ids,
+                conversation_id,
+            );
+            outgoing
+                .send_server_notification(ServerNotification::ThreadQueueChanged(
+                    ThreadQueueChangedNotification {
+                        thread_id: conversation_id.to_string(),
                     },
                 ))
                 .await;
@@ -808,9 +829,9 @@ pub(super) async fn handle_pending_thread_resume_request(
         .await;
     // App-server owns resume response and snapshot ordering, so wait until
     // replay completes before letting extensions react to the idle thread.
-    if pending.emit_thread_goal_update {
-        conversation.emit_thread_idle_lifecycle_if_idle().await;
-    }
+    conversation
+        .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed)
+        .await;
 }
 
 pub(super) async fn send_thread_goal_snapshot_notification(

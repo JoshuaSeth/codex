@@ -7,11 +7,11 @@ use std::sync::Weak;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::protocol::validate_thread_goal_objective;
+use codex_rollout::RolloutItem;
 
 use crate::runtime::GoalRuntimeHandle;
 use crate::runtime::PreviousGoalSnapshot;
@@ -54,6 +54,8 @@ pub struct GoalSetRequest<'a> {
     pub objective: GoalObjectiveUpdate<'a>,
     pub status: Option<ThreadGoalStatus>,
     pub token_budget: GoalTokenBudgetUpdate,
+    /// Configured cap and default budget for goal token budgets.
+    pub max_goal_token_budget: Option<i64>,
     pub completion_work_id: Option<&'a str>,
     pub completion_callback_metadata_json: Option<&'a str>,
 }
@@ -152,6 +154,7 @@ impl GoalService {
             objective,
             status,
             token_budget,
+            max_goal_token_budget,
             completion_work_id,
             completion_callback_metadata_json,
         } = request;
@@ -162,14 +165,16 @@ impl GoalService {
         };
         let token_budget = match token_budget {
             GoalTokenBudgetUpdate::Keep => None,
-            GoalTokenBudgetUpdate::Set(token_budget) => Some(token_budget),
+            GoalTokenBudgetUpdate::Set(token_budget) => {
+                Some(token_budget.or(max_goal_token_budget))
+            }
         };
 
         if let Some(objective) = objective {
             validate_thread_goal_objective(objective).map_err(GoalServiceError::InvalidRequest)?;
         }
         if objective.is_some() || token_budget.is_some() {
-            validate_goal_budget(token_budget.flatten())
+            validate_goal_budget(token_budget.flatten(), max_goal_token_budget)
                 .map_err(GoalServiceError::InvalidRequest)?;
         }
 

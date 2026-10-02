@@ -2,7 +2,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use codex_core_skills::SkillLoadOutcome;
 use codex_extension_api::ContextualUserFragment;
 
 mod executor;
@@ -10,6 +9,7 @@ mod host;
 mod orchestrator;
 
 use crate::HostSkillsSnapshot;
+use crate::SkillLoadOutcome;
 use crate::render::SkillCatalogRenderPolicy;
 use crate::render::render_available_skills;
 use crate::render::skill_metadata_budget;
@@ -109,6 +109,7 @@ pub fn render_host_skills_instructions(
         &catalog,
         SkillCatalogRenderPolicy::CoreCompatible,
         skill_metadata_budget(context_window),
+        include_skills_usage_instructions,
     )?;
     let warning = rendered.report.warning_message();
     let fragment = rendered
@@ -120,6 +121,11 @@ pub fn render_host_skills_instructions(
 /// The empty catalog fragment: what a managed context renders when a turn has
 /// no available skill, or when skill instructions are disabled.
 pub fn empty_skills_instructions_fragment() -> String {
-    crate::fragments::AvailableSkillsInstructions::from_skill_lines(Vec::new(), Vec::new(), false)
-        .render()
+    crate::fragments::AvailableSkillsInstructions::from_skill_lines(
+        crate::catalog_prompt::SkillPromptKind::Unaliased,
+        Vec::new(),
+        Vec::new(),
+        false,
+    )
+    .render()
 }

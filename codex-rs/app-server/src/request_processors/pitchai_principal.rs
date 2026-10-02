@@ -3,7 +3,7 @@ use super::invalid_request;
 use codex_config::PitchAiSkillPrincipal;
 use codex_core::CodexThread;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -60,7 +60,7 @@ pub(super) fn validate_requested_principal_against_rollout(
     require_persisted: bool,
 ) -> Result<(), JSONRPCErrorError> {
     let persisted =
-        codex_protocol::protocol::pitchai_skill_principal_from_rollout_items(items, thread_id)
+        codex_rollout::pitchai_skill_principal_from_rollout_items(items, thread_id)
             .map_err(invalid_request)?;
     if let Some(persisted) = persisted.as_ref() {
         codex_protocol::protocol::validate_pitchai_skill_principal(persisted)

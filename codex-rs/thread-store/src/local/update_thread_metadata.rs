@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::RolloutItem;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::find_archived_thread_path_by_id_str;
@@ -21,6 +21,9 @@ use super::LocalThreadStore;
 use super::helpers::git_info_from_parts;
 use super::helpers::permission_profile_to_metadata_value;
 use super::live_writer;
+use super::thread_rollout_resolver;
+use super::thread_rollout_resolver::ResolvedThreadRollout;
+use super::thread_rollout_resolver::RolloutLocation;
 use crate::AppendThreadItemsParams;
 use crate::GitInfoPatch;
 use crate::ReadThreadParams;
@@ -31,11 +34,6 @@ use crate::ThreadStoreResult;
 use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
 use crate::local::read_thread;
-
-struct ResolvedRolloutPath {
-    path: PathBuf,
-    archived: bool,
-}
 
 pub(super) async fn update_thread_metadata(
     store: &LocalThreadStore,
@@ -146,30 +144,37 @@ pub(super) async fn update_thread_metadata(
     if live_thread_loaded {
         live_writer::persist_thread(store, thread_id).await?;
     }
-    let mut resolved_rollout_path =
-        resolve_rollout_path(store, thread_id, params.include_archived).await?;
+    let mut resolved_rollout = if params.include_archived {
+        thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
+    } else {
+        thread_rollout_resolver::resolve_current(store, thread_id).await?
+    }
+    .ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("thread not found: {thread_id}"),
+    })?;
     let name = patch.name;
     let git_info = patch.git_info;
     if let Some(memory_mode) = patch.memory_mode {
         apply_thread_memory_mode(
             store,
-            resolved_rollout_path.path.as_path(),
+            resolved_rollout.path.as_path(),
             thread_id,
             memory_mode,
             live_thread_loaded,
         )
         .await?;
-        refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
+        refresh_resolved_rollout_path(&mut resolved_rollout).await;
     }
 
     let state_db_ctx = store.state_db().await;
     codex_rollout::state_db::reconcile_rollout(
         state_db_ctx.as_deref(),
-        resolved_rollout_path.path.as_path(),
+        resolved_rollout.path.as_path(),
         store.config.default_model_provider_id.as_str(),
         /*builder*/ None,
         &[],
-        /*archived_only*/ resolved_rollout_path.archived.then_some(true),
+        /*archived_only*/
+        (resolved_rollout.location == RolloutLocation::Archived).then_some(true),
         /*new_thread_memory_mode*/ None,
     )
     .await;
@@ -228,7 +233,7 @@ pub(super) async fn update_thread_metadata(
     if let Some(((sha, branch, origin_url), memory_mode)) = resolved_git_info.as_ref() {
         apply_thread_git_info_to_rollout(
             store,
-            resolved_rollout_path.path.as_path(),
+            resolved_rollout.path.as_path(),
             thread_id,
             sha,
             branch,
@@ -237,7 +242,7 @@ pub(super) async fn update_thread_metadata(
             live_thread_loaded,
         )
         .await?;
-        refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
+        refresh_resolved_rollout_path(&mut resolved_rollout).await;
         apply_thread_git_info(store, thread_id, sha, branch, origin_url).await?;
     }
 
@@ -255,7 +260,7 @@ pub(super) async fn update_thread_metadata(
         Err(_) => {
             read_thread::read_thread_by_rollout_path(
                 store,
-                resolved_rollout_path.path,
+                resolved_rollout.path,
                 params.include_archived,
                 /*include_history*/ false,
             )
@@ -312,7 +317,7 @@ pub(super) async fn apply_thread_metadata_patch(
     .await
 }
 
-async fn refresh_resolved_rollout_path(resolved: &mut ResolvedRolloutPath) {
+async fn refresh_resolved_rollout_path(resolved: &mut ResolvedThreadRollout) {
     if let Some(path) = codex_rollout::existing_rollout_path(resolved.path.as_path()).await {
         resolved.path = path;
     }
@@ -344,8 +349,16 @@ async fn apply_metadata_update(
                     })?;
             let advance_recency_at = patch.advance_recency_at;
             if existing.is_none() && rollout_path.is_none() {
-                let resolved = resolve_rollout_path(store, thread_id, include_archived).await?;
-                rollout_path_archived = resolved.archived;
+                let resolved = if include_archived {
+                    thread_rollout_resolver::resolve_current_including_archived(store, thread_id)
+                        .await?
+                } else {
+                    thread_rollout_resolver::resolve_current(store, thread_id).await?
+                }
+                .ok_or_else(|| ThreadStoreError::InvalidRequest {
+                    message: format!("thread not found: {thread_id}"),
+                })?;
+                rollout_path_archived = resolved.location == RolloutLocation::Archived;
                 rollout_path = Some(resolved.path);
             }
             let mut metadata = match existing.clone() {
@@ -841,55 +854,6 @@ fn memory_mode_as_str(mode: ThreadMemoryMode) -> &'static str {
     }
 }
 
-async fn resolve_rollout_path(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    include_archived: bool,
-) -> ThreadStoreResult<ResolvedRolloutPath> {
-    if let Ok(path) = live_writer::rollout_path(store, thread_id).await {
-        let archived = rollout_path_is_archived(store, path.as_path());
-        return Ok(ResolvedRolloutPath { path, archived });
-    }
-
-    let state_db_ctx = store.state_db().await;
-    let active_path = find_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        &thread_id.to_string(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate thread id {thread_id}: {err}"),
-    })?;
-    if let Some(path) = active_path {
-        return Ok(ResolvedRolloutPath {
-            path,
-            archived: false,
-        });
-    }
-    if !include_archived {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!("thread not found: {thread_id}"),
-        });
-    }
-    find_archived_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        &thread_id.to_string(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    .map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to locate archived thread id {thread_id}: {err}"),
-    })?
-    .map(|path| ResolvedRolloutPath {
-        path,
-        archived: true,
-    })
-    .ok_or_else(|| ThreadStoreError::InvalidRequest {
-        message: format!("thread not found: {thread_id}"),
-    })
-}
-
 fn rollout_path_is_archived(store: &LocalThreadStore, path: &Path) -> bool {
     path.starts_with(store.config.codex_home.join(ARCHIVED_SESSIONS_SUBDIR))
 }
@@ -927,7 +891,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -982,7 +946,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set thread name");
+            .expect("set thread name")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.name.as_deref(), Some("A sharper name"));
         let latest_name = codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
@@ -1041,6 +1006,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         let pinned_metadata = runtime
@@ -1053,6 +1019,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         assert_eq!(pinned_metadata.preview.as_deref(), Some("Hello from user"));
@@ -1095,6 +1062,7 @@ mod tests {
             Some(codex_state::ThreadSection {
                 id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
                 name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
             })
         );
         assert_eq!(
@@ -1167,7 +1135,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set paginated thread name");
+            .expect("set paginated thread name")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.name.as_deref(), Some("Canonical paginated name"));
         let metadata = runtime
@@ -1196,7 +1165,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("apply derived paginated metadata");
+            .expect("apply derived paginated metadata")
+            .expect("local store returns updated thread");
         assert_eq!(thread.name.as_deref(), Some("Canonical paginated name"));
 
         let session_index_path = home.path().join("session_index.jsonl");
@@ -1212,7 +1182,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set paginated thread name with unavailable index");
+            .expect("set paginated thread name with unavailable index")
+            .expect("local store returns updated thread");
         assert_eq!(thread.name.as_deref(), Some("Updated SQLite name"));
 
         let err = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None)
@@ -1260,7 +1231,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set thread memory mode");
+            .expect("set thread memory mode")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.thread_id, thread_id);
         let appended = last_rollout_item(path.as_path());
@@ -1289,7 +1261,7 @@ mod tests {
         .expect("session file");
         let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1399,7 +1371,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("paginated metadata update");
+            .expect("paginated metadata update")
+            .expect("local store returns updated thread");
 
         let git_info = thread.git_info.expect("git info");
         assert_eq!(git_info.commit_hash, None);
@@ -1487,7 +1460,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set git metadata");
+            .expect("set git metadata")
+            .expect("local store returns updated thread");
 
         assert_eq!(
             thread.git_info.expect("git info").branch.as_deref(),
@@ -1546,7 +1520,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set memory mode on external live thread");
+            .expect("set memory mode on external live thread")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.thread_id, thread_id);
         assert!(thread.rollout_path.is_some());
@@ -1584,7 +1559,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set git metadata");
+            .expect("set git metadata")
+            .expect("local store returns updated thread");
 
         let git_info = thread.git_info.expect("git info should be present");
         assert_eq!(
@@ -1624,7 +1600,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("set permission profile");
+            .expect("set permission profile")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.permission_profile, PermissionProfile::Disabled);
         let thread = store
@@ -1637,7 +1614,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("clear reasoning effort");
+            .expect("clear reasoning effort")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.reasoning_effort, None);
         let metadata = runtime
@@ -1697,7 +1675,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("partially update git metadata");
+            .expect("partially update git metadata")
+            .expect("local store returns updated thread");
 
         let git_info = thread.git_info.expect("git info should be present");
         assert_eq!(
@@ -1757,7 +1736,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("clear git metadata");
+            .expect("clear git metadata")
+            .expect("local store returns updated thread");
 
         assert!(thread.git_info.is_none());
         let appended = last_rollout_item(path.as_path());
@@ -1838,7 +1818,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("partially update after clear with missing sqlite row");
+            .expect("partially update after clear with missing sqlite row")
+            .expect("local store returns updated thread");
         let git_info = thread.git_info.expect("branch should be present");
         assert_eq!(git_info.commit_hash, None);
         assert_eq!(git_info.branch.as_deref(), Some("feature"));
@@ -1945,7 +1926,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("combined patch should apply");
+            .expect("combined patch should apply")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.name.as_deref(), Some("Combined metadata"));
         assert_eq!(
@@ -2045,7 +2027,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("apply observed metadata");
+            .expect("apply observed metadata")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.name.as_deref(), Some("Derived first message"));
     }
@@ -2089,7 +2072,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("apply later observed metadata");
+            .expect("apply later observed metadata")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.preview, "Hello from user");
         assert_eq!(
@@ -2177,7 +2161,8 @@ mod tests {
                 include_archived: false,
             })
             .await
-            .expect("update paginated thread without sqlite row");
+            .expect("update paginated thread without sqlite row")
+            .expect("local store returns updated thread");
 
         assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
         assert_eq!(
@@ -2217,7 +2202,8 @@ mod tests {
                 include_archived: true,
             })
             .await
-            .expect("update archived thread without sqlite row");
+            .expect("update archived thread without sqlite row")
+            .expect("local store returns updated thread");
 
         assert!(thread.archived_at.is_some());
         assert!(
@@ -2346,7 +2332,8 @@ mod tests {
                 include_archived: true,
             })
             .await
-            .expect("set archived thread name");
+            .expect("set archived thread name")
+            .expect("local store returns updated thread");
 
         assert!(thread.archived_at.is_some());
         assert!(
@@ -2410,7 +2397,8 @@ mod tests {
                 include_archived: true,
             })
             .await
-            .expect("set archived thread name");
+            .expect("set archived thread name")
+            .expect("local store returns updated thread");
 
         assert!(thread.archived_at.is_some());
         assert!(

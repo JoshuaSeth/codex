@@ -1,4 +1,6 @@
 use super::*;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use crate::context::ContextualUserFragment;
 use crate::context::InternalContextSource;
 use crate::context::InternalModelContextFragment;
@@ -44,6 +46,17 @@ async fn process_compacted_history_with_test_session(
     (refreshed, initial_context)
 }
 
+fn annotated(items: Vec<ResponseItem>) -> Vec<ResponseItemEnvelope> {
+    items.into_iter().map(ResponseItemEnvelope::new).collect()
+}
+
+fn raw(items: Vec<ResponseItemEnvelope>) -> Vec<ResponseItem> {
+    items
+        .into_iter()
+        .map(ResponseItemEnvelope::into_item)
+        .collect()
+}
+
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -60,6 +73,7 @@ fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
         message: text.to_string(),
         internal_chat_message_metadata_passthrough: None,
+        harness_metadata: None,
     }
 }
 
@@ -128,6 +142,28 @@ fn collect_user_messages_extracts_user_text_only() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("first")], collected);
+}
+
+#[test]
+fn collect_annotated_user_messages_extracts_user_text_only() {
+    let items = vec![
+        ResponseItemEnvelope {
+            item: user_message("first"),
+            metadata: Some(CodexHarnessMetadata::default()),
+        },
+        ResponseItemEnvelope::new(ResponseItem::Other),
+    ];
+
+    let collected = collect_annotated_user_messages(&items);
+
+    assert_eq!(
+        vec![CompactedUserMessage {
+            message: "first".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+            harness_metadata: Some(CodexHarnessMetadata::default()),
+        }],
+        collected
+    );
 }
 
 #[test]
@@ -218,12 +254,18 @@ fn current_goal_context_supersedes_stale_goal_before_remote_summary() {
         user_message("historical pause request"),
         stale_goal,
         compaction.clone(),
-    ];
+    ]
+    .into_iter()
+    .map(ResponseItemEnvelope::new)
+    .collect::<Vec<_>>();
 
     let refreshed = replace_goal_context_before_compaction_summary(history, Some(&current_goal));
 
     assert_eq!(
-        refreshed,
+        refreshed
+            .into_iter()
+            .map(ResponseItemEnvelope::into_item)
+            .collect::<Vec<_>>(),
         vec![
             user_message("historical pause request"),
             current_goal,
@@ -236,12 +278,18 @@ fn current_goal_context_supersedes_stale_goal_before_remote_summary() {
 fn current_goal_context_is_inserted_before_local_summary() {
     let current_goal = goal_context("resume the campaign");
     let summary = user_message(&format!("{SUMMARY_PREFIX}\ncompacted work"));
-    let history = vec![user_message("historical pause request"), summary.clone()];
+    let history = vec![user_message("historical pause request"), summary.clone()]
+        .into_iter()
+        .map(ResponseItemEnvelope::new)
+        .collect::<Vec<_>>();
 
     let refreshed = replace_goal_context_before_compaction_summary(history, Some(&current_goal));
 
     assert_eq!(
-        refreshed,
+        refreshed
+            .into_iter()
+            .map(ResponseItemEnvelope::into_item)
+            .collect::<Vec<_>>(),
         vec![
             user_message("historical pause request"),
             current_goal,
@@ -260,12 +308,18 @@ fn normal_turn_compaction_does_not_resurrect_historical_goal_context() {
             encrypted_content: "encrypted".to_string(),
             internal_chat_message_metadata_passthrough: None,
         },
-    ];
+    ]
+    .into_iter()
+    .map(ResponseItemEnvelope::new)
+    .collect::<Vec<_>>();
 
     let refreshed = replace_goal_context_before_compaction_summary(history, None);
 
     assert_eq!(
-        refreshed,
+        refreshed
+            .into_iter()
+            .map(ResponseItemEnvelope::into_item)
+            .collect::<Vec<_>>(),
         vec![
             user_message("new ordinary task"),
             ResponseItem::Compaction {
@@ -283,7 +337,11 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // that oversized user content is truncated.
     let max_tokens = 16;
     let big = "word ".repeat(200);
-    let user_message = compacted_user_message(&big);
+    let user_message = CompactedUserMessage {
+        message: big.clone(),
+        internal_chat_message_metadata_passthrough: None,
+        harness_metadata: Some(CodexHarnessMetadata::default()),
+    };
     let history = super::build_compacted_history_with_limit(
         Vec::new(),
         std::slice::from_ref(&user_message),
@@ -292,8 +350,8 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     );
     assert_eq!(history.len(), 2);
 
-    let truncated_message = &history[0];
-    let summary_message = &history[1];
+    let truncated_message = &history[0].item;
+    let summary_message = &history[1].item;
 
     let truncated_text = match truncated_message {
         ResponseItem::Message { role, content, .. } if role == "user" => {
@@ -318,11 +376,13 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
         other => panic!("unexpected item in history: {other:?}"),
     };
     assert_eq!(summary_text, "SUMMARY");
+    assert_eq!(history[0].metadata, Some(CodexHarnessMetadata::default()));
+    assert_eq!(history[1].metadata, None);
 }
 
 #[test]
 fn build_token_limited_compacted_history_appends_summary_message() {
-    let initial_context: Vec<ResponseItem> = Vec::new();
+    let initial_context: Vec<ResponseItemEnvelope> = Vec::new();
     let user_messages = vec![compacted_user_message("first user message")];
     let summary_text = "summary text";
 
@@ -333,7 +393,7 @@ fn build_token_limited_compacted_history_appends_summary_message() {
     );
 
     let last = history.last().expect("history should have a summary entry");
-    let summary = match last {
+    let summary = match &last.item {
         ResponseItem::Message { role, content, .. } if role == "user" => {
             content_items_to_text(content).unwrap_or_default()
         }
@@ -354,12 +414,15 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
                     ..Default::default()
                 },
             ),
+            harness_metadata: Some(CodexHarnessMetadata::default()),
         }],
         "summary text",
     );
 
     assert_eq!(history[0].turn_id(), Some("turn-1"));
     assert_eq!(history[1].turn_id(), None);
+    assert_eq!(history[0].metadata, Some(CodexHarnessMetadata::default()));
+    assert_eq!(history[1].metadata, None);
 }
 
 #[tokio::test]
@@ -708,8 +771,10 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+        annotated(compacted_history),
+        annotated(initial_context),
+    ));
     let expected = vec![
         ResponseItem::Message {
             id: None,
@@ -779,8 +844,10 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+        annotated(compacted_history),
+        annotated(initial_context),
+    ));
     let expected = vec![
         ResponseItem::Message {
             id: None,

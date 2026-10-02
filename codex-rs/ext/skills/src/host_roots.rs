@@ -4,23 +4,25 @@ use std::sync::Arc;
 
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
+use codex_config::PitchAiSkillPrincipal;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
-use codex_core_skills::loader::SkillRoot;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::SkillScope;
+use codex_skills::SkillError;
 use codex_skills::system_cache_root_dir;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginSkillRoot;
-use codex_utils_plugins::SkillDiscoveryMode;
 use dirs::home_dir;
 use futures::StreamExt;
 use toml::Value as TomlValue;
 
 use crate::loader::HostSkillRoot;
+use crate::pitchai_principal::PitchAiSkillResolution;
+use crate::pitchai_principal::resolve_pitchai_skill_profile;
 
 const AGENTS_DIR_NAME: &str = ".agents";
 const SKILLS_DIR_NAME: &str = "skills";
@@ -32,7 +34,71 @@ pub(crate) async fn resolve_skill_roots(
     cwd: &AbsolutePathBuf,
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
-) -> Vec<SkillRoot> {
+) -> Vec<HostSkillRoot> {
+    skill_roots_with_diagnostics(
+        repository_file_system,
+        config_layer_stack,
+        cwd,
+        plugin_skill_roots,
+        extra_skill_roots,
+        /*explicit_principal*/ None,
+    )
+    .await
+    .roots
+}
+
+/// The roots one load resolves to, together with the diagnostics a managed
+/// principal carries when it cannot be resolved.
+pub(crate) struct SkillRootsResolution {
+    pub(crate) roots: Vec<HostSkillRoot>,
+    pub(crate) errors: Vec<SkillError>,
+}
+
+/// Resolves the skill roots for one load, honoring a managed PitchAI principal.
+///
+/// Without a principal and without `PITCHAI_SKILL_CATALOG_RELEASE` this is the
+/// legacy per-cwd catalog. A managed principal resolves the immutable
+/// catalog's system / tenant / user profiles instead, and an invalid principal
+/// resolves to no roots plus one diagnostic the caller surfaces.
+pub(crate) async fn skill_roots_with_diagnostics(
+    repository_file_system: Option<Arc<dyn ExecutorFileSystem>>,
+    config_layer_stack: &ConfigLayerStack,
+    cwd: &AbsolutePathBuf,
+    plugin_skill_roots: Vec<PluginSkillRoot>,
+    extra_skill_roots: Vec<AbsolutePathBuf>,
+    explicit_principal: Option<&PitchAiSkillPrincipal>,
+) -> SkillRootsResolution {
+    match resolve_pitchai_skill_profile(config_layer_stack, explicit_principal, cwd) {
+        PitchAiSkillResolution::Legacy => SkillRootsResolution {
+            roots: resolve_legacy_skill_roots(
+                repository_file_system,
+                config_layer_stack,
+                cwd,
+                plugin_skill_roots,
+                extra_skill_roots,
+            )
+            .await,
+            errors: Vec::new(),
+        },
+        PitchAiSkillResolution::Invalid { path, message } => SkillRootsResolution {
+            roots: Vec::new(),
+            errors: vec![SkillError { path, message }],
+        },
+        PitchAiSkillResolution::Managed(profile) => SkillRootsResolution {
+            roots: managed_skill_roots(repository_file_system, config_layer_stack, cwd, profile)
+                .await,
+            errors: Vec::new(),
+        },
+    }
+}
+
+async fn resolve_legacy_skill_roots(
+    repository_file_system: Option<Arc<dyn ExecutorFileSystem>>,
+    config_layer_stack: &ConfigLayerStack,
+    cwd: &AbsolutePathBuf,
+    plugin_skill_roots: Vec<PluginSkillRoot>,
+    extra_skill_roots: Vec<AbsolutePathBuf>,
+) -> Vec<HostSkillRoot> {
     let home_dir =
         home_dir().and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok());
     resolve_skill_roots_with_home_dir(
@@ -46,6 +112,52 @@ pub(crate) async fn resolve_skill_roots(
     .await
 }
 
+/// The managed catalog replaces the per-cwd and plugin roots: repository roots
+/// stay, bounded by the repository boundary, and the catalog's user, tenant and
+/// system profiles are appended in shadowing order with the catalog itself as
+/// their source boundary.
+async fn managed_skill_roots(
+    repository_file_system: Option<Arc<dyn ExecutorFileSystem>>,
+    config_layer_stack: &ConfigLayerStack,
+    cwd: &AbsolutePathBuf,
+    profile: crate::pitchai_principal::PitchAiSkillCatalogProfile,
+) -> Vec<HostSkillRoot> {
+    let repo_boundary = match repository_file_system.as_ref() {
+        Some(repository_file_system) => {
+            let project_root_markers = project_root_markers_from_stack(config_layer_stack);
+            Some(find_project_root(repository_file_system.as_ref(), cwd, &project_root_markers).await)
+        }
+        None => None,
+    };
+    let mut roots = roots_from_layer_stack(
+        config_layer_stack,
+        /*home_dir*/ None,
+        repository_file_system.clone(),
+    );
+    roots.retain(|root| root.scope == SkillScope::Repo);
+    for root in &mut roots {
+        root.allowed_source_root = repo_boundary.clone();
+    }
+    let mut repo_roots =
+        repo_agents_skill_roots(repository_file_system, config_layer_stack, cwd).await;
+    for root in &mut repo_roots {
+        root.allowed_source_root = repo_boundary.clone();
+    }
+    repo_roots.reverse();
+    roots.extend(repo_roots);
+    for (path, scope) in [
+        (profile.user_root, SkillScope::User),
+        (profile.tenant_root, SkillScope::Tenant),
+        (profile.system_root, SkillScope::System),
+    ] {
+        let mut root = local_root(path, scope);
+        root.allowed_source_root = Some(profile.catalog_root.clone());
+        roots.push(root);
+    }
+    dedupe_skill_roots_by_path(&mut roots);
+    roots
+}
+
 async fn resolve_skill_roots_with_home_dir(
     repository_file_system: Option<Arc<dyn ExecutorFileSystem>>,
     config_layer_stack: &ConfigLayerStack,
@@ -53,34 +165,20 @@ async fn resolve_skill_roots_with_home_dir(
     home_dir: Option<&AbsolutePathBuf>,
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
-) -> Vec<SkillRoot> {
+) -> Vec<HostSkillRoot> {
     let mut roots =
-        roots_from_layer_stack(config_layer_stack, home_dir, repository_file_system.clone())
+        roots_from_layer_stack(config_layer_stack, home_dir, repository_file_system.clone());
+    roots.extend(
+        plugin_skill_roots
             .into_iter()
-            .map(host_root_to_skill_root)
-            .collect::<Vec<_>>();
-    roots.extend(plugin_skill_roots.into_iter().map(|root| SkillRoot {
-        path: root.path,
-        scope: SkillScope::User,
-        file_system: Arc::clone(&LOCAL_FS),
-        plugin_identity: Some(root.plugin_identity),
-        plugin_namespace: Some(root.plugin_namespace),
-        plugin_root: Some(root.plugin_root),
-        allowed_source_root: None,
-        discovery_mode: root.discovery_mode,
-    }));
+            .map(|root| HostSkillRoot::plugin(root, Arc::clone(&LOCAL_FS))),
+    );
     roots.extend(
         extra_skill_roots
             .into_iter()
-            .map(|path| local_root(path, SkillScope::User))
-            .map(host_root_to_skill_root),
+            .map(|path| local_root(path, SkillScope::User)),
     );
-    roots.extend(
-        repo_agents_skill_roots(repository_file_system, config_layer_stack, cwd)
-            .await
-            .into_iter()
-            .map(host_root_to_skill_root),
-    );
+    roots.extend(repo_agents_skill_roots(repository_file_system, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
     roots
 }
@@ -100,12 +198,11 @@ fn roots_from_layer_stack(
         match &layer.name {
             ConfigLayerSource::Project { .. } => {
                 if let Some(repository_file_system) = &repository_file_system {
-                    roots.push(HostSkillRoot {
-                        path: config_folder.join(SKILLS_DIR_NAME),
-                        scope: SkillScope::Repo,
-                        file_system: Arc::clone(repository_file_system),
-                        plugin_root: None,
-                    });
+                    roots.push(HostSkillRoot::host(
+                        config_folder.join(SKILLS_DIR_NAME),
+                        SkillScope::Repo,
+                        Arc::clone(repository_file_system),
+                    ));
                 }
             }
             ConfigLayerSource::User { .. } => {
@@ -134,7 +231,8 @@ fn roots_from_layer_stack(
                     SkillScope::Admin,
                 ));
             }
-            ConfigLayerSource::Mdm { .. }
+            ConfigLayerSource::PackagedDefaults { .. }
+            | ConfigLayerSource::Mdm { .. }
             | ConfigLayerSource::EnterpriseManaged { .. }
             | ConfigLayerSource::SessionFlags
             | ConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
@@ -146,25 +244,7 @@ fn roots_from_layer_stack(
 }
 
 fn local_root(path: AbsolutePathBuf, scope: SkillScope) -> HostSkillRoot {
-    HostSkillRoot {
-        path,
-        scope,
-        file_system: Arc::clone(&LOCAL_FS),
-        plugin_root: None,
-    }
-}
-
-fn host_root_to_skill_root(root: HostSkillRoot) -> SkillRoot {
-    SkillRoot {
-        path: root.path,
-        scope: root.scope,
-        file_system: root.file_system,
-        plugin_identity: None,
-        plugin_namespace: None,
-        plugin_root: None,
-        allowed_source_root: None,
-        discovery_mode: SkillDiscoveryMode::Recursive,
-    }
+    HostSkillRoot::host(path, scope, Arc::clone(&LOCAL_FS))
 }
 
 async fn repo_agents_skill_roots(
@@ -195,12 +275,11 @@ async fn repo_agents_skill_roots(
         .buffered(MAX_CONCURRENT_ANCESTOR_PROBES);
     while let Some((agents_skills, result)) = results.next().await {
         match result {
-            Ok(metadata) if metadata.is_directory => roots.push(HostSkillRoot {
-                path: agents_skills,
-                scope: SkillScope::Repo,
-                file_system: Arc::clone(&repository_file_system),
-                plugin_root: None,
-            }),
+            Ok(metadata) if metadata.is_directory => roots.push(HostSkillRoot::host(
+                agents_skills,
+                SkillScope::Repo,
+                Arc::clone(&repository_file_system),
+            )),
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -294,7 +373,7 @@ fn dirs_between_project_root_and_cwd(
     directories
 }
 
-fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
+fn dedupe_skill_roots_by_path(roots: &mut Vec<HostSkillRoot>) {
     let mut seen = HashSet::new();
     roots.retain(|root| seen.insert(root.path.clone()));
 }

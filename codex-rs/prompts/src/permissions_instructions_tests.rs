@@ -455,10 +455,14 @@ fn catalog_approval_admission_is_byte_bounded_for_both_reviewers() {
                 ApprovalsReviewer::User => ApprovalMessages {
                     on_request: Some(selected.clone()),
                     on_request_auto_review: oversized_other,
+                    never: None,
+                    unless_trusted: None,
                 },
                 ApprovalsReviewer::AutoReview => ApprovalMessages {
                     on_request: oversized_other,
                     on_request_auto_review: Some(selected.clone()),
+                    never: None,
+                    unless_trusted: None,
                 },
             };
             let expected = if selected.len() <= MAX_CATALOG_APPROVAL_BYTES {

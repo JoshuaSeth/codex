@@ -18,9 +18,15 @@ use codex_skills::system_cache_root_dir;
 
 use crate::image_url::REMOTE_IMAGE_URL_ERROR;
 use crate::image_url::is_remote_image_url;
+use codex_core::StartIfIdleSubmission;
 use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
+use codex_core::TurnStartOptions;
+use codex_protocol::turn_input::NotSubmittedReason;
+use codex_protocol::turn_input::SteerSubmission;
 
-const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
+pub(super) const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
 const MAX_CALLBACK_TEXT_CHARS: usize = 65_536;
 const MAX_CALLBACK_FINAL_TEXT_CHARS: usize = 1_048_576;
@@ -39,7 +45,9 @@ pub(super) fn can_accept_direct_input(
         )
 }
 
-fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+pub(super) fn validate_user_input_image_urls(
+    input: &[V2UserInput],
+) -> Result<(), JSONRPCErrorError> {
     if input.iter().any(|item| {
         matches!(
             item,
@@ -93,6 +101,14 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
 
 fn preserve_completion_binding_after_submit_error(error: &CodexErr) -> bool {
     matches!(error.details(), CodexErrorDetails::InternalAgentDied)
+}
+
+/// Why a steer-only submission did not reach the active turn.
+enum SteerTurnError {
+    /// The submission never crossed the session loop.
+    Transport(CodexErr),
+    /// Core rejected the input without steering or applying settings.
+    NotSubmitted(NotSubmittedReason),
 }
 
 async fn release_rejected_completion_binding(
@@ -151,6 +167,36 @@ fn map_additional_context(
         .collect()
 }
 
+/// Submits one steer-only turn input and reports the id of the steered turn.
+///
+/// The expected turn id pins the steer to the turn the caller believes is
+/// active; Core rejects the input when a different turn is running.
+async fn steer_turn(
+    thread: &CodexThread,
+    mapped_items: Vec<CoreInputItem>,
+    additional_context: BTreeMap<String, CoreAdditionalContextEntry>,
+    expected_turn_id: &str,
+    client_user_message_id: Option<String>,
+    responsesapi_client_metadata: Option<HashMap<String, String>>,
+) -> Result<String, SteerTurnError> {
+    let request = TurnInputRequest::new(TurnInput::UserInput {
+        content: mapped_items,
+        client_id: client_user_message_id,
+    })
+    .with_additional_context(additional_context)
+    .with_responses_metadata(responsesapi_client_metadata);
+    match thread
+        .steer_turn(request, expected_turn_id.to_string())
+        .await
+    {
+        Ok(SteerSubmission::Steered { turn_id }) => Ok(turn_id),
+        Ok(SteerSubmission::NotSubmitted { reason }) => {
+            Err(SteerTurnError::NotSubmitted(reason))
+        }
+        Err(error) => Err(SteerTurnError::Transport(error)),
+    }
+}
+
 struct ThreadSettingsBuildParams {
     method: &'static str,
     environments: Option<TurnEnvironmentSelections>,
@@ -207,18 +253,29 @@ async fn inject_callback_into_thread(
         return Ok(());
     };
     // The idle-turn gate takes typed turn input, so the callback's response
-    // items are wrapped for that attempt while the items themselves stay
-    // available for the running-turn injector the rejection falls back to.
-    let idle_input: Vec<TurnInput> = items.iter().cloned().map(TurnInput::ResponseItem).collect();
-    match thread.try_start_turn_if_idle(idle_input).await {
-        Ok(()) => Ok(()),
-        Err(rejection) => {
-            let reason = rejection.reason();
+    // items are batched for that attempt while the items themselves stay
+    // available for the running-turn injector the rejection falls back to. The
+    // batch keeps the callback's function call and its output in the same turn.
+    match thread
+        .start_turn_if_idle(TurnInputRequest::new(TurnInput::ResponseItems(items.clone())))
+        .await
+    {
+        Ok(StartIfIdleSubmission::Started { .. }) => Ok(()),
+        Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
             if thread.inject_if_running(items).await.is_ok() {
                 Ok(())
             } else {
                 Err(format!(
                     "callback could not enter the target thread yet: {reason:?}"
+                ))
+            }
+        }
+        Err(error) => {
+            if thread.inject_if_running(items).await.is_ok() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "callback could not enter the target thread yet: {error}"
                 ))
             }
         }
@@ -614,7 +671,7 @@ impl TurnRequestProcessor {
         };
         if self
             .thread_manager
-            .remove_thread_if_current(&thread_id, expected_thread)
+            .remove_thread_if_matches(&thread_id, expected_thread)
             .await
             .is_none()
         {
@@ -657,7 +714,7 @@ impl TurnRequestProcessor {
             .await
     }
 
-    fn input_too_large_error(actual_chars: usize) -> JSONRPCErrorError {
+    pub(super) fn input_too_large_error(actual_chars: usize) -> JSONRPCErrorError {
         let mut error = invalid_params(format!(
             "Input exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters."
         ));
@@ -669,7 +726,7 @@ impl TurnRequestProcessor {
         error
     }
 
-    fn validate_v2_input_limit(items: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+    pub(super) fn validate_v2_input_limit(items: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
         let actual_chars: usize = items.iter().map(V2UserInput::text_char_count).sum();
         if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
             return Err(Self::input_too_large_error(actual_chars));
@@ -767,15 +824,21 @@ impl TurnRequestProcessor {
                     .map(PermissionProfile::from_legacy_sandbox_policy)
             });
 
-        // Start the turn by submitting the user input. Return its submission id as turn_id.
-        let turn_op = Op::UserInput {
-            items: mapped_items,
+        // Start the turn by submitting the user input. Core reports whether the input started a
+        // turn or steered the active one; completion-bound turns submit under their durable
+        // completion work id so retries of the same work item address the same turn.
+        let turn_input_request = TurnInputRequest::new(TurnInput::UserInput {
+            content: mapped_items,
+            client_id: client_user_message_id,
+        })
+        .with_thread_settings(thread_settings)
+        .on_start(TurnStartOptions {
             final_output_json_schema: params.output_schema,
-            responsesapi_client_metadata: params.responsesapi_client_metadata,
-            additional_context,
-            thread_settings,
-        };
-        let turn_id = if let Some(completion_work_id) = completion_work_id.as_deref() {
+            ..Default::default()
+        })
+        .with_additional_context(additional_context)
+        .with_responses_metadata(params.responsesapi_client_metadata);
+        let (turn_id, started) = if let Some(completion_work_id) = completion_work_id.as_deref() {
             let state_db = self.completion_state_db(thread.as_ref())?;
             let completions = state_db.completions();
             let _admission_guard = completions.lock_turn_admission().await;
@@ -809,7 +872,9 @@ impl TurnRequestProcessor {
                     (turn_id, binding_state)
                 }
             };
-            if binding_state != CompletionBindingState::Terminal {
+            if binding_state == CompletionBindingState::Terminal {
+                (turn_id, false)
+            } else {
                 let submitted_in_process = completions
                     .turn_was_submitted_in_process(completion_work_id)
                     .await;
@@ -824,69 +889,81 @@ impl TurnRequestProcessor {
                                 "failed to confirm retried turn submission: {err}"
                             ))
                         })?;
+                    (turn_id, false)
                 } else {
-                    let submission = codex_protocol::protocol::Submission {
-                        id: turn_id.clone(),
-                        op: turn_op,
-                        client_user_message_id,
-                        trace: self.request_trace_context(&request_id).await,
-                        parent_turn_id: None,
-                    };
-                    if let Err(err) = thread.submit_user_input_with_id(submission).await {
-                        self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
-                            .await;
-                        if let Err(release_err) = release_rejected_completion_binding(
-                            completions,
-                            completion_work_id,
-                            &err,
+                    let submission_turn_id = turn_id.clone();
+                    match self
+                        .submit_turn_start_input(
+                            &request_id,
+                            thread_id,
+                            &thread,
+                            turn_input_request.clone(),
+                            Some(submission_turn_id),
                         )
                         .await
-                        {
-                            tracing::error!(
-                                %completion_work_id,
-                                error = %release_err,
-                                "failed to release rejected turn completion binding"
-                            );
+                    {
+                        Ok((turn_id, started)) => {
+                            completions
+                                .note_turn_submitted(completion_work_id, thread_id, &turn_id)
+                                .await;
+                            completions
+                                .mark_turn_submitted(completion_work_id)
+                                .await
+                                .map_err(|err| {
+                                    internal_error(format!(
+                                        "turn was accepted but its completion binding could not be confirmed: {err}"
+                                    ))
+                                })?;
+                            (turn_id, started)
                         }
-                        let error = internal_error(format!("failed to start turn: {err}"));
-                        self.track_error_response(&request_id, &error, /*error_type*/ None);
-                        return Err(error);
+                        Err((error, submit_error)) => {
+                            match submit_error.as_ref() {
+                                Some(submit_error) => {
+                                    if let Err(release_err) = release_rejected_completion_binding(
+                                        completions,
+                                        completion_work_id,
+                                        submit_error,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            %completion_work_id,
+                                            error = %release_err,
+                                            "failed to release rejected turn completion binding"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    if let Err(release_err) = completions
+                                        .release_registered_turn_binding(completion_work_id)
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            %completion_work_id,
+                                            error = %release_err,
+                                            "failed to release rejected turn completion binding"
+                                        );
+                                    }
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
-                    completions
-                        .note_turn_submitted(completion_work_id, thread_id, &turn_id)
-                        .await;
-                    completions
-                        .mark_turn_submitted(completion_work_id)
-                        .await
-                        .map_err(|err| {
-                            internal_error(format!(
-                                "turn was accepted but its completion binding could not be confirmed: {err}"
-                            ))
-                        })?;
                 }
             }
-            turn_id
         } else {
-            match thread
-                .submit_user_input_with_client_user_message_id(
-                    turn_op,
-                    self.request_trace_context(&request_id).await,
-                    client_user_message_id,
-                )
-                .await
-            {
-                Ok(turn_id) => turn_id,
-                Err(err) => {
-                    self.evict_proven_dead_thread_handle(thread_id, &thread, &err)
-                        .await;
-                    let error = internal_error(format!("failed to start turn: {err}"));
-                    self.track_error_response(&request_id, &error, /*error_type*/ None);
-                    return Err(error);
-                }
-            }
+            self.submit_turn_start_input(
+                &request_id,
+                thread_id,
+                &thread,
+                turn_input_request,
+                /*submission_turn_id*/ None,
+            )
+            .await
+            .map_err(|(error, _submit_error)| error)?
         };
 
-        if turn_has_input {
+        if turn_has_input && started {
             let config_snapshot = thread.config_snapshot().await;
             let parent_permission_profile =
                 parent_permission_profile_override.unwrap_or(config_snapshot.permission_profile);
@@ -916,6 +993,42 @@ impl TurnRequestProcessor {
         };
 
         Ok(TurnStartResponse { turn })
+    }
+
+    /// Submits one turn-start input and reports Core's routing decision.
+    ///
+    /// `submission_turn_id` pins the turn id Core records for a started turn;
+    /// completion-bound callers pass their durable completion work id so retries of the
+    /// same work item address the same turn.
+    async fn submit_turn_start_input(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+        request: TurnInputRequest,
+        submission_turn_id: Option<String>,
+    ) -> Result<(String, bool), (JSONRPCErrorError, Option<CodexErr>)> {
+        let request = request.with_trace(self.request_trace_context(request_id).await);
+        let submission = match submission_turn_id {
+            Some(turn_id) => thread.start_or_steer_turn_with_id(request, turn_id).await,
+            None => thread.start_or_steer_turn(request).await,
+        };
+        match submission {
+            Ok(TurnInputSubmission::Started { turn_id }) => Ok((turn_id, true)),
+            Ok(TurnInputSubmission::Steered { turn_id }) => Ok((turn_id, false)),
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => {
+                let error = internal_error(format!("failed to submit turn input: {reason:?}"));
+                self.track_error_response(request_id, &error, /*error_type*/ None);
+                Err((error, None))
+            }
+            Err(err) => {
+                self.evict_proven_dead_thread_handle(thread_id, thread, &err)
+                    .await;
+                let error = internal_error(format!("failed to start turn: {err}"));
+                self.track_error_response(request_id, &error, /*error_type*/ None);
+                Err((error, Some(err)))
+            }
+        }
     }
 
     async fn build_environment_override(
@@ -1395,15 +1508,15 @@ impl TurnRequestProcessor {
                 if binding_state != CompletionBindingState::Registered {
                     Ok(params.expected_turn_id.clone())
                 } else {
-                    let steer_result = thread
-                        .steer_input(
-                            mapped_items,
-                            additional_context,
-                            Some(&params.expected_turn_id),
-                            params.client_user_message_id,
-                            params.responsesapi_client_metadata,
-                        )
-                        .await;
+                    let steer_result = steer_turn(
+                        thread.as_ref(),
+                        mapped_items,
+                        additional_context,
+                        &params.expected_turn_id,
+                        params.client_user_message_id,
+                        params.responsesapi_client_metadata,
+                    )
+                    .await;
                     if steer_result.is_ok() {
                         completions
                             .note_turn_submitted(
@@ -1434,72 +1547,87 @@ impl TurnRequestProcessor {
                 }
             }
             None => {
-                thread
-                    .steer_input(
-                        mapped_items,
-                        additional_context,
-                        Some(&params.expected_turn_id),
-                        params.client_user_message_id,
-                        params.responsesapi_client_metadata,
-                    )
-                    .await
+                steer_turn(
+                    thread.as_ref(),
+                    mapped_items,
+                    additional_context,
+                    &params.expected_turn_id,
+                    params.client_user_message_id,
+                    params.responsesapi_client_metadata,
+                )
+                .await
             }
         };
         let turn_id = steer_result.map_err(|err| {
             let (message, data, error_type) = match err {
-                SteerInputError::NoActiveTurn(_) => (
-                    "no active turn to steer".to_string(),
-                    None,
-                    Some(AnalyticsJsonRpcError::TurnSteer(
-                        TurnSteerRequestError::NoActiveTurn,
-                    )),
-                ),
-                SteerInputError::ExpectedTurnMismatch { expected, actual } => (
-                    format!("expected active turn id `{expected}` but found `{actual}`"),
-                    None,
-                    Some(AnalyticsJsonRpcError::TurnSteer(
-                        TurnSteerRequestError::ExpectedTurnMismatch,
-                    )),
-                ),
-                SteerInputError::ActiveTurnNotSteerable { turn_kind } => {
-                    let (message, turn_steer_error) = match turn_kind {
-                        codex_protocol::protocol::NonSteerableTurnKind::Review => (
-                            "cannot steer a review turn".to_string(),
-                            TurnSteerRequestError::NonSteerableReview,
-                        ),
-                        codex_protocol::protocol::NonSteerableTurnKind::Compact => (
-                            "cannot steer a compact turn".to_string(),
-                            TurnSteerRequestError::NonSteerableCompact,
-                        ),
-                    };
-                    let error = TurnError {
-                        message: message.clone(),
-                        codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
-                            turn_kind: turn_kind.into(),
-                        }),
-                        additional_details: None,
-                    };
-                    let data = match serde_json::to_value(error) {
-                        Ok(data) => Some(data),
-                        Err(error) => {
-                            tracing::error!(
-                                ?error,
-                                "failed to serialize active-turn-not-steerable turn error"
-                            );
-                            None
-                        }
-                    };
-                    (
-                        message,
-                        data,
-                        Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
-                    )
+                SteerTurnError::Transport(error) => {
+                    let error = internal_error(format!("failed to steer turn: {error}"));
+                    self.track_error_response(request_id, &error, /*error_type*/ None);
+                    return error;
                 }
-                SteerInputError::EmptyInput => (
-                    "input must not be empty".to_string(),
-                    None,
-                    Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
-                ),
+                SteerTurnError::NotSubmitted(reason) => match reason {
+                    NotSubmittedReason::NoActiveTurn
+                    | NotSubmittedReason::NotIdle
+                    | NotSubmittedReason::PendingTriggerTurn
+                    | NotSubmittedReason::PlanMode => (
+                        "no active turn to steer".to_string(),
+                        None,
+                        Some(AnalyticsJsonRpcError::TurnSteer(
+                            TurnSteerRequestError::NoActiveTurn,
+                        )),
+                    ),
+                    NotSubmittedReason::ExpectedTurnMismatch { expected, actual } => (
+                        format!("expected active turn id `{expected}` but found `{actual}`"),
+                        None,
+                        Some(AnalyticsJsonRpcError::TurnSteer(
+                            TurnSteerRequestError::ExpectedTurnMismatch,
+                        )),
+                    ),
+                    NotSubmittedReason::ActiveTurnNotSteerable { turn_kind } => {
+                        let (message, turn_steer_error) = match turn_kind {
+                            codex_protocol::protocol::NonSteerableTurnKind::Review => (
+                                "cannot steer a review turn".to_string(),
+                                TurnSteerRequestError::NonSteerableReview,
+                            ),
+                            codex_protocol::protocol::NonSteerableTurnKind::Compact => (
+                                "cannot steer a compact turn".to_string(),
+                                TurnSteerRequestError::NonSteerableCompact,
+                            ),
+                        };
+                        let error = TurnError {
+                            message: message.clone(),
+                            codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                                turn_kind: turn_kind.into(),
+                            }),
+                            additional_details: None,
+                        };
+                        let data = match serde_json::to_value(error) {
+                            Ok(data) => Some(data),
+                            Err(error) => {
+                                tracing::error!(
+                                    ?error,
+                                    "failed to serialize active-turn-not-steerable turn error"
+                                );
+                                None
+                            }
+                        };
+                        (
+                            message,
+                            data,
+                            Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
+                        )
+                    }
+                    NotSubmittedReason::ActiveTurnOutputSchemaMismatch => (
+                        "active turn uses a different output schema".to_string(),
+                        None,
+                        None,
+                    ),
+                    NotSubmittedReason::EmptyInput => (
+                        "input must not be empty".to_string(),
+                        None,
+                        Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
+                    ),
+                },
             };
             let mut error = invalid_request(message);
             error.data = data;
